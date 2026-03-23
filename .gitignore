@@ -1,0 +1,9 @@
+*
+!src/
+!src/**
+!CMakeLists.txt
+!CMakePresets.json
+!vcpkg.json
+!cmake/
+!cmake/**
+!.gitignore
