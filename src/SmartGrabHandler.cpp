@@ -3,8 +3,10 @@
 #include "CookingHandler.h"
 #include "DropToHand.h"
 #include "Grab.h"
+#include "Heisenberg.h"
 #include "Hooks.h"
 #include "F4VROffsets.h"
+#include "VRInput.h"
 #include "WandNodeHelper.h"
 #include "f4vr/PlayerNodes.h"
 #include "VirtualHolstersAPI.h"
@@ -103,6 +105,44 @@ namespace heisenberg
         return false;
     }
 
+    // Per-type item weight. TESWeightForm's weight member sits at different offsets per concrete
+    // type, so we cast (same dispatch ThrownObjectTracker uses). WEAP reads its per-instance
+    // weaponData.weight; ARMO/other rarely-bulk types are left at 0 (a small underestimate that
+    // only makes the over-encumbered check slightly conservative).
+    static float SmartGrabItemWeight(RE::TESBoundObject* obj)
+    {
+        if (!obj) return 0.0f;
+        switch (obj->GetFormType()) {
+            case RE::ENUM_FORM_ID::kMISC: return static_cast<RE::TESObjectMISC*>(obj)->GetFormWeight();
+            case RE::ENUM_FORM_ID::kALCH: return static_cast<RE::AlchemyItem*>(obj)->GetFormWeight();
+            case RE::ENUM_FORM_ID::kAMMO: return static_cast<RE::TESAmmo*>(obj)->GetFormWeight();
+            case RE::ENUM_FORM_ID::kKEYM: return static_cast<RE::TESKey*>(obj)->GetFormWeight();
+            case RE::ENUM_FORM_ID::kNOTE: return static_cast<RE::BGSNote*>(obj)->GetFormWeight();
+            case RE::ENUM_FORM_ID::kWEAP: return static_cast<RE::TESObjectWEAP*>(obj)->weaponData.weight;
+            default:                      return 0.0f;
+        }
+    }
+
+    // True when the player's carried weight meets/exceeds their carry capacity.
+    // Summed once per smart-grab trigger (not per-frame), so the O(n) walk is fine.
+    static bool IsPlayerOverEncumbered(RE::PlayerCharacter* player)
+    {
+        if (!player || !player->inventoryList) return false;
+        auto* av = RE::ActorValue::GetSingleton();
+        if (!av || !av->carryWeight) return false;
+
+        const float maxCarry = player->GetActorValue(*av->carryWeight);
+        if (maxCarry <= 0.0f) return false;
+
+        float total = 0.0f;
+        for (auto& it : player->inventoryList->data) {
+            if (!it.object || it.GetCount() <= 0) continue;
+            total += SmartGrabItemWeight(it.object) * static_cast<float>(it.GetCount());
+            if (total > maxCarry) return true;  // early-out once over
+        }
+        return total > maxCarry;
+    }
+
     // =========================================================================
     // INITIALIZATION
     // =========================================================================
@@ -185,7 +225,7 @@ namespace heisenberg
 
         // Combat - use IsInActiveCombat to avoid false positives from stale/ended combat groups
         needs.inCombat = heisenberg::IsInActiveCombat(reinterpret_cast<RE::Actor*>(player));
-        needs.isOverencumbered = false;
+        needs.isOverencumbered = IsPlayerOverEncumbered(player);
 
         spdlog::debug("[SMARTGRAB] AssessPlayerNeeds: checkpoint 4 - combat/rad area OK");
 
@@ -384,6 +424,14 @@ namespace heisenberg
                 result.categories = result.categories | SmartGrabCategory::Drink;
         }
 
+        // Sleep aid (caffeine) — tagged independently of other categories, since a drink can
+        // also fight fatigue. Pulled when survival fatigue (sleep deprivation) is detected.
+        if (ContainsCI(nameStr, "coffee") || ContainsCI(nameStr, "tea") ||
+            ContainsCI(nameStr, "caffeine") || ContainsCI(nameStr, "nuka-cola") ||
+            ContainsCI(nameStr, "nuka cola")) {
+            result.categories = result.categories | SmartGrabCategory::SleepAid;
+        }
+
         // Compute sub-priority for stimpack, food and drink
         if (HasCategory(result.categories, SmartGrabCategory::Stimpack)) {
             result.subPriority = (std::max)(result.subPriority, GetStimpackSubPriority(obj));
@@ -472,19 +520,28 @@ namespace heisenberg
             bool condition;
         };
 
-        // Stack-allocated priority list (no heap alloc)
+        // Stack-allocated priority list (no heap alloc). Each "Include …" MCM toggle gates
+        // the categories it controls (Health→Stimpack, Food→Food/Drink, CombatChems→CombatChem,
+        // Antibiotics→Antibiotic, CarryWeight→CarryWeightAid). RadAway honors the rads-percent
+        // threshold slider (was firing on any rads at all). SleepAid is pulled when fatigued.
+        const bool incHealth   = g_config.smartGrabIncludeHealth;
+        const bool incFood     = g_config.smartGrabIncludeFood;
+        const bool incChems    = g_config.smartGrabIncludeCombatChems;
+        const bool incAnti     = g_config.smartGrabIncludeAntibiotics;
+        const bool incCarry    = g_config.smartGrabIncludeCarryWeight;
         const PriorityEntry priorities[] = {
-            { SmartGrabCategory::Stimpack,       needs.healthPercent < g_config.smartGrabHealthThreshold },
-            { SmartGrabCategory::RadAway,         needs.radsLevel > 0.0f },
-            { SmartGrabCategory::CombatChem,      needs.inCombat },
+            { SmartGrabCategory::Stimpack,       incHealth && needs.healthPercent < g_config.smartGrabHealthThreshold },
+            { SmartGrabCategory::RadAway,         needs.radsLevel > 0.0f && needs.radsPercent >= g_config.smartGrabRadsThreshold },
+            { SmartGrabCategory::CombatChem,      incChems && needs.inCombat },
             { SmartGrabCategory::RadResistance,   needs.takingRadDamage },
-            { SmartGrabCategory::Antibiotic,      needs.hasDisease },
+            { SmartGrabCategory::Antibiotic,      incAnti && needs.hasDisease },
             { SmartGrabCategory::Addictol,        needs.hasAddiction },
-            { SmartGrabCategory::Food,            needs.isHungry },
-            { SmartGrabCategory::Drink,           needs.isThirsty },
-            { SmartGrabCategory::Stimpack,        needs.inCombat && needs.healthPercent < 0.75f },
-            { SmartGrabCategory::CarryWeightAid,  needs.isOverencumbered },
-            { SmartGrabCategory::Drink,           needs.isFatigued },
+            { SmartGrabCategory::Food,            incFood && needs.isHungry },
+            { SmartGrabCategory::Drink,           incFood && needs.isThirsty },
+            { SmartGrabCategory::Stimpack,        incHealth && needs.inCombat && needs.healthPercent < 0.75f },
+            { SmartGrabCategory::SleepAid,        needs.isFatigued },
+            { SmartGrabCategory::CarryWeightAid,  incCarry && needs.isOverencumbered },
+            { SmartGrabCategory::Drink,           incFood && needs.isFatigued },  // caffeine fallback if no sleep aid
         };
 
         // Single-pass: categorize all ALCH items once, track best per category
@@ -799,6 +856,24 @@ namespace heisenberg
         if (grabState.active && grabState.stickyGrab) {
             spdlog::debug("[SMARTGRAB] BLOCKED: {} hand has active sticky grab - grip is for storing, not retrieving",
                          isLeft ? "left" : "right");
+            return false;
+        }
+
+        // Don't trigger smart retrieval on the hand that has a weapon equipped —
+        // that hand's grip belongs to weapon-hold/draw logic.
+        if (g_heisenberg.GetCachedHasRealWeapon()) {
+            bool isLeftHandedMode = heisenberg::VRInput::GetSingleton().IsLeftHandedMode();
+            bool isPrimaryHand = (isLeft == isLeftHandedMode);
+            if (isPrimaryHand) {
+                spdlog::debug("[SMARTGRAB] BLOCKED: {} hand is weapon hand — not retrieving",
+                             isLeft ? "left" : "right");
+                return false;
+            }
+        }
+
+        // Cooldown after weapon unequip in storage zone — prevent immediate smart retrieval
+        if (Heisenberg::GetSingleton().IsWeaponUnequipCooldownActive()) {
+            spdlog::debug("[SMARTGRAB] BLOCKED: weapon unequip cooldown active");
             return false;
         }
 

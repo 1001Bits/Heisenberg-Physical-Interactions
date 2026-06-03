@@ -7,6 +7,14 @@
 
 namespace heisenberg
 {
+    namespace
+    {
+        // Trigger interaction dispatch calls beyond the slots we mapped on the
+        // synthetic listener vtable, so this path must stay disabled until the
+        // full hknpCharacterProxyListener ABI is understood.
+        constexpr bool kEnableSyntheticProxyListenerRegistration = false;
+    }
+
     // =========================================================================
     // STATIC DATA
     // =========================================================================
@@ -43,6 +51,13 @@ namespace heisenberg
     {
         if (_initialized) {
             spdlog::debug("[PROXY_LISTENER] Already initialized");
+            return true;
+        }
+
+        if (!kEnableSyntheticProxyListenerRegistration) {
+            _vtablePtr = nullptr;
+            _initialized = true;
+            spdlog::warn("[PROXY_LISTENER] Synthetic player proxy listener is hard-disabled; using pair filtering only");
             return true;
         }
 
@@ -90,6 +105,11 @@ namespace heisenberg
             std::lock_guard<std::mutex> lock(_handBodyIdsMutex);
             _handBodyIds.clear();
         }
+        {
+            std::lock_guard<std::mutex> lock(_grabbedBodyIdsMutex);
+            _grabbedBodyIds.clear();
+        }
+        _activeBodyCount.store(0, std::memory_order_relaxed);
 
         _initialized = false;
         spdlog::info("[PROXY_LISTENER] Shutdown complete");
@@ -115,6 +135,17 @@ namespace heisenberg
     {
         if (!_initialized) {
             spdlog::error("[PROXY_LISTENER] Cannot register - not initialized");
+            return false;
+        }
+
+        if (!kEnableSyntheticProxyListenerRegistration) {
+            static bool loggedDisabled = false;
+            if (!loggedDisabled) {
+                spdlog::warn("[PROXY_LISTENER] RegisterWithPlayer blocked: synthetic listener remains disabled until full ABI is mapped");
+                loggedDisabled = true;
+            }
+            _playerProxy = nullptr;
+            _registered = false;
             return false;
         }
 
@@ -158,58 +189,48 @@ namespace heisenberg
             return false;
         }
 
-        auto* charController = middleHigh->charController.get();
+        // VR: charController is at middleHigh + 0x3E8 (NOT CommonLibF4's 0x3E0)
+        constexpr std::ptrdiff_t rawCharControllerOffset = 0x3E8;
+        void* rawPtr = *reinterpret_cast<void**>(
+            reinterpret_cast<uintptr_t>(middleHigh) + rawCharControllerOffset);
+        auto* charController = reinterpret_cast<RE::bhkCharacterController*>(rawPtr);
         if (!charController) {
             static auto lastLog = std::chrono::steady_clock::now();
             auto now = std::chrono::steady_clock::now();
             if (std::chrono::duration_cast<std::chrono::seconds>(now - lastLog).count() >= 1) {
-                // Dump the raw pointer at offset 0x3E0 to see if it's zero or if smart pointer is broken
-                void* rawPtr = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(middleHigh) + 0x3E0);
-                spdlog::warn("[PROXY_LISTENER] Player has no charController (middleHigh @ {:x}, raw ptr at +0x3E0 = {:x})",
-                    reinterpret_cast<uintptr_t>(middleHigh), reinterpret_cast<uintptr_t>(rawPtr));
+                spdlog::warn("[PROXY_LISTENER] Player has no charController (middleHigh @ {:x}, raw ptr at +0x3E8 = 0)",
+                    reinterpret_cast<uintptr_t>(middleHigh));
                 lastLog = now;
             }
             return false;
         }
+        spdlog::info("[PROXY_LISTENER] Found charController at {:p} via offset 0x3E8", rawPtr);
 
         spdlog::info("[PROXY_LISTENER] Got character controller at {:p}", (void*)charController);
 
-        // The character controller in F4VR is bhkCharProxyController which has the proxy inside
-        // bhkCharProxyController inherits from bhkCharacterController (at offset 0) 
-        // and has the hknpCharacterProxy at some offset
-        // 
-        // In Skyrim HIGGS:
-        //   bhkCharProxyController : hkpCharacterProxyListener, bhkCharacterController
-        //   offset 0x340: bhkCharacterProxy proxy
-        //   proxy.characterProxy is the hkpCharacterProxy*
-        //
-        // For F4VR we need to find the hknpCharacterProxy*
-        // Looking at bhkCharacterController, it's 0x450 bytes
-        // bhkCharProxyController likely has proxy after that
+        // Ghidra: bhkCharProxyController::Init reads *(param_1 + 0x480) for the proxy.
+        // param_1 is the OBJECT BASE. GetCharController returns the bhkCharacterController
+        // subobject at base + 0x10. So proxy = charController + (0x480 - 0x10) = charController + 0x470.
+        // We read the proxy pointer directly without going through the wrapper.
+        constexpr std::ptrdiff_t PROXY_POINTER_OFFSET_FROM_CONTROLLER = 0x470;
 
-        // Try to find the hknpCharacterProxy by checking known offsets
-        // The bhkCharProxyController has 2 vtables at 0x2e892b8 and 0x2e89328
-        // The second vtable (0x2e89328) is the listener vtable
-        
-        // For now, let's try to find the proxy by exploring the structure
-        // In Skyrim, it's at offset 0x340 after the bhkCharacterController base
-        // F4VR's bhkCharacterController is 0x450 bytes, so proxy might be at 0x450 or thereabouts
-        
-        constexpr std::ptrdiff_t PROXY_OFFSET_FROM_CONTROLLER = 0x450;  // After bhkCharacterController
-        
         uintptr_t controllerAddr = reinterpret_cast<uintptr_t>(charController);
-        void* proxyHolder = reinterpret_cast<void*>(controllerAddr + PROXY_OFFSET_FROM_CONTROLLER);
-        
-        spdlog::info("[PROXY_LISTENER] Checking for proxy at controller + 0x{:X} = {:p}", 
-                     PROXY_OFFSET_FROM_CONTROLLER, proxyHolder);
-
-        // The proxy structure should have the hknpCharacterProxy* at offset 0x10 (like Skyrim's bhkCharacterProxy)
-        // bhkCharacterProxy : bhkSerializable { hkRefPtr<hknpCharacterProxy> characterProxy; // 0x10 }
-        void** proxyPtr = reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(proxyHolder) + 0x10);
+        void** proxyPtr = reinterpret_cast<void**>(controllerAddr + PROXY_POINTER_OFFSET_FROM_CONTROLLER);
         void* hknpProxy = *proxyPtr;
+
+        spdlog::info("[PROXY_LISTENER] Reading proxy pointer at charController + 0x{:X} = {:p}, value = {:p}",
+                     PROXY_POINTER_OFFSET_FROM_CONTROLLER,
+                     (void*)proxyPtr, hknpProxy);
 
         if (!hknpProxy) {
             spdlog::warn("[PROXY_LISTENER] hknpCharacterProxy is null - player may not be fully initialized");
+            return false;
+        }
+
+        // Sanity check: proxy should be on the heap, not in code segment
+        uintptr_t proxyAddr = reinterpret_cast<uintptr_t>(hknpProxy);
+        if (proxyAddr > 0x7FF000000000ULL && proxyAddr < 0x800000000000ULL) {
+            spdlog::error("[PROXY_LISTENER] Proxy address {:p} is in code segment — wrong offset!", hknpProxy);
             return false;
         }
 
@@ -238,19 +259,24 @@ namespace heisenberg
 
     void PlayerCharacterProxyListener::UnregisterFromPlayer()
     {
-        if (!_registered || !_playerProxy) {
+        if (!kEnableSyntheticProxyListenerRegistration) {
+            _playerProxy = nullptr;
+            _registered = false;
             return;
         }
 
-        spdlog::info("[PROXY_LISTENER] Unregistering from player's character proxy...");
-        
-        void* ourListener = &_vtablePtr;
-        s_removeListener(_playerProxy, ourListener);
+        if (!_registered && !_playerProxy) {
+            return;
+        }
 
+        spdlog::info("[PROXY_LISTENER] Marking proxy listener as unregistered (proxy may be dead on save/load)");
+
+        // DON'T call removeListener — during save/load the proxy may already be
+        // destroyed. Just mark ourselves as unregistered. The old proxy's destruction
+        // cleans up its own listener array. The new proxy after load gets re-registered
+        // from HookPlayerCharacterUpdate.
         _playerProxy = nullptr;
         _registered = false;
-
-        spdlog::info("[PROXY_LISTENER] Unregistered from player proxy");
     }
 
     // =========================================================================
@@ -259,24 +285,72 @@ namespace heisenberg
 
     void PlayerCharacterProxyListener::RegisterHandBodyId(std::uint32_t bodyId)
     {
+        if (!kEnableSyntheticProxyListenerRegistration) {
+            return;
+        }
+
         std::lock_guard<std::mutex> lock(_handBodyIdsMutex);
-        _handBodyIds.insert(bodyId);
-        spdlog::info("[PROXY_LISTENER] Registered hand body ID 0x{:08X} (total: {})", 
+        auto result = _handBodyIds.insert(bodyId);
+        if (result.second) _activeBodyCount.fetch_add(1, std::memory_order_relaxed);
+        spdlog::info("[PROXY_LISTENER] Registered hand body ID 0x{:08X} (total: {})",
                      bodyId, _handBodyIds.size());
     }
 
     void PlayerCharacterProxyListener::UnregisterHandBodyId(std::uint32_t bodyId)
     {
+        if (!kEnableSyntheticProxyListenerRegistration) {
+            return;
+        }
+
         std::lock_guard<std::mutex> lock(_handBodyIdsMutex);
-        _handBodyIds.erase(bodyId);
-        spdlog::info("[PROXY_LISTENER] Unregistered hand body ID 0x{:08X} (total: {})", 
+        if (_handBodyIds.erase(bodyId)) _activeBodyCount.fetch_sub(1, std::memory_order_relaxed);
+        spdlog::info("[PROXY_LISTENER] Unregistered hand body ID 0x{:08X} (total: {})",
                      bodyId, _handBodyIds.size());
     }
 
     bool PlayerCharacterProxyListener::IsHandBodyId(std::uint32_t bodyId) const
     {
+        if (!kEnableSyntheticProxyListenerRegistration) {
+            return false;
+        }
+
         std::lock_guard<std::mutex> lock(_handBodyIdsMutex);
         return _handBodyIds.find(bodyId) != _handBodyIds.end();
+    }
+
+    void PlayerCharacterProxyListener::RegisterGrabbedBodyId(std::uint32_t bodyId)
+    {
+        if (!kEnableSyntheticProxyListenerRegistration) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(_grabbedBodyIdsMutex);
+        auto result = _grabbedBodyIds.insert(bodyId);
+        if (result.second) _activeBodyCount.fetch_add(1, std::memory_order_relaxed);
+        spdlog::info("[PROXY_LISTENER] Registered grabbed body ID 0x{:08X} (total: {})",
+                     bodyId, _grabbedBodyIds.size());
+    }
+
+    void PlayerCharacterProxyListener::UnregisterGrabbedBodyId(std::uint32_t bodyId)
+    {
+        if (!kEnableSyntheticProxyListenerRegistration) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(_grabbedBodyIdsMutex);
+        if (_grabbedBodyIds.erase(bodyId)) _activeBodyCount.fetch_sub(1, std::memory_order_relaxed);
+        spdlog::info("[PROXY_LISTENER] Unregistered grabbed body ID 0x{:08X} (total: {})",
+                     bodyId, _grabbedBodyIds.size());
+    }
+
+    bool PlayerCharacterProxyListener::IsGrabbedBodyId(std::uint32_t bodyId) const
+    {
+        if (!kEnableSyntheticProxyListenerRegistration) {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(_grabbedBodyIdsMutex);
+        return _grabbedBodyIds.find(bodyId) != _grabbedBodyIds.end();
     }
 
     // =========================================================================
@@ -317,6 +391,10 @@ namespace heisenberg
         void* contacts,  // hkArray<hknpCharacterProxy::Contact>*
         hkSimplexSolverInput* input)
     {
+        if (!kEnableSyntheticProxyListenerRegistration) {
+            return;
+        }
+
         // Safety checks
         if (!input || !input->m_constraints || input->m_numConstraints <= 0) {
             return;
@@ -324,41 +402,63 @@ namespace heisenberg
 
         auto& instance = GetSingleton();
         
-        // Quick check - if no hand bodies registered, nothing to do
-        if (instance._handBodyIds.empty()) {
+        // =====================================================================
+        // SELECTIVE CONSTRAINT FILTERING (HIGGS pattern for hknp)
+        // Contact struct: 0x40 bytes per entry, bodyId at +0x28
+        // Contacts array: *(void**)(contacts+0x00) = data, *(int*)(contacts+0x08) = count
+        // Constraints and contacts are parallel arrays (contact[i] → constraint[i])
+        // Constraint velocity at SurfaceConstraintInfo+0x10 (hkVector4f)
+        // =====================================================================
+        if (instance._activeBodyCount.load(std::memory_order_relaxed) == 0) {
             return;
         }
 
-        // For now, log that the callback was hit (for debugging)
-        static int callCount = 0;
-        if (++callCount % 1000 == 0) {
-            spdlog::debug("[PROXY_LISTENER] processConstraintsCallback hit {} times, {} constraints", 
-                         callCount, input->m_numConstraints);
+        // Read contacts array
+        uintptr_t contactsAddr = reinterpret_cast<uintptr_t>(contacts);
+        void* contactData = *reinterpret_cast<void**>(contactsAddr);
+        int contactCount = *reinterpret_cast<int*>(contactsAddr + 0x08);
+
+        if (!contactData || contactCount <= 0) {
+            return;
         }
 
-        // AGGRESSIVE ZEROING: Zero velocity for ALL constraints, not just hand-body ones.
-        //
-        // Trade-off analysis:
-        //   PRO: Completely prevents player pushback from hand collision bodies.
-        //   CON: Also zeroes constraints from world geometry, NPCs, etc., which can
-        //        cause the player to clip through walls in edge cases.
-        //
-        // Proper fix (deferred - requires reverse engineering):
-        //   The hkSurfaceConstraintInfo struct has body ID fields at unknown offsets.
-        //   To filter correctly, we'd need to:
-        //   1. Reverse engineer hkSurfaceConstraintInfo to find bodyIdA/bodyIdB offsets
-        //   2. Compare against our hand body IDs from HandCollision::GetHandBody()
-        //   3. Only zero velocities for constraints where one body is our hand body
-        //   This is blocked on mapping the contact struct layout from Havok 2014+ SDK.
-        
-        for (int i = 0; i < input->m_numConstraints; ++i) {
-            hkSurfaceConstraintInfo& constraint = input->m_constraints[i];
-            
-            // Zero out the velocity to prevent pushback
-            constraint.m_velocity.x = 0.0f;
-            constraint.m_velocity.y = 0.0f;
-            constraint.m_velocity.z = 0.0f;
-            constraint.m_velocity.w = 0.0f;
+        int numConstraints = input->m_numConstraints;
+        int count = (contactCount < numConstraints) ? contactCount : numConstraints;
+
+        for (int i = 0; i < count; ++i) {
+            // Read bodyId from Contact[i] at +0x28
+            std::int32_t bodyId = *reinterpret_cast<std::int32_t*>(
+                reinterpret_cast<uintptr_t>(contactData) + i * 0x40 + 0x28);
+
+            if (bodyId == 0x7FFFFFFF) {
+                continue;  // Invalid contact
+            }
+
+            std::uint32_t uBodyId = static_cast<std::uint32_t>(bodyId);
+
+            // Check if this body is one of our hand bodies or grabbed objects
+            bool shouldFilter = false;
+            {
+                std::lock_guard<std::mutex> lock1(instance._handBodyIdsMutex);
+                if (instance._handBodyIds.find(uBodyId) != instance._handBodyIds.end()) {
+                    shouldFilter = true;
+                }
+            }
+            if (!shouldFilter) {
+                std::lock_guard<std::mutex> lock2(instance._grabbedBodyIdsMutex);
+                if (instance._grabbedBodyIds.find(uBodyId) != instance._grabbedBodyIds.end()) {
+                    shouldFilter = true;
+                }
+            }
+
+            if (shouldFilter) {
+                // Zero this constraint's velocity to prevent player pushback
+                hkSurfaceConstraintInfo& constraint = input->m_constraints[i];
+                constraint.m_velocity.x = 0.0f;
+                constraint.m_velocity.y = 0.0f;
+                constraint.m_velocity.z = 0.0f;
+                constraint.m_velocity.w = 0.0f;
+            }
         }
     }
 

@@ -6,14 +6,18 @@
 #include "FRIKInterface.h"
 #include "Grab.h"
 #include "Heisenberg.h"
+#include "HeisenbergInterface001.h"
 #include "Highlight.h"
 #include "Hooks.h"
 #include "MenuChecker.h"
+#include "ContactImpulseListener.h"
 #include "Physics.h"
+#include "PickpocketHandler.h"
 #include "SmartGrabHandler.h"
 #include "Utils.h"
 #include "VRInput.h"
 #include "WandNodeHelper.h"
+#include "HeisenbergInterface001.h"
 
 #include <f4vr/PlayerNodes.h>
 #include <RE/Bethesda/UI.h>
@@ -118,7 +122,9 @@ namespace heisenberg
             // not drop held items. Passively track grip state so there is no stale
             // transition when the menu closes.
             if (grabState.active) {
-                _grabPressed = g_vrInput.IsPressed(_isLeft, VRButton::Grip);
+                VRButton grabBtn = _isLeft ? (g_config.useXForLeftGrab  ? VRButton::X : VRButton::Grip)
+                                           : (g_config.useAForRightGrab ? VRButton::A : VRButton::Grip);
+                _grabPressed = g_vrInput.IsPressed(_isLeft, grabBtn);
             } else {
                 _grabPressed = false;
             }
@@ -136,6 +142,18 @@ namespace heisenberg
         UpdateTracking();
         UpdateSelection();  // Find nearby objects first
         UpdateState();      // Transition states based on selection
+
+        // Tell the OpenVR callback whether this hand has a valid grab target.
+        // When false, remapped buttons pass through to game for native actions.
+        {
+            bool hasTarget = (_state == State::SelectedClose) && _selection.IsValid();
+            auto& heisenberg = Heisenberg::GetSingleton();
+            if (_isLeft)
+                heisenberg._hasGrabTargetLeft.store(hasTarget, std::memory_order_relaxed);
+            else
+                heisenberg._hasGrabTargetRight.store(hasTarget, std::memory_order_relaxed);
+        }
+
         UpdateInput();      // Check VR controller input (now state is correct)
 
         // Sync Hand state with GrabManager - handles grabs started by DropToHand
@@ -171,15 +189,55 @@ namespace heisenberg
 
     void Hand::UpdateInput()
     {
-        // Check grip button state from VR controllers
-        bool gripPressed = g_vrInput.IsPressed(_isLeft, VRButton::Grip);
-        float gripValue = g_vrInput.GetGripValue(_isLeft);
+        // Determine which button this hand uses for grabbing
+        VRButton grabButton = _isLeft ? (g_config.useXForLeftGrab  ? VRButton::X : VRButton::Grip)
+                                      : (g_config.useAForRightGrab ? VRButton::A : VRButton::Grip);
 
-        // DEBUG: Log grip state periodically
-        static int frameCounter = 0;
-        if (++frameCounter % 90 == 0) {  // Every ~1 second at 90Hz
-            spdlog::debug("[INPUT DEBUG] {} hand: gripValue={:.2f} gripPressed={} _grabPressed={} state={}",
-                        _isLeft ? "Left" : "Right", gripValue, gripPressed, _grabPressed, static_cast<int>(_state));
+        // Hysteresis on the analog Grip axis: Valve Index Knuckles and similar controllers
+        // can have the grip value fluctuate around 0.5 mid-hold, causing spurious releases.
+        // Only applies when using Grip — A/X are digital and don't need it.
+        float gripValue = g_vrInput.GetGripValue(_isLeft);
+        bool gripPressed;
+        if (grabButton == VRButton::Grip && _grabPressed) {
+            // Already holding with Grip — stay held until clearly released (0.3 threshold)
+            gripPressed = (gripValue > 0.3f);
+        } else {
+            gripPressed = g_vrInput.IsPressed(_isLeft, grabButton);
+        }
+
+        // DEBUG: Per-hand grip/button diagnostics.
+        // 1) Log every press/release transition so we never miss the button edge.
+        // 2) Log a periodic sample using a per-instance counter (the previous static
+        //    counter was shared between Left/Right, so only one hand ever logged).
+        bool logTransition = (gripPressed != _grabPressed);
+        _inputDebugCounter++;
+        bool logPeriodic = (_inputDebugCounter % 90 == 0);
+        if (logTransition || logPeriodic) {
+            uint64_t rawMask = g_vrInput.GetRawButtonMask(_isLeft);
+            float analogGrip = gripValue;
+            bool hasAnalog = (gripValue > 0.0f);
+            const char* tag = logTransition ? (gripPressed ? "PRESS" : "RELEASE") : "SAMPLE";
+            if (grabButton != VRButton::Grip) {
+                spdlog::info("[GRAB-BTN:{}] {} hand: button={} raw=0x{:016X} bit7={} bit2={} analog={:.2f} hasAnalog={} pressed={} config=L{}/R{}",
+                    tag,
+                    _isLeft ? "Left" : "Right",
+                    static_cast<int>(grabButton),
+                    rawMask,
+                    (rawMask & (1ULL << 7)) != 0,
+                    (rawMask & (1ULL << 2)) != 0,
+                    analogGrip, hasAnalog,
+                    gripPressed,
+                    g_config.useXForLeftGrab, g_config.useAForRightGrab);
+            } else {
+                spdlog::info("[GRAB-BTN:{}] {} hand: analog={:.2f} hasAnalog={} bit2={} bit7={} gripVal={:.2f} pressed={} _prev={} state={} config=L{}/R{}",
+                            tag,
+                            _isLeft ? "Left" : "Right",
+                            analogGrip, hasAnalog,
+                            (rawMask & (1ULL << 2)) != 0,
+                            (rawMask & (1ULL << 7)) != 0,
+                            gripValue, gripPressed, _grabPressed, static_cast<int>(_state),
+                            g_config.useXForLeftGrab, g_config.useAForRightGrab);
+            }
         }
 
         // =========================================================================
@@ -209,19 +267,108 @@ namespace heisenberg
             return;
         }
 
-        // Detect press/release transitions
-        if (gripPressed && !_grabPressed) {
-            RE::TESObjectREFR* selRefr = _selection.GetRefr();
-            spdlog::debug("[INPUT] {} grip PRESSED (state={}, selection={})", 
-                         _isLeft ? "Left" : "Right", 
-                         static_cast<int>(_state),
-                         selRefr ? selRefr->formID : 0);
-            OnGrabPressed();
-        } else if (!gripPressed && _grabPressed) {
-            spdlog::debug("[INPUT] {} grip RELEASED (state={})", 
-                         _isLeft ? "Left" : "Right",
-                         static_cast<int>(_state));
-            OnGrabReleased();
+        // Check if hand is disabled via the API (another plugin called DisableHand)
+        if (HeisenbergPluginAPI::IsHandDisabledByAPI(_isLeft)) {
+            // If we're holding something, release it
+            if (_state == State::Held || _state == State::Pulling) {
+                spdlog::debug("[API] {} hand disabled - releasing grab", _isLeft ? "Left" : "Right");
+                auto& grabMgr = GrabManager::GetSingleton();
+                grabMgr.EndGrab(_isLeft, nullptr);
+                TransitionToIdle();
+            }
+            _grabPressed = gripPressed;  // Track state but don't act on it
+            return;
+        }
+
+        // Suppress normal grip handling when pickpocket browse is active on this hand.
+        // The PickpocketHandler handles grip presses for cycling items.
+        if (PickpocketHandler::GetSingleton().IsBrowsing() &&
+            PickpocketHandler::GetSingleton().GetBrowsingHand() == _isLeft) {
+            _grabPressed = gripPressed;
+            return;
+        }
+
+        // =========================================================================
+        // A/X HOLD-TO-GRAB: delay grab start until button is held past threshold.
+        // Tap (<200ms) = native game action (callback injects tap to game).
+        // Hold (>200ms) = Heisenberg grab.
+        // For Grip buttons, grab starts immediately as before.
+        // =========================================================================
+        bool useHoldToGrab = (grabButton != VRButton::Grip);
+
+        if (useHoldToGrab) {
+            if (gripPressed && !_grabPressed) {
+                if (_state == State::Held) {
+                    // Already holding an item (sticky grab) — drop immediately, no delay needed
+                    _axGrabHoldConfirmed = true;
+                    spdlog::debug("[INPUT] {} A/X PRESSED while holding — immediate drop",
+                                 _isLeft ? "Left" : "Right");
+                    OnGrabPressed();
+                } else {
+                    // Not holding — start hold timer, don't grab yet
+                    _axGrabPressTime = Utils::GetTime();
+                    _axGrabHoldConfirmed = false;
+                    spdlog::debug("[INPUT] {} A/X PRESSED — waiting for hold confirmation",
+                                 _isLeft ? "Left" : "Right");
+                }
+            }
+            else if (gripPressed && _grabPressed && !_axGrabHoldConfirmed) {
+                // Still held, check if past threshold
+                double held = Utils::GetTime() - _axGrabPressTime;
+                if (held >= kAXGrabHoldThreshold) {
+                    _axGrabHoldConfirmed = true;
+                    RE::TESObjectREFR* selRefr = _selection.GetRefr();
+                    spdlog::debug("[INPUT] {} A/X HOLD confirmed ({:.0f}ms) — grabbing (state={}, selection={})",
+                                 _isLeft ? "Left" : "Right",
+                                 held * 1000.0,
+                                 static_cast<int>(_state),
+                                 selRefr ? selRefr->formID : 0);
+                    OnGrabPressed();
+                }
+            }
+            else if (!gripPressed && _grabPressed) {
+                if (_axGrabHoldConfirmed) {
+                    // Was a hold-grab — release normally
+                    if (_state == State::Pulling) {
+                        spdlog::debug("[INPUT] {} A/X released during pull — ignored (anti-bounce)",
+                                     _isLeft ? "Left" : "Right");
+                    } else {
+                        spdlog::debug("[INPUT] {} A/X RELEASED (state={})",
+                                     _isLeft ? "Left" : "Right",
+                                     static_cast<int>(_state));
+                        OnGrabReleased();
+                    }
+                } else {
+                    // Was a tap — game handles it (callback injected tap)
+                    spdlog::debug("[INPUT] {} A/X TAP — letting native game handle",
+                                 _isLeft ? "Left" : "Right");
+                }
+                _axGrabHoldConfirmed = false;
+            }
+        }
+        // Grip: immediate grab (no hold delay)
+        else {
+            if (gripPressed && !_grabPressed) {
+                RE::TESObjectREFR* selRefr = _selection.GetRefr();
+                spdlog::debug("[INPUT] {} grip PRESSED (state={}, selection={})",
+                             _isLeft ? "Left" : "Right",
+                             static_cast<int>(_state),
+                             selRefr ? selRefr->formID : 0);
+                OnGrabPressed();
+            } else if (!gripPressed && _grabPressed) {
+                // Ignore grip releases while a pull animation is in progress.
+                // Controllers like Valve Index Knuckles (digital-only legacy grip) can bounce
+                // the button on/off every 30ms — faster than any pull animation completes.
+                if (_state == State::Pulling) {
+                    spdlog::debug("[INPUT] {} grip released during pull — ignored (anti-bounce)",
+                                 _isLeft ? "Left" : "Right");
+                } else {
+                    spdlog::debug("[INPUT] {} grip RELEASED (state={})",
+                                 _isLeft ? "Left" : "Right",
+                                 static_cast<int>(_state));
+                    OnGrabReleased();
+                }
+            }
         }
     }
 
@@ -276,6 +423,18 @@ namespace heisenberg
             return;
         }
 
+        // Don't select objects when hand is disabled via API
+        if (HeisenbergPluginAPI::IsHandDisabledByAPI(_isLeft)) {
+            if (_selection.IsValid()) {
+                std::scoped_lock lock(_stateMutex);
+                _selection.Clear();
+                if (_state == State::SelectedClose) {
+                    _state = State::Idle;
+                }
+            }
+            return;
+        }
+
         // =====================================================================
         // SIMPLE VIEWCASTER-ONLY SELECTION
         // Check what the game's native wand laser is pointing at.
@@ -286,8 +445,16 @@ namespace heisenberg
         
         // Check if target changed from last frame
         bool targetChanged = (targetHandle != _lastViewCasterHandle);
+        RE::ObjectRefHandle oldHandle = _lastViewCasterHandle;
         _lastViewCasterHandle = targetHandle;
-        
+
+        // Fire ViewCaster target-changed callback for external plugins
+        if (targetChanged) {
+            RE::TESObjectREFR* newTarget = targetHandle ? targetHandle.get().get() : nullptr;
+            RE::TESObjectREFR* oldTarget = oldHandle ? oldHandle.get().get() : nullptr;
+            HeisenbergPluginAPI::InvokeViewCasterTargetChangedCallbacks(_isLeft, newTarget, oldTarget);
+        }
+
         if (!targetHandle) {
             // No target - clear selection if we had one
             if (_selection.IsValid()) {
@@ -347,7 +514,25 @@ namespace heisenberg
         newSelection.hitPoint = objPos;
         newSelection.hitNormal = RE::NiPoint3(0, 0, 1);
         newSelection.distance = distance;
-        newSelection.isClose = (distance <= Config::GetSingleton().closeGrabThreshold);
+        const auto& cfg = Config::GetSingleton();
+        newSelection.isClose = (distance <= cfg.closeGrabThreshold);
+
+        // Task #12: HIGGS-style collision-overlap candidate bias. When the hand
+        // body is currently in CONTACT_STARTED with at least one dynamic body,
+        // force isClose = true so a ViewCaster pick at borderline distance still
+        // counts as grabbable. This is intentionally a soft signal: we don't
+        // reverse-lookup REFR→bodyId here (no helper exists), we just trust that
+        // any overlap means the user is physically interacting with nearby
+        // clutter and relax the threshold.
+        if (cfg.useCollisionOverlapForGrabCandidates && !newSelection.isClose) {
+            auto overlaps = ContactImpulseListener::GetSingleton().GetOverlappingBodies(_isLeft);
+            if (!overlaps.empty()) {
+                newSelection.isClose = true;
+                spdlog::debug("[SELECT-VC] {} hand: overlap-set ({} bodies) promoted refr {:08X} to isClose",
+                             _isLeft ? "Left" : "Right", overlaps.size(), refr->formID);
+            }
+        }
+
         _selection = newSelection;
         _lastSelectionTime = Utils::GetTime();
         
@@ -614,8 +799,28 @@ namespace heisenberg
             break;
 
         default:
-            // No valid target - check weapon unequip or SmartGrab (grip in storage zone)
+            // No valid target - check hand-to-hand transfer, then weapon unequip
+            // or SmartGrab (grip in storage zone)
             {
+                // HAND-TO-HAND TRANSFER: a held object at point-blank range is
+                // never ViewCaster-selected (it's right at the other hand, not
+                // something you aim at), so _state stays Idle and we never reach
+                // SelectedClose/TryStartGrab. Trigger it explicitly here:
+                // TryStartGrab()'s proximity fallback builds the selection from
+                // the other hand's held object, and GrabManager::StartGrab's
+                // transfer path (otherState.GetRefr() == selRefr) hands it over.
+                {
+                    auto& gmXfer = GrabManager::GetSingleton();
+                    if (gmXfer.IsGrabbing(!_isLeft) && !gmXfer.IsGrabbing(_isLeft) && !_selection.IsValid()) {
+                        if (TryStartGrab()) {
+                            spdlog::info("[GRAB] {} hand: hand-to-hand transfer grab succeeded",
+                                         _isLeft ? "Left" : "Right");
+                            TransitionToHeld();
+                            break;
+                        }
+                    }
+                }
+
                 auto storageCheck = CheckItemStorageZone(_position);
 
                 // WEAPON UNEQUIP: If weapon hand is in storage zone and weapon is drawn, unequip it.
@@ -732,6 +937,17 @@ namespace heisenberg
 
     bool Hand::TryStartGrab()
     {
+        // Block grabbing if hand is disabled via API
+        if (HeisenbergPluginAPI::IsHandDisabledByAPI(_isLeft)) {
+            return false;
+        }
+
+        // ROCK dynamic handoff: while we're injecting a synthetic grip edge to hand the
+        // just-placed object to ROCK, don't let Heisenberg re-grab on that same edge.
+        if (Heisenberg::GetSingleton().IsRockHandoffSuppressingGrab(_isLeft)) {
+            return false;
+        }
+
         // Block grabbing when PRIMARY hand is in chest pocket zone (throwable mode)
         // Primary = right hand normally, left hand in left-handed mode
         if (IsPrimaryHand() && Heisenberg::GetSingleton().IsInChestPocketZone()) {
@@ -745,13 +961,46 @@ namespace heisenberg
         // via ShouldBlockGripForHolsteredWeapon() which strips grip from native input.
         // Heisenberg uses unfiltered input so it can still grab.
         
+        // =====================================================================
+        // HAND-TO-HAND TRANSFER (proximity fallback)
+        // =====================================================================
+        // If the OTHER hand is holding an object and this (empty) hand grips near it,
+        // transfer it to this hand — even when the ViewCaster didn't select it. A held
+        // object at close range is usually NOT ViewCaster-targetable (it's right at the
+        // other hand, not something you point at from a distance), so the normal selection
+        // path never offers it and the transfer in GrabManager::StartGrab (which keys on
+        // otherState.GetRefr() == selRefr) never fires. Build the selection here from the
+        // other hand's held object so that transfer path triggers.
+        if (!_selection.IsValid()) {
+            auto& gmXfer = GrabManager::GetSingleton();
+            if (gmXfer.IsGrabbing(!_isLeft)) {
+                auto& otherState = gmXfer.GetGrabState(!_isLeft);
+                RE::TESObjectREFR* heldRefr = otherState.GetRefr();
+                RE::NiAVObject* held3D = heldRefr ? heldRefr->Get3D() : nullptr;
+                if (heldRefr && held3D) {
+                    const RE::NiPoint3 objPos = otherState.node
+                        ? otherState.node->world.translate
+                        : RE::NiPoint3{ heldRefr->data.location.x, heldRefr->data.location.y, heldRefr->data.location.z };
+                    const float dist = (objPos - _position).Length();
+                    const float kTransferRange = (std::max)(30.0f, Config::GetSingleton().closeGrabThreshold * 1.5f);
+                    if (dist <= kTransferRange) {
+                        _selection.SetRefr(heldRefr);
+                        _selection.node.reset(held3D);
+                        _selection.isClose = true;
+                        spdlog::info("[GRAB] {} hand: hand-to-hand transfer grab of held {:08X} (dist={:.1f}u)",
+                                     _isLeft ? "Left" : "Right", heldRefr->formID, dist);
+                    }
+                }
+            }
+        }
+
         if (!_selection.IsValid()) {
             spdlog::debug("TryStartGrab: No valid selection");
             return false;
         }
 
         auto& grabMgr = GrabManager::GetSingleton();
-        
+
         // Create a copy of selection with the 3D node populated
         Selection grabSelection = _selection;
         RE::TESObjectREFR* grabRefr = grabSelection.GetRefr();

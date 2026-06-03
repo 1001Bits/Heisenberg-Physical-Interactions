@@ -882,7 +882,29 @@ namespace heisenberg
             result.matchedName = itemName;
             return result;
         }
-        
+
+        // Priority 4: Holotape form-type default — every kNOTE item shares
+        // the __NOTE_DEFAULT offset since they're physically identical.
+        // The embedded entry has isLeftHanded=true so it lands in the map
+        // under "__NOTE_DEFAULT_L". Try the hand-specific variant first;
+        // for the right hand, fall back to "_L" and let the mirror system
+        // flip it (HIGGS-style — the offset works for either hand).
+        if (auto* baseObj = refr->GetObjectReference();
+            baseObj && baseObj->GetFormType() == RE::ENUM_FORM_ID::kNOTE) {
+            std::string noteDefault = std::string("__NOTE_DEFAULT") + handSuffix;
+            auto it = _offsets.find(noteDefault);
+            if (it == _offsets.end()) {
+                noteDefault = "__NOTE_DEFAULT_L";
+                it = _offsets.find(noteDefault);
+            }
+            if (it != _offsets.end()) {
+                spdlog::info("[ItemOffsets]  NOTE default for '{}' ({})", itemName, noteDefault);
+                ItemOffset result = it->second;
+                result.matchedName = noteDefault;
+                return result;
+            }
+        }
+
         // No exact match found - do NOT use dimension-based fallback
         spdlog::debug("[ItemOffsets] No exact match for '{}' (FormID: {})", itemName, formId);
         return std::nullopt;
@@ -1415,8 +1437,9 @@ namespace heisenberg
             if (baseObj && formType == RE::ENUM_FORM_ID::kNOTE) {
                 std::string noteDefault = std::string("__NOTE_DEFAULT") + handSuffix;
                 auto it = _offsets.find(noteDefault);
-                if (it == _offsets.end() && !isLeft) {
-                    // No _R variant — use _L and let the mirror system handle right hand
+                if (it == _offsets.end()) {
+                    // Embedded entry is stored as "__NOTE_DEFAULT_L"; for the
+                    // right hand fall back to it and let the mirror system flip.
                     noteDefault = "__NOTE_DEFAULT_L";
                     it = _offsets.find(noteDefault);
                 }

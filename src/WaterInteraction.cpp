@@ -1,7 +1,7 @@
 /**
  * WaterInteraction.cpp - Realistic water ripple and splash effects for VR hands
  *
- * Ported from Water Interactions VR
+ * Ported from Water Interactions VR (Skyrim VR mod by Shizof)
  * Adapted for Fallout 4 VR using F4SE/CommonLibF4 APIs.
  *
  * Key differences from Skyrim version:

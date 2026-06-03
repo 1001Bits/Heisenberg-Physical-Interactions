@@ -134,11 +134,19 @@ namespace heisenberg
         double _stateEnterTime = 0.0;
         double _lastSelectionTime = 0.0;
         float _lastDeltaTime = 1.0f / 90.0f;
+
+        // A/X grab hold detection: hold = grab, tap = native game action.
+        // Lets users put grab on A/X without losing the native button function.
+        double _axGrabPressTime = 0.0;       // When A/X was first pressed
+        bool   _axGrabHoldConfirmed = false;  // True once held past threshold
+
+        static constexpr float kAXGrabHoldThreshold = 0.20f; // Seconds to distinguish hold from tap
         
         // Performance optimization: cache position and skip frames
         RE::NiPoint3 _lastSelectionPosition;  // Position at last selection check
         int _selectionFrameCounter = 0;       // Frame counter for skipping
-        int _debugFrameCounter = 0;           // Per-hand debug logging counter
+        int _debugFrameCounter = 0;           // Per-hand debug logging counter (UpdateSelection)
+        int _inputDebugCounter = 0;           // Per-hand counter for UpdateInput sample logging
         static constexpr float kPositionCacheThreshold = 5.0f;  // Units - recheck if moved more than this
         static constexpr int kSelectionFrameSkip = 9;           // Frames to skip when idle+stationary (~100ms at 90Hz)
         

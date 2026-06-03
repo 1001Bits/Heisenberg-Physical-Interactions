@@ -185,4 +185,51 @@ namespace heisenberg
         // If deactivation becomes an issue, we can add deactivation manager calls here
     }
 
+    // MOTORED soft-keyframe. Identical to SetupKeyframed except we leave
+    // inverse-mass/inertia alone so the body can actually be pushed back by
+    // solver contacts, and we do not set IS_KEYFRAMED in the body flags — the
+    // motor itself drives the body toward its target. This is the mode HIGGS
+    // Skyrim uses when the hand should be influenced by impact rather than be
+    // an immovable sweep volume.
+    bool KeyframedPhysicsHelper::SetupMotored()
+    {
+        if (!IsValid()) {
+            spdlog::warn("[KeyframedPhysics] SetupMotored: not initialized");
+            return false;
+        }
+
+        void* body = AccessBody();
+        if (!body) {
+            spdlog::warn("[KeyframedPhysics] SetupMotored: AccessBody returned null");
+            return false;
+        }
+
+        std::uint16_t* flags = reinterpret_cast<std::uint16_t*>(
+            reinterpret_cast<std::uintptr_t>(body) + Offsets::hknpBody_flags);
+        _savedFlags = *flags;
+
+        constexpr std::uint16_t TEMP_REBUILD_COLLISION_CACHES = 0x0002;
+        constexpr std::uint16_t IS_ACTIVE = 0x0004;
+        // Deliberately not setting IS_KEYFRAMED — solver treats MOTORED as a
+        // driven DYNAMIC body instead.
+        *flags |= (TEMP_REBUILD_COLLISION_CACHES | IS_ACTIVE);
+
+        std::uint32_t motionId = *reinterpret_cast<std::uint32_t*>(
+            reinterpret_cast<std::uintptr_t>(body) + Offsets::hknpBody_motionId);
+
+        void* motion = hknpBSWorld_accessMotion(_world, motionId);
+        if (motion) {
+            std::uint16_t* motionPropsId = reinterpret_cast<std::uint16_t*>(
+                reinterpret_cast<std::uintptr_t>(motion) + Offsets::hknpMotion_motionPropertiesId);
+            _savedMotionPropertiesId = *motionPropsId;
+            // In Havok 2014 the MOTORED preset index is 3; the exact number can
+            // vary between the SKSE-era headers, so we log the transition.
+            constexpr std::uint16_t MOTORED_ID = 3;
+            *motionPropsId = MOTORED_ID;
+            spdlog::info("[KeyframedPhysics] SetupMotored: motionId={} propsId: {} -> {} (MOTORED)",
+                         motionId, _savedMotionPropertiesId, MOTORED_ID);
+        }
+        return true;
+    }
+
 }  // namespace heisenberg

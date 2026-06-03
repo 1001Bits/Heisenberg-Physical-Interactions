@@ -279,12 +279,12 @@ namespace HeisenbergPluginAPI {
         void GetFingerCurls(bool isLeft, float values[5]) override
         {
             const auto& state = heisenberg::GrabManager::GetSingleton().GetGrabState(isLeft);
-            if (state.hasItemOffset && state.itemOffset.hasFingerCurls) {
-                values[0] = state.itemOffset.thumbCurl;
-                values[1] = state.itemOffset.indexCurl;
-                values[2] = state.itemOffset.middleCurl;
-                values[3] = state.itemOffset.ringCurl;
-                values[4] = state.itemOffset.pinkyCurl;
+            if (state.hasRuntimeFingerCurls) {
+                values[0] = state.runtimeThumbCurl;
+                values[1] = state.runtimeIndexCurl;
+                values[2] = state.runtimeMiddleCurl;
+                values[3] = state.runtimeRingCurl;
+                values[4] = state.runtimePinkyCurl;
             } else {
                 // Default - return current single curl value for all fingers
                 float curl = heisenberg::Heisenberg::GetSingleton().GetFingerCurlValue(isLeft);
@@ -296,15 +296,9 @@ namespace HeisenbergPluginAPI {
 
         void SetFingerCurls(bool isLeft, const float values[5]) override
         {
-            // Store in the grab state's item offset
             auto& state = heisenberg::GrabManager::GetSingleton().GetGrabState(isLeft);
-            state.itemOffset.thumbCurl = values[0];
-            state.itemOffset.indexCurl = values[1];
-            state.itemOffset.middleCurl = values[2];
-            state.itemOffset.ringCurl = values[3];
-            state.itemOffset.pinkyCurl = values[4];
-            state.itemOffset.hasFingerCurls = true;
-            state.hasItemOffset = true;
+            state.SetRuntimeFingerCurls(values[0], values[1], values[2], values[3], values[4]);
+            state.pendingFingerCurls = false;
             
             // Also set the single curl value used by Heisenberg for FRIK
             float avgCurl = (values[0] + values[1] + values[2] + values[3] + values[4]) / 5.0f;
@@ -492,6 +486,12 @@ namespace HeisenbergPluginAPI {
         {
             return heisenberg::HandCollision::GetSingleton().GetContactObject(isLeft);
         }
+
+        void SuppressItemToHand(unsigned int durationMs) override
+        {
+            heisenberg::DropToHand::SuppressItemToHand(
+                durationMs ? durationMs : 1500);
+        }
     };
 
     // =========================================================================
@@ -583,6 +583,15 @@ namespace HeisenbergPluginAPI {
         }
         
         return s_cachedInterface;
+    }
+
+    // =========================================================================
+    // INTERNAL QUERY (for Hand.cpp / Grab.cpp)
+    // =========================================================================
+
+    bool IsHandDisabledByAPI(bool isLeft)
+    {
+        return isLeft ? g_leftHandDisabled : g_rightHandDisabled;
     }
 
 } // namespace HeisenbergPluginAPI

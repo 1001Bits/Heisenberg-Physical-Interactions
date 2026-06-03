@@ -25,7 +25,7 @@ namespace heisenberg
          * Use after ActivateRef to catch deferred native messages that fire on later frames.
          * Call SetSuppressHUDMessages(true) first, then this to auto-unsuppress later.
          */
-        void ScheduleDeferredHUDUnsuppress(int frames = 3);
+        void ScheduleDeferredHUDUnsuppress(int frames = 3, const char* queuedMessage = nullptr);
 
         /**
          * Tick the deferred HUD unsuppress counter. Call once per frame.
@@ -129,6 +129,13 @@ namespace heisenberg
          * @param formID The formID of the dropped TESObjectREFR
          */
         void RecordDroppedRef(uint32_t formID);
+
+        /**
+         * Clear the recently-dropped ring buffer.
+         * Called on kPreLoadGame so stale form IDs from a save made shortly
+         * after a drop cannot block activation in the next session.
+         */
+        void ClearRecentDrops();
 
         /**
          * Install ActivateRef detour hook.

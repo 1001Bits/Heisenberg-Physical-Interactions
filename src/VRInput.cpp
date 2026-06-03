@@ -111,14 +111,24 @@ namespace heisenberg
         vrSystem->GetDeviceToAbsoluteTrackingPose(
             vr::TrackingUniverseStanding, 0.0f, poses, vr::k_unMaxTrackedDeviceCount);
 
-        // Get left controller state
-        // Use standard GetControllerState (goes through vtable hook path which has correct
-        // SteamVR input binding data). The Heisenberg callback only masks ulButtonPressed/ulButtonTouched,
-        // rAxis values are untouched so we get real analog grip/trigger values.
+        // Read controller state UNFILTERED — bypassing the vtable hook entirely.
+        // The Heisenberg callback strips A/Grip from ulButtonPressed when grabbing
+        // (to hide those buttons from the game). If we read through the hooked path,
+        // we'd see our own masking and think the player released the button = jitter.
+        // GetControllerStateUnfiltered() calls the original vtable function pointer
+        // directly, giving us the true hardware state.
+        // Fallback: if unfiltered isn't available (vtable not hooked), use vrSystem
+        // directly — in that case no vtable hook exists so it's already unfiltered.
+
         _leftController.valid = false;
         if (leftIndex != vr::k_unTrackedDeviceIndexInvalid) {
             vr::VRControllerState_t state{};
-            if (vrSystem->GetControllerState(leftIndex, &state, sizeof(state))) {
+            bool gotState = openvrHook.GetControllerStateUnfiltered(leftIndex, &state, sizeof(state));
+            if (!gotState) {
+                // Fallback: no vtable hook active, call directly (already unfiltered)
+                gotState = vrSystem->GetControllerState(leftIndex, &state, sizeof(state));
+            }
+            if (gotState) {
                 _leftController.current = state.ulButtonPressed;
                 _leftController.triggerValue = state.rAxis[1].x;
                 _leftController.gripValue = state.rAxis[2].x;
@@ -126,15 +136,6 @@ namespace heisenberg
                 _leftController.thumbstickY = state.rAxis[0].y;
                 _leftController.valid = true;
                 if (state.rAxis[2].x > 0.1f) _leftController.hasAnalogGrip = true;
-                // Grip hysteresis for analog controllers (Index): grab at 0.5, release at 0.3
-                if (_leftController.hasAnalogGrip) {
-                    bool wasGrip = (_leftController.previous & ButtonMask(VRButton::Grip)) != 0;
-                    float threshold = wasGrip ? 0.3f : 0.5f;
-                    if (state.rAxis[2].x > threshold)
-                        _leftController.current |= ButtonMask(VRButton::Grip);
-                    else
-                        _leftController.current &= ~ButtonMask(VRButton::Grip);
-                }
             }
             if (poses[leftIndex].bPoseIsValid) {
                 auto& av = poses[leftIndex].vAngularVelocity;
@@ -144,29 +145,58 @@ namespace heisenberg
 
         // Get right controller state
         _rightController.valid = false;
+        bool rightGotState = false;
+        vr::VRControllerState_t rightRawState{};
         if (rightIndex != vr::k_unTrackedDeviceIndexInvalid) {
-            vr::VRControllerState_t state{};
-            if (vrSystem->GetControllerState(rightIndex, &state, sizeof(state))) {
-                _rightController.current = state.ulButtonPressed;
-                _rightController.triggerValue = state.rAxis[1].x;
-                _rightController.gripValue = state.rAxis[2].x;
-                _rightController.thumbstickX = state.rAxis[0].x;
-                _rightController.thumbstickY = state.rAxis[0].y;
+            rightGotState = openvrHook.GetControllerStateUnfiltered(rightIndex, &rightRawState, sizeof(rightRawState));
+            if (!rightGotState) {
+                rightGotState = vrSystem->GetControllerState(rightIndex, &rightRawState, sizeof(rightRawState));
+            }
+            if (rightGotState) {
+                _rightController.current = rightRawState.ulButtonPressed;
+                _rightController.triggerValue = rightRawState.rAxis[1].x;
+                _rightController.gripValue = rightRawState.rAxis[2].x;
+                _rightController.thumbstickX = rightRawState.rAxis[0].x;
+                _rightController.thumbstickY = rightRawState.rAxis[0].y;
                 _rightController.valid = true;
-                if (state.rAxis[2].x > 0.1f) _rightController.hasAnalogGrip = true;
-                // Grip hysteresis for analog controllers (Index): grab at 0.5, release at 0.3
-                if (_rightController.hasAnalogGrip) {
-                    bool wasGrip = (_rightController.previous & ButtonMask(VRButton::Grip)) != 0;
-                    float threshold = wasGrip ? 0.3f : 0.5f;
-                    if (state.rAxis[2].x > threshold)
-                        _rightController.current |= ButtonMask(VRButton::Grip);
-                    else
-                        _rightController.current &= ~ButtonMask(VRButton::Grip);
-                }
+                if (rightRawState.rAxis[2].x > 0.1f) _rightController.hasAnalogGrip = true;
             }
             if (poses[rightIndex].bPoseIsValid) {
                 auto& av = poses[rightIndex].vAngularVelocity;
                 _rightController.angularVelMag = std::sqrt(av.v[0]*av.v[0] + av.v[1]*av.v[1] + av.v[2]*av.v[2]);
+            }
+        }
+
+        // DIAGNOSTIC: OpenComposite right-grip asymmetry probe.
+        // Dump full raw state returned by OpenComposite for the right controller so we
+        // can see whether grip is hiding in a different rAxis slot or is missing entirely.
+        {
+            static int s_probeFrames = 0;
+            static uint64_t s_lastPressed = ~0ULL;
+            static float s_lastAxes[5] = {-999,-999,-999,-999,-999};
+            s_probeFrames++;
+            bool initialBurst = (s_probeFrames <= 600);
+            bool changed = false;
+            if (rightGotState) {
+                if (rightRawState.ulButtonPressed != s_lastPressed) changed = true;
+                for (int i = 0; i < 5; ++i) {
+                    if (std::abs(rightRawState.rAxis[i].x - s_lastAxes[i]) > 0.05f) { changed = true; break; }
+                }
+            }
+            bool periodic = (s_probeFrames % 90 == 0);
+            if (initialBurst || changed || periodic) {
+                spdlog::info("[RIGHT-RAW] frame={} idx={} got={} pressed=0x{:016X} touched=0x{:016X} "
+                             "ax0=({:.2f},{:.2f}) ax1=({:.2f},{:.2f}) ax2=({:.2f},{:.2f}) "
+                             "ax3=({:.2f},{:.2f}) ax4=({:.2f},{:.2f})",
+                             s_probeFrames, rightIndex, rightGotState,
+                             rightRawState.ulButtonPressed, rightRawState.ulButtonTouched,
+                             rightRawState.rAxis[0].x, rightRawState.rAxis[0].y,
+                             rightRawState.rAxis[1].x, rightRawState.rAxis[1].y,
+                             rightRawState.rAxis[2].x, rightRawState.rAxis[2].y,
+                             rightRawState.rAxis[3].x, rightRawState.rAxis[3].y,
+                             rightRawState.rAxis[4].x, rightRawState.rAxis[4].y);
+                s_lastPressed = rightRawState.ulButtonPressed;
+                for (int i = 0; i < 5; ++i) s_lastAxes[i] = rightRawState.rAxis[i].x;
             }
         }
     }
@@ -176,17 +206,16 @@ namespace heisenberg
         const auto& state = GetControllerState(isLeftHand);
         if (!state.valid) return false;
         
-        // Grip: use ONLY the physical analog grip axis (rAxis[2]).
-        // This is immune to SteamVR button remapping — always reflects physical grip hardware.
+        // Grip: prefer analog grip axis (rAxis[2]) — immune to SteamVR binding remaps.
         // The digital ulButtonPressed bit IS remapped by SteamVR, so with e.g. Grip<>A swap
         // pressing physical A would set the digital grip bit and falsely trigger our grab.
-        // Only fall back to digital bit for controllers that never report analog grip data
-        // (rare — all modern VR controllers have analog grip).
+        // Fall back to digital only when analog data is absent this frame.
         if (button == VRButton::Grip) {
-            if (state.hasAnalogGrip) {
-                return state.gripValue > 0.5f;  // Analog only — always physical grip
-            }
-            // No analog data ever seen — digital fallback (may be affected by remaps)
+            if (state.gripValue > 0.5f) return true;    // Analog: pressed
+            if (state.gripValue > 0.01f) return false;  // Analog present but below threshold
+            // Analog reads ~0: either grip not pressed (normal), or analog data missing
+            // (e.g. FO4VRTools/hook issue). Fall through to digital as safety net.
+            // Digital may be affected by SteamVR remaps, but no detection is worse.
             return (state.current & ButtonMask(VRButton::Grip)) != 0;
         }
 
@@ -194,7 +223,29 @@ namespace heisenberg
         if (button == VRButton::Trigger) {
             return state.triggerValue > 0.5f;
         }
-        
+
+        // A/X buttons: SteamVR may swap Grip <-> A in legacy bindings.
+        // With such a swap, physical A sets bit 2 (Grip digital) instead of bit 7,
+        // and physical Grip sets bit 7 (A digital) instead of bit 2.
+        // Use the analog grip axis to disambiguate — physical A/X doesn't move the
+        // analog grip, but physical Grip does:
+        //   bit set + low analog grip  = physical A/X press  → detect
+        //   bit set + high analog grip = physical Grip press → ignore
+        if (button == VRButton::A /* == VRButton::X, both bit 7 */) {
+            constexpr uint64_t aBit = 1ULL << 7;   // Native A/X bit
+            constexpr uint64_t gripBit = 1ULL << 2; // Native Grip bit (target of A→Grip remap)
+            bool bit7 = (state.current & aBit) != 0;
+            bool bit2 = (state.current & gripBit) != 0;
+
+            if (state.hasAnalogGrip) {
+                // Accept either bit, as long as the physical grip isn't engaged.
+                // This catches both normal (A→bit7) and remapped (A→bit2) bindings.
+                return (bit7 || bit2) && state.gripValue < 0.2f;
+            }
+            // No analog grip data: can only check native bit 7
+            return bit7;
+        }
+
         return (state.current & ButtonMask(button)) != 0;
     }
 

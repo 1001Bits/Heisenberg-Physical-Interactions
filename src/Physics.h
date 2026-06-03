@@ -60,6 +60,9 @@ namespace heisenberg
         // Check if an object has physics (rigid body)
         bool HasPhysics(RE::TESObjectREFR* refr);
 
+        // Resolve a Havok body ID to a reference for immediate use.
+        RE::TESObjectREFR* GetRefrFromBodyId(void* bhkWorld, std::uint32_t bodyId);
+
         // Check if an object can be grabbed
         bool IsGrabbable(RE::TESObjectREFR* refr);
         
@@ -181,7 +184,58 @@ namespace heisenberg
          * @return Player body ID, or 0x7FFFFFFF if not found
          */
         std::uint32_t GetPlayerBodyId();
-        
+
+        /**
+         * Drop the cached player body id so the next GetPlayerBodyId() re-walks the
+         * resolution chain (character-proxy phantom first). Used to recover from an
+         * early/transient resolution that latched onto the wrong (e.g. ragdoll) body.
+         */
+        void InvalidatePlayerBodyId();
+
+        /**
+         * Force the player character proxy to drop its cached "support" (ground) body.
+         * The proxy refcounts that pointer (bhkCharacterController::SetSupportBody);
+         * freeing one of our keyframed collider bodies while the proxy still caches it
+         * leaves a dangling pointer -> next-frame char-proxy crash. Call at the START of
+         * any ROCK collider-body teardown (before releasing our own refs). SEH-guarded;
+         * no-op if no player/charController or the proxy holds nothing.
+         */
+        void ClearPlayerProxySupportBody();
+
+        /**
+         * Held-object mass / inertia (1:1 with ROCK GrabConstraint). Mass comes from the
+         * hknpMotion packed inverse-mass (bfloat16). NormalizeHeldObjectInertia clamps the
+         * inverse-inertia ratio to maxRatio (ROCK default 10) so elongated objects don't
+         * spin wildly under the grab motor, saving the original packed inertia into saved[3]
+         * (returns true only if it modified anything). RestoreHeldObjectInertia puts it back
+         * on release. Both rebuild the solver's derived mass props.
+         */
+        float GetHeldObjectMass(RE::bhkNPCollisionObject* obj);
+        bool GetHeldObjectVelocity(RE::bhkNPCollisionObject* obj, RE::NiPoint3& outLinearHavok, RE::NiPoint3& outAngularHavok);
+        bool NormalizeHeldObjectInertia(RE::bhkNPCollisionObject* obj, float maxRatio, std::int16_t savedOut[3]);
+        void RestoreHeldObjectInertia(RE::bhkNPCollisionObject* obj, const std::int16_t saved[3]);
+
+        /**
+         * ROCK-style collision suppression for held/grabbed bodies. Reads the body's
+         * collisionFilterInfo field and toggles bit 14 (kSuppressionNoCollideBit = 0x4000)
+         * — the engine's collision filter rejects pairs involving any body that has this
+         * bit, including against the player character proxy. More reliable than per-pair
+         * disableCollisionsBetween (no player-body resolution required).
+         *
+         * @param hknpWorld           World containing the body
+         * @param bodyId              Body to modify
+         * @param enable              true = OR the bit in (suppress collision), false = clear it
+         * @param outOriginalFilter   Optional: pre-modification filter value (for restore)
+         * @return true on successful read+write; false on invalid body or AV
+         */
+        bool SetBodyNoCollideBit(void* hknpWorld, std::uint32_t bodyId, bool enable, std::uint32_t* outOriginalFilter = nullptr);
+
+        /** Direct write of the body's collisionFilterInfo (SEH-wrapped). */
+        bool TryWriteBodyFilterInfo(void* hknpWorld, std::uint32_t bodyId, std::uint32_t filterInfo);
+
+        /** Direct read of the body's collisionFilterInfo (SEH-wrapped). */
+        bool TryReadBodyFilterInfo(void* hknpWorld, std::uint32_t bodyId, std::uint32_t& outFilterInfo);
+
         /**
          * Enable or disable player collision with world objects.
          * Used to let hands reach through player hitbox to touch activators.
@@ -195,5 +249,19 @@ namespace heisenberg
          * @return True if player collision has been disabled via SetPlayerCollisionEnabled(false)
          */
         bool IsPlayerCollisionDisabled();
+
+        /**
+         * Disable collision between two specific bodies using hknpPairCollisionFilter.
+         * Both bodies keep their normal collisions with everything else.
+         * Returns false if the underlying engine call threw (caller should treat
+         * the pair as still active — e.g. by destroying the body so it doesn't
+         * shove the player capsule).
+         */
+        bool DisableCollisionBetween(void* hknpWorld, std::uint32_t bodyIdA, std::uint32_t bodyIdB);
+
+        /**
+         * Re-enable collision between two bodies (removes the pair filter entry).
+         */
+        void EnableCollisionBetween(void* hknpWorld, std::uint32_t bodyIdA, std::uint32_t bodyIdB);
     }
 }

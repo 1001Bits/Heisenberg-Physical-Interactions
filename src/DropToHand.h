@@ -10,6 +10,7 @@
 
 #include "RE/Fallout.h"
 
+#include <atomic>
 #include <mutex>
 #include <set>
 #include <vector>
@@ -92,6 +93,78 @@ namespace heisenberg
         void MarkAsRecentlyLootedFrom(std::uint32_t containerFormID);
         bool WasRecentlyLootedFrom(std::uint32_t containerFormID);
 
+        /**
+         * Session-ready gate for all "to hand" systems.
+         * During game load, container-changed events fire for engine items
+         * (survival effects, perk items, etc.) that must not be intercepted.
+         * Call SetSessionNotReady() on kPreLoadGame to block interception,
+         * then SetSessionReady() on LoadingMenu close with a grace period so
+         * all engine-internal transfers complete before we start intercepting.
+         */
+        static void SetSessionNotReady()
+        {
+            s_sessionReadyTick.store(0, std::memory_order_release);
+            spdlog::info("[DropToHand] Session NOT ready — all to-hand systems disabled");
+        }
+
+        static void SetSessionReady(uint64_t delayMs = 5000)
+        {
+            uint64_t readyAt = GetTickCount64() + delayMs;
+            s_sessionReadyTick.store(readyAt, std::memory_order_release);
+            spdlog::info("[DropToHand] Session will be ready in {}ms (tick={})", delayMs, readyAt);
+        }
+
+        static bool IsSessionReady()
+        {
+            uint64_t readyAt = s_sessionReadyTick.load(std::memory_order_acquire);
+            if (readyAt == 0) return false;
+            return GetTickCount64() >= readyAt;
+        }
+
+        // Inline static: wall-clock tick when session becomes ready (0 = not ready)
+        static inline std::atomic<uint64_t> s_sessionReadyTick{0};
+
+        // Harvest window: stamped by HookActivateRef when the player activates
+        // a FLOR/TREE, valid for ~500ms. Gates the harvest-to-hand branch so
+        // script AddItem calls from unrelated mods (which also fire as
+        // old=0 → player container events) cannot slip through.
+        static void OpenHarvestWindow(uint64_t windowMs = 500)
+        {
+            uint64_t deadline = GetTickCount64() + windowMs;
+            s_harvestWindowDeadline.store(deadline, std::memory_order_release);
+        }
+
+        static bool IsHarvestWindowOpen()
+        {
+            uint64_t deadline = s_harvestWindowDeadline.load(std::memory_order_acquire);
+            if (deadline == 0) return false;
+            return GetTickCount64() < deadline;
+        }
+
+        static inline std::atomic<uint64_t> s_harvestWindowDeadline{0};
+
+        // Item-to-hand suppression window: stamped via the Heisenberg plugin API
+        // (interface method SuppressItemToHand or message kMessage_SuppressItemToHand)
+        // so a scripted bulk transfer — e.g. the companion voice mod's "give me
+        // everything" — lands directly in inventory instead of being routed to
+        // hand/floor by loot-to-hand. The engine's TESContainerChangedEvent
+        // carries no transfer reason, so the transferring plugin tells us
+        // explicitly. Default 1.5s covers the synchronous RemoveItem loop plus
+        // any thread skew.
+        static void SuppressItemToHand(uint64_t windowMs = 1500)
+        {
+            s_itemToHandSuppressedUntil.store(GetTickCount64() + windowMs, std::memory_order_release);
+        }
+
+        static bool IsItemToHandSuppressed()
+        {
+            uint64_t deadline = s_itemToHandSuppressedUntil.load(std::memory_order_acquire);
+            if (deadline == 0) return false;
+            return GetTickCount64() < deadline;
+        }
+
+        static inline std::atomic<uint64_t> s_itemToHandSuppressedUntil{0};
+
     private:
         DropToHand() = default;
         ~DropToHand() = default;
@@ -142,8 +215,19 @@ namespace heisenberg
             bool forcedIsLeft = false;        // Which hand to force (if forceHand is true)
             bool stickyGrab = true;           // If false, item releases when grip is released (world weapon pickup)
             bool markAsSmartGrab = false;     // If true, set isFromSmartGrab on grab state (prevents auto-storage)
+            std::uint32_t oldContainerFormID = 0;  // Source container (for Take-All bulk detection)
+            std::uint64_t burstId = 0;        // Frame-burst id when queued (for Take-All bulk detection)
         };
         std::vector<PendingLoot> _pendingLoots;
+
+        // Take-All / bulk-transfer detection: all container-changed events from a
+        // single "Take All" fire synchronously in one game frame, so they share a
+        // burst id. When >= kTakeAllThreshold distinct items from the same
+        // container land in one burst, it's a bulk transfer — keep them in
+        // inventory (vanilla behavior) instead of dropping each to the world,
+        // which would pile non-grabbed items on the floor. Incremented once per
+        // OnFrameUpdate so events between two updates share an id.
+        std::uint64_t _lootBurstId = 1;
 
 
         // Pipboy drop ref capture state

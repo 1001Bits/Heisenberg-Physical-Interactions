@@ -59,6 +59,12 @@ namespace heisenberg
         // Check if in chest pocket zone (for native grenades)
         bool IsInChestPocketZone() const { return _isInChestPocketZone; }
 
+        // Accessors for the game-level grenade-ready hook (Hooks.cpp HookMeleeThrow...).
+        bool HasGrabTarget(bool isLeft) const {
+            return (isLeft ? _hasGrabTargetLeft : _hasGrabTargetRight).load(std::memory_order_relaxed);
+        }
+        bool IsAButtonHeldLongEnough() const { return _cb_aButtonHeldLongEnough.load(std::memory_order_relaxed); }
+
         // Input suppression - prevents native F4VR from also responding to grip
         void UpdateInputSuppression();
 
@@ -75,12 +81,34 @@ namespace heisenberg
         // Only force-sheathe for right hand grabs (isLeft=false)
         void OnGrabEnded(bool isLeft);
 
-        // Deactivate unarmed fists at grab start so the hand opens for the grabbed item.
-        // Suppresses kFighting briefly so the game doesn't immediately re-equip fists.
+        // Sheathe bare fists (unarmed only) at grab start so the hand opens for the
+        // grabbed item. No-op if a real weapon — or nothing — is drawn (real weapons
+        // block grabbing in StartGrab). Suppresses kFighting briefly so fists don't
+        // immediately re-equip.
         void DeactivateUnarmedForGrab();
 
         // Set flag to keep weapon sheathed until trigger (called when force-sheathing for grab)
         void SetWeaponForceSheathed() { _weaponForceSheathed = true; }
+
+        // Arm a just-unholstered throwable immediately (skip the hold-to-arm delay).
+        // Called from the VH-unholster message handler. Injects synthetic grip for a
+        // few frames; no-op unless a throwable is actually in hand.
+        void ForceArmThrowable() { _cb_forceArmThrowableFrames.store(8, std::memory_order_relaxed); }
+
+        // EXPERIMENTAL ROCK dynamic handoff: inject a synthetic grip release->press edge
+        // on the given hand so ROCK's (edge-triggered) grab catches an object Heisenberg
+        // just placed at the hand. Also opens a window where Heisenberg suppresses its own
+        // re-grab so it doesn't fight ROCK on the synthetic edge.
+        void TriggerRockGripHandoff(bool isLeft) {
+            _rockHandoffHand.store(isLeft ? 1 : 0, std::memory_order_relaxed);
+            _rockHandoffGripOffFrames.store(3, std::memory_order_relaxed);   // release phase
+            _rockHandoffGripOnFrames.store(5, std::memory_order_relaxed);    // forced press phase (overrides primary-hand grip strip)
+            _rockHandoffSuppressGrabFrames.store(20, std::memory_order_relaxed);
+        }
+        bool IsRockHandoffSuppressingGrab(bool isLeft) const {
+            return _rockHandoffHand.load(std::memory_order_relaxed) == (isLeft ? 1 : 0)
+                && _rockHandoffSuppressGrabFrames.load(std::memory_order_relaxed) > 0;
+        }
 
         // Check if Virtual Holsters mod is detected (for compatibility mode)
         bool IsVirtualHolstersActive() const { return _virtualHolstersDetected; }
@@ -126,7 +154,7 @@ namespace heisenberg
         /**
          * Reset grenade zone tracking and callback state after save load.
          */
-        void ReapplyThrowDelay();
+        void ResetGrenadeZoneState();
 
     private:
 
@@ -263,6 +291,52 @@ namespace heisenberg
         std::atomic<bool>   _cb_aButtonHeldLongEnough{false};
         std::atomic<bool>   _cb_aButtonWasPressed{false};
 
+        // SteamVR Grip→A binding detection (sticky once observed in the session).
+        // Set when we see "A digital pressed + analog grip > 0.5 + Grip digital
+        // not pressed" — that signature is only produced by a Grip→A binding.
+        // Used so the throwables logic can route activations correctly.
+        std::atomic<bool>   _cb_gripABindingDetected{false};
+
+        // Set by the VH-unholster message (kMessage_ArmThrowable) so a throwable
+        // pulled from a Virtual Holster is armed/readied immediately, skipping the
+        // normal throwableHoldDuration hold. Frame countdown: the throwable timer
+        // forces the grip-injection while > 0, holding it a few frames so the arm
+        // reliably triggers, then decrements to 0.
+        std::atomic<int>    _cb_forceArmThrowableFrames{0};
+
+        // EXPERIMENTAL ROCK dynamic-handoff grip injection state (see TriggerRockGripHandoff).
+        std::atomic<int>    _rockHandoffHand{-1};               // 0=right, 1=left, -1=none
+        std::atomic<int>    _rockHandoffGripOffFrames{0};       // frames to force grip OFF (release edge for ROCK)
+        std::atomic<int>    _rockHandoffGripOnFrames{0};        // frames to force grip ON after release (press edge; overrides primary-hand strip)
+        std::atomic<int>    _rockHandoffSuppressGrabFrames{0};  // frames to suppress Heisenberg re-grab
+
+        // A/X grab hold-timing state (per hand)
+        // Blocks A/X from game while pressed; injects tap on quick release
+        // Left hand:
+        std::atomic<double> _cb_axGrabPressTimeL{0.0};
+        std::atomic<bool>   _cb_axGrabWasPressedL{false};
+        std::atomic<bool>   _cb_axGrabHeldLongL{false};
+        std::atomic<int>    _cb_axGrabInjectTapL{0};  // >0 = frames to inject tap
+        // Right hand:
+        std::atomic<double> _cb_axGrabPressTimeR{0.0};
+        std::atomic<bool>   _cb_axGrabWasPressedR{false};
+        std::atomic<bool>   _cb_axGrabHeldLongR{false};
+        std::atomic<int>    _cb_axGrabInjectTapR{0};  // >0 = frames to inject tap
+
+    public:
+        // THREAD SAFETY: Hand has a grabbable object selected (main thread writes, callback reads)
+        // When false, A/X passes through to game for native actions (activate, loot, etc.)
+        std::atomic<bool> _hasGrabTargetLeft{false};
+        std::atomic<bool> _hasGrabTargetRight{false};
+
+        // Check if the primary (weapon/grenade) hand is busy — either
+        // already holding an object OR has a valid grab selection.
+        // Used to gate grenade ready so grip-hold-to-grab doesn't ready
+        // a grenade simultaneously. Off-hand grabs do not count.
+        bool IsPrimaryHandBusy() const;
+
+    private:
+
         // THREAD SAFETY: Physical grip state from OpenVR callback
         // Written by OpenVR thread, read by main thread for finger-closing decision
         std::atomic<bool> _physicalGripPressedLeft{false};
@@ -280,6 +354,16 @@ namespace heisenberg
         // Last weapon unequipped via storage zone - for re-equip on next grip
         RE::TESForm* _lastUnequippedWeapon = nullptr;
         std::string _lastUnequippedWeaponName;
+
+        // Weapon unequip cooldown — blocks smart retrieval briefly after unequip
+        // so the storage-zone unequip flow doesn't immediately re-fire as a
+        // smart-grab candidate on the same hand.
+        float _weaponUnequipCooldown = 0.0f;
+
+    public:
+        bool IsWeaponUnequipCooldownActive() const { return _weaponUnequipCooldown > 0.0f; }
+        void StartWeaponUnequipCooldown() { _weaponUnequipCooldown = 0.5f; }
+        void UpdateWeaponUnequipCooldown(float dt) { if (_weaponUnequipCooldown > 0.0f) _weaponUnequipCooldown -= dt; }
 
     public:
         // Thread-safe accessors for OpenVR callback

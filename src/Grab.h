@@ -9,6 +9,17 @@
 
 namespace heisenberg
 {
+    // True only for actual HOLOTAPES (playable on the Pip-Boy: voice logs, programs/games,
+    // terminal tapes). Paper notes (kImage/kText) are kNOTE too but return false here, so they
+    // can be treated as ordinary clutter — any hand, no deck scaling, normal grab placement.
+    inline bool IsHolotapeNote(RE::TESForm* form)
+    {
+        if (!form || form->GetFormType() != RE::ENUM_FORM_ID::kNOTE) return false;
+        auto* note = static_cast<RE::BGSNote*>(form);
+        using T = RE::BGSNote::NOTE_TYPE;
+        return note->type == T::kVoice || note->type == T::kProgram || note->type == T::kTerminal;
+    }
+
     // Tick the deferred disable queue (call once per frame from main update)
     void TickDeferredDisables();
 
@@ -40,10 +51,13 @@ namespace heisenberg
     enum class GrabMode
     {
         Keyframed = 0,    // Simple: set motion to KEYFRAMED and use ApplyHardKeyframe
-        BallSocket = 1,   // Physics: use ball-socket constraint (BROKEN - crashes)
-        Motor = 2,        // 6-DOF motor constraint (like Skyrim HIGGS) (BROKEN - crashes)
-        VirtualSpring = 3, // Apply forces to simulate spring (no HandBody needed)
-        MouseSpring = 4   // Use native game mouse spring system - RECOMMENDED
+        BallSocket = 1,   // Physics: ball-socket constraint only (no motors)
+        Motor = 2,        // 6-DOF motor constraint (like Skyrim HIGGS) — ACTIVE
+        VirtualSpring = 3, // Virtual spring velocity + HeldBody system
+        MouseSpring = 4,  // Use native game mouse spring system
+        DynamicRock = 5   // Self-contained ROCK-style grab: place keyframed at offset,
+                          // then switch the held body to DYNAMIC and drive it via velocity
+                          // so it collides with walls/NPCs while held. No ROCK.dll needed.
     };
 
     /**
@@ -67,6 +81,14 @@ namespace heisenberg
         bool usedSnapMode = false;      // True if snap positioning was used (distance > 10cm)
         bool usingKeyframedMode = false;   // True if using KEYFRAMED physics mode (for interiors, DynamicNode, proxy objects)
         bool isProxyCollision = false;  // True if physics is on a child node (ragdolls, animated toys)
+        bool rockHandoffDone = false;      // EXPERIMENTAL: object already handed off to ROCK dynamic grab
+        int  rockHandoffSettleFrames = 0;  // frames the object has been placed at offset before handoff
+        bool rockDynamicActive = false;    // iGrabMode=5: held body flipped KEYFRAMED->DYNAMIC after settle
+        int  rockDynamicSettleFrames = 0;  // frames placed at offset before the self-contained dynamic flip
+        bool heldPlayerFilterApplied = false; // ROCK-style suppression bit applied (bit 14 of body filter info)
+        int  heldPlayerFilterFrames = 0;      // frame counter for periodic re-application
+        std::uint32_t heldOriginalFilterInfo = 0; // body's filter info before suppression bit set (for restore)
+        bool heldHadSuppressionBitOriginally = false; // true if bit 14 was already set before we ORed it (don't clear on release)
 
         // =========================================================================
         // SAFE OBJECT REFERENCES - Use handles and smart pointers
@@ -101,6 +123,31 @@ namespace heisenberg
         bool hasItemOffset = false;         // True if custom offset was found for this item
         bool isFRIKOffset = false;          // True if using FRIK-style offset (needs Weapon node parent transform)
 
+        // Live held-object placement. When automatic hand placement is enabled,
+        // these override the saved item offset position/rotation for the active grab.
+        bool hasRuntimeHandPlacement = false;
+        RE::NiPoint3 runtimeHandPlacementPosition;
+        RE::NiMatrix3 runtimeHandPlacementRotation;
+        // True when the placement was computed in the SKINNED hand frame
+        // (COM-tree LArm_Hand/RArm_Hand) rather than the wand frame. When set,
+        // apply sites must resolve the parent transform from that same skinned
+        // hand so the object tracks the same node the fingers cast from —
+        // otherwise FRIK IK offset between wand and bone reintroduces drift.
+        bool runtimePlacementSkinnedHand = false;
+
+        // Live held-object finger curls. Keep these separate from saved item
+        // offset curls so automatic grab poses are never persisted to JSON.
+        bool hasRuntimeFingerCurls = false;
+        float runtimeThumbCurl = 0.6f;
+        float runtimeIndexCurl = 0.6f;
+        float runtimeMiddleCurl = 0.6f;
+        float runtimeRingCurl = 0.6f;
+        float runtimePinkyCurl = 0.6f;
+
+        // Per-frame curl recompute throttle. Incremented each held frame; when
+        // it reaches `fingerCurlPerFrameInterval` we recompute geometry curls.
+        std::uint32_t fingerCurlRecalcFrameCounter = 0;
+
         // Sticky grab mode for config - keeps item grabbed even without grip held
         bool stickyGrab = false;            // True if in sticky grab mode (for repositioning)
 
@@ -129,7 +176,7 @@ namespace heisenberg
         RE::NiPoint3 lastTargetPos;
         RE::NiMatrix3 lastTargetRot;
         float lastDeltaTime = 0.016f;
-        bool needsPostPhysicsUpdate = false;
+        bool needsPostPhysicsUpdate = false;  // Legacy field — kept for state layout compatibility
 
         // Hand velocity tracking (for shoulder/mouth detection)
         RE::NiPoint3 lastHandPos;
@@ -139,6 +186,7 @@ namespace heisenberg
         float behindEarTimer = 0.0f;  // Accumulates time spent in storage zone
         float lastStoragePulseTime = 0.0f;  // Per-hand: last time haptic pulse fired in storage zone
         bool isInStorageZone = false; // True if hand is currently in a storage zone
+        bool bookStoreBlockedHinted = false; // One-shot: hinted that a magazine can't be stashed behind head (read at face)
         
         // Equip zone tracking (equips armor/weapons on grip release when in body zone)
         bool isInEquipZone = false; // True if held armor/weapon is in equip zone
@@ -168,6 +216,17 @@ namespace heisenberg
         bool skipStorageZone = false; // True to skip storage zone (e.g. holotape from deck near Pipboy)
         bool isNaturalGrab = false;   // True if this was a natural grab (close to object)
         bool isTelekinesis = false;   // True if this is a telekinesis grab (object follows hand from distance)
+        bool naturalFingerPosing = false;  // close natural grab — wrap fingers around mesh + keep reapplying them
+        bool deferredHeldBodyStart = false;  // True if HeldBody should activate after pull-to-hand completes
+
+        // HeldBody dynamic grab state (used by HeldBodyGrab system)
+        bool usingHeldBodyGrab = false;         // True if using HeldBody spring/constraint grab
+        std::uint32_t handBodyId = 0x7FFFFFFF;  // Physics body ID for hand body
+        double heldBodyGrabTime = 0.0;          // Time when held body grab started
+        bool heldBodyConstraintActive = false;  // True if the HeldBody backend is active
+        std::uint32_t constraintId = 0;         // Havok constraint ID
+        float currentAngularTau = 0.8f;         // Current angular motor softness
+        float currentLinearTau = 0.8f;          // Current linear motor softness
 
         // Simple mode room tracking (per-grab state, not global)
         RE::NiPoint3 lastRoomPos;       // Last frame's room node position
@@ -218,6 +277,43 @@ namespace heisenberg
          */
         bool HasValidRefr() const { return GetRefr() != nullptr; }
 
+        void SetRuntimeFingerCurls(float thumb, float index, float middle, float ring, float pinky)
+        {
+            hasRuntimeFingerCurls = true;
+            runtimeThumbCurl = thumb;
+            runtimeIndexCurl = index;
+            runtimeMiddleCurl = middle;
+            runtimeRingCurl = ring;
+            runtimePinkyCurl = pinky;
+        }
+
+        void ClearRuntimeFingerCurls()
+        {
+            hasRuntimeFingerCurls = false;
+            runtimeThumbCurl = 0.6f;
+            runtimeIndexCurl = 0.6f;
+            runtimeMiddleCurl = 0.6f;
+            runtimeRingCurl = 0.6f;
+            runtimePinkyCurl = 0.6f;
+        }
+
+        void SetRuntimeHandPlacement(const RE::NiPoint3& position, const RE::NiMatrix3& rotation, bool skinnedHandFrame = false)
+        {
+            hasRuntimeHandPlacement = true;
+            runtimeHandPlacementPosition = position;
+            runtimeHandPlacementRotation = rotation;
+            runtimePlacementSkinnedHand = skinnedHandFrame;
+        }
+
+        void ClearRuntimeHandPlacement()
+        {
+            hasRuntimeHandPlacement = false;
+            runtimeHandPlacementPosition = RE::NiPoint3();
+            runtimeHandPlacementRotation = RE::NiMatrix3();
+            runtimeHandPlacementRotation.MakeIdentity();
+            runtimePlacementSkinnedHand = false;
+        }
+
         void Clear()
         {
             active = false;
@@ -228,6 +324,14 @@ namespace heisenberg
             isDynamicNodeGrab = false;
             usingKeyframedMode = false;
             isProxyCollision = false;
+            rockHandoffDone = false;
+            rockHandoffSettleFrames = 0;
+            rockDynamicActive = false;
+            rockDynamicSettleFrames = 0;
+            heldPlayerFilterApplied = false;
+            heldPlayerFilterFrames = 0;
+            heldOriginalFilterInfo = 0;
+            heldHadSuppressionBitOriginally = false;
             lastRoomPos = RE::NiPoint3();
             smoothedRoomDelta = RE::NiPoint3();
             roomTrackingInitialized = false;
@@ -246,6 +350,8 @@ namespace heisenberg
             itemOffset = ItemOffset();
             hasItemOffset = false;
             isFRIKOffset = false;
+            ClearRuntimeHandPlacement();
+            ClearRuntimeFingerCurls();
             stickyGrab = false;
             savedState = SavedPhysicsState();
             keyframedHelper = KeyframedPhysicsHelper();  // Reset helper
@@ -258,6 +364,7 @@ namespace heisenberg
             behindEarTimer = 0.0f;
             lastStoragePulseTime = 0.0f;
             isInStorageZone = false;
+            bookStoreBlockedHinted = false;
             isInEquipZone = false;
             isInVHZone = false;
             vhHolsterSlot = 0;
@@ -271,6 +378,16 @@ namespace heisenberg
             skipStorageZone = false;
             isNaturalGrab = false;
             isTelekinesis = false;
+            naturalFingerPosing = false;
+            deferredHeldBodyStart = false;
+            // HeldBody grab state
+            usingHeldBodyGrab = false;
+            handBodyId = 0x7FFFFFFF;
+            heldBodyGrabTime = 0.0;
+            heldBodyConstraintActive = false;
+            constraintId = 0;
+            currentAngularTau = 0.8f;
+            currentLinearTau = 0.8f;
             // Velocity tracking
             prevWandPos = RE::NiPoint3();
             prevObjectPos = RE::NiPoint3();
@@ -281,6 +398,14 @@ namespace heisenberg
         }
     };
 
+    bool IsAutomaticHandPlacementEnabled();
+    void GetEffectiveGrabPlacement(const GrabState& state, RE::NiPoint3& outLocalOffset, RE::NiMatrix3& outLocalRotation);
+
+    // Per-hand opportunistic finger calibration — call every frame while idle.
+    // No-ops once the hand is calibrated. Uses a straightness gate so only
+    // open-hand frames capture the zero-angle/normal triplets.
+    void TryCalibrateFingerDataIfIdle(bool isLeft);
+
     /**
      * GrabManager - Manages physics-based grabbing of objects
      *
@@ -289,7 +414,7 @@ namespace heisenberg
      * This is simpler than constraints but works well for basic grabbing.
      *
      * Thread safety:
-     *   - Main thread: StartGrab, UpdateGrab, EndGrab, PrePhysicsUpdate, PostPhysicsUpdate, PreRenderUpdate
+     *   - Main thread: StartGrab, UpdateGrab, EndGrab, PostPhysicsGrabUpdate, PreRenderUpdate
      *   - OpenVR callback thread: IsGrabbing (read-only on _leftGrab.active / _rightGrab.active)
      *   - _releaseCooldowns: protected by _cooldownMutex (accessed from main thread + possible OpenVR reads)
      *   - _leftGrab/_rightGrab: main-thread only (except .active read from OpenVR thread)
@@ -342,24 +467,16 @@ namespace heisenberg
         bool IsGrabbing(bool isLeft) const;
 
         /**
-         * Post-physics update - runs AFTER engine physics step
-         * This is where we apply our position/velocity changes so they
-         * won't be overwritten by the physics simulation.
+         * Post-physics grab update - runs from the post-physics hook (0xd8405e).
+         * Updates grabbed object visual positions and hand body keyframes.
+         * Called AFTER the engine physics step completes.
          */
-        void PostPhysicsUpdate();
+        void PostPhysicsGrabUpdate();
 
         /**
-         * Pre-physics update - runs BEFORE engine physics step
-         * THE KEY TO ELIMINATING LATENCY!
-         * Updates grabbed object positions BEFORE physics runs, so changes
-         * take effect THIS frame instead of next frame.
-         */
-        void PrePhysicsUpdate();
-        
-        /**
-         * Pre-render update - runs just before rendering
-         * Updates grabbed object VISUAL positions with final wand position
-         * after player movement has been applied. No prediction needed.
+         * Pre-render visual update. Currently DORMANT — the pre-render hook
+         * (0x1C21156) is disabled due to scene graph crashes.
+         * Kept for future restoration.
          */
         void PreRenderUpdate();
 

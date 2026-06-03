@@ -149,10 +149,11 @@ namespace heisenberg
      */
     struct hkpSetupStabilizationAtom : public hkpConstraintAtom
     {
-        bool enabled;           // 0x02
-        std::uint8_t pad03;     // 0x03
-        float maxAngle;         // 0x04
-        std::uint64_t pad08;    // 0x08
+        bool enabled;               // 0x02
+        std::uint8_t pad03;         // 0x03
+        float maxLinearImpulse;     // 0x04
+        float maxAngularImpulse;    // 0x08
+        float maxAngle;             // 0x0C
     };
     static_assert(sizeof(hkpSetupStabilizationAtom) == 0x10);
 
@@ -220,16 +221,22 @@ namespace heisenberg
     class GrabConstraintData
     {
     public:
-        // Solver result indices like Skyrim HIGGS
+        // Havok 2014 motor atoms each use two solver results.
         enum
         {
-            SOLVER_RESULT_MOTOR_0 = 0,  // angular motor 0
-            SOLVER_RESULT_MOTOR_1 = 1,  // angular motor 1
-            SOLVER_RESULT_MOTOR_2 = 2,  // angular motor 2
-            SOLVER_RESULT_MOTOR_3 = 3,  // linear motor 0
-            SOLVER_RESULT_MOTOR_4 = 4,  // linear motor 1
-            SOLVER_RESULT_MOTOR_5 = 5,  // linear motor 2
-            SOLVER_RESULT_MAX = 6
+            SOLVER_RESULT_MOTOR_ANG_0 = 0,
+            SOLVER_RESULT_MOTOR_ANG_0_INTERNAL = 1,
+            SOLVER_RESULT_MOTOR_ANG_1 = 2,
+            SOLVER_RESULT_MOTOR_ANG_1_INTERNAL = 3,
+            SOLVER_RESULT_MOTOR_ANG_2 = 4,
+            SOLVER_RESULT_MOTOR_ANG_2_INTERNAL = 5,
+            SOLVER_RESULT_MOTOR_LIN_0 = 6,
+            SOLVER_RESULT_MOTOR_LIN_0_INTERNAL = 7,
+            SOLVER_RESULT_MOTOR_LIN_1 = 8,
+            SOLVER_RESULT_MOTOR_LIN_1_INTERNAL = 9,
+            SOLVER_RESULT_MOTOR_LIN_2 = 10,
+            SOLVER_RESULT_MOTOR_LIN_2_INTERNAL = 11,
+            SOLVER_RESULT_MAX = 12
         };
         
         // hkpConstraintData vtable and header
@@ -238,7 +245,7 @@ namespace heisenberg
         std::uint16_t referenceCount;    // 0x0A
         std::uint32_t pad0C;             // 0x0C
         std::uint64_t userData;          // 0x10
-        std::uint32_t constraintType;    // 0x18 - CONSTRAINT_TYPE_CUSTOM = 100
+        std::uint32_t constraintType;    // 0x18 - CONSTRAINT_TYPE_CUSTOM = 20
         std::uint8_t pad1C[4];           // 0x1C
         
         // Atoms structure
@@ -262,21 +269,26 @@ namespace heisenberg
         // Runtime data offsets for solver
         struct Runtime
         {
-            // Solver results for all 6 motors
-            std::uint8_t solverResults[6 * 8];  // 0x00 - hkpSolverResults (8 bytes each)
+            // Solver results for the 6 motor atoms (2 results per motor in Havok 2014).
+            std::uint8_t solverResults[SOLVER_RESULT_MAX * 8];  // 0x00
             
             // Angular motor runtime
-            std::uint8_t initialized[3];         // 0x30
-            std::uint8_t pad33;                  // 0x33
-            float previousTargetAngles[3];       // 0x34
+            std::uint8_t initialized[3];         // 0x60
+            std::uint8_t pad63;                  // 0x63
+            float previousTargetAngles[3];       // 0x64
             
             // Linear motor runtime
-            std::uint8_t initializedLinear[3];   // 0x40
-            std::uint8_t pad43;                  // 0x43
-            float previousTargetPositions[3];    // 0x44
+            std::uint8_t initializedLinear[3];   // 0x70
+            std::uint8_t pad73;                  // 0x73
+            float previousTargetPositions[3];    // 0x74
             
-            static int getSizeOfExternalRuntime() { return sizeof(Runtime) * 2; }
+            static int getSizeOfExternalRuntime() { return sizeof(Runtime); }
         };
+        static_assert(offsetof(Runtime, initialized) == 0x60);
+        static_assert(offsetof(Runtime, previousTargetAngles) == 0x64);
+        static_assert(offsetof(Runtime, initializedLinear) == 0x70);
+        static_assert(offsetof(Runtime, previousTargetPositions) == 0x74);
+        static_assert(sizeof(Runtime) == 0x80);
         
         // =====================================================================
         // CONSTRUCTOR / DESTRUCTOR (like Skyrim HIGGS)
@@ -325,13 +337,9 @@ namespace heisenberg
         // Set transforms in body space
         void setInBodySpace(const RE::NiTransform& transformA, const RE::NiTransform& transformB);
         
-        // Set target rotation (copies 3x4 matrix to float[12])
-        void SetTarget(const RE::NiMatrix3& target)
-        {
-            // NiMatrix3 is stored as float[3][4] (row-major with padding)
-            // We copy it directly as 12 floats
-            std::memcpy(atoms.ragdollMotors.target_bRca, &target, sizeof(float) * 12);
-        }
+        // Set target rotation (copies 3x4 matrix to float[12]).
+        // Clamps angular deviation to grabConstraintAngularMaxAngleDeg if soft limits enabled.
+        void SetTarget(const RE::NiMatrix3& target);
         
         // Set target rotation from raw float array
         void SetTargetRaw(const float* target)
@@ -571,7 +579,7 @@ namespace heisenberg
         // Constraint data (heap allocated) - either ball-socket or motor
         void* constraintData = nullptr;
         
-        // Motor objects (if using motor constraint)
+        // Non-owning pointers to the motors stored inside GrabConstraintData.
         hkpPositionConstraintMotor* angularMotor = nullptr;
         hkpPositionConstraintMotor* linearMotor = nullptr;
         
@@ -610,13 +618,177 @@ namespace heisenberg
     };
 
     // =========================================================================
+    // GRAB CONSTRAINT VTABLE
+    // Custom vtable for GrabConstraintData (6-DOF motor constraint)
+    // =========================================================================
+
+    namespace GrabConstraintVtable
+    {
+        constexpr int CONSTRAINT_TYPE_CUSTOM = 20;
+        constexpr std::int32_t HK_SUCCESS = 0;
+        constexpr std::int32_t HK_FAILURE = 1;
+
+        struct ConstraintInfo
+        {
+            int m_maxSizeOfSchema;
+            int m_sizeOfSchemas;
+            int m_numSolverResults;
+            int m_numSolverElemTemps;
+            hkpConstraintAtom* m_atoms;
+            std::uint32_t m_sizeOfAllAtoms;
+            std::uint32_t m_extraSchemaSize;
+
+            void clear()
+            {
+                m_maxSizeOfSchema = 0;
+                m_sizeOfSchemas = 0;
+                m_numSolverResults = 0;
+                m_numSolverElemTemps = 0;
+                m_atoms = nullptr;
+                m_sizeOfAllAtoms = 0;
+                m_extraSchemaSize = 0;
+            }
+
+            void add(int schemaSize, int numSolverResults, int numSolverTempElems)
+            {
+                m_sizeOfSchemas += schemaSize;
+                m_numSolverResults += numSolverResults;
+                m_numSolverElemTemps += numSolverTempElems;
+                if (schemaSize > m_maxSizeOfSchema) {
+                    m_maxSizeOfSchema = schemaSize;
+                }
+            }
+        };
+
+        struct RuntimeInfo
+        {
+            int m_sizeOfExternalRuntime;
+            int m_numSolverResults;
+        };
+
+        // Slot 0: ~dtor
+        inline void __fastcall Destructor(GrabConstraintData* thisPtr) {}
+
+        // Slot 1: __first_virtual_table_function__ (hkBaseObject)
+        inline void __fastcall FirstVirtualTableFunction(GrabConstraintData* thisPtr) {}
+
+        // Slot 2: getClassType (hkReferencedObject)
+        inline void* __fastcall GetClassType(GrabConstraintData* thisPtr) { return nullptr; }
+
+        // Slot 3: deleteThisReferencedObject (hkReferencedObject)
+        inline void __fastcall DeleteThisReferencedObject(GrabConstraintData* thisPtr) {}
+
+        // Slot 4: getType (hkpConstraintData - pure virtual)
+        inline int __fastcall GetType(GrabConstraintData* thisPtr) { return CONSTRAINT_TYPE_CUSTOM; }
+
+        // Slot 6: isValid (hkpConstraintData - pure virtual)
+        inline bool __fastcall IsValid(GrabConstraintData* thisPtr) { return true; }
+
+        inline void __fastcall GetConstraintInfo(GrabConstraintData* thisPtr, ConstraintInfo* infoOut)
+        {
+            // Schema sizes from Havok SDK hkpJacobianSchemaInfo:
+            // SetLocalTransforms: schema=144, results=0, temps=0
+            // SetupStabilization: schema=16,  results=0, temps=0
+            // AngularMotor1D:     schema=64,  results=2, temps=2  (×3 axes)
+            // LinearMotor1D:      schema=80,  results=2, temps=2  (×3 axes)
+            infoOut->clear();
+
+            infoOut->add(144, 0, 0);   // SetLocalTransforms
+            infoOut->add(16, 0, 0);    // SetupStabilization
+            infoOut->add(64 * 3, 2 * 3, 2 * 3);  // 3 angular motors
+            infoOut->add(80 * 3, 2 * 3, 2 * 3);  // 3 linear motors
+            // m_maxSizeOfSchema = largest single atom schema = SetLocalTransforms (144)
+            // (add() already tracks the max internally)
+
+            infoOut->m_atoms = const_cast<hkpConstraintAtom*>(thisPtr->atoms.getAtoms());
+            infoOut->m_sizeOfAllAtoms = thisPtr->atoms.getSizeOfAllAtoms();
+            infoOut->m_extraSchemaSize = 0;
+        }
+
+        inline void __fastcall SetMaximumLinearImpulse(GrabConstraintData* thisPtr, float value) {}
+        inline void __fastcall SetMaximumAngularImpulse(GrabConstraintData* thisPtr, float value) {}
+        inline void __fastcall SetBreachImpulse(GrabConstraintData* thisPtr, float value) {}
+        inline float __fastcall GetMaximumLinearImpulse(GrabConstraintData* thisPtr) { return 3.402823466e+38f; }
+        inline float __fastcall GetMaximumAngularImpulse(GrabConstraintData* thisPtr) { return 3.402823466e+38f; }
+        inline float __fastcall GetBreachImpulse(GrabConstraintData* thisPtr) { return 3.402823466e+38f; }
+        inline void __fastcall SetBodyToNotify(GrabConstraintData* thisPtr, int bodyIndex) {}
+        inline std::uint8_t __fastcall GetNotifiedBodyIndex(GrabConstraintData* thisPtr) { return 0; }
+
+        inline void __fastcall SetSolvingMethod(GrabConstraintData* thisPtr, int method)
+        {
+            thisPtr->atoms.setupStabilization.enabled = (method == 0);
+        }
+
+        inline std::int32_t __fastcall SetInertiaStabilizationFactor(GrabConstraintData* thisPtr, float value) { return HK_FAILURE; }
+        inline std::int32_t __fastcall GetInertiaStabilizationFactor(GrabConstraintData* thisPtr, float* valueOut)
+        {
+            if (valueOut) {
+                *valueOut = 0.0f;
+            }
+            return HK_FAILURE;
+        }
+
+        inline void __fastcall GetRuntimeInfo(GrabConstraintData* thisPtr, bool wantRuntime, RuntimeInfo* infoOut)
+        {
+            if (wantRuntime) {
+                infoOut->m_sizeOfExternalRuntime = GrabConstraintData::Runtime::getSizeOfExternalRuntime();
+                infoOut->m_numSolverResults = GrabConstraintData::SOLVER_RESULT_MAX;
+            } else {
+                infoOut->m_sizeOfExternalRuntime = 0;
+                infoOut->m_numSolverResults = 0;
+            }
+        }
+
+        inline void* __fastcall GetSolverResults(GrabConstraintData* thisPtr, void* runtime) { return runtime; }
+
+        inline void __fastcall AddInstance(GrabConstraintData* thisPtr, void* runtime, int sizeOfRuntime)
+        {
+            if (runtime) std::memset(runtime, 0, sizeOfRuntime);
+        }
+
+        inline void __fastcall BuildJacobian(GrabConstraintData* thisPtr, void* queryIn, void* queryOut) {}
+        inline bool __fastcall IsBuildJacobianCallbackRequired(GrabConstraintData* thisPtr) { return false; }
+        inline void __fastcall BuildJacobianCallback(GrabConstraintData* thisPtr, void* queryIn, void* queryOut) {}
+
+        // Vtable layout must match real hkpConstraintData (24 slots).
+        // Verified against hkpRagdollConstraintData vtable at 0x142e18298 via Ghidra.
+        inline void* g_GrabConstraintVtable[24] = {
+            reinterpret_cast<void*>(&Destructor),                    // 0: ~dtor
+            reinterpret_cast<void*>(&FirstVirtualTableFunction),     // 1: __first_virtual_table_function__
+            reinterpret_cast<void*>(&GetClassType),                  // 2: getClassType
+            reinterpret_cast<void*>(&DeleteThisReferencedObject),    // 3: deleteThisReferencedObject
+            reinterpret_cast<void*>(&GetType),                       // 4: getType (pure)
+            reinterpret_cast<void*>(&GetConstraintInfo),             // 5: getConstraintInfo (pure) ← CRITICAL
+            reinterpret_cast<void*>(&IsValid),                       // 6: isValid (pure)
+            reinterpret_cast<void*>(&SetMaximumLinearImpulse),       // 7
+            reinterpret_cast<void*>(&SetMaximumAngularImpulse),      // 8
+            reinterpret_cast<void*>(&SetBreachImpulse),              // 9
+            reinterpret_cast<void*>(&GetMaximumLinearImpulse),       // 10
+            reinterpret_cast<void*>(&GetMaximumAngularImpulse),      // 11
+            reinterpret_cast<void*>(&GetBreachImpulse),              // 12
+            reinterpret_cast<void*>(&SetBodyToNotify),               // 13
+            reinterpret_cast<void*>(&GetNotifiedBodyIndex),          // 14
+            reinterpret_cast<void*>(&SetSolvingMethod),              // 15
+            reinterpret_cast<void*>(&SetInertiaStabilizationFactor), // 16
+            reinterpret_cast<void*>(&GetInertiaStabilizationFactor), // 17
+            reinterpret_cast<void*>(&GetRuntimeInfo),                // 18: getRuntimeInfo (pure) ← CRITICAL
+            reinterpret_cast<void*>(&GetSolverResults),
+            reinterpret_cast<void*>(&AddInstance),
+            reinterpret_cast<void*>(&BuildJacobian),
+            reinterpret_cast<void*>(&IsBuildJacobianCallbackRequired),
+            reinterpret_cast<void*>(&BuildJacobianCallback),
+        };
+
+        inline void* GetVtable() { return &g_GrabConstraintVtable[0]; }
+
+    }  // namespace GrabConstraintVtable
+
+    // =========================================================================
     // CONSTRAINT FUNCTION POINTERS
     // =========================================================================
-    
+
     namespace ConstraintFunctions
     {
-        // Disabled: only used by constraint system (currently #if 0 in GrabConstraint.cpp)
-#if 0
         // hkpBallAndSocketConstraintData constructor
         // VR offset: 0x19af690 - Status 4 (Verified)
         using BallSocketCtor_t = void(*)(hkpBallAndSocketConstraintData*);
@@ -631,8 +803,9 @@ namespace heisenberg
 
         // hknpWorld::createConstraint
         // VR offset: 0x15469b0 - Status 4 (Verified)
-        // Returns hknpConstraintId
-        using CreateConstraint_t = hknpConstraintId(*)(void* hknpWorld, const hknpConstraintCinfo& cinfo);
+        // Uses output parameter pattern (like createBody)
+        using CreateConstraint_t = hknpConstraintId*(*)(void* hknpWorld, hknpConstraintId* outId,
+                                                         const hknpConstraintCinfo* cinfo);
         inline REL::Relocation<CreateConstraint_t> CreateConstraint{ REL::Offset(0x15469b0) };
 
         // hknpWorld::destroyConstraints
@@ -643,15 +816,15 @@ namespace heisenberg
         // hknpBSWorld::addConstraintBodyMap
         // VR offset: 0x1df66d0 - Status 4 (Verified)
         using AddConstraintBodyMap_t = void(*)(void* hknpBSWorld, hknpConstraintId id,
-                                                std::uint32_t bodyA, std::uint32_t bodyB);
+                                                const hknpConstraintCinfo* cinfo);
         inline REL::Relocation<AddConstraintBodyMap_t> AddConstraintBodyMap{ REL::Offset(0x1df66d0) };
 
         // hknpBSWorld::removeConstraintBodyMap
         // VR offset: 0x1df6720 - Status 4 (Verified)
-        using RemoveConstraintBodyMap_t = void(*)(void* hknpBSWorld, hknpConstraintId id);
+        using RemoveConstraintBodyMap_t = void(*)(void* hknpBSWorld, std::uint64_t unused,
+                                                   std::uint32_t constraintId);
         inline REL::Relocation<RemoveConstraintBodyMap_t> RemoveConstraintBodyMap{ REL::Offset(0x1df6720) };
-#endif
-        
+
         // =====================================================================
         // BODY CREATION FUNCTIONS
         // =====================================================================
@@ -684,18 +857,45 @@ namespace heisenberg
         // Returns hknpConvexShape*
         using CreateConvexShapeFromHalfExtents_t = void*(*)(const RE::NiPoint4& halfExtents, float radius, hknpConvexShapeBuildConfig* buildConfig);
         inline REL::Relocation<CreateConvexShapeFromHalfExtents_t> CreateConvexShapeFromHalfExtents{ REL::Offset(0x16d57c0) };
+
+        // hkAabb structure - axis-aligned bounding box
+        struct hkAabb {
+            RE::NiPoint4 min;
+            RE::NiPoint4 max;
+        };
+
+        // hknpConvexShape::createFromAabb(hkAabb& aabb, float radius, BuildConfig& config)
+        // VR offset: 0x16d5800 - Status 4 (Verified)
+        using CreateConvexShapeFromAabb_t = void*(*)(const hkAabb& aabb, float radius, hknpConvexShapeBuildConfig* buildConfig);
+        inline REL::Relocation<CreateConvexShapeFromAabb_t> CreateConvexShapeFromAabb{ REL::Offset(0x16d5800) };
+
+        // hkStridedVertices — Havok strided vertex-array descriptor.
+        // Ghidra-verified layout (createFromVertices reads numVertices at +0x8, builds an internal
+        // 16-byte/hkVector4 buffer via SHL 4): { ptr(+0), int numVertices(+8), int striding(+0xC) }.
+        // striding = BYTES between consecutive source vertices (16 for hkVector4-packed x,y,z,w).
+        struct hkStridedVertices {
+            const float* vertices = nullptr;
+            std::int32_t numVertices = 0;
+            std::int32_t striding = 16;
+        };
+
+        // hknpConvexShape::createFromVertices(hkStridedVertices&, float radius, BuildConfig&)
+        // VR offset: 0x16d4b30 - Ghidra-verified May 31 2026 (sibling of createFromHalfExtents/Aabb;
+        // RCX=verts&, XMM1=radius, R8=BuildConfig&, returns hknpConvexShape*). Builds the convex
+        // hull internally (hkgpConvexHull) from the supplied point cloud.
+        using CreateConvexShapeFromVertices_t = void*(*)(const hkStridedVertices& verts, float radius, hknpConvexShapeBuildConfig* buildConfig);
+        inline REL::Relocation<CreateConvexShapeFromVertices_t> CreateConvexShapeFromVertices{ REL::Offset(0x16d4b30) };
         
-        // Disabled: only used by constraint system (currently #if 0 in GrabConstraint.cpp)
-#if 0
         // hknpWorld::createBody(hknpBodyCinfo&, AdditionMode, AdditionFlags)
         // VR offset: 0x1543ff0 - Status 4 (Verified)
         // From PDB: hknpWorld::createBody(hknpBodyCinfo&,hknpWorld::AdditionMode,hkFlags<hknpWorld::AdditionFlagsEnum,uchar>)
-        // Returns hknpBodyId (uint32)
+        // Returns pointer to output param (outBodyId)
+        // CRITICAL: Uses OUTPUT PARAMETER for body ID, NOT return value!
         // NOTE: This is a MEMBER function - first param is 'this' (hknpWorld*)
-        using CreateBody_t = std::uint32_t(__fastcall*)(void* thisWorld, const hknpBodyCinfo* bodyCinfo, int additionMode, int additionFlags);
+        using CreateBody_t = std::uint32_t*(__fastcall*)(void* thisWorld, std::uint32_t* outBodyId,
+                                                          const hknpBodyCinfo* bodyCinfo, int additionMode, int additionFlags);
         inline REL::Relocation<CreateBody_t> CreateBody{ REL::Offset(0x1543ff0) };
-#endif
-        
+
         // hknpBodyCinfo::hknpBodyCinfo(void) - Default constructor
         // VR offset: 0x1561dd0 - Status 4 (Verified)
         // This initializes the structure with default values
@@ -707,13 +907,21 @@ namespace heisenberg
         // NOTE: This is a MEMBER function - first param is 'this' (hknpWorld*)
         using DestroyBodies_t = void(__fastcall*)(void* thisWorld, const std::uint32_t* bodyIds, int count, int activationMode);
         inline REL::Relocation<DestroyBodies_t> DestroyBodies{ REL::Offset(0x1544e80) };
-        
-        // Disabled: only used by constraint system (currently #if 0 in GrabConstraint.cpp)
+
+        // hknpWorld::commitAddBodies(void)
+        // VR offset: 0x1544a50 - Status 4 (Verified)
+        using CommitAddBodies_t = void(__fastcall*)(void* thisWorld);
+        inline REL::Relocation<CommitAddBodies_t> hknpWorld_commitAddBodies{ REL::Offset(0x1544a50) };
+
+        // hknpWorld::activateBody(hknpBodyId)
+        // VR offset: 0x1546ef0 - Status 4 (Verified)
+        using ActivateBody_t = void(__fastcall*)(void* thisWorld, std::uint32_t bodyId);
+        inline REL::Relocation<ActivateBody_t> hknpWorld_activateBody{ REL::Offset(0x1546ef0) };
+
         // NOTE: bhkPhysicsSystem_CreateInstance is a duplicate of BhkPhysicsSystemCreateInstance (same offset 0x1e0c320)
         // NOTE: bhkPhysicsSystem_Ctor is a duplicate of BhkPhysicsSystemCtor (same offset 0x1e0c2b0)
         // NOTE: hknpPhysicsSystem_Ctor is a duplicate of PhysicsSystemCtor (same offset 0x1564de0)
         // NOTE: hknpPhysicsSystem_AddToWorld is a duplicate of PhysicsSystemAddToWorld (same offset 0x1565770)
-#if 0
         // =====================================================================
         // BETHESDA WRAPPER APPROACH - More reliable than direct hknpWorld calls
         // =====================================================================
@@ -761,10 +969,7 @@ namespace heisenberg
         using SetBodyTransform_t = void(*)(void* hknpBSWorld, std::uint32_t bodyId,
                                             const RE::NiTransform& transform, int activationBehavior);
         inline REL::Relocation<SetBodyTransform_t> SetBodyTransform{ REL::Offset(0x1df55f0) };
-#endif
-        
-        // Disabled: only used by constraint system (currently #if 0 in GrabConstraint.cpp)
-#if 0
+
         // =====================================================================
         // MOTOR CONSTRAINT FUNCTIONS
         // For implementing 6-DOF motor-based grab constraints like Skyrim HIGGS
@@ -785,7 +990,6 @@ namespace heisenberg
         // VR offset: 0x141af7260 - Status 4 (Verified)
         using RagdollMotorControllerUpdate_t = void(*)(void* controller);
         inline REL::Relocation<RagdollMotorControllerUpdate_t> RagdollMotorControllerUpdate{ REL::Offset(0x1af7260) };
-#endif
         
         // hkpPositionConstraintMotor vtable - for manually creating motors
         // VR offset: 0x2e95fe8 - Status 3
@@ -793,17 +997,27 @@ namespace heisenberg
         inline constexpr std::uintptr_t PositionConstraintMotorVtable = 0x2e95fe8;  // Relative to module base
         
         // hkpRagdollConstraintData vtable - for creating ragdoll constraints
-        // VR offset: 0x2e8d978 (from vr_address_tools database) - Status 3
-        // The ragdoll constraint contains 3 angular motors for full rotation control
-        inline constexpr std::uintptr_t RagdollConstraintDataVtable = 0x2e8d978;  // Relative to module base
+        // VR offset: 0x2e18298 (VERIFIED via Ghidra - constructor assigns this to vtable)
+        inline constexpr std::uintptr_t RagdollConstraintDataVtable = 0x2e18298;  // Relative to module base
+
+        // hkpRagdollConstraintData::hkpRagdollConstraintData() - Default constructor
+        // VR offset: 0x19b1d50 - Creates ragdoll constraint with default settings
+        using RagdollConstraintDataCtor_t = void*(*)(void* constraintData);
+        inline REL::Relocation<RagdollConstraintDataCtor_t> RagdollConstraintData_ctor{ REL::Offset(0x19b1d50) };
+
+        // hkpRagdollConstraintData::setInBodySpace(pivotA, pivotB, planeA, planeB, twistA, twistB)
+        // VR offset: 0x19b21d0
+        using RagdollSetInBodySpace_t = void(*)(void* constraintData,
+                                                 const RE::NiPoint4* pivotA, const RE::NiPoint4* pivotB,
+                                                 const RE::NiPoint4* planeA, const RE::NiPoint4* planeB,
+                                                 const RE::NiPoint4* twistA, const RE::NiPoint4* twistB);
+        inline REL::Relocation<RagdollSetInBodySpace_t> RagdollSetInBodySpace{ REL::Offset(0x19b21d0) };
         
         // hkpGenericConstraintData vtable - for creating generic 6-DOF constraints
         // VR offset: 0x2e8fb38 (from vr_address_tools database) - Status 3
         // The generic constraint can have any combination of linear/angular motors
         inline constexpr std::uintptr_t GenericConstraintDataVtable = 0x2e8fb38;  // Relative to module base
         
-        // Disabled: only used by constraint system (currently #if 0 in GrabConstraint.cpp)
-#if 0
         // =====================================================================
         // HAVOK REFERENCE COUNTING
         // =====================================================================
@@ -836,7 +1050,6 @@ namespace heisenberg
         // VR offset: 0x158bd90 - Status 2, ID 99620
         using HkBlockAlloc_t = void*(*)(void* allocator, int numBytes);
         inline REL::Relocation<HkBlockAlloc_t> hkContainerHeapAllocator_blockAlloc{ REL::Offset(0x158bd90) };
-#endif
         
         // =====================================================================
         // HAVOK MEMORY ROUTER ACCESS
@@ -944,12 +1157,10 @@ namespace heisenberg
             return true;
         }
         
-        // Disabled: only used by constraint system (currently #if 0 in GrabConstraint.cpp)
         // NOTE: PhysicsSystemCtor is a duplicate of hknpPhysicsSystem_Ctor (same offset 0x1564de0)
         // NOTE: PhysicsSystemAddToWorld is a duplicate of hknpPhysicsSystem_AddToWorld (same offset 0x1565770)
         // NOTE: BhkPhysicsSystemCtor is a duplicate of bhkPhysicsSystem_Ctor (same offset 0x1e0c2b0)
         // NOTE: BhkPhysicsSystemCreateInstance is a duplicate of bhkPhysicsSystem_CreateInstance (same offset 0x1e0c320)
-#if 0
         // =====================================================================
         // hknpPhysicsSystem / hknpPhysicsSystemData FUNCTIONS
         // For creating bodies via the proper Havok pattern (like in the SDK)
@@ -1007,7 +1218,25 @@ namespace heisenberg
         // VR offset: 0x1e0c580 - Status 4 (Verified)
         using BhkPhysicsSystemAddToWorld_t = void(__fastcall*)(void* thisSystem);
         inline REL::Relocation<BhkPhysicsSystemAddToWorld_t> BhkPhysicsSystemAddToWorld{ REL::Offset(0x1e0c580) };
-#endif
+
+        // =====================================================================
+        // bhkNPCollisionObject FUNCTIONS
+        // =====================================================================
+
+        // bhkNPCollisionObject::bhkNPCollisionObject(uint bodyIndex, bhkPhysicsSystem&)
+        // VR offset: 0x1e07710 - Status 4 (Verified)
+        using BhkNPCollisionObjectCtor_t = void*(__fastcall*)(void* thisCollObj, std::uint32_t bodyIndex, void* bhkPhysicsSystem);
+        inline REL::Relocation<BhkNPCollisionObjectCtor_t> BhkNPCollisionObjectCtor{ REL::Offset(0x1e07710) };
+
+        // bhkNPCollisionObject::AddToWorld(bhkWorld*)
+        // VR offset: 0x1e07be0 - Status 4 (Verified)
+        using BhkNPCollisionObjectAddToWorld_t = void(__fastcall*)(void* thisCollObj, void* bhkWorld);
+        inline REL::Relocation<BhkNPCollisionObjectAddToWorld_t> BhkNPCollisionObjectAddToWorld{ REL::Offset(0x1e07be0) };
+
+        // bhkNPCollisionObject::SetMotionType(int motionType)
+        // VR offset: 0x1e07300 - Status 4 (Verified)
+        using BhkNPCollisionObjectSetMotionType_t = void(__fastcall*)(void* thisCollObj, int motionType);
+        inline REL::Relocation<BhkNPCollisionObjectSetMotionType_t> BhkNPCollisionObjectSetMotionType{ REL::Offset(0x1e07300) };
 
         // bhkPhysicsSystem::GetBodyId(uint* outBodyId, uint index) - Get body ID at index
         // VR offset: 0x1e0c460 - Status 4 (Verified)
@@ -1019,6 +1248,55 @@ namespace heisenberg
         // VR offset: 0x1e0c780 - Status 4 (Verified)
         using BhkPhysicsSystemGetNumBodies_t = std::uint32_t(__fastcall*)(void* thisSystem);
         inline REL::Relocation<BhkPhysicsSystemGetNumBodies_t> BhkPhysicsSystemGetNumBodies{ REL::Offset(0x1e0c780) };
+
+        // ============================================================================
+        // ROCK BethesdaPhysicsBody port — additional REL::Relocations (May 2026)
+        // Extracted from ROCK.dll via Ghidra (see BethesdaPhysicsBodyOffsets.h).
+        // These five offsets, combined with the existing ones above, give us the full
+        // F4VR vocabulary needed to mirror ROCK's BethesdaPhysicsBody::create pipeline.
+        // ============================================================================
+
+        // hknpMotionCinfo constructor — called when growing a systemData's MotionCinfos
+        // array for non-static bodies. (Static bodies skip this; their motion index is
+        // 0x7FFFFFFF.)
+        using MotionCinfoCtor_t = void*(__fastcall*)(void* thisMotionCinfo);
+        inline REL::Relocation<MotionCinfoCtor_t> MotionCinfoCtor{ REL::Offset(0x17a2fc0) };
+
+        // hknpMaterial constructor — called for each material slot in systemData's
+        // Materials array. ROCK uses local material index 0 (single material per body)
+        // and overrides the global material id via setBodyMaterial after add-to-world.
+        using MaterialCtor_t = void*(__fastcall*)(void* thisMaterial);
+        inline REL::Relocation<MaterialCtor_t> MaterialCtor{ REL::Offset(0x1536cb0) };
+
+        // hknpWorld::SetBodyMaterial(world, bodyId, materialId, mode=0) — assigns a
+        // world-level material id to a body after add-to-world. Used to swap from
+        // local material index 0 to a real world material.
+        using HknpWorld_SetBodyMaterial_t = void(__fastcall*)(void* hknpWorld, std::uint32_t bodyId, std::uint16_t materialId, std::int32_t mode);
+        inline REL::Relocation<HknpWorld_SetBodyMaterial_t> HknpWorld_SetBodyMaterial{ REL::Offset(0x153afc0) };
+
+        // hknpWorld::SetBodyKeyframed(world, bodyId) — the keyframed motion-type
+        // promoter for ROCK-generated bodies. Different from
+        // BhkNPCollisionObjectSetMotionType: keyframed driver bodies must be promoted
+        // on the hknp body itself, not via the bhk wrapper.
+        using HknpWorld_SetBodyKeyframed_t = void(__fastcall*)(void* hknpWorld, std::uint32_t bodyId);
+        inline REL::Relocation<HknpWorld_SetBodyKeyframed_t> HknpWorld_SetBodyKeyframed{ REL::Offset(0x1df5cb0) };
+
+        // bhkWorld::RemovePhysicsSystemInstance(world, physicsSystemInstance) — used
+        // by destroy() to detach the native hknpPhysicsSystemInstance from the world
+        // before letting the bhkPhysicsSystem wrapper refcount-zero free itself.
+        // Pass the NATIVE instance pointer, not the bhk wrapper.
+        using BhkWorld_RemovePhysicsSystemInstance_t = void(__fastcall*)(void* bhkWorld, void* physicsSystemInstance);
+        inline REL::Relocation<BhkWorld_RemovePhysicsSystemInstance_t> BhkWorld_RemovePhysicsSystemInstance{ REL::Offset(0x1dfad00) };
+
+        // hkArrayReserveMore(allocatorInfo, arrayBase, stride) — grows a Havok hkArray's
+        // underlying buffer when size >= capacity. Returns true on success. Required for
+        // appending bodyCinfo/materialCinfo/etc. entries into a fresh hknpPhysicsSystemData.
+        using HkArrayReserveMore_t = bool(__fastcall*)(void* allocatorInfo, void* arrayBase, std::int32_t stride);
+        inline REL::Relocation<HkArrayReserveMore_t> HkArrayReserveMore{ REL::Offset(0x155d820) };
+
+        // The Havok allocator info struct used as 1st arg to HkArrayReserveMore.
+        // Read as a global pointer (it's stored at the F4VR address).
+        inline REL::Relocation<std::uintptr_t> HavokAllocatorInfo{ REL::Offset(0x3866310) };
         
         // =====================================================================
         // WORLD BODY MANIPULATION FUNCTIONS  
@@ -1031,8 +1309,6 @@ namespace heisenberg
                                                      const RE::NiPoint4& position, int activationBehavior);
         inline REL::Relocation<SetBodyPosition_t> hknpWorld_setBodyPosition{ REL::Offset(0x15391c0) };
         
-        // Disabled: only used by constraint system (currently #if 0 in GrabConstraint.cpp)
-#if 0
         // hknpWorld::setBodyTransform(hknpBodyId, hkTransformf&, hknpActivationBehavior::Enum)
         // VR offset: 0x15395e0 - Status 4 (Verified)
         using SetBodyTransformWorld_t = void(__fastcall*)(void* thisWorld, std::uint32_t bodyId,
@@ -1065,7 +1341,6 @@ namespace heisenberg
         using SetBodyQuality_t = void(__fastcall*)(void* thisWorld, std::uint32_t bodyId,
                                                     std::uint8_t qualityId, int rebuildCachesMode);
         inline REL::Relocation<SetBodyQuality_t> hknpWorld_setBodyQuality{ REL::Offset(0x153b070) };
-#endif
         
     }
 
@@ -1231,21 +1506,18 @@ namespace heisenberg
             bool isColliding);
         
         /**
-         * Create a fully initialized GrabConstraintData with 6-DOF motors
+         * Create a fully initialized GrabConstraintData with 6-DOF motors.
+         * The constraint data constructor owns and initializes its motors.
          * @param transformA Local transform in body A's space (hand body)
          * @param transformB Local transform in body B's space (grabbed object)
-         * @param angularMotor Pre-created angular motor (shared by all 3 axes)
-         * @param linearMotor Pre-created linear motor (shared by all 3 axes)
          * @return Allocated and initialized GrabConstraintData, or nullptr on failure
          */
         GrabConstraintData* CreateGrabConstraintData(
             const RE::NiTransform& transformA,
-            const RE::NiTransform& transformB,
-            hkpPositionConstraintMotor* angularMotor,
-            hkpPositionConstraintMotor* linearMotor);
+            const RE::NiTransform& transformB);
         
         /**
-         * Destroy a GrabConstraintData (does NOT destroy motors - caller owns those)
+         * Destroy a GrabConstraintData and its owned motors.
          */
         void DestroyGrabConstraintData(GrabConstraintData* data);
         

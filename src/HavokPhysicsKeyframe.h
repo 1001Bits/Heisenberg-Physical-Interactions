@@ -217,6 +217,20 @@ namespace heisenberg
         void KeepActive();
         
         /**
+         * Soft-keyframe / MOTORED setup — HIGGS uses this for the hand body when
+         * it needs to *push* dynamic clutter rather than behave as a pure velocity
+         * source. MOTORED bodies respond to external contact while still being
+         * driven toward a target transform by an internal motor.
+         *
+         * NOTE: The numeric Bethesda motion-type index for MOTORED is not
+         * officially documented for F4VR and may differ between SKSE-derived
+         * headers. Default implementation forwards `3` to
+         * BhkNPCollisionObjectSetMotionType; callers must verify on their build
+         * before relying on it. Gate callers behind a config flag.
+         */
+        bool SetupMotored();
+
+        /**
          * Check if helper was successfully initialized
          */
         bool IsValid() const { return _world != nullptr && _bodyId.isValid(); }

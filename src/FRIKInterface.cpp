@@ -12,9 +12,13 @@ namespace heisenberg
 
         _initialized = true;
 
-        // Use the official FRIK API initialization
-        const int err = FRIKApi::initialize();
-        
+        // Accept FRIK v2+ for the CORE features (finger poses, grip, position reads — all in
+        // the v2 ABI prefix). Do NOT require v9 globally: that would disable ALL FRIK on an
+        // older install. The v9-only hand-pushback functions are gated separately by version
+        // (see SupportsPushback / the pushback wrappers below).
+        constexpr std::uint32_t kCoreMinVersion = 2;
+        const int err = FRIKApi::initialize(kCoreMinVersion);
+
         switch (err) {
         case 0:
             break;  // Success
@@ -29,7 +33,7 @@ namespace heisenberg
             spdlog::error("FRIKAPI_GetApi returned nullptr");
             return false;
         case 4:
-            spdlog::error("FRIK API version too old - Heisenberg requires API v{}", frik::api::FRIK_API_VERSION);
+            spdlog::error("FRIK API version too old - Heisenberg requires API v2+ (yours is older)");
             return false;
         default:
             spdlog::error("FRIK API initialization failed with unknown error: {}", err);
@@ -158,5 +162,72 @@ namespace heisenberg
             return api->getModVersion();
         }
         return "unknown";
+    }
+
+    // --- v9 hand pushback API -------------------------------------------------------------
+    // The external-hand-transform functions were introduced at FRIK "ROCK API v5". The header
+    // we compile against is v9 (newer), but the API is append-only so these functions sit at
+    // the same struct offset on v5+. We gate on getVersion() >= 5 and SEH-guard the raw calls:
+    // if a layout mismatch makes the pointer bogus, the fault is caught and pushback disables
+    // permanently instead of crashing.
+    namespace
+    {
+        constexpr std::uint32_t kPushbackMinVersion = 5;  // applyExternalHandWorldTransform added here
+        bool s_pushbackFaulted = false;
+        bool s_loggedDisable = false;
+
+        // SEH leaves (no C++ objects needing unwind — NiTransform is trivially destructible).
+        bool ApplyExtSEH(const frik::api::FRIKApi* api, const char* tag, frik::api::FRIKApi::Hand h,
+                         const RE::NiTransform& w, int prio)
+        {
+            __try { return api->applyExternalHandWorldTransform(tag, h, w, prio); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+        }
+        bool ClearExtSEH(const frik::api::FRIKApi* api, const char* tag, frik::api::FRIKApi::Hand h)
+        {
+            __try { return api->clearExternalHandWorldTransform(tag, h); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+        }
+        bool GetHandWorldSEH(const frik::api::FRIKApi* api, frik::api::FRIKApi::Hand h, RE::NiTransform& out)
+        {
+            __try { out = api->getHandWorldTransform(h); return true; }
+            __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+        }
+    }
+
+    bool FRIKInterface::SupportsPushback() const
+    {
+        if (DEBUG_DISABLE_FRIK_API || s_pushbackFaulted) return false;
+        auto* api = Api();
+        return api && api->getVersion && api->getVersion() >= kPushbackMinVersion;
+    }
+
+    bool FRIKInterface::GetHandWorldTransform(bool isLeft, RE::NiTransform& outWorld) const
+    {
+        if (!SupportsPushback()) return false;
+        auto* api = Api();
+        if (!api->getHandWorldTransform || !api->isSkeletonReady || !api->isSkeletonReady()) return false;
+        if (!GetHandWorldSEH(api, ToHand(isLeft), outWorld)) {
+            s_pushbackFaulted = true;
+            if (!s_loggedDisable) { spdlog::error("[FRIK] pushback call faulted (API layout mismatch?) — disabling pushback"); s_loggedDisable = true; }
+            return false;
+        }
+        return true;
+    }
+
+    bool FRIKInterface::ApplyExternalHandWorldTransform(bool isLeft, const RE::NiTransform& world, int priority) const
+    {
+        if (!SupportsPushback()) return false;
+        auto* api = Api();
+        if (!api->applyExternalHandWorldTransform) return false;
+        return ApplyExtSEH(api, HEISENBERG_HAND_PUSHBACK_TAG, ToHand(isLeft), world, priority);
+    }
+
+    bool FRIKInterface::ClearExternalHandWorldTransform(bool isLeft) const
+    {
+        if (!SupportsPushback()) return false;
+        auto* api = Api();
+        if (!api->clearExternalHandWorldTransform) return false;
+        return ClearExtSEH(api, HEISENBERG_HAND_PUSHBACK_TAG, ToHand(isLeft));
     }
 }

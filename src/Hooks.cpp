@@ -7,6 +7,7 @@
 #include "MenuChecker.h"
 #include "DropToHand.h"
 #include "PipboyInteraction.h"
+#include "rock/RockBridge.h"
 #include "Utils.h"
 #include "F4VROffsets.h"
 
@@ -14,6 +15,16 @@
 #include "f4vr/PlayerNodes.h"
 #include "Config.h"
 #include "ActivatorHandler.h"
+#include "HeisenbergInterface001.h"
+#include "PlayerCharacterProxyListener.h"
+#include "HandCollision.h"
+#include "Physics.h"
+#include "ThrownObjectTracker.h"
+#include "HandWallPushback.h"
+#include "rock_integration/HandBoneColliderSet.h"
+#include "rock_integration/BodyBoneColliderSet.h"
+#include "rock_integration/WeaponCollision.h"
+#include "rock_integration/TwoHandedGrip.h"
 
 #include <atomic>
 
@@ -32,6 +43,7 @@ namespace heisenberg::Hooks
     static RE::Setting* g_showHUDMessagesSetting = nullptr;
     static bool g_showHUDMessagesSettingSearched = false;
     static int g_deferredUnsuppressFrames = 0;  // Deferred HUD unsuppress countdown
+    static std::string g_deferredHUDMessage;    // Message to show when deferred unsuppress fires
     
     namespace
     {
@@ -52,6 +64,21 @@ namespace heisenberg::Hooks
         using EndUpdateFunc = void(*)(uint64_t rcx);
         EndUpdateFunc g_originalEndUpdate = nullptr;
 
+        // PlayerCharacter::Update vtable hook — runs BEFORE physics step.
+        // All world-modifying operations (body creation, pair filter, constraint setup)
+        // happen here, matching HIGGS Skyrim's architecture.
+        using PlayerCharacterUpdateFunc = void(*)(RE::PlayerCharacter*, float);
+        PlayerCharacterUpdateFunc g_originalPlayerCharacterUpdate = nullptr;
+
+        enum class HandCollisionUpdatePhase
+        {
+            PrePhysics,
+            PostPhysics
+        };
+
+        // Forward declaration — defined before HookEndUpdate
+        void UpdateHandCollisionBodies(HandCollisionUpdatePhase phase);
+
         // PipboyInventoryMenu::DropItem hook
         // Signature: void DropItem(uint32_t inventoryHandle, void* stackDataArray, uint32_t count)
         // VR address: 0x140b9b9e0
@@ -61,9 +88,57 @@ namespace heisenberg::Hooks
         // TESObjectREFR::SetPosition (VR 0x3f4370) - properly updates data.location + physics + cell
         using SetPositionFunc = void(*)(RE::TESObjectREFR*, RE::NiPoint3*);
 
+        // Check if the item about to be dropped from Pipboy is a placement mod item.
+        // param2 points to an inventory entry; the base form is at the start of the
+        // BGSInventoryItem structure. We read it defensively.
+        static bool IsPipboyDropPlacementItem(void* param2)
+        {
+            if (!param2) return false;
+            // BGSInventoryItem starts with TESBoundObject* object
+            auto* baseObj = *reinterpret_cast<RE::TESBoundObject**>(param2);
+            if (!baseObj) return false;
+            if (baseObj->GetFormType() != RE::ENUM_FORM_ID::kMISC) return false;
+            const char* editorID = baseObj->GetFormEditorID();
+            if (editorID && std::strstr(editorID, "CampingKit_")) {
+                spdlog::info("[PipboyDrop] Detected Campsite placement item: '{}' ({:08X}) — full bypass",
+                    editorID, baseObj->formID);
+                return true;
+            }
+            // SS2 plans
+            std::string itemName(RE::TESFullName::GetFullName(*baseObj, false));
+            if (itemName.find("Plan:") != std::string::npos ||
+                itemName.find("Plan -") != std::string::npos ||
+                itemName.find("SS2") != std::string::npos) {
+                spdlog::info("[PipboyDrop] Detected SS2 placement item: '{}' ({:08X}) — full bypass",
+                    itemName, baseObj->formID);
+                return true;
+            }
+            return false;
+        }
+
         void HookPipboyDropItem(uint32_t param1, void* param2, uint32_t param3)
         {
             spdlog::debug("[PipboyDrop] HookPipboyDropItem CALLED (param1={}, param3={})", param1, param3);
+
+            // Never run drop-to-hand logic during a loading screen. Hand nodes,
+            // grab state and captured ref IDs are not meaningful until the world
+            // is live — just pass through to the original drop.
+            if (MenuChecker::GetSingleton().IsLoading()) {
+                if (g_originalPipboyDropItem) {
+                    g_originalPipboyDropItem(param1, param2, param3);
+                }
+                return;
+            }
+
+            // Placement mod items (Campsite tents, SS2 plans) must bypass all our
+            // drop-to-hand logic. Call the original function and return immediately
+            // so the item drops at the player's feet and the mod's script handles it.
+            if (IsPipboyDropPlacementItem(param2)) {
+                if (g_originalPipboyDropItem) {
+                    g_originalPipboyDropItem(param1, param2, param3);
+                }
+                return;
+            }
 
             auto& dropToHand = DropToHand::GetSingleton();
 
@@ -180,21 +255,191 @@ namespace heisenberg::Hooks
                 return;
             }
 
-            __try {
-                if (MenuChecker::GetSingleton().IsLoading()) {
-                    return;
-                }
-                
-                g_vrInput.Update();
-                GrabManager::GetSingleton().PrePhysicsUpdate();
-                g_heisenberg.OnInputUpdate();
-                g_heisenberg.OnGrabUpdate();
+            // No outer SEH: /EHsc means __except skips C++ destructors on unwind,
+            // so wrapping WorldWriteLock-taking code in a catch-all leaks the
+            // physics lock on any fault (→ next-frame deadlock). Narrow SEH
+            // stays only around specific raw pointer reads (e.g. Physics.cpp
+            // proxy body resolution) where no RAII is on the stack.
+            if (MenuChecker::GetSingleton().IsLoading()) {
+                return;
             }
-            __except (EXCEPTION_EXECUTE_HANDLER) {
-                spdlog::error("[HOOKS] Exception in HookPostPhysics - Heisenberg processing skipped this frame");
+
+            g_vrInput.Update();
+            GrabManager::GetSingleton().PostPhysicsGrabUpdate();
+            g_heisenberg.OnInputUpdate();
+            g_heisenberg.OnGrabUpdate();
+
+            // Fire post-physics callbacks for external plugins
+            heisenberg::HandCollision::GetSingleton().FlushPendingHaptics();
+            HeisenbergPluginAPI::InvokePostPhysicsCallbacks(nullptr);
+
+            // Drain thrown-object impacts captured on the Havok worker thread and run
+            // their damage/knockback/aggro here on the game thread (engine-safe).
+            heisenberg::ThrownObjectTracker::GetSingleton().DrainPendingImpacts();
+
+            // Hand wall-pushback: push the rendered hand out of static geometry (FRIK v9).
+            // No-op when iHandWallPushbackMode=0. Runs post-physics so FRIK's hand transform
+            // for this frame is available.
+            heisenberg::hand_wall_pushback::Update();
+
+            // Hand collision body management.
+            {
+                static bool wasLoading = false;
+                if (MenuChecker::GetSingleton().IsLoading()) {
+                    if (!wasLoading) {
+                        heisenberg::HandCollision::GetSingleton().Shutdown();
+                        wasLoading = true;
+                    }
+                } else {
+                    wasLoading = false;
+                    static int hcFrameCount = 0;
+                    if (++hcFrameCount == 100) {
+                        spdlog::info("[HOOKS] HookPostPhysics running (frame 100), calling UpdateHandCollisionBodies");
+                    }
+                    UpdateHandCollisionBodies(HandCollisionUpdatePhase::PostPhysics);
+                }
             }
         }
         
+        // =====================================================================
+        // PlayerCharacter::Update hook — runs BEFORE physics step each frame.
+        // This is where HIGGS does all world-modifying operations.
+        // Safe to create/destroy bodies, set collision filters, etc.
+        // =====================================================================
+        void HookPlayerCharacterUpdate(RE::PlayerCharacter* player, float delta)
+        {
+            // Call original first — game logic, animation, etc.
+            if (g_originalPlayerCharacterUpdate) {
+                g_originalPlayerCharacterUpdate(player, delta);
+            }
+
+            // Skip during loading
+            if (MenuChecker::GetSingleton().IsLoading()) {
+                // Destroy hand collision bodies immediately when loading starts
+                // The engine's physics step will crash on stale KEYFRAMED bodies during teardown
+                static bool wasLoading = false;
+                if (!wasLoading) {
+                    heisenberg::HandCollision::GetSingleton().Shutdown();
+                    wasLoading = true;
+                }
+                return;
+            } else {
+                static bool wasLoading = false;
+                wasLoading = false;
+            }
+
+            // Hand collision body creation
+            static int frameCount = 0;
+            if (++frameCount == 100) {
+                spdlog::info("[HOOKS] PlayerCharacterUpdate running (frame 100), calling UpdateHandCollisionBodies");
+            }
+            UpdateHandCollisionBodies(HandCollisionUpdatePhase::PrePhysics);
+
+            // Proxy listener DISABLED — addListener causes vtable corruption on save/load.
+            // Hand collision uses pair filter (disableCollisionsBetween) instead.
+            // Grabbed objects use kNonCollidable fallback when pair filter unavailable.
+        }
+
+        // Separate function for hand collision body management.
+        // Uses WorldWriteLock (C++ RAII) which can't be in __try functions.
+        void UpdateHandCollisionBodies(HandCollisionUpdatePhase phase)
+        {
+            // ROCK integration: when ROCK integration is active, Heisenberg must
+            // NEVER run its own hand collision. Only ONE mod may drive hand bodies
+            // / modify object transforms per frame — running both (e.g. during
+            // ROCK's not-yet-ready startup window) races on hknpWorld::setBodyPosition
+            // and crashes in updateMotionAndAttachedBodiesAfterModifyingTransform.
+            // So we gate on IsActive() alone, NOT physics-ready. If ROCK is present
+            // but disabled (e.g. FRIK API mismatch), there is briefly no hand push;
+            // set [ROCK] iUseRockPhysics=0 to force the built-in fallback instead.
+            {
+                auto& rock = heisenberg::RockBridge::GetSingleton();
+                if (rock.IsActive()) {
+                    static bool loggedRock = false;
+                    if (!loggedRock) {
+                        spdlog::info("[HOOKS] ROCK integration active — built-in hand collision disabled (ROCK owns hand physics).");
+                        loggedRock = true;
+                    }
+                    return;
+                }
+            }
+
+            if (!heisenberg::g_config.enableHandCollision) {
+                static bool loggedOnce = false;
+                if (!loggedOnce) {
+                    spdlog::warn("[HOOKS] Hand collision disabled (bEnableHandCollision=false) — "
+                                 "hand strikes won't push objects. Set bEnableHandCollision=true in "
+                                 "Heisenberg_F4VR.ini or via MCM to enable.");
+                    loggedOnce = true;
+                }
+                return;
+            }
+
+            auto* playerNodes = f4cf::f4vr::getPlayerNodes();
+            if (!playerNodes) {
+                return;
+            }
+
+            RE::NiNode* leftWand = heisenberg::GetWandNode(playerNodes, true);
+            RE::NiNode* rightWand = heisenberg::GetWandNode(playerNodes, false);
+            if (!leftWand || !rightWand) {
+                return;
+            }
+
+            auto& hc = heisenberg::HandCollision::GetSingleton();
+
+            // Physics-body path (full Havok hand bodies) is opt-in and gated separately;
+            // proximity-based push always runs when enableHandCollision is true so a
+            // user with usePhysicsHandBodies=false still gets hand-strike impulse.
+            const bool usePhysicsBodies = heisenberg::g_config.usePhysicsHandBodies;
+            if (usePhysicsBodies && phase == HandCollisionUpdatePhase::PrePhysics) {
+                hc.CreateBodiesIfNeeded(leftWand->world.translate, rightWand->world.translate);
+                hc.ApplyPlayerPairFilterIfNeeded();
+            }
+
+            if (phase == HandCollisionUpdatePhase::PrePhysics) {
+                return;
+            }
+
+            // Position updates — use wand nodes directly. The wand world transforms
+            // are set by the OpenVR pose pipeline and update with the controller in
+            // real time. Earlier code preferred firstPersonSkeleton's LArm_Hand bone,
+            // but at HookPostPhysics timing FRIK has only refreshed the LOCAL bone
+            // transform; the world transform is recomputed later in the scene graph
+            // traversal, so reading world.translate here yielded a stale (frozen)
+            // position and the collision body never followed the hand.
+            // hc.Update() is also where the per-frame ROCK integration modules
+            // (HandBoneCollider / BodyBoneCollider / WeaponCollision / TwoHandedGrip)
+            // get ticked, so include their active state in the gate — otherwise enabling
+            // any of them while the cup bodies are intentionally torn down means none
+            // of them ever build anything.
+            const bool rockOwnsHandPhysics =
+                heisenberg::rock_hand_collider::IsActive() ||
+                heisenberg::rock_body_collider::IsActive() ||
+                heisenberg::rock_weapon_collision::IsActive() ||
+                heisenberg::rock_two_handed_grip::IsActive();
+            if (hc.HasHandBodies() || !usePhysicsBodies || rockOwnsHandPhysics) {
+                RE::NiPoint3 leftPos = leftWand->world.translate;
+                RE::NiPoint3 rightPos = rightWand->world.translate;
+                RE::NiMatrix3 leftRot = leftWand->world.rotate;
+                RE::NiMatrix3 rightRot = rightWand->world.rotate;
+
+                static RE::NiPoint3 prevL = leftPos, prevR = rightPos;
+                static double prevTime = Utils::GetTime();
+                const double now = Utils::GetTime();
+                float dt = static_cast<float>(now - prevTime);
+                if (dt <= 0.0001f || dt > 0.1f) {
+                    dt = 1.0f / 90.0f;
+                }
+                prevTime = now;
+                RE::NiPoint3 leftVel = (leftPos - prevL) * (1.0f / dt);
+                RE::NiPoint3 rightVel = (rightPos - prevR) * (1.0f / dt);
+                prevL = leftPos; prevR = rightPos;
+
+                hc.Update(leftPos, rightPos, leftVel, rightVel, leftRot, rightRot, dt);
+            }
+        }
+
         // End-of-update hook (0xd84f2c) - runs AFTER all animation/skeleton/game processing
         // This is where we write tape deck transforms and manually compute world.rotate.
         // By this point FRIK + game function have fully processed the skeleton.
@@ -246,6 +491,10 @@ namespace heisenberg::Hooks
                 __except (EXCEPTION_EXECUTE_HANDLER) {
                     spdlog::error("[HOOKS] Exception in ProcessPendingWeaponReequip");
                 }
+
+                // Hand collision: body creation + pair filter
+                // Uses BSWriteLocker like HIGGS to safely modify the physics world.
+                // Hand collision moved to HookPlayerCharacterUpdate (pre-physics).
             }
         }
 
@@ -324,6 +573,24 @@ namespace heisenberg::Hooks
         g_originalEndUpdate = reinterpret_cast<EndUpdateFunc>(
             trampoline.write_call<5>(endUpdateHook.address(), &HookEndUpdate));
         spdlog::info("EndUpdateHook: Installed at {:X}", endUpdateHook.address());
+
+        // PlayerCharacter::Update vtable hook — runs BEFORE physics step.
+        // Matches HIGGS Skyrim architecture: all world-modifying operations here.
+        // Vtable: 0x2D80F88, slot 0xCF (Actor::Update override)
+        {
+            REL::Relocation<std::uintptr_t> pcVtable{ REL::Offset(0x2D80F88) };
+            auto* vtablePtr = reinterpret_cast<PlayerCharacterUpdateFunc*>(pcVtable.address() + 0xCF * 8);
+
+            DWORD oldProtect;
+            if (VirtualProtect(vtablePtr, sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                g_originalPlayerCharacterUpdate = *vtablePtr;
+                *vtablePtr = &HookPlayerCharacterUpdate;
+                VirtualProtect(vtablePtr, sizeof(void*), oldProtect, &oldProtect);
+                spdlog::info("PlayerCharacterUpdate vtable hook: slot 0xCF, orig={:p}", (void*)g_originalPlayerCharacterUpdate);
+            } else {
+                spdlog::error("PlayerCharacterUpdate vtable hook: VirtualProtect FAILED");
+            }
+        }
 
         // PipboyInventoryMenu::DropItem hook - intercepts items dropped from Pipboy menu
         // so we can immediately move them to the hand position and hide them.
@@ -533,10 +800,11 @@ namespace heisenberg::Hooks
         }
     }
     
-    void ScheduleDeferredHUDUnsuppress(int frames)
+    void ScheduleDeferredHUDUnsuppress(int frames, const char* queuedMessage)
     {
         g_deferredUnsuppressFrames = frames;
-        spdlog::debug("[HUD] Scheduled deferred unsuppress in {} frames", frames);
+        g_deferredHUDMessage = queuedMessage ? queuedMessage : "";
+        spdlog::debug("[HUD] Scheduled deferred unsuppress in {} frames, message='{}'", frames, g_deferredHUDMessage);
     }
 
     void UpdateDeferredHUDUnsuppress()
@@ -547,6 +815,12 @@ namespace heisenberg::Hooks
                 if (g_showHUDMessagesSetting) {
                     g_showHUDMessagesSetting->SetBinary(true);
                     spdlog::debug("[HUD] Deferred unsuppress complete - HUD messages restored");
+                }
+                // Show queued message now that native messages have been discarded
+                if (!g_deferredHUDMessage.empty()) {
+                    ShowHUDMessage_VR(g_deferredHUDMessage.c_str(), nullptr, false, false);
+                    spdlog::info("[HUD] Showed deferred message: '{}'", g_deferredHUDMessage);
+                    g_deferredHUDMessage.clear();
                 }
             }
         }
@@ -622,8 +896,33 @@ namespace heisenberg::Hooks
                 if (player && player->actorState.IsWeaponDrawn()) {
                     spdlog::debug("[GripHook] Weapon drawn - passing WandGrip through (reload/holster)");
                 } else {
-                    spdlog::debug("[GripHook] Blocked WandGrip from ReadyWeaponHandler (weapon not drawn)");
-                    return;
+                    // Weapon holstered: normally block WandGrip here so grip doesn't draw the
+                    // weapon. BUT a mod secondary action on an activator/furniture (Tune The
+                    // Radios, Sentinel PA) triggers on the primary-hand grip while aiming at it,
+                    // and was getting eaten — only the offhand grip (which never reaches
+                    // ReadyWeaponHandler) still worked. When the primary wand is aimed at an
+                    // ACTI/FURN and we're NOT grabbing, let the grip reach the original handler
+                    // so the secondary action fires. Empty-air / non-activator grips still block.
+                    bool passToActivator = false;
+                    if (heisenberg::g_config.passGripToActivatorSecondary) {
+                        auto& grabMgr2 = heisenberg::GrabManager::GetSingleton();
+                        if (!grabMgr2.IsGrabbing(true) && !grabMgr2.IsGrabbing(false)) {
+                            const bool primaryIsLeft = heisenberg::VRInput::GetSingleton().IsLeftHandedMode();
+                            auto tgt = heisenberg::GetVRWandTargetHandle(primaryIsLeft).get();
+                            auto* base = tgt ? tgt->data.objectReference : nullptr;
+                            if (base) {
+                                const auto ft = base->GetFormType();
+                                if (ft == RE::ENUM_FORM_ID::kACTI || ft == RE::ENUM_FORM_ID::kFURN) {
+                                    passToActivator = true;
+                                    spdlog::debug("[GripHook] WandGrip -> activator/furniture secondary action ({:08X})", tgt->formID);
+                                }
+                            }
+                        }
+                    }
+                    if (!passToActivator) {
+                        spdlog::debug("[GripHook] Blocked WandGrip from ReadyWeaponHandler (weapon not drawn)");
+                        return;
+                    }
                 }
             }
         }
@@ -633,7 +932,148 @@ namespace heisenberg::Hooks
             g_originalReadyWeaponOnButtonEvent(thisPtr, a_event);
         }
     }
-    
+
+    // =====================================================================
+    // MELEE THROW / GRENADE-READY HOOK (MeleeThrowHandler::vf011 @ 0xFC8AE0)
+    // =====================================================================
+    // This handler readies/throws a held grenade: when the throw input (grip
+    // in VR) is held >= DAT_1437d5b18 (0.3s) and a throwable is equipped in
+    // slot 0x2B, it readies the grenade (trajectory arc) and throws on release.
+    // We hook it to control grenade readying at the GAME level per our rules,
+    // instead of stripping/injecting grip in the OpenVR stream (which broke
+    // VirtualHolsters equip/holster, grip-reload, and mod secondary actions).
+    // "Block" = cap the event's held-duration just below the 0.3s ready
+    // threshold so the handler runs normally (state machine intact, DrawWeapon
+    // fallback already NOP'd below) but never reaches the ready/throw branch.
+    using MeleeThrowOnButtonEvent_t = void(*)(void* thisPtr, RE::ButtonEvent* a_event, void* p3, void* p4);
+    static MeleeThrowOnButtonEvent_t g_originalMeleeThrowOnButtonEvent = nullptr;
+
+    // Safe "is a throwable equipped" probe — replicates the game's own check
+    // (AttackBlockHandler::IsPlayerThrowingWeapon @ 0xFCBCD0): player+0x300 = currentProcess,
+    // +8 = middleHigh, +0x290 = equippedItems BSTArray (data@0, size@+0x10, 40 bytes/item;
+    // item[0] -> form, form+0x1a = equip slot byte; 0x2B = the grenade/throwable slot).
+    // SEH-guarded so any layout mismatch returns false instead of access-violating — unlike
+    // GetEquippedWeapon(player, 2), which crashed on grab (index 2 out of range). Gating the
+    // grenade hook on this means melee + POWER ATTACKS are never touched: those are
+    // AttackBlockHandler with its OWN attackTimer (Ghidra-confirmed), unrelated to this handler.
+    static bool PlayerHasThrowableEquipped()
+    {
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player) return false;
+        __try {
+            const uintptr_t base = reinterpret_cast<uintptr_t>(player);
+            const uintptr_t process = *reinterpret_cast<uintptr_t*>(base + 0x300);
+            if (!process) return false;
+            const uintptr_t middleHigh = *reinterpret_cast<uintptr_t*>(process + 8);
+            if (!middleHigh) return false;
+            const uintptr_t arrObj = middleHigh + 0x290;
+            const uintptr_t data = *reinterpret_cast<uintptr_t*>(arrObj);
+            const uint32_t size = *reinterpret_cast<uint32_t*>(arrObj + 0x10);
+            if (!data || size == 0 || size > 32) return false;
+            for (uint32_t i = 0; i < size; ++i) {
+                const uintptr_t item = data + static_cast<uintptr_t>(i) * 40;
+                const uintptr_t form = *reinterpret_cast<uintptr_t*>(item);
+                if (form && *reinterpret_cast<uint8_t*>(form + 0x1a) == 0x2B) {
+                    return true;
+                }
+            }
+            return false;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
+
+    void HookMeleeThrowOnButtonEvent(void* thisPtr, RE::ButtonEvent* a_event, void* p3, void* p4)
+    {
+        // The block mechanism (below) caps the event's held-duration just under the 0.3s throw
+        // delay. That is intentionally NON-destructive to the sub-0.3 path: a grip held <0.3s
+        // still does its normal thing (power attack / nothing), only the >=0.3s ready/throw/draw
+        // is suppressed. We never strip grip from the OpenVR stream, so grip still reaches the
+        // game / VirtualHolsters. Power attacks are AttackBlockHandler (own timer) — untouched.
+        bool blockReady = false;
+        if (a_event && heisenberg::g_config.useGrenadeReadyHook && heisenberg::g_config.enableGrenadeHandling) {
+            auto& mod = heisenberg::Heisenberg::GetSingleton();
+            const bool primaryIsLeft = heisenberg::VRInput::GetSingleton().IsLeftHandedMode();
+            const bool hasThrowable = PlayerHasThrowableEquipped();
+            if (hasThrowable) {
+                // A throwable is equipped → gate GRENADE readying per our rules.
+                if (heisenberg::g_config.remapGrenadeButtonToA) {
+                    // ALTERNATE CONTROL (remap to A) is AUTHORITATIVE: a throwable must NEVER ready
+                    // from a grip hold. The ONLY way to ready is the A long-press, which injects a
+                    // brief grip while IsAButtonHeldLongEnough() is true — allow only that. This
+                    // takes priority over the weapon-on-hand / zone exceptions below: with alt
+                    // control on, grenades come out via A, period.
+                    if (!mod.IsAButtonHeldLongEnough()) {
+                        blockReady = true;
+                    }
+                }
+                else {
+                    // Default control (grip readies grenades). When a real weapon is also on the
+                    // throwing hand, NEVER block — you're throwing a grenade, not grabbing, so let
+                    // the game ready it on that hand.
+                    const bool weaponOnThrowHand = mod.GetCachedHasRealWeapon();
+
+                    // HAND-TO-HAND TRANSFER GUARD: if the OTHER hand is holding an object and the
+                    // hands are brought close together, the player is transferring an object hand-
+                    // to-hand — NOT throwing. Gripping the (empty) throwing hand to receive it has
+                    // no world grab-target, so without this the equipped grenade readies by
+                    // accident. Block while a transfer is plausibly in progress.
+                    bool handToHandTransfer = false;
+                    if (heisenberg::GrabManager::GetSingleton().IsGrabbing(!primaryIsLeft)) {
+                        if (auto* nodes = f4cf::f4vr::getPlayerNodes()) {
+                            RE::NiNode* primN = heisenberg::GetWandNode(nodes, primaryIsLeft);
+                            RE::NiNode* secN  = heisenberg::GetWandNode(nodes, !primaryIsLeft);
+                            if (primN && secN) {
+                                const float handDist = (primN->world.translate - secN->world.translate).Length();
+                                handToHandTransfer = handDist < 25.0f;  // ~35cm — hands together for a transfer
+                            }
+                        }
+                    }
+
+                    if (weaponOnThrowHand) {
+                        // no block
+                    }
+                    else if (handToHandTransfer) {
+                        blockReady = true;  // bringing an object to the throwing hand → don't ready
+                    }
+                    else if (mod.HasGrabTarget(primaryIsLeft)) {
+                        blockReady = true;  // grab target → grab, don't ready
+                    }
+                    else if (heisenberg::g_config.throwableActivationZone != 0 && !mod.IsInChestPocketZone()) {
+                        blockReady = true;  // chest-pocket zone mode → only ready inside the zone
+                    }
+                }
+            }
+            else if (heisenberg::g_config.disableGripWeaponDraw) {
+                // No throwable: a grip-hold >= 0.3s here DRAWS/sheathes the weapon (the byte
+                // patches only cover one of the two draw paths; the PerformAction else-branch
+                // still toggles it — that's why grip was unsheathing weapons on grab). Heisenberg
+                // repurposes grip for grabbing, so cap the hold below 0.3s: the weapon never
+                // draws, and the sub-0.3 power-attack path is preserved.
+                blockReady = true;
+            }
+        }
+
+        if (blockReady && a_event) {
+            // Pin held-duration just below the 0.3s ready threshold for this call only,
+            // then restore so any downstream consumers see the real value.
+            const float saved = a_event->heldDownSecs;
+            constexpr float kBelowThreshold = 0.29f;  // < DAT_1437d5b18 (0.3s)
+            if (a_event->heldDownSecs > kBelowThreshold) {
+                a_event->heldDownSecs = kBelowThreshold;
+            }
+            if (g_originalMeleeThrowOnButtonEvent) {
+                g_originalMeleeThrowOnButtonEvent(thisPtr, a_event, p3, p4);
+            }
+            a_event->heldDownSecs = saved;
+            return;
+        }
+
+        if (g_originalMeleeThrowOnButtonEvent) {
+            g_originalMeleeThrowOnButtonEvent(thisPtr, a_event, p3, p4);
+        }
+    }
+
     void SetGripWeaponDrawDisabled(bool disabled)
     {
         if (disabled == g_gripWeaponDrawDisabled) {
@@ -829,6 +1269,47 @@ namespace heisenberg::Hooks
                     p.label, origByte, addr);
             }
         }
+
+        // =====================================================================
+        // MELEE THROW / GRENADE-READY entry trampoline (control readying)
+        // =====================================================================
+        // Trampoline-hook MeleeThrowHandler::vf011 @ 0xFC8AE0 so we can block/allow
+        // grenade readying per our rules (HookMeleeThrowOnButtonEvent). Prologue
+        // (Ghidra-verified, F4VR 1.2.72): 40 55 56 57 41 56 48 8B EC 48 83 EC 78
+        // 0F 29 74 24 60 = PUSH RBP/RSI/RDI/R14; MOV RBP,RSP; SUB RSP,0x78;
+        // MOVAPS [RSP+0x60],XMM6 = 18 bytes (clean instruction boundary).
+        {
+            constexpr size_t MT_STOLEN = 18;
+            REL::Relocation<std::uintptr_t> meleeThrow{ REL::Offset(0xfc8ae0) };
+            uintptr_t mtAddr = meleeThrow.address();
+            uint8_t mtOrig[MT_STOLEN];
+            std::memcpy(mtOrig, reinterpret_cast<void*>(mtAddr), MT_STOLEN);
+            const uint8_t mtExpected[] = { 0x40,0x55,0x56,0x57,0x41,0x56,0x48,0x8B,0xEC,0x48,0x83,0xEC,0x78,0x0F,0x29,0x74,0x24,0x60 };
+            if (std::memcmp(mtOrig, mtExpected, MT_STOLEN) != 0) {
+                spdlog::error("[GripHook] MeleeThrow prologue mismatch @ 0x{:X} — grenade-ready hook NOT installed", mtAddr);
+            } else {
+                void* mtMem = VirtualAlloc(nullptr, 128, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+                if (!mtMem) {
+                    spdlog::error("[GripHook] MeleeThrow VirtualAlloc failed — grenade-ready hook NOT installed");
+                } else {
+                    uint8_t* tr = reinterpret_cast<uint8_t*>(mtMem);
+                    size_t tp = 0;
+                    std::memcpy(tr, reinterpret_cast<void*>(mtAddr), MT_STOLEN); tp += MT_STOLEN;
+                    tr[tp++] = 0xFF; tr[tp++] = 0x25; tr[tp++] = 0x00; tr[tp++] = 0x00; tr[tp++] = 0x00; tr[tp++] = 0x00;
+                    uintptr_t mtCont = mtAddr + MT_STOLEN;
+                    std::memcpy(&tr[tp], &mtCont, 8); tp += 8;
+                    g_originalMeleeThrowOnButtonEvent = reinterpret_cast<MeleeThrowOnButtonEvent_t>(mtMem);
+
+                    uint8_t mtPatch[MT_STOLEN];
+                    mtPatch[0] = 0xFF; mtPatch[1] = 0x25; mtPatch[2] = 0x00; mtPatch[3] = 0x00; mtPatch[4] = 0x00; mtPatch[5] = 0x00;
+                    uintptr_t mtHookAddr = reinterpret_cast<uintptr_t>(&HookMeleeThrowOnButtonEvent);
+                    std::memcpy(&mtPatch[6], &mtHookAddr, 8);
+                    for (size_t i = 14; i < MT_STOLEN; i++) mtPatch[i] = 0x90;
+                    REL::safe_write(mtAddr, mtPatch, MT_STOLEN);
+                    spdlog::info("[GripHook] Grenade-ready hook installed @ 0x{:X} (trampoline 0x{:X})", mtAddr, reinterpret_cast<uintptr_t>(mtMem));
+                }
+            }
+        }
     }
 
     // =========================================================================
@@ -873,6 +1354,18 @@ namespace heisenberg::Hooks
         spdlog::debug("[ActivateHook] Recorded drop of {:08X}", formID);
     }
 
+    void ClearRecentDrops()
+    {
+        // Called on kPreLoadGame so a save made shortly after a drop can't
+        // carry stale formIDs into the next session and block activation.
+        for (int i = 0; i < MAX_RECENT_DROPS; ++i) {
+            s_recentDrops[i].formID = 0;
+            s_recentDrops[i].tickMs = 0;
+        }
+        s_recentDropIdx = 0;
+        spdlog::debug("[ActivateHook] Cleared recently-dropped buffer (pre-load)");
+    }
+
     static bool WasRecentlyDropped(uint32_t formID)
     {
         if (formID == 0) return false;
@@ -904,6 +1397,17 @@ namespace heisenberg::Hooks
                           bool fromScript,
                           bool looping)
     {
+        // Never block during a loading screen — the engine may activate refs
+        // while placing/initializing cell contents, and our grab/drop state is
+        // not meaningful until the world is live.
+        if (MenuChecker::GetSingleton().IsLoading()) {
+            if (g_originalActivateRef) {
+                return g_originalActivateRef(refr, activator, objectToGet, count,
+                                              defaultProcessingOnly, fromScript, looping);
+            }
+            return false;
+        }
+
         // Allow internal activations (storage, consume, etc.) through without checks
         if (g_internalActivation.load(std::memory_order_relaxed)) {
             if (g_originalActivateRef) {
@@ -923,6 +1427,21 @@ namespace heisenberg::Hooks
                 bool isGrabbableType = false;
                 if (baseObj) {
                     auto ft = baseObj->GetFormType();
+                    // Player is harvesting flora — open the harvest-to-hand window so
+                    // the item the game is about to add (old=0->player) is routed to
+                    // the hand. Only a real FLOR/TREE activation stamps this window;
+                    // unrelated script AddItems (Fill'em Up, cooking/crafting) never
+                    // do, so they correctly stay in inventory.
+                    if (ft == RE::ENUM_FORM_ID::kFLOR || ft == RE::ENUM_FORM_ID::kTREE) {
+                        DropToHand::OpenHarvestWindow();
+                    }
+                    // Terminal about to open: if in projected mode + force-on-wrist, flip to
+                    // wrist NOW (before TerminalMenu opens) so the terminal initializes on the
+                    // wrist Pipboy renderer instead of the projected VR overlay (which can't be
+                    // redirected). Same timing as the holotape override (applied before display open).
+                    if (ft == RE::ENUM_FORM_ID::kTERM) {
+                        PipboyInteraction::GetSingleton().PrepareProjectedTerminalOnWrist();
+                    }
                     isGrabbableType = (ft == RE::ENUM_FORM_ID::kMISC ||
                                        ft == RE::ENUM_FORM_ID::kWEAP ||
                                        ft == RE::ENUM_FORM_ID::kARMO ||
@@ -961,15 +1480,22 @@ namespace heisenberg::Hooks
                     }
                 }
 
-                // Check if either hand has this item as a selected grab target
-                auto checkSelection = [&](Hand* hand) -> bool {
-                    if (!hand) return false;
-                    auto* selRefr = hand->GetSelection().GetRefr();
-                    return selRefr && selRefr->formID == targetFormID;
-                };
-                if (checkSelection(heisenberg.GetLeftHand()) || checkSelection(heisenberg.GetRightHand())) {
-                    spdlog::debug("[ActivateHook] BLOCKED activation of grab target {:08X}", targetFormID);
-                    return false;
+                // Check if either hand has this item as a selected grab target.
+                // GATED (default OFF): blocking A/activate just because you're AIMING at a
+                // grabbable item breaks A-button looting and mod secondary actions (Tune The
+                // Radios, Sentinel PA). The held-item block above already handles the Grip>A
+                // binding case (the item is held by the time grip-release sends A), so this is
+                // only needed for that specific binding — opt-in via bBlockActivateOnGrabSelection.
+                if (g_config.blockActivateOnGrabSelection) {
+                    auto checkSelection = [&](Hand* hand) -> bool {
+                        if (!hand) return false;
+                        auto* selRefr = hand->GetSelection().GetRefr();
+                        return selRefr && selRefr->formID == targetFormID;
+                    };
+                    if (checkSelection(heisenberg.GetLeftHand()) || checkSelection(heisenberg.GetRightHand())) {
+                        spdlog::debug("[ActivateHook] BLOCKED activation of grab target {:08X}", targetFormID);
+                        return false;
+                    }
                 }
             }
         }
@@ -1157,6 +1683,17 @@ namespace heisenberg::Hooks
                           bool applyNow,
                           bool locked)
     {
+        // Never intercept during a loading screen. The engine re-equips all
+        // worn gear and applies status effects on save-load (actor == player),
+        // and our redirect logic must not run before the world/menus settle.
+        if (MenuChecker::GetSingleton().IsLoading()) {
+            if (g_originalEquipObject) {
+                return g_originalEquipObject(equipManager, actor, instance, stackID, number,
+                                              slot, queueEquip, forceEquip, playSounds, applyNow, locked);
+            }
+            return false;
+        }
+
         // Only intercept for the player
         auto* player = RE::PlayerCharacter::GetSingleton();
         if (actor == player && instance) {
@@ -1180,7 +1717,15 @@ namespace heisenberg::Hooks
             // holotapes cause physics issues when spawned in PA.
             bool blockPA = g_config.blockConsumptionInPA && Utils::IsPlayerInPowerArmor();
 
-            if (baseForm && baseForm->GetFormType() == RE::ENUM_FORM_ID::kALCH && !blockPA) {
+            // Skip non-playable ALCH items. Survival mode status effects (Tired,
+            // Overtired, Weary, Incapacitated, Rested, Hungry, Parched, etc.) are
+            // non-playable ALCH items the engine equips on the player each tick.
+            // Without this skip, the Pipboy-open check below redirects every status
+            // effect to drop-to-hand. Since these items have no 3D model, the
+            // TryGrabPendingDrop queue loops forever "waiting for 3D" and the pickup
+            // sound spams continuously.
+            if (baseForm && baseForm->GetFormType() == RE::ENUM_FORM_ID::kALCH && !blockPA
+                && baseForm->GetPlayable(nullptr)) {
                 // Guard: skip if we just redirected this same item (game may call EquipObject twice)
                 static RE::TESFormID s_lastRedirectedFormID = 0;
                 static ULONGLONG s_lastRedirectedTick = 0;
@@ -1196,6 +1741,9 @@ namespace heisenberg::Hooks
                 bool shouldRedirect = false;
                 const char* source = nullptr;
 
+                // Consume-to-hand fires when the player picks a consumable from
+                // either the Pipboy inventory or the Favorites quick-wheel. Any
+                // other menu (workbench, cooking, container, dialogue) is blocked.
                 if (g_config.consumableToHand && menuChecker.IsPipboyOpen()) {
                     shouldRedirect = true;
                     source = "Pipboy";

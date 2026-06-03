@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include "RE/Havok/hkVector4.h"
 #include "RE/Havok/hkArray.h"
 #include "RE/Fallout.h"  // For REL::Relocation, REL::Offset
@@ -145,9 +146,15 @@ namespace heisenberg
         void RegisterHandBodyId(std::uint32_t bodyId);
         void UnregisterHandBodyId(std::uint32_t bodyId);
         bool IsHandBodyId(std::uint32_t bodyId) const;
+
+        // Track which body IDs are currently grabbed objects (suppress capsule collision)
+        void RegisterGrabbedBodyId(std::uint32_t bodyId);
+        void UnregisterGrabbedBodyId(std::uint32_t bodyId);
+        bool IsGrabbedBodyId(std::uint32_t bodyId) const;
         
         // Get the current player proxy (if registered)
         hknpCharacterProxy* GetPlayerProxy() const { return _playerProxy; }
+        bool IsRegisteredWithPlayer() const { return _registered && _playerProxy != nullptr; }
 
     private:
         PlayerCharacterProxyListener() = default;
@@ -176,6 +183,14 @@ namespace heisenberg
         // Set of hand body IDs to check against
         std::set<std::uint32_t> _handBodyIds;
         mutable std::mutex _handBodyIdsMutex;
+
+        // Set of grabbed object body IDs (suppress capsule collision while held)
+        std::set<std::uint32_t> _grabbedBodyIds;
+        mutable std::mutex _grabbedBodyIdsMutex;
+
+        // Lock-free counter for the callback (total hand + grabbed bodies)
+        // The callback runs on the physics thread and MUST NOT lock mutexes
+        std::atomic<int> _activeBodyCount{0};
         
         bool _initialized = false;
         bool _registered = false;

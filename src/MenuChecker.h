@@ -79,6 +79,8 @@ namespace heisenberg
         bool IsWorkshopOpen() const { return _isWorkshopOpen.load(std::memory_order_relaxed); }
         bool IsCookingOpen() const { return _isCookingOpen.load(std::memory_order_relaxed); }
         bool IsFavoritesOpen() const { return _isFavoritesOpen.load(std::memory_order_relaxed); }
+        bool IsExamineOpen() const { return _isExamineOpen.load(std::memory_order_relaxed); }
+        bool IsExamineConfirmOpen() const { return _isExamineConfirmOpen.load(std::memory_order_relaxed); }
 
         /**
          * Check if Favorites menu is open or was recently open (within 500ms).
@@ -142,6 +144,8 @@ namespace heisenberg
         std::atomic<bool> _isCookingOpen{ false };
         std::atomic<bool> _isFavoritesOpen{ false };
         std::atomic<bool> _isScopeOpen{ false };
+        std::atomic<bool> _isExamineOpen{ false };
+        std::atomic<bool> _isExamineConfirmOpen{ false };
 
         // Combined flag for "any blocking menu" - updated when individual flags change
         std::atomic<bool> _isGameStopped{ false };

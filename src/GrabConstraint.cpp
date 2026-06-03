@@ -2,16 +2,27 @@
 #include "Config.h"
 #include "FRIKInterface.h"
 #include "Heisenberg.h"
+#include "Physics.h"
 
 namespace
 {
     // Havok world scale - 1 game unit = 0.0142875 Havok units (1/70)
     constexpr float HAVOK_WORLD_SCALE = 0.0142875f;
+
+    inline std::uintptr_t GetModuleBase()
+    {
+        return REL::Module::get().base();
+    }
     
     // bhkNPCollisionObject::SetLinearVelocity(hkVector4f&)
     // VR offset: 0x1e08050 - Status 2
     using SetLinearVelocity_t = void(*)(RE::bhkNPCollisionObject*, RE::NiPoint4&);
     REL::Relocation<SetLinearVelocity_t> SetLinearVelocity{ REL::Offset(0x1e08050) };
+
+    // bhkNPCollisionObject::ApplyHardKeyframe(hkTransformf&, float invDeltaTime)
+    // VR offset: 0x1e086e0 - Status 4 (Verified)
+    using ApplyHardKeyframe_t = void(*)(RE::bhkNPCollisionObject*, RE::hkTransformf&, float);
+    REL::Relocation<ApplyHardKeyframe_t> ApplyHardKeyframeReloc{ REL::Offset(0x1e086e0) };
     
     // Helper to validate collision object before physics operations
     inline bool IsCollisionObjectValid(RE::bhkNPCollisionObject* obj)
@@ -22,114 +33,33 @@ namespace
         }
         return true;
     }
-    
-    // bhkNPCollisionObject::ApplyHardKeyframe(hkTransformf&, float invDeltaTime)
-    // VR offset: 0x1e086e0 - Status 4 (Verified)
-    using ApplyHardKeyframe_t = void(*)(RE::bhkNPCollisionObject*, RE::hkTransformf&, float);
-    REL::Relocation<ApplyHardKeyframe_t> ApplyHardKeyframe{ REL::Offset(0x1e086e0) };
-    
-    // bhkNPCollisionObject::SetMotionType(hknpMotionPropertiesId::Preset)
-    // VR offset: 0x1e07300 - Status 4 (from fo4_database.csv ID 200912)
-    // NOTE: CommonLibF4VR's SetMotionType uses REL::ID which resolves to WRONG address in VR!
-    using SetMotionType_t = void(*)(RE::bhkNPCollisionObject*, RE::hknpMotionPropertiesId::Preset);
-    REL::Relocation<SetMotionType_t> SetMotionTypeVR{ REL::Offset(0x1e07300) };
-    
-    // Module base for vtable addresses
-    std::uintptr_t GetModuleBase()
+
+    inline std::uint32_t GetPlayerBodyId()
     {
-        static std::uintptr_t base = reinterpret_cast<std::uintptr_t>(GetModuleHandleA("Fallout4VR.exe"));
-        return base;
+        return heisenberg::Physics::GetPlayerBodyId();
     }
-    
-    /**
-     * Get the player's character controller body ID
-     * This can be used as an anchor for constraints instead of creating a HandBody
-     * @return The body ID, or 0x7FFFFFFF if not found
-     */
-    std::uint32_t GetPlayerBodyId()
+
+    inline void SetMotionTypeVR(RE::bhkNPCollisionObject* obj, RE::hknpMotionPropertiesId::Preset motion)
     {
-        auto* player = RE::PlayerCharacter::GetSingleton();
-        if (!player)
-        {
-            spdlog::debug("[CONSTRAINT] GetPlayerBodyId: No player singleton");
-            return 0x7FFFFFFF;
+        if (!IsCollisionObjectValid(obj)) {
+            return;
         }
-        
-        // Method 1: Try character controller from currentProcess
-        auto* process = player->currentProcess;
-        if (process)
-        {
-            spdlog::debug("[CONSTRAINT] GetPlayerBodyId: Got process at {:p}", (void*)process);
-            
-            auto* middleHigh = process->middleHigh;
-            if (middleHigh)
-            {
-                spdlog::debug("[CONSTRAINT] GetPlayerBodyId: Got middleHigh at {:p}", (void*)middleHigh);
-                
-                auto* charController = middleHigh->charController.get();
-                if (charController)
-                {
-                    RE::hknpBodyId bodyId = charController->GetBodyIdImpl();
-                    std::uint32_t id = bodyId.value;
-                    spdlog::debug("[CONSTRAINT] GetPlayerBodyId: Got player body ID from charController = 0x{:08X}", id);
-                    return id;
-                }
-                else
-                {
-                    spdlog::debug("[CONSTRAINT] GetPlayerBodyId: middleHigh->charController is null");
-                }
-            }
-            else
-            {
-                spdlog::debug("[CONSTRAINT] GetPlayerBodyId: process->middleHigh is null");
-            }
+
+        heisenberg::ConstraintFunctions::BhkNPCollisionObjectSetMotionType(
+            obj, static_cast<int>(motion));
+    }
+
+    inline void ApplyHardKeyframe(RE::bhkNPCollisionObject* obj, RE::hkTransformf& transform, float invDeltaTime)
+    {
+        if (!IsCollisionObjectValid(obj)) {
+            return;
         }
-        else
-        {
-            spdlog::debug("[CONSTRAINT] GetPlayerBodyId: player->currentProcess is null");
-        }
-        
-        // Method 2: Try to get collision object from player's 3D
-        auto* root3d = player->Get3D();
-        if (root3d)
-        {
-            spdlog::debug("[CONSTRAINT] GetPlayerBodyId: Got player 3D at {:p}", (void*)root3d);
-            
-            // Try to find a collision object on the player using collisionObject member
-            auto* collObj = root3d->collisionObject.get();
-            if (collObj)
-            {
-                auto* rtti = collObj->GetRTTI();
-                if (rtti && rtti->GetName())
-                {
-                    spdlog::debug("[CONSTRAINT] GetPlayerBodyId: Found collision object on player 3D, type={}", rtti->GetName());
-                    
-                    // Check if it's a bhkNPCollisionObject
-                    if (std::string_view(rtti->GetName()) == "bhkNPCollisionObject")
-                    {
-                        // Cast and try to get body ID
-                        // The body ID is typically at a known offset in bhkNPCollisionObject
-                        // For now, we'll use a fallback approach
-                        spdlog::debug("[CONSTRAINT] GetPlayerBodyId: Player has bhkNPCollisionObject but we need to extract body ID");
-                    }
-                }
-            }
-            else
-            {
-                spdlog::debug("[CONSTRAINT] GetPlayerBodyId: No collision object on player root 3D");
-            }
-        }
-        else
-        {
-            spdlog::debug("[CONSTRAINT] GetPlayerBodyId: player->Get3D() is null");
-        }
-        
-        spdlog::debug("[CONSTRAINT] GetPlayerBodyId: Could not get player body ID via any method");
-        return 0x7FFFFFFF;
+
+        ApplyHardKeyframeReloc(obj, transform, invDeltaTime);
     }
 }
 
-#if 0  // DISABLED: Motor constraint code not yet complete - uses undefined ConstraintFunctions::
+// 6-DOF motor constraint implementation — signature fixes applied, now enabled
 namespace heisenberg
 {
     // =========================================================================
@@ -281,164 +211,26 @@ namespace heisenberg
         
         GrabConstraintData* CreateGrabConstraintData(
             const RE::NiTransform& transformA,
-            const RE::NiTransform& transformB,
-            hkpPositionConstraintMotor* angularMotor,
-            hkpPositionConstraintMotor* linearMotor)
+            const RE::NiTransform& transformB)
         {
-            if (!angularMotor || !linearMotor)
-            {
-                spdlog::error("[MOTOR] CreateGrabConstraintData: Motors cannot be null");
-                return nullptr;
-            }
-            
-            // Allocate the constraint data
             auto* data = new GrabConstraintData();
             if (!data)
             {
                 spdlog::error("[MOTOR] CreateGrabConstraintData: Failed to allocate");
                 return nullptr;
             }
-            
-            std::memset(data, 0, sizeof(GrabConstraintData));
-            
-            // Initialize header - use generic constraint vtable 
-            // Note: We might need to use a different vtable or create atoms directly
-            // For now, set up the header fields
-            data->vtable = nullptr;  // We'll need to find the right vtable for custom constraints
-            data->memSizeAndFlags = sizeof(GrabConstraintData);
-            data->referenceCount = 1;
-            data->userData = 0;
-            data->constraintType = 100;  // CONSTRAINT_TYPE_CUSTOM
-            
-            // =====================================================================
-            // Initialize transform atoms
-            // =====================================================================
-            data->atoms.transforms.type = hkpConstraintAtom::TYPE_SET_LOCAL_TRANSFORMS;
-            
-            // Copy transformA (hand body local frame) to hkTransform format
-            // hkTransform: rotation (3x4 matrix = 48 bytes) + translation (16 bytes)
-            // The rotation part is stored as 3 column vectors (each 16 bytes = 4 floats)
-            float* transA = reinterpret_cast<float*>(data->atoms.transforms.transformA);
-            // Column 0 (X axis)
-            transA[0] = transformA.rotate.entry[0][0];
-            transA[1] = transformA.rotate.entry[1][0];
-            transA[2] = transformA.rotate.entry[2][0];
-            transA[3] = 0.0f;
-            // Column 1 (Y axis)
-            transA[4] = transformA.rotate.entry[0][1];
-            transA[5] = transformA.rotate.entry[1][1];
-            transA[6] = transformA.rotate.entry[2][1];
-            transA[7] = 0.0f;
-            // Column 2 (Z axis)
-            transA[8] = transformA.rotate.entry[0][2];
-            transA[9] = transformA.rotate.entry[1][2];
-            transA[10] = transformA.rotate.entry[2][2];
-            transA[11] = 0.0f;
-            // Translation
-            transA[12] = transformA.translate.x * HAVOK_WORLD_SCALE;
-            transA[13] = transformA.translate.y * HAVOK_WORLD_SCALE;
-            transA[14] = transformA.translate.z * HAVOK_WORLD_SCALE;
-            transA[15] = 0.0f;
-            
-            // Copy transformB (object local frame)
-            float* transB = reinterpret_cast<float*>(data->atoms.transforms.transformB);
-            // Column 0 (X axis)
-            transB[0] = transformB.rotate.entry[0][0];
-            transB[1] = transformB.rotate.entry[1][0];
-            transB[2] = transformB.rotate.entry[2][0];
-            transB[3] = 0.0f;
-            // Column 1 (Y axis)
-            transB[4] = transformB.rotate.entry[0][1];
-            transB[5] = transformB.rotate.entry[1][1];
-            transB[6] = transformB.rotate.entry[2][1];
-            transB[7] = 0.0f;
-            // Column 2 (Z axis)
-            transB[8] = transformB.rotate.entry[0][2];
-            transB[9] = transformB.rotate.entry[1][2];
-            transB[10] = transformB.rotate.entry[2][2];
-            transB[11] = 0.0f;
-            // Translation
-            transB[12] = transformB.translate.x * HAVOK_WORLD_SCALE;
-            transB[13] = transformB.translate.y * HAVOK_WORLD_SCALE;
-            transB[14] = transformB.translate.z * HAVOK_WORLD_SCALE;
-            transB[15] = 0.0f;
-            
-            // =====================================================================
-            // Initialize stabilization atom
-            // =====================================================================
-            data->atoms.setupStabilization.type = hkpConstraintAtom::TYPE_SETUP_STABILIZATION;
-            data->atoms.setupStabilization.enabled = true;
-            data->atoms.setupStabilization.maxAngle = 0.1f;  // Small angle for stability
-            
-            // =====================================================================
-            // Initialize ragdoll motor atom (3-axis angular control)
-            // =====================================================================
-            data->atoms.ragdollMotors.type = hkpConstraintAtom::TYPE_RAGDOLL_MOTOR;
-            data->atoms.ragdollMotors.enabled = true;
-            data->atoms.ragdollMotors.initializedOffset = 
-                static_cast<std::int16_t>(offsetof(GrabConstraintData::Runtime, initialized));
-            data->atoms.ragdollMotors.previousTargetAnglesOffset = 
-                static_cast<std::int16_t>(offsetof(GrabConstraintData::Runtime, previousTargetAngles));
-            
-            // Set identity target rotation initially
-            // target_bRca is a 3x4 matrix stored as 12 floats (3 rows, 4 columns)
-            // Row-major format: [row0: x y z w] [row1: x y z w] [row2: x y z w]
-            data->atoms.ragdollMotors.target_bRca[0] = 1.0f;  // Row 0
-            data->atoms.ragdollMotors.target_bRca[1] = 0.0f;
-            data->atoms.ragdollMotors.target_bRca[2] = 0.0f;
-            data->atoms.ragdollMotors.target_bRca[3] = 0.0f;
-            data->atoms.ragdollMotors.target_bRca[4] = 0.0f;  // Row 1
-            data->atoms.ragdollMotors.target_bRca[5] = 1.0f;
-            data->atoms.ragdollMotors.target_bRca[6] = 0.0f;
-            data->atoms.ragdollMotors.target_bRca[7] = 0.0f;
-            data->atoms.ragdollMotors.target_bRca[8] = 0.0f;  // Row 2
-            data->atoms.ragdollMotors.target_bRca[9] = 0.0f;
-            data->atoms.ragdollMotors.target_bRca[10] = 1.0f;
-            data->atoms.ragdollMotors.target_bRca[11] = 0.0f;
-            
-            // Assign the same angular motor to all 3 axes
-            data->atoms.ragdollMotors.motors[0] = angularMotor;
-            data->atoms.ragdollMotors.motors[1] = angularMotor;
-            data->atoms.ragdollMotors.motors[2] = angularMotor;
-            
-            // =====================================================================
-            // Initialize linear motor atoms (3-axis position control)
-            // =====================================================================
-            
-            // Linear motor 0 (X axis)
-            data->atoms.linearMotor0.type = hkpConstraintAtom::TYPE_LIN_MOTOR;
-            data->atoms.linearMotor0.isEnabled = true;
-            data->atoms.linearMotor0.motorAxis = 0;  // X axis
-            data->atoms.linearMotor0.initializedOffset = 
-                static_cast<std::int16_t>(offsetof(GrabConstraintData::Runtime, initializedLinear));
-            data->atoms.linearMotor0.previousTargetPosOffset = 
-                static_cast<std::int16_t>(offsetof(GrabConstraintData::Runtime, previousTargetPositions));
-            data->atoms.linearMotor0.targetPosition = 0.0f;
-            data->atoms.linearMotor0.motor = linearMotor;
-            
-            // Linear motor 1 (Y axis)
-            data->atoms.linearMotor1.type = hkpConstraintAtom::TYPE_LIN_MOTOR;
-            data->atoms.linearMotor1.isEnabled = true;
-            data->atoms.linearMotor1.motorAxis = 1;  // Y axis
-            data->atoms.linearMotor1.initializedOffset = 
-                static_cast<std::int16_t>(offsetof(GrabConstraintData::Runtime, initializedLinear) + 1);
-            data->atoms.linearMotor1.previousTargetPosOffset = 
-                static_cast<std::int16_t>(offsetof(GrabConstraintData::Runtime, previousTargetPositions) + 4);
-            data->atoms.linearMotor1.targetPosition = 0.0f;
-            data->atoms.linearMotor1.motor = linearMotor;
-            
-            // Linear motor 2 (Z axis)
-            data->atoms.linearMotor2.type = hkpConstraintAtom::TYPE_LIN_MOTOR;
-            data->atoms.linearMotor2.isEnabled = true;
-            data->atoms.linearMotor2.motorAxis = 2;  // Z axis
-            data->atoms.linearMotor2.initializedOffset = 
-                static_cast<std::int16_t>(offsetof(GrabConstraintData::Runtime, initializedLinear) + 2);
-            data->atoms.linearMotor2.previousTargetPosOffset = 
-                static_cast<std::int16_t>(offsetof(GrabConstraintData::Runtime, previousTargetPositions) + 8);
-            data->atoms.linearMotor2.targetPosition = 0.0f;
-            data->atoms.linearMotor2.motor = linearMotor;
-            
-            spdlog::debug("[MOTOR] Created GrabConstraintData with 6-DOF motors");
+            data->setInBodySpace(transformA, transformB);
+
+            auto* angularMotor = data->GetAngularMotor();
+            auto* linearMotor = data->GetLinearMotor();
+            if (!angularMotor || !linearMotor)
+            {
+                spdlog::error("[MOTOR] CreateGrabConstraintData: Constructor did not initialize motors");
+                delete data;
+                return nullptr;
+            }
+
+            spdlog::debug("[MOTOR] Created GrabConstraintData with constructor-owned 6-DOF motors");
             spdlog::debug("[MOTOR]   Angular motor: vtable={:p}, tau={:.2f}, maxForce={:.1f}",
                           angularMotor->vtable, angularMotor->tau, angularMotor->maxForce);
             spdlog::debug("[MOTOR]   Linear motor: vtable={:p}, tau={:.2f}, maxForce={:.1f}",
@@ -451,11 +243,41 @@ namespace heisenberg
         {
             if (data)
             {
-                // Note: Motors are NOT destroyed here - caller owns them
                 delete data;
             }
         }
         
+        // Clamp a 3x3 rotation so its angular deviation from identity is within maxAngleRad.
+        // Operates on the axis-angle representation extracted from the matrix.
+        static RE::NiMatrix3 ClampRotationToMaxAngle(const RE::NiMatrix3& r, float maxAngleRad)
+        {
+            // Angle of rotation = acos((trace - 1) / 2), clamped to [0, pi]
+            float trace = r.entry[0][0] + r.entry[1][1] + r.entry[2][2];
+            float cosA = std::clamp((trace - 1.0f) * 0.5f, -1.0f, 1.0f);
+            float angle = std::acos(cosA);
+            if (angle <= maxAngleRad || angle < 1e-4f) {
+                return r;
+            }
+
+            // Extract rotation axis (unnormalized) from skew part
+            float x = r.entry[2][1] - r.entry[1][2];
+            float y = r.entry[0][2] - r.entry[2][0];
+            float z = r.entry[1][0] - r.entry[0][1];
+            float norm = std::sqrt(x*x + y*y + z*z);
+            if (norm < 1e-5f) {
+                return r;  // Degenerate (180° flip handling would go here)
+            }
+            x /= norm; y /= norm; z /= norm;
+
+            // Rebuild matrix at clamped angle using Rodrigues' formula
+            float c = std::cos(maxAngleRad), s = std::sin(maxAngleRad), oc = 1.0f - c;
+            RE::NiMatrix3 clamped;
+            clamped.entry[0][0] = c + x*x*oc;      clamped.entry[0][1] = x*y*oc - z*s;  clamped.entry[0][2] = x*z*oc + y*s;
+            clamped.entry[1][0] = y*x*oc + z*s;    clamped.entry[1][1] = c + y*y*oc;    clamped.entry[1][2] = y*z*oc - x*s;
+            clamped.entry[2][0] = z*x*oc - y*s;    clamped.entry[2][1] = z*y*oc + x*s;  clamped.entry[2][2] = c + z*z*oc;
+            return clamped;
+        }
+
         void UpdateGrabConstraintTargets(
             GrabConstraintData* data,
             const RE::NiMatrix3& targetRotation,
@@ -463,26 +285,55 @@ namespace heisenberg
         {
             if (!data)
                 return;
-            
+
+            // ===========================================================
+            // Task #2 — Soft 6DOF limits.
+            // Clamp target position magnitude and target rotation angle so
+            // the motor never tries to drive beyond the configured limits.
+            // This is functionally equivalent to a Havok limit atom but
+            // safer on hknp 2014 (no solver-atom layout changes required).
+            // ===========================================================
+            RE::NiMatrix3 rotToUse = targetRotation;
+            RE::NiPoint3 posToUse = targetPositions;
+
+            const auto& cfg = Config::GetSingleton();
+            if (cfg.grabConstraintEnableSoftLimits) {
+                // Linear: clamp target-offset magnitude (game units)
+                float lenSq = posToUse.x * posToUse.x + posToUse.y * posToUse.y + posToUse.z * posToUse.z;
+                float maxLen = (std::max)(0.01f, cfg.grabConstraintLinearMaxStretch);
+                if (lenSq > maxLen * maxLen) {
+                    float invLen = maxLen / std::sqrt(lenSq);
+                    posToUse.x *= invLen;
+                    posToUse.y *= invLen;
+                    posToUse.z *= invLen;
+                    spdlog::debug("[CONSTRAINT-LIMIT] Linear target clamped to {:.1f} units", maxLen);
+                }
+
+                // Angular: clamp rotation angle-from-identity to configured max
+                constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+                float maxAngle = (std::max)(0.01f, cfg.grabConstraintAngularMaxAngleDeg) * kDegToRad;
+                rotToUse = ClampRotationToMaxAngle(rotToUse, maxAngle);
+            }
+
             // Update angular target (ragdoll motor target rotation)
             // The target is stored as a 3x4 matrix in row-major format
-            data->atoms.ragdollMotors.target_bRca[0] = targetRotation.entry[0][0];  // Row 0
-            data->atoms.ragdollMotors.target_bRca[1] = targetRotation.entry[0][1];
-            data->atoms.ragdollMotors.target_bRca[2] = targetRotation.entry[0][2];
+            data->atoms.ragdollMotors.target_bRca[0] = rotToUse.entry[0][0];  // Row 0
+            data->atoms.ragdollMotors.target_bRca[1] = rotToUse.entry[0][1];
+            data->atoms.ragdollMotors.target_bRca[2] = rotToUse.entry[0][2];
             data->atoms.ragdollMotors.target_bRca[3] = 0.0f;
-            data->atoms.ragdollMotors.target_bRca[4] = targetRotation.entry[1][0];  // Row 1
-            data->atoms.ragdollMotors.target_bRca[5] = targetRotation.entry[1][1];
-            data->atoms.ragdollMotors.target_bRca[6] = targetRotation.entry[1][2];
+            data->atoms.ragdollMotors.target_bRca[4] = rotToUse.entry[1][0];  // Row 1
+            data->atoms.ragdollMotors.target_bRca[5] = rotToUse.entry[1][1];
+            data->atoms.ragdollMotors.target_bRca[6] = rotToUse.entry[1][2];
             data->atoms.ragdollMotors.target_bRca[7] = 0.0f;
-            data->atoms.ragdollMotors.target_bRca[8] = targetRotation.entry[2][0];  // Row 2
-            data->atoms.ragdollMotors.target_bRca[9] = targetRotation.entry[2][1];
-            data->atoms.ragdollMotors.target_bRca[10] = targetRotation.entry[2][2];
+            data->atoms.ragdollMotors.target_bRca[8] = rotToUse.entry[2][0];  // Row 2
+            data->atoms.ragdollMotors.target_bRca[9] = rotToUse.entry[2][1];
+            data->atoms.ragdollMotors.target_bRca[10] = rotToUse.entry[2][2];
             data->atoms.ragdollMotors.target_bRca[11] = 0.0f;
-            
+
             // Update linear targets (position offsets in Havok units)
-            data->atoms.linearMotor0.targetPosition = targetPositions.x * HAVOK_WORLD_SCALE;
-            data->atoms.linearMotor1.targetPosition = targetPositions.y * HAVOK_WORLD_SCALE;
-            data->atoms.linearMotor2.targetPosition = targetPositions.z * HAVOK_WORLD_SCALE;
+            data->atoms.linearMotor0.targetPosition = posToUse.x * HAVOK_WORLD_SCALE;
+            data->atoms.linearMotor1.targetPosition = posToUse.y * HAVOK_WORLD_SCALE;
+            data->atoms.linearMotor2.targetPosition = posToUse.z * HAVOK_WORLD_SCALE;
         }
     }
     
@@ -494,12 +345,15 @@ namespace heisenberg
     GrabConstraintData::GrabConstraintData()
     {
         // Initialize header
-        vtable = nullptr;  // Will be set later if needed
+        vtable = GrabConstraintVtable::GetVtable();
         memSizeAndFlags = sizeof(GrabConstraintData);
         referenceCount = 1;
         pad0C = 0;
         userData = 0;
-        constraintType = 100;  // CONSTRAINT_TYPE_CUSTOM
+        constraintType = 20;  // CONSTRAINT_TYPE_CUSTOM (100+ are chain types)
+
+        std::memset(pad1C, 0, sizeof(pad1C));
+        std::memset(&atoms, 0, sizeof(atoms));
         
         auto& config = Config::GetSingleton();
         
@@ -516,16 +370,23 @@ namespace heisenberg
         
         // Initialize stabilization atom
         atoms.setupStabilization.type = hkpConstraintAtom::TYPE_SETUP_STABILIZATION;
-        atoms.setupStabilization.enabled = true;
-        atoms.setupStabilization.maxAngle = 0.1f;
+        atoms.setupStabilization.enabled = false;
+        atoms.setupStabilization.maxLinearImpulse = 3.402823466e+38f;
+        atoms.setupStabilization.maxAngularImpulse = 3.402823466e+38f;
+        atoms.setupStabilization.maxAngle = 3.402823466e+38f;
         
         // Initialize ragdoll motor atom
         atoms.ragdollMotors.type = hkpConstraintAtom::TYPE_RAGDOLL_MOTOR;
         atoms.ragdollMotors.enabled = false;  // Disabled until grab starts
-        atoms.ragdollMotors.initializedOffset = static_cast<std::int16_t>(
-            offsetof(Runtime, initialized));
-        atoms.ragdollMotors.previousTargetAnglesOffset = static_cast<std::int16_t>(
-            offsetof(Runtime, previousTargetAngles));
+        // Runtime offsets are RELATIVE to the runtime cursor (param_4[1]) at the time
+        // the ragdoll motor atom is processed by hknpSolverBuildJacobianFromAtomsNotContact.
+        // The runtime buffer layout is:
+        //   [0x00-0x5F]: Solver results (12 results * 8 bytes = 0x60)
+        //   [0x60-0x7F]: External runtime (initialized bytes, target angles/positions)
+        // When the ragdoll motor starts, the cursor is at offset 0x00.
+        // initialized[3] is at external offset 0x60, previousTargetAngles[3] at 0x64.
+        atoms.ragdollMotors.initializedOffset = offsetof(Runtime, initialized);          // 0x60
+        atoms.ragdollMotors.previousTargetAnglesOffset = offsetof(Runtime, previousTargetAngles);  // 0x64
         // Identity target rotation
         for (int i = 0; i < 12; i++) {
             atoms.ragdollMotors.target_bRca[i] = (i == 0 || i == 5 || i == 10) ? 1.0f : 0.0f;
@@ -554,33 +415,32 @@ namespace heisenberg
         atoms.ragdollMotors.motors[2] = reinterpret_cast<hkpConstraintMotor*>(angularMotor);
         
         // Initialize linear motor atoms
+        // Linear motor runtime offsets: each linear motor is processed after the ragdoll
+        // motor (cursor at 0x30) and after preceding linear motors (+0x10 each).
+        // Linear motor 0: cursor at 0x30, initialized[0] at 0x70, target[0] at 0x74
         atoms.linearMotor0.type = hkpConstraintAtom::TYPE_LIN_MOTOR;
         atoms.linearMotor0.isEnabled = false;
         atoms.linearMotor0.motorAxis = 0;
-        atoms.linearMotor0.initializedOffset = static_cast<std::int16_t>(
-            offsetof(Runtime, initializedLinear[0]));
-        atoms.linearMotor0.previousTargetPosOffset = static_cast<std::int16_t>(
-            offsetof(Runtime, previousTargetPositions[0]));
+        atoms.linearMotor0.initializedOffset = offsetof(Runtime, initializedLinear) - 0x30;   // 0x70-0x30=0x40
+        atoms.linearMotor0.previousTargetPosOffset = offsetof(Runtime, previousTargetPositions) - 0x30; // 0x74-0x30=0x44
         atoms.linearMotor0.targetPosition = 0.0f;
         atoms.linearMotor0.motor = nullptr;
-        
+
+        // Linear motor 1: cursor at 0x40, initialized[1] at 0x71, target[1] at 0x78
         atoms.linearMotor1.type = hkpConstraintAtom::TYPE_LIN_MOTOR;
         atoms.linearMotor1.isEnabled = false;
         atoms.linearMotor1.motorAxis = 1;
-        atoms.linearMotor1.initializedOffset = static_cast<std::int16_t>(
-            offsetof(Runtime, initializedLinear[1]));
-        atoms.linearMotor1.previousTargetPosOffset = static_cast<std::int16_t>(
-            offsetof(Runtime, previousTargetPositions[1]));
+        atoms.linearMotor1.initializedOffset = static_cast<std::int16_t>(offsetof(Runtime, initializedLinear) + 1 - 0x40);  // 0x71-0x40=0x31
+        atoms.linearMotor1.previousTargetPosOffset = static_cast<std::int16_t>(offsetof(Runtime, previousTargetPositions) + 4 - 0x40); // 0x78-0x40=0x38
         atoms.linearMotor1.targetPosition = 0.0f;
         atoms.linearMotor1.motor = nullptr;
-        
+
+        // Linear motor 2: cursor at 0x50, initialized[2] at 0x72, target[2] at 0x7C
         atoms.linearMotor2.type = hkpConstraintAtom::TYPE_LIN_MOTOR;
         atoms.linearMotor2.isEnabled = false;
         atoms.linearMotor2.motorAxis = 2;
-        atoms.linearMotor2.initializedOffset = static_cast<std::int16_t>(
-            offsetof(Runtime, initializedLinear[2]));
-        atoms.linearMotor2.previousTargetPosOffset = static_cast<std::int16_t>(
-            offsetof(Runtime, previousTargetPositions[2]));
+        atoms.linearMotor2.initializedOffset = static_cast<std::int16_t>(offsetof(Runtime, initializedLinear) + 2 - 0x50);  // 0x72-0x50=0x22
+        atoms.linearMotor2.previousTargetPosOffset = static_cast<std::int16_t>(offsetof(Runtime, previousTargetPositions) + 8 - 0x50); // 0x7C-0x50=0x2C
         atoms.linearMotor2.targetPosition = 0.0f;
         atoms.linearMotor2.motor = nullptr;
         
@@ -733,12 +593,25 @@ namespace heisenberg
     {
         // target_bRca = bRa * transformA.rotation
         float* transA = reinterpret_cast<float*>(atoms.transforms.transformA);
-        
+
         ConstraintFunctions::hkMatrix3f_setMul(
             atoms.ragdollMotors.target_bRca,  // result
             bRa,                               // bRa rotation
             transA                             // transformA rotation
         );
+    }
+
+    // SetTarget now clamps rotation angle to soft-limit when enabled (Task #2).
+    void GrabConstraintData::SetTarget(const RE::NiMatrix3& target)
+    {
+        RE::NiMatrix3 clamped = target;
+        const auto& cfg = Config::GetSingleton();
+        if (cfg.grabConstraintEnableSoftLimits) {
+            constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+            float maxAngle = (std::max)(0.01f, cfg.grabConstraintAngularMaxAngleDeg) * kDegToRad;
+            clamped = MotorHelpers::ClampRotationToMaxAngle(target, maxAngle);
+        }
+        std::memcpy(atoms.ragdollMotors.target_bRca, &clamped, sizeof(float) * 12);
     }
     
     bool ConstraintGrabManager::Initialize()
@@ -776,23 +649,24 @@ namespace heisenberg
             EndConstraintGrab(isLeft, nullptr);
         }
         
-        if (!selection.refr || !selection.node)
+        RE::TESObjectREFR* selRefr = selection.GetRefr();
+        if (!selRefr || !selection.node)
         {
             spdlog::debug("[CONSTRAINT] StartConstraintGrab: Invalid selection");
             return false;
         }
-        
+
         spdlog::debug("[CONSTRAINT] {} hand: Starting constraint grab on {:08X}",
-                     isLeft ? "Left" : "Right", selection.refr->formID);
-        
+                     isLeft ? "Left" : "Right", selRefr->formID);
+
         // Store basic info
-        state.refr = selection.refr;
-        state.node = selection.node;
+        state.refr = selRefr;
+        state.node = selection.node.get();
         state.initialHandPos = handPos;
         state.initialHandRot = handRot;
-        
+
         // Get collision object
-        auto* root = state.refr->Get3D();
+        auto* root = selRefr->Get3D();
         if (!root)
         {
             spdlog::debug("[CONSTRAINT] StartConstraintGrab: No 3D on ref");
@@ -1137,16 +1011,17 @@ namespace heisenberg
         cinfo.constraintData = state.constraintData;
         cinfo.bodyIdA = state.handBodyId;
         cinfo.bodyIdB = state.objectBodyId;
-        cinfo.flags = 0;
-        
+        cinfo.flags = 1;  // Bit 0 = wantRuntime: forces hknp to allocate constraint runtime buffer
+
         spdlog::debug("[CONSTRAINT] cinfo: constraintData={:p}, bodyA=0x{:08X}, bodyB=0x{:08X}",
                       cinfo.constraintData, cinfo.bodyIdA, cinfo.bodyIdB);
         
-        // 4. Create the constraint in the world
+        // 4. Create the constraint in the world (output parameter pattern)
         spdlog::debug("[CONSTRAINT] Calling CreateConstraint at {:p}...",
                      (void*)ConstraintFunctions::CreateConstraint.address());
-        state.constraintId = ConstraintFunctions::CreateConstraint(state.hknpWorld, cinfo);
-        
+        state.constraintId.m_value = 0x7FFFFFFF;
+        ConstraintFunctions::CreateConstraint(state.hknpWorld, &state.constraintId, &cinfo);
+
         if (!state.constraintId.IsValid())
         {
             spdlog::error("[CONSTRAINT] CreateConstraint failed! Returned id=0x{:08X}", state.constraintId.m_value);
@@ -1154,14 +1029,13 @@ namespace heisenberg
             state.constraintData = nullptr;
             return false;
         }
-        
+
         spdlog::debug("[CONSTRAINT] Created constraint id=0x{:08X}", state.constraintId.m_value);
-        
+
         // 5. Register in body map for proper tracking
         spdlog::debug("[CONSTRAINT] Calling AddConstraintBodyMap at {:p}...",
                       (void*)ConstraintFunctions::AddConstraintBodyMap.address());
-        ConstraintFunctions::AddConstraintBodyMap(state.hknpWorld, state.constraintId, 
-                                                   state.handBodyId, state.objectBodyId);
+        ConstraintFunctions::AddConstraintBodyMap(state.hknpWorld, state.constraintId, &cinfo);
         
         spdlog::debug("[CONSTRAINT] CreateGrabConstraint: SUCCESS! Constraint active.");
         
@@ -1206,42 +1080,6 @@ namespace heisenberg
                      state.handBodyId, state.objectBodyId);
         
         // =====================================================================
-        // CREATE MOTORS
-        // =====================================================================
-        
-        // Angular motor - controls rotation (softer for natural feel)
-        state.angularMotor = MotorHelpers::CreatePositionMotor(
-            0.6f,    // tau - softness (0=soft, 1=hard)
-            1.5f,    // damping
-            100.0f,  // maxForce - angular needs less force
-            2.0f,    // proportionalRecoveryVelocity
-            1.0f     // constantRecoveryVelocity
-        );
-        
-        if (!state.angularMotor)
-        {
-            spdlog::error("[MOTOR_CONSTRAINT] Failed to create angular motor");
-            return false;
-        }
-        
-        // Linear motor - controls position (stronger for pulling objects)
-        state.linearMotor = MotorHelpers::CreatePositionMotor(
-            0.8f,     // tau - stiffer for position
-            1.0f,     // damping
-            1000.0f,  // maxForce
-            3.0f,     // proportionalRecoveryVelocity
-            1.0f      // constantRecoveryVelocity
-        );
-        
-        if (!state.linearMotor)
-        {
-            spdlog::error("[MOTOR_CONSTRAINT] Failed to create linear motor");
-            MotorHelpers::DestroyPositionMotor(state.angularMotor);
-            state.angularMotor = nullptr;
-            return false;
-        }
-        
-        // =====================================================================
         // CREATE GRAB CONSTRAINT DATA
         // =====================================================================
         
@@ -1256,14 +1094,23 @@ namespace heisenberg
         objectTransform.translate = state.grabOffsetLocal;
         objectTransform.scale = 1.0f;
         
-        auto* grabData = MotorHelpers::CreateGrabConstraintData(
-            handTransform, objectTransform, state.angularMotor, state.linearMotor);
+        state.angularMotor = nullptr;
+        state.linearMotor = nullptr;
+
+        auto* grabData = MotorHelpers::CreateGrabConstraintData(handTransform, objectTransform);
         
         if (!grabData)
         {
             spdlog::error("[MOTOR_CONSTRAINT] Failed to create GrabConstraintData");
-            MotorHelpers::DestroyPositionMotor(state.angularMotor);
-            MotorHelpers::DestroyPositionMotor(state.linearMotor);
+            return false;
+        }
+
+        state.angularMotor = grabData->GetAngularMotor();
+        state.linearMotor = grabData->GetLinearMotor();
+        if (!state.angularMotor || !state.linearMotor)
+        {
+            spdlog::error("[MOTOR_CONSTRAINT] GrabConstraintData returned null motor pointers");
+            delete grabData;
             state.angularMotor = nullptr;
             state.linearMotor = nullptr;
             return false;
@@ -1282,31 +1129,29 @@ namespace heisenberg
         cinfo.constraintData = grabData;
         cinfo.bodyIdA = state.handBodyId;
         cinfo.bodyIdB = state.objectBodyId;
-        cinfo.flags = 0;
-        
+        cinfo.flags = 1;  // Bit 0 = wantRuntime: forces hknp to allocate constraint runtime buffer
+
         spdlog::info("[MOTOR_CONSTRAINT] Calling CreateConstraint...");
-        state.constraintId = ConstraintFunctions::CreateConstraint(state.hknpWorld, cinfo);
-        
+        state.constraintId.m_value = 0x7FFFFFFF;
+        ConstraintFunctions::CreateConstraint(state.hknpWorld, &state.constraintId, &cinfo);
+
         if (!state.constraintId.IsValid())
         {
-            spdlog::error("[MOTOR_CONSTRAINT] CreateConstraint failed! id=0x{:08X}", 
+            spdlog::error("[MOTOR_CONSTRAINT] CreateConstraint failed! id=0x{:08X}",
                           state.constraintId.m_value);
             MotorHelpers::DestroyGrabConstraintData(grabData);
-            MotorHelpers::DestroyPositionMotor(state.angularMotor);
-            MotorHelpers::DestroyPositionMotor(state.linearMotor);
             state.constraintData = nullptr;
             state.angularMotor = nullptr;
             state.linearMotor = nullptr;
             state.useMotorConstraint = false;
             return false;
         }
-        
-        spdlog::info("[MOTOR_CONSTRAINT] Created motor constraint id=0x{:08X}", 
+
+        spdlog::info("[MOTOR_CONSTRAINT] Created motor constraint id=0x{:08X}",
                      state.constraintId.m_value);
-        
+
         // Register in body map
-        ConstraintFunctions::AddConstraintBodyMap(state.hknpWorld, state.constraintId,
-                                                   state.handBodyId, state.objectBodyId);
+        ConstraintFunctions::AddConstraintBodyMap(state.hknpWorld, state.constraintId, &cinfo);
         
         spdlog::info("[MOTOR_CONSTRAINT] SUCCESS! 6-DOF motor constraint active.");
         return true;
@@ -1320,8 +1165,8 @@ namespace heisenberg
         spdlog::debug("[CONSTRAINT] Destroying constraint id={} (motor={})", 
                       state.constraintId.m_value, state.useMotorConstraint);
         
-        // Remove from body map first
-        ConstraintFunctions::RemoveConstraintBodyMap(state.hknpWorld, state.constraintId);
+        // Remove from body map first (unused param must be 0)
+        ConstraintFunctions::RemoveConstraintBodyMap(state.hknpWorld, 0, state.constraintId.m_value);
         
         // Destroy the constraint
         ConstraintFunctions::DestroyConstraints(state.hknpWorld, &state.constraintId, 1);
@@ -1495,8 +1340,9 @@ namespace heisenberg
         spdlog::debug("[CONSTRAINT] CreateHandBody: Calling CreateBody at {:p}...",
                      (void*)ConstraintFunctions::CreateBody.address());
         
-        std::uint32_t bodyId = ConstraintFunctions::CreateBody(hknpWorld, &bodyCinfo, 1, 0);
-        
+        std::uint32_t bodyId = 0x7FFFFFFF;
+        ConstraintFunctions::CreateBody(hknpWorld, &bodyId, &bodyCinfo, 1, 0);
+
         if (bodyId == 0x7FFFFFFF || bodyId == 0)
         {
             spdlog::error("[CONSTRAINT] CreateHandBody: Failed to create body (id=0x{:08X}). "
@@ -1574,40 +1420,6 @@ namespace heisenberg
         );
     }
 }
-#endif  // DISABLED: Motor constraint code
+// End of 6-DOF motor constraint implementation
 
-// =============================================================================
-// STUB IMPLEMENTATIONS - ConstraintGrabManager (disabled for now)
-// =============================================================================
-namespace heisenberg
-{
-    bool ConstraintGrabManager::Initialize()
-    {
-        // Motor constraints not yet implemented - use keyframe mode
-        _initialized = false;
-        return false;
-    }
-
-    bool ConstraintGrabManager::StartConstraintGrab(const Selection& /*selection*/, const RE::NiPoint3& /*handPos*/,
-                                                     const RE::NiMatrix3& /*handRot*/, bool /*isLeft*/)
-    {
-        return false;  // Not implemented
-    }
-
-    void ConstraintGrabManager::UpdateConstraintGrab(const RE::NiPoint3& /*handPos*/, const RE::NiMatrix3& /*handRot*/,
-                                                      bool /*isLeft*/, float /*deltaTime*/)
-    {
-        // Not implemented
-    }
-
-    void ConstraintGrabManager::EndConstraintGrab(bool /*isLeft*/, const RE::NiPoint3* /*throwVelocity*/)
-    {
-        // Not implemented
-    }
-
-    bool ConstraintGrabManager::IsGrabbing(bool /*isLeft*/) const
-    {
-        return false;  // Never grabbing via constraint since not implemented
-    }
-}
-
+// Stub implementations removed — real implementations now active above.

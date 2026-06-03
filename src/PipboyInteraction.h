@@ -76,6 +76,13 @@ namespace heisenberg
         // Signal that this is a new game (player starts in vault, no Pipboy yet)
         void SetNewGame();
 
+        // Called from the activate hook when a terminal is being activated. If the player
+        // is in projected Pipboy mode and bForceTerminalOnWrist is on, flips to wrist mode
+        // BEFORE TerminalMenu opens so the terminal renders through the wrist Pipboy renderer
+        // (not the projected VR overlay). Mirrors how the holotape override is applied before
+        // playback opens the display. Auto-restores if no terminal opens shortly after.
+        void PrepareProjectedTerminalOnWrist();
+
         // Check if a form ID is the Heisenberg intro holotape
         bool IsIntroHolotape(std::uint32_t formID) const;
 
@@ -186,6 +193,8 @@ namespace heisenberg
         bool            _terminalRedirectActive     = false; // True = terminal is active with redirect
         bool            _isWorldTerminalRedirect    = false; // True = world terminal (Screen:0), false = holotape (FRIK wrist)
         bool            _terminalPatchesSuspended   = false; // True = binary patches reverted (PA/projected mode)
+        bool            _hasReachedExterior         = false; // One-way latch: player has LEFT Vault 111 (exterior cell). Terminal redirect gated on this.
+        bool            _pipboyOpenedSinceAcquire   = false; // One-way latch: player opened the Pip-Boy at least once after acquiring it (vanilla bootup). Intro ceremony waits for this + Pip-Boy closed.
         int             _savedLayerLock             = 0;     // Saved render layer singleton lock value (+0x374)
         int             _savedModeLock              = 0;     // Saved render mode singleton lock value (+0x374)
         int             _savedLayerValue            = -1;    // Saved render layer singleton value (+0x36c)

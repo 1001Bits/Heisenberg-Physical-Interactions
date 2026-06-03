@@ -12,37 +12,97 @@
 #include "WandNodeHelper.h"
 #include "f4vr/F4VRUtils.h"
 #include "f4vr/PlayerNodes.h"
+#include <algorithm>
+#include <map>
+#include <utility>
 
 namespace heisenberg
 {
-    // Check if an item is a Sim Settlements 2 plan (should not be handled by loot-to-hand)
-    // SS2 plans are MISC items that trigger building placement when "used" - dropping them
-    // to hand interferes with this and puts a building model in your hand instead
-    static bool IsSimSettlements2Plan(RE::TESForm* baseForm)
+    // Check if a MISC item is a scripted "placement" item from a known mod.
+    // These items have scripts that react to OnContainerChanged — when loot-to-hand
+    // removes them from inventory (DropObject), the mod's script interprets it as
+    // "place this item in the world" and triggers placement instead of physics drop.
+    // Known mods: Sim Settlements 2 (building plans), Campsite (camping gear).
+    // True if any of the form's source plugins matches a_pluginName (case-insensitive).
+    // VR-safe: walks sourceFiles directly — TESForm::GetFile() uses a REL::ID that is wrong
+    // on F4VR. The defining/override plugins all live in sourceFiles.
+    static bool IsFormFromPlugin(RE::TESForm* baseForm, const char* a_pluginName)
     {
         if (!baseForm) return false;
-        
-        // SS2 plans are MISC items
+        const auto* arr = baseForm->sourceFiles.array;
+        if (!arr) return false;
+        const std::uint32_t n = arr->size();
+        for (std::uint32_t i = 0; i < n; ++i) {
+            const RE::TESFile* f = (*arr)[i];
+            if (!f) continue;
+            const std::string_view fn = f->GetFilename();
+            if (!fn.empty() && _stricmp(std::string(fn).c_str(), a_pluginName) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static bool IsPlacementModItem(RE::TESForm* baseForm)
+    {
+        if (!baseForm) return false;
+
+        // Placement / config mods (Place in Red VR, etc.): their control/config items are
+        // activated from the Pipboy and re-added on use. DropToHand must NEVER touch anything
+        // from these plugins — intercepting yanks the item to the hand (where it renders as
+        // nothing) and the mod re-adds it, producing the inventory loop the user sees. Match
+        // by source plugin, for ANY form type (the config item may be a holotape/aid/note).
+        static const char* const kBypassPlugins[] = { "PlaceInRedVR.esp" };
+        for (const char* plugin : kBypassPlugins) {
+            if (IsFormFromPlugin(baseForm, plugin)) {
+                spdlog::info("[DropToHand] Bypassing item {:08X} from placement plugin '{}'",
+                             baseForm->GetFormID(), plugin);
+                return true;
+            }
+        }
+
+        // Only MISC items are affected by the editorID/name heuristics below
         if (baseForm->GetFormType() != RE::ENUM_FORM_ID::kMISC) {
             return false;
         }
-        
-        // Check the item name for SS2 plan indicators
-        auto* boundObj = baseForm->As<RE::TESBoundObject>();
-        if (!boundObj) return false;
-        
-        std::string itemName(RE::TESFullName::GetFullName(*boundObj, false));
-        
-        // SS2 plans typically have "Plan" in the name or contain "SS2"
-        // Examples: "Building Plan:", "Agricultural Plan:", "SS2_Plan_*"
-        if (itemName.find("Plan:") != std::string::npos ||
-            itemName.find("Plan -") != std::string::npos ||
-            itemName.find("SS2") != std::string::npos) {
-            spdlog::debug("[LootToHand] Detected SS2 plan: '{}'", itemName);
+
+        // Campsite mod: inventory items have editor IDs starting with "CampingKit_Inv"
+        const char* editorID = baseForm->GetFormEditorID();
+        if (editorID && std::strstr(editorID, "CampingKit_Inv")) {
+            spdlog::debug("[LootToHand] Detected Campsite placement item: '{}'", editorID);
             return true;
         }
-        
+
+        // Sim Settlements 2: plans have "Plan:" or "SS2" in the display name
+        auto* boundObj = baseForm->As<RE::TESBoundObject>();
+        if (boundObj) {
+            std::string itemName(RE::TESFullName::GetFullName(*boundObj, false));
+            if (itemName.find("Plan:") != std::string::npos ||
+                itemName.find("Plan -") != std::string::npos ||
+                itemName.find("SS2") != std::string::npos) {
+                spdlog::debug("[LootToHand] Detected SS2 plan: '{}'", itemName);
+                return true;
+            }
+        }
+
         return false;
+    }
+
+    // True when a crafting/cooking/vendor/workbench menu is open. Item-to-hand
+    // must NOT fire in these contexts: cooking outputs, crafted weapon mods,
+    // vendor purchases, etc. fire container-changed events that look like loot
+    // but should land in inventory (otherwise items spawn in the hand, pile up,
+    // and explode when the menu closes).
+    static bool IsCraftingOrVendorMenuOpen()
+    {
+        auto& mc = MenuChecker::GetSingleton();
+        if (mc.IsCookingOpen() || mc.IsExamineOpen() || mc.IsWorkshopOpen()) {
+            return true;
+        }
+        auto* ui = RE::UI::GetSingleton();
+        // Workbench crafting (chem/weapon/armor/PA) and vendor barter aren't
+        // tracked by MenuChecker — query the UI directly.
+        return ui && (ui->GetMenuOpen("CraftingMenu") || ui->GetMenuOpen("BarterMenu"));
     }
 
     void DropToHand::MarkAsRecentlyStored(std::uint32_t baseFormID)
@@ -128,11 +188,57 @@ namespace heisenberg
         }
         
         std::uint32_t playerFormID = player->GetFormID();
-        
+
+        // SESSION-READY GATE: Block all "to hand" interception during load.
+        // During game load, container-changed events fire for engine-internal
+        // transfers (survival status effects, perk items, NPC inventory fills).
+        // These must not be intercepted by any to-hand system. The gate opens
+        // a few seconds after LoadingMenu closes (set in MenuChecker).
+        if (!IsSessionReady()) {
+            return RE::BSEventNotifyControl::kContinue;
+        }
+
+        // ===== DIAGNOSTIC: Log ALL container change events =====
+        {
+            std::string formName;
+            const char* editorID = "";
+            auto* baseForm = RE::TESForm::GetFormByID(a_event.baseObjectFormID);
+            if (baseForm) {
+                auto nameView = RE::TESFullName::GetFullName(*baseForm, false);
+                formName = std::string(nameView);
+                editorID = baseForm->GetFormEditorID();
+                if (!editorID) editorID = "";
+            }
+            spdlog::info("[ContainerEvent] base={:08X} '{}' edID='{}' old={:08X} new={:08X} ref={:08X} count={}"
+                         " | dropMode={} lootMode={} harvestTH={} pipOpen={} containerOpen={}",
+                a_event.baseObjectFormID, formName, editorID,
+                a_event.oldContainerFormID, a_event.newContainerFormID,
+                a_event.referenceFormID, a_event.itemCount,
+                g_config.dropToHandMode, g_config.lootToHandMode, g_config.enableHarvestToHand,
+                MenuChecker::GetSingleton().IsPipboyOpen(),
+                MenuChecker::GetSingleton().IsContainerOpen());
+        }
+
+        // EARLY, ALL-PATH bypass for placement/config mod items (Place in Red VR's
+        // 'PIRVR_Holotape', etc.). Their control items get used and re-added in a tight
+        // loop; intercepting on EITHER the drop OR the loot path perpetuates it. The old
+        // check only covered the drop path, so the re-add (loot path) kept the loop alive.
+        // Bypass here, before any drop/loot logic, on every path.
+        if (auto* earlyForm = RE::TESForm::GetFormByID(a_event.baseObjectFormID)) {
+            if (IsPlacementModItem(earlyForm)) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+        }
+
         // =====================================================================
         // DROP TO HAND: Player dropping item to world
         // =====================================================================
-        if (g_config.dropToHandMode > 0) {
+        // Only active when the Pipboy inventory is open. This prevents the
+        // "consume-and-replace loop" caused by EquipObject calls from the favorites
+        // wheel (e.g. stimpak): the consume fires a container-changed event with
+        // refID=0 that looks identical to a drop, and the RefID=0 fallback below
+        // would loot-to-hand another copy from inventory.
+        if (g_config.dropToHandMode > 0 && MenuChecker::GetSingleton().IsPipboyOpen()) {
             // Check if this is the player dropping an item to the world
             // oldContainerFormID = player, newContainerFormID = 0 (world)
             if (a_event.oldContainerFormID == playerFormID && a_event.newContainerFormID == 0) {
@@ -164,11 +270,44 @@ namespace heisenberg
                             a_event.baseObjectFormID);
                         return RE::BSEventNotifyControl::kContinue;
                     }
+                    // Skip scripted placement items (Campsite tents, SS2 plans, etc.)
+                    // These must completely bypass all our systems. Let the game
+                    // drop the item normally so the mod's Papyrus script handles it.
+                    if (IsPlacementModItem(baseForm)) {
+                        spdlog::info("[DropToHand] Skipping placement mod item {:08X} - full bypass",
+                            a_event.baseObjectFormID);
+                        return RE::BSEventNotifyControl::kContinue;
+                    }
+                    // Skip non-playable engine items — Survival status effects
+                    // (Peckish/Hungry/Parched/Dehydrated/Weary etc.) live as hidden
+                    // ALCH items in player inventory. When the effect changes tier,
+                    // the old one is removed (old=player, new=0, refID=real) and
+                    // that looks identical to a player drop, flooding _pendingDrops
+                    // and looping the pickup sound.
+                    if (!baseForm->GetPlayable(nullptr)) {
+                        spdlog::info("[DropToHand] Skipping non-playable item {:08X} '{}' (engine transfer)",
+                            a_event.baseObjectFormID,
+                            RE::TESFullName::GetFullName(*baseForm, false));
+                        return RE::BSEventNotifyControl::kContinue;
+                    }
+                    // Fallback: GetPlayable() is unreliable for HC_ status effects
+                    // and omod items — catch them by editor ID prefix.
+                    {
+                        const char* editorID = baseForm->GetFormEditorID();
+                        if (editorID && (std::strncmp(editorID, "HC_", 3) == 0 ||
+                                         std::strncmp(editorID, "omod", 4) == 0)) {
+                            spdlog::info("[DropToHand] Skipping engine item {:08X} '{}' edID='{}' (HC_/omod prefix)",
+                                a_event.baseObjectFormID,
+                                RE::TESFullName::GetFullName(*baseForm, false), editorID);
+                            return RE::BSEventNotifyControl::kContinue;
+                        }
+                    }
                 }
 
-                // Mode 2 (Holotapes Only): skip non-holotape items
+                // Mode 2 (Holotapes Only): skip everything that isn't an actual holotape
+                // (paper notes are excluded too — they're ordinary clutter).
                 if (g_config.dropToHandMode == 2) {
-                    if (!baseForm || baseForm->GetFormType() != RE::ENUM_FORM_ID::kNOTE) {
+                    if (!IsHolotapeNote(baseForm)) {
                         spdlog::debug("[DropToHand] Skipping non-holotape {:08X} (mode=HolotapesOnly)",
                             a_event.baseObjectFormID);
                         return RE::BSEventNotifyControl::kContinue;
@@ -262,25 +401,45 @@ namespace heisenberg
             if (a_event.oldContainerFormID != 0 &&
                 a_event.oldContainerFormID != playerFormID &&
                 a_event.newContainerFormID == playerFormID) {
-                
-                // Skip if BarterMenu is open - player is buying from vendor, not looting
-                auto* ui = RE::UI::GetSingleton();
-                if (ui && ui->GetMenuOpen("BarterMenu")) {
-                    spdlog::debug("[LootToHand] Skipping - BarterMenu open (vendor purchase)");
+
+                // A plugin doing a scripted bulk transfer (e.g. the companion
+                // voice mod's "give me everything") signals us to keep these
+                // items out of the hand/floor pipeline — they must land directly
+                // in inventory. The engine event carries no transfer reason, so
+                // the transferring plugin sets this window explicitly via F4SE
+                // messaging just before its RemoveItem loop.
+                if (IsItemToHandSuppressed()) {
+                    spdlog::debug("[LootToHand] Suppressed (plugin API) — {:08X} from {:08X} stays in inventory",
+                        a_event.baseObjectFormID, a_event.oldContainerFormID);
                     return RE::BSEventNotifyControl::kContinue;
                 }
 
-                // Skip scripted item transfers: only process loot-to-hand when the player
-                // is actively looting from a container UI. Scripts (ActivateRef, AddItem, etc.)
-                // add items without ContainerMenu/ExamineMenu open — these should go to
-                // inventory silently. This prevents auto-consume/quest/crafting mods from
-                // having their items intercepted.
-                auto& menuChecker = MenuChecker::GetSingleton();
-                if (!menuChecker.IsMenuOpen("ContainerMenu") && !menuChecker.IsMenuOpen("ExamineMenu")) {
-                    spdlog::debug("[LootToHand] Skipping - no container menu open (likely scripted transfer)");
+                // Vendor purchases (BarterMenu) and workbench crafting transfers
+                // must go to inventory, not the hand.
+                if (IsCraftingOrVendorMenuOpen()) {
+                    spdlog::debug("[LootToHand] Crafting/vendor menu open — {:08X} stays in inventory",
+                        a_event.baseObjectFormID);
                     return RE::BSEventNotifyControl::kContinue;
                 }
-                
+
+                // Loot-to-hand fires when the player is actively looting via
+                // ContainerMenu or a quick-loot-style menu (LootMenu / WSLootMenu).
+                // Any other menu (workbench, cooking, pipboy, dialogue, workshop)
+                // fires container-changed events for unrelated reasons (crafting
+                // component transfers, vendor purchases, quest rewards) and must
+                // not be routed to hand.
+                {
+                    auto& mc = MenuChecker::GetSingleton();
+                    auto* ui = RE::UI::GetSingleton();
+                    bool inAllowedLootContext =
+                        mc.IsContainerOpen() ||
+                        (ui && (ui->GetMenuOpen("LootMenu") || ui->GetMenuOpen("WSLootMenu")));
+                    if (!inAllowedLootContext) {
+                        spdlog::debug("[LootToHand] Skipping - no container/quickloot menu open");
+                        return RE::BSEventNotifyControl::kContinue;
+                    }
+                }
+
                 // Item looted from container to player!
                 if (a_event.baseObjectFormID != 0) {
                     // Skip items we just stored via StoreGrabbedItem (anti-loop)
@@ -301,21 +460,45 @@ namespace heisenberg
                         return RE::BSEventNotifyControl::kContinue;
                     }
                     
-                    // Skip Sim Settlements 2 plans - these trigger building placement
-                    // and should not be dropped to hand
-                    if (IsSimSettlements2Plan(baseForm)) {
-                        spdlog::debug("[LootToHand] Skipping SS2 plan: {:08X}", a_event.baseObjectFormID);
+                    // Skip scripted placement items (SS2 plans, Campsite gear, etc.)
+                    // These have scripts that trigger building/campsite placement when
+                    // removed from inventory — loot-to-hand's DropObject would fire them.
+                    if (IsPlacementModItem(baseForm)) {
+                        spdlog::debug("[LootToHand] Skipping placement mod item: {:08X}", a_event.baseObjectFormID);
                         return RE::BSEventNotifyControl::kContinue;
                     }
                     
                     std::lock_guard<std::mutex> lock(_mutex);
-                    
+
                     // Queue this item to be dropped from inventory on next frame
                     PendingLoot loot;
                     loot.baseFormID = a_event.baseObjectFormID;
                     loot.itemCount = a_event.itemCount;
                     loot.timeQueued = 0.0f;
-                    
+                    loot.oldContainerFormID = a_event.oldContainerFormID;  // for Take-All bulk detection
+                    loot.burstId = _lootBurstId;                            // same id for all events this frame
+
+                    // Deliver to the hand that looted this container: whichever wand's
+                    // viewcaster is pointing at the container being looted. Falls back
+                    // to GetTargetHand() if neither wand resolves to it (wand moved).
+                    for (int h = 0; h < 2; ++h) {
+                        bool handIsLeft = (h == 0);
+                        auto tgt = GetVRWandTargetHandle(handIsLeft).get();
+                        if (tgt && tgt->formID == a_event.oldContainerFormID) {
+                            // If the looting hand is the primary hand and a real weapon
+                            // is drawn, that hand can't receive the item — use the off-hand.
+                            const bool primaryIsLeft = VRInput::GetSingleton().IsLeftHandedMode();
+                            if (handIsLeft == primaryIsLeft && g_heisenberg.GetCachedHasRealWeapon()) {
+                                handIsLeft = !primaryIsLeft;
+                            }
+                            loot.forceHand = true;
+                            loot.forcedIsLeft = handIsLeft;
+                            spdlog::debug("[LootToHand] Looting hand = {} (wand targeting container {:08X})",
+                                handIsLeft ? "left" : "right", a_event.oldContainerFormID);
+                            break;
+                        }
+                    }
+
                     _pendingLoots.push_back(loot);
 
                     // Suppress "X added" HUD message — it displays next frame
@@ -332,12 +515,53 @@ namespace heisenberg
         // HARVEST TO HAND: Flora harvested → item appears from world (oldContainer=0)
         // =====================================================================
         if (g_config.enableHarvestToHand && g_config.lootToHandMode > 0) {
+            // Harvest-to-hand is allowed when:
+            //   - No menu is open (world harvest / flora pickup)
+            //   - ContainerMenu is open (player is actively looting)
+            //   - A quick-loot-style menu is open (LootMenu / WSLootMenu)
+            // Blocked for everything else (workbench, cooking, pipboy, dialogue,
+            // workshop, etc.) — those fire similar events for unrelated reasons.
+            {
+                // Harvest-to-hand is for the player physically harvesting flora.
+                // The harvest window is stamped only when the player activates a
+                // FLOR/TREE ref (see HookActivateRef). Requiring it keeps script
+                // AddItem calls from unrelated mods — Fill'em Up bottles at a pump,
+                // cooking/crafting outputs, etc., which fire the same old=0->player
+                // event shape — from being yanked into the hand and piling up.
+                if (!IsHarvestWindowOpen()) {
+                    spdlog::debug("[HarvestToHand] No harvest window — {:08X} stays in inventory (not a flora harvest)",
+                        a_event.baseObjectFormID);
+                    return RE::BSEventNotifyControl::kContinue;
+                }
+                // And never while a crafting/cooking/vendor menu is open.
+                if (IsCraftingOrVendorMenuOpen()) {
+                    return RE::BSEventNotifyControl::kContinue;
+                }
+            }
             // Harvest events: item comes from world (0) into player
             if (a_event.oldContainerFormID == 0 && a_event.newContainerFormID == playerFormID) {
                 // Skip items we recently stored (anti-loop for grab→store→event cycle)
                 if (!WasRecentlyStored(a_event.baseObjectFormID)) {
                     auto* baseForm = RE::TESForm::GetFormByID(a_event.baseObjectFormID);
                     if (baseForm) {
+                        // Skip non-playable items — Survival mode status effects
+                        // (Hungry, Parched, Weary, etc.) are non-playable ALCH items that
+                        // the engine adds to the player with oldContainer=0, the same shape
+                        // as a harvest event. Without this filter they get queued and the
+                        // HUD suppress/unsuppress cycle spams on every tick.
+                        if (!baseForm->GetPlayable(nullptr)) {
+                            spdlog::debug("[HarvestToHand] Skipping non-playable item {:08X} '{}' (likely survival status effect)",
+                                a_event.baseObjectFormID,
+                                RE::TESFullName::GetFullName(*baseForm, false));
+                            return RE::BSEventNotifyControl::kContinue;
+                        }
+
+                        // Skip scripted placement items (SS2 plans, Campsite gear, etc.)
+                        if (IsPlacementModItem(baseForm)) {
+                            spdlog::debug("[HarvestToHand] Skipping placement mod item: {:08X}", a_event.baseObjectFormID);
+                            return RE::BSEventNotifyControl::kContinue;
+                        }
+
                         auto formType = baseForm->GetFormType();
                         // Only intercept harvest-like items: ingredients, alchemy, misc
                         if (formType == RE::ENUM_FORM_ID::kINGR ||
@@ -372,8 +596,9 @@ namespace heisenberg
         bool leftHolding = grabMgr.IsGrabbing(true);
         bool rightHolding = grabMgr.IsGrabbing(false);
         
-        // Check if player has a real weapon equipped (blocks PRIMARY hand grabs)
-        bool hasWeaponEquipped = HasRealWeaponEquipped();
+        // Check if player has a real weapon equipped (blocks PRIMARY hand grabs).
+        // Use cached value updated once/frame to avoid per-call WEAPON CHECK spam.
+        bool hasWeaponEquipped = g_heisenberg.GetCachedHasRealWeapon();
         
         // Determine which hand is the primary (weapon) hand
         // Primary = right hand normally, left hand in left-handed mode
@@ -588,9 +813,10 @@ namespace heisenberg
         }
         
         // Determine target hand.
-        // Holotapes ALWAYS go to right hand (for Pipboy deck insertion) regardless of forceHand.
+        // HOLOTAPES always go to the right hand (for Pip-Boy deck insertion) regardless of
+        // forceHand. Paper notes are ordinary clutter — choose a hand normally.
         bool isLeft = true;
-        if (baseObj && baseObj->GetFormType() == RE::ENUM_FORM_ID::kNOTE) {
+        if (baseObj && IsHolotapeNote(baseObj)) {
             isLeft = false;
             spdlog::debug("[DropToHand] Holotape -> right hand (always)");
         } else if (drop.forceHand) {
@@ -682,24 +908,25 @@ namespace heisenberg
 
             auto& state = grabMgr.GetGrab(isLeft);
 
-            // Scale holotapes for hand size. Hologram_* variants get extra compensation.
-            // Skip storage zone briefly — holotape starts near Pipboy (= storage zone) after deck removal
-            if (baseObj && baseObj->GetFormType() == RE::ENUM_FORM_ID::kNOTE && state.node) {
-                const float pipScale = PipboyInteraction::GetSingleton().GetFrikPipboyScale();
-                constexpr float BASE_HAND_SCALE = 0.7f;
-                float finalScale = BASE_HAND_SCALE * pipScale;
+            // Scale HOLOTAPES for hand size (Pip-Boy deck proportions). Paper notes keep their
+            // native scale. Both get the brief storage-zone grace — a note/holotape can start
+            // near the Pip-Boy (= storage zone) and shouldn't auto-store the instant it spawns.
+            if (baseObj && baseObj->GetFormType() == RE::ENUM_FORM_ID::kNOTE) {
+                if (IsHolotapeNote(baseObj) && state.node) {
+                    const float pipScale = PipboyInteraction::GetSingleton().GetFrikPipboyScale();
+                    constexpr float BASE_HAND_SCALE = 0.7f;
+                    float finalScale = BASE_HAND_SCALE * pipScale;
 
-                std::string_view nodeName(state.node->name.c_str());
-                if (nodeName.find("Hologram") != std::string_view::npos) {
-                    constexpr float HOLOGRAM_COMPENSATION = 1.9f;
-                    finalScale *= HOLOGRAM_COMPENSATION;
-                    spdlog::debug("[DropToHand] Hologram variant '{}' scale={:.2f} (compensation={}x)",
-                                nodeName, finalScale, HOLOGRAM_COMPENSATION);
+                    std::string_view nodeName(state.node->name.c_str());
+                    if (nodeName.find("Hologram") != std::string_view::npos) {
+                        constexpr float HOLOGRAM_COMPENSATION = 1.9f;
+                        finalScale *= HOLOGRAM_COMPENSATION;
+                        spdlog::debug("[DropToHand] Hologram variant '{}' scale={:.2f} (compensation={}x)",
+                                    nodeName, finalScale, HOLOGRAM_COMPENSATION);
+                    }
+
+                    state.node->local.scale = finalScale;
                 }
-
-                state.node->local.scale = finalScale;
-                state.skipStorageZone = true;
-            } else if (baseObj && baseObj->GetFormType() == RE::ENUM_FORM_ID::kNOTE) {
                 state.skipStorageZone = true;
             }
 
@@ -784,9 +1011,10 @@ namespace heisenberg
         }
         
         // Determine which hand to use
-        // Holotapes ALWAYS go to right hand (for Pipboy deck insertion) regardless of forceHand.
+        // HOLOTAPES always go to the right hand (for Pip-Boy deck insertion). Paper notes are
+        // ordinary clutter — choose a hand normally.
         bool isLeft = true;
-        if (formType == RE::ENUM_FORM_ID::kNOTE) {
+        if (IsHolotapeNote(boundObj)) {
             isLeft = false;
             spdlog::debug("[LootToHand] Holotape -> right hand (always)");
         } else if (loot.forceHand) {
@@ -972,6 +1200,12 @@ namespace heisenberg
             return;
         }
 
+        // Advance the loot burst id once per frame. All container-changed events
+        // the game fires between two OnFrameUpdate calls (e.g. a single "Take All")
+        // share the previous id, so a bulk transfer is detectable by grouping
+        // pending loots by burstId below.
+        _lootBurstId++;
+
         // Cleanup expired RecentlyStored entries
         {
             std::lock_guard<std::mutex> lock(_mutex);
@@ -1010,6 +1244,45 @@ namespace heisenberg
             // Lock to update times and get items ready to process
             {
                 std::lock_guard<std::mutex> lock(_mutex);
+
+                // TAKE-ALL GUARD: a "Take All" queues many items from one container
+                // at once. They all target the SAME hand (whichever wand pointed at
+                // the container), so loot-to-hand can place at most ONE; DropObject'ing
+                // the rest piles every ungrabbed item on the FLOOR. Desired behavior:
+                // one item to the hand, everything else stays in the player's INVENTORY
+                // (never the floor). So when >= threshold auto-loots from one container
+                // are pending simultaneously, keep just one for hand delivery (only if a
+                // hand is actually free) and cancel the rest. Grouped by container only
+                // (NOT frame-burst) so it triggers even when Take-All spreads its events
+                // across several frames. forceHand loots (explicit QueueStoreAndGrab /
+                // QueueDropToHand) are deliberate single requests and are exempt.
+                const int takeAllThreshold = g_config.lootToHandTakeAllThreshold;
+                if (takeAllThreshold > 0) {
+                    std::map<std::uint32_t, int> containerCounts;
+                    for (const auto& l : _pendingLoots) {
+                        if (l.forceHand) continue;
+                        containerCounts[l.oldContainerFormID]++;
+                    }
+                    auto& gmXfer = GrabManager::GetSingleton();
+                    const bool anyHandFree = !gmXfer.IsGrabbing(true) || !gmXfer.IsGrabbing(false);
+                    const int keepToHand = anyHandFree ? 1 : 0;  // at most one item can land in a hand
+                    for (const auto& [container, count] : containerCounts) {
+                        if (count < takeAllThreshold) continue;
+                        int kept = 0;
+                        const std::size_t before = _pendingLoots.size();
+                        _pendingLoots.erase(
+                            std::remove_if(_pendingLoots.begin(), _pendingLoots.end(),
+                                [&](const PendingLoot& l) {
+                                    if (l.forceHand || l.oldContainerFormID != container) return false;
+                                    if (kept < keepToHand) { ++kept; return false; }  // keep for hand
+                                    return true;  // cancel -> stays in inventory
+                                }),
+                            _pendingLoots.end());
+                        spdlog::info("[LootToHand] Take-All from container {:08X}: {} to hand, {} kept in inventory (threshold {})",
+                            container, kept, before - _pendingLoots.size(), takeAllThreshold);
+                    }
+                }
+
                 auto lootIt = _pendingLoots.begin();
                 while (lootIt != _pendingLoots.end()) {
                     // Skip event-driven loots when lootToHandMode is off

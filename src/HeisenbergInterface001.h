@@ -40,11 +40,46 @@ namespace HeisenbergPluginAPI {
     {
         // Unique message type ID (randomly generated)
         enum { kMessage_GetInterface = 0xF4D3B7A2 };
-        
+
         // Callback that Heisenberg fills in
         // Call with revision=1 to get IHeisenbergInterface001*
         void* (*GetApiFunction)(unsigned int revisionNumber) = nullptr;
     };
+
+    /**
+     * Fire-and-forget message: suppress item-to-hand routing for a window.
+     *
+     * When Heisenberg's loot-to-hand / drop-to-hand features are enabled, items
+     * that enter the player's inventory while a container/quick-loot menu is
+     * open get routed to the player's hand (or dropped on the floor if hands are
+     * full). A plugin doing a scripted bulk transfer (e.g. a companion "give me
+     * everything" command) usually wants those items to land in inventory
+     * instead. The engine's TESContainerChangedEvent carries no transfer reason,
+     * so the transferring plugin signals Heisenberg just before its transfer.
+     *
+     * Two equivalent ways to trigger it:
+     *   1. Interface method: IHeisenbergInterface001::SuppressItemToHand(ms)
+     *   2. This message (no interface handshake required):
+     *        std::uint32_t ms = 1500;
+     *        messaging->Dispatch(kMessage_SuppressItemToHand, &ms, sizeof(ms),
+     *                            "Heisenberg_F4VR");
+     *
+     * Payload: optional uint32 window length in milliseconds. If absent/zero,
+     * Heisenberg uses a sensible default (~1500ms). The window is time-based, so
+     * it survives thread skew and only needs to cover the synchronous transfer.
+     * No-op if Heisenberg isn't installed (Dispatch finds no listener).
+     */
+    enum : unsigned int { kMessage_SuppressItemToHand = 0x48535550 };  // 'HSUP'
+
+    /**
+     * Fire-and-forget message: a throwable was just pulled from a Virtual Holsters
+     * holster — arm/ready it in hand immediately, skipping Heisenberg's normal
+     * hold-to-arm delay (fThrowableHoldDuration). Dispatched by Virtual Holsters
+     * on unholster:
+     *   messaging->Dispatch(kMessage_ArmThrowable, nullptr, 0, "Heisenberg_F4VR");
+     * No payload required.
+     */
+    enum : unsigned int { kMessage_ArmThrowable = 0x48544852 };  // 'HTHR'
 
     /**
      * Get the Heisenberg interface.
@@ -397,15 +432,21 @@ namespace HeisenbergPluginAPI {
 
         /**
          * Callback before physics simulation runs.
-         * Use this to modify velocities or positions before the physics step.
-         * @param bhkWorld Pointer to the bhkWorld
+         *
+         * NOTE: Currently NOT fired. The pre-physics hook (0xd83ec4) is disabled
+         * due to crashes. Registering this callback will succeed but the callback
+         * will never be invoked until the hook is restored.
+         * Use AddPostPhysicsCallback for post-physics timing.
+         *
+         * @param bhkWorld Pointer to the bhkWorld (nullptr when dormant)
          */
         typedef void(*PrePhysicsCallback)(void* bhkWorld);
 
         /**
          * Callback after physics simulation runs.
-         * Use this to read physics results.
-         * @param bhkWorld Pointer to the bhkWorld
+         * Fired once per frame from the post-physics hook (0xd8405e),
+         * after all Heisenberg grab/input processing completes.
+         * @param bhkWorld Currently nullptr (reserved for future use)
          */
         typedef void(*PostPhysicsCallback)(void* bhkWorld);
 
@@ -483,11 +524,32 @@ namespace HeisenbergPluginAPI {
         /**
          * Get the object the hand is currently touching.
          * Only valid if hand collision is enabled and IsHandInContact returns true.
-         * 
+         *
          * @param isLeft Which hand
          * @return Pointer to the contacted TESObjectREFR, or nullptr
          */
         virtual RE::TESObjectREFR* GetHandContactObject(bool isLeft) = 0;
+
+        // =====================================================================
+        // ITEM-TO-HAND SUPPRESSION
+        // =====================================================================
+
+        /**
+         * Suppress loot-to-hand / drop-to-hand routing for a short window so a
+         * scripted bulk inventory transfer (e.g. a companion "give me everything"
+         * command) lands directly in the player's inventory instead of being
+         * routed to the hand or dropped on the floor.
+         *
+         * Call this immediately before performing the transfer (RemoveItem with
+         * a_otherContainer = player, AddItem, etc.). The window is time-based and
+         * covers the synchronous transfer plus any thread skew.
+         *
+         * Equivalent to dispatching kMessage_SuppressItemToHand. Safe to call
+         * from the main game thread.
+         *
+         * @param durationMs Window length in milliseconds (0 = default ~1500ms)
+         */
+        virtual void SuppressItemToHand(unsigned int durationMs) = 0;
     };
 
     // =========================================================================
@@ -524,6 +586,9 @@ namespace HeisenbergPluginAPI {
     void InvokePrePhysicsCallbacks(void* bhkWorld);
     void InvokePostPhysicsCallbacks(void* bhkWorld);
     void InvokeViewCasterTargetChangedCallbacks(bool isLeft, RE::TESObjectREFR* newTarget, RE::TESObjectREFR* oldTarget);
+
+    /** Check if a hand is disabled via the API (for internal use by Hand.cpp, Grab.cpp). */
+    bool IsHandDisabledByAPI(bool isLeft);
 
 } // namespace HeisenbergPluginAPI
 

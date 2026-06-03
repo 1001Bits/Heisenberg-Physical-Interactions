@@ -20,11 +20,14 @@ namespace heisenberg
 {
     // Convenient aliases for the official FRIK types
     using FRIKHand            = frik::api::FRIKApi::Hand;
-    using FRIKHandPoses       = frik::api::FRIKApi::HandPoses;
+    using FRIKHandPoses       = frik::api::FRIKApi::HandPoseKind;  // v5 renamed HandPoses -> HandPoseKind
     using FRIKHandPoseTagState = frik::api::FRIKApi::HandPoseTagState;
 
     // Tag used for Heisenberg hand pose overrides
     constexpr const char* HEISENBERG_HAND_POSE_TAG = "Heisenberg_Grab";
+
+    // Tag used for the v9 external-hand-world-transform override (wall pushback).
+    constexpr const char* HEISENBERG_HAND_PUSHBACK_TAG = "Heisenberg_HandPushback";
 
     // DEBUG: Set to true to disable all FRIK API calls (for crash debugging)
     constexpr bool DEBUG_DISABLE_FRIK_API = false;
@@ -76,6 +79,18 @@ namespace heisenberg
 
         // Get FRIK mod version string (e.g. "0.77.1")
         const char* GetModVersion() const;
+
+        // --- v9 hand pushback API ---------------------------------------------------------
+        // True only when the loaded FRIK is API v9+ (the external-hand-transform functions
+        // exist). Core FRIK features work on older FRIK; pushback requires v9.
+        bool SupportsPushback() const;
+        // Read the rendered hand's current world transform (FRIK's IK result this frame).
+        bool GetHandWorldTransform(bool isLeft, RE::NiTransform& outWorld) const;
+        // Override the rendered hand to a world target — FRIK solves the arm to it. Used to
+        // push the visible hand out of walls. Re-call each frame while overriding.
+        bool ApplyExternalHandWorldTransform(bool isLeft, const RE::NiTransform& world, int priority = 10) const;
+        // Release the override so FRIK resumes normal controller tracking for that hand.
+        bool ClearExternalHandWorldTransform(bool isLeft) const;
 
     private:
         FRIKInterface() = default;

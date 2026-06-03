@@ -140,6 +140,28 @@ namespace heisenberg
          */
         bool IsLeftHandedMode() const { return _isLeftHandedMode; }
 
+        /**
+         * Get the raw analog grip axis value (no digital fallback)
+         * @param isLeftHand Which controller
+         * @return Raw rAxis[2].x value as stored in ButtonState
+         */
+        float GetAnalogGripValue(bool isLeftHand) const
+        {
+            const auto& state = GetControllerState(isLeftHand);
+            return state.valid ? state.gripValue : 0.0f;
+        }
+
+        /**
+         * Returns true once we've observed an analog grip value > 0.1 from this
+         * controller. False on controllers that only report digital grip.
+         * Used to gate logic that needs to differentiate physical-grip squeeze
+         * from a digital grip-bit press (e.g. SteamVR Grip→A bindings).
+         */
+        bool HasAnalogGrip(bool isLeftHand) const
+        {
+            return (isLeftHand ? _leftController : _rightController).hasAnalogGrip;
+        }
+
     private:
         VRInput() = default;
         

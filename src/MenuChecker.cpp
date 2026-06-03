@@ -1,4 +1,5 @@
 #include "MenuChecker.h"
+#include "DropToHand.h"
 #include "Utils.h"
 
 namespace heisenberg
@@ -45,6 +46,8 @@ namespace heisenberg
         if (strcmp(menuName, "CookingMenu") == 0) return _isCookingOpen.load(std::memory_order_relaxed);
         if (strcmp(menuName, "FavoritesMenu") == 0) return _isFavoritesOpen.load(std::memory_order_relaxed);
         if (strcmp(menuName, "ScopeMenu") == 0) return _isScopeOpen.load(std::memory_order_relaxed);
+        if (strcmp(menuName, "ExamineMenu") == 0) return _isExamineOpen.load(std::memory_order_relaxed);
+        if (strcmp(menuName, "ExamineConfirmMenu") == 0) return _isExamineConfirmOpen.load(std::memory_order_relaxed);
         
         // For other menus, fall back to direct UI check (less safe but works)
         auto* ui = RE::UI::GetSingleton();
@@ -99,6 +102,8 @@ namespace heisenberg
         _isCookingOpen.store(false, std::memory_order_relaxed);
         _isFavoritesOpen.store(false, std::memory_order_relaxed);
         _isScopeOpen.store(false, std::memory_order_relaxed);
+        _isExamineOpen.store(false, std::memory_order_relaxed);
+        _isExamineConfirmOpen.store(false, std::memory_order_relaxed);
         _isGameStopped.store(false, std::memory_order_relaxed);
         _menuCloseCooldown.store(0.0f, std::memory_order_relaxed);
         _favoritesCloseTime.store(0.0, std::memory_order_relaxed);
@@ -136,6 +141,16 @@ namespace heisenberg
         // Update the appropriate atomic flag
         if (strcmp(menuName, "LoadingMenu") == 0) {
             _owner._isLoading.store(opening, std::memory_order_relaxed);
+
+            // Tie the to-hand session-ready gate to the REAL end of loading.
+            // kPostLoadGame fires long before LoadingMenu closes (observed: 17s gap),
+            // so we anchor the gate to the menu close event here and add a short
+            // grace period for any tail-end engine transfers.
+            if (opening) {
+                heisenberg::DropToHand::SetSessionNotReady();
+            } else {
+                heisenberg::DropToHand::SetSessionReady(5000);
+            }
         }
         else if (strcmp(menuName, "PauseMenu") == 0) {
             _owner._isPaused.store(opening, std::memory_order_relaxed);
@@ -178,6 +193,16 @@ namespace heisenberg
             if (!opening) {
                 _owner._favoritesCloseTime.store(Utils::GetTime(), std::memory_order_relaxed);
             }
+        }
+        else if (strcmp(menuName, "ExamineMenu") == 0) {
+            // Weapon/armor workbench (and scrap/mod confirm flow parent).
+            _owner._isExamineOpen.store(opening, std::memory_order_relaxed);
+        }
+        else if (strcmp(menuName, "ExamineConfirmMenu") == 0) {
+            // Child confirm dialog inside ExamineMenu — the crafting output
+            // container event fires in the single ms after this closes while
+            // ExamineMenu is still up, so we track both independently.
+            _owner._isExamineConfirmOpen.store(opening, std::memory_order_relaxed);
         }
 
         // Log ALL menu open/close events for debugging

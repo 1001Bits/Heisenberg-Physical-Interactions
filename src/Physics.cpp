@@ -8,8 +8,10 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <shared_mutex>
+#include <limits>
 #include <vector>
 #include <functional>  // For std::function in TryFindPlayerBodyAlternative
+#include <cstring>
 #include <intrin.h>  // For _mm_set1_ps SSE intrinsic
 
 namespace heisenberg::Physics
@@ -93,21 +95,30 @@ namespace heisenberg::Physics
     // ==================================================================================
     // HIGGS-STYLE PAIR COLLISION FILTER
     // hknpPairCollisionFilter::disableCollisionsBetween(hknpWorld*, hknpBodyId, hknpBodyId)
-    // Disables collision between two specific bodies without affecting their other collisions.
+    // THIS IS A MEMBER FUNCTION — first param is 'this' (pairCollisionFilter*)
     // VR Offset from fo4_database.csv: 379288,0x1418ebbc0,0x14196de70,4
     // ==================================================================================
-    using DisableCollisionsBetween_t = void(*)(void* hknpWorld, std::uint32_t bodyIdA, std::uint32_t bodyIdB);
+    using DisableCollisionsBetween_t = void(*)(void* pairCollisionFilter, void* hknpWorld, std::uint32_t bodyIdA, std::uint32_t bodyIdB);
     inline REL::Relocation<DisableCollisionsBetween_t> hknpPairCollisionFilter_disableCollisionsBetween{ REL::Offset(0x196de70) };
 
+    // Helper: get the pair collision filter from hknpWorld
+    // Path: hknpWorld+0x150 → modifierManager → +0x5E8 → collisionFilter (IS-A pairCollisionFilter)
+    inline void* GetPairCollisionFilter(void* hknpWorld) {
+        if (!hknpWorld) return nullptr;
+        void* modifierManager = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(hknpWorld) + 0x150);
+        if (!modifierManager) return nullptr;
+        return *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(modifierManager) + 0x5E8);
+    }
+
     // ==================================================================================
-    // RE-ENABLE PAIR COLLISION
-    // The disable function stores entries in hkMapBase. To re-enable, we clear the entry.
-    // hknpPairCollisionFilter::clearAll clears all disabled pairs (not ideal for selective enable)
-    // VR Offset: 0x196e0f0 for clearAll
-    // 
-    // For selective enable, we'd need to call hkMapBase::remove with the Key.
-    // However, this is complex. For now, clearAll can be used if needed.
+    // RE-ENABLE PAIR COLLISION (selective)
+    // Key = (min(bodyA,bodyB) | (max(bodyA,bodyB) << 32))
+    // hkMapBase::remove(Key) at VR offset 0x196ec50
+    // The pair filter map lives at pairCollisionFilter + 0x18
     // ==================================================================================
+    using RemoveCollisionPair_t = void(*)(void* mapBase, std::uint64_t key);
+    inline REL::Relocation<RemoveCollisionPair_t> hkMapBase_remove{ REL::Offset(0x196ec50) };
+
     using ClearAllCollisionPairs_t = void(*)(void* pairCollisionFilter);
     inline REL::Relocation<ClearAllCollisionPairs_t> hknpPairCollisionFilter_clearAll{ REL::Offset(0x196e0f0) };
 
@@ -117,6 +128,48 @@ namespace heisenberg::Physics
     static RE::hknpShape* g_sphereShape = nullptr;
     static bool g_sphereShapeInitialized = false;
     static constexpr uint32_t INVALID_BODY_ID = 0x7FFFFFFF;
+    static constexpr uint32_t INVALID_BODY_ID_ALT = 0xFFFFFFFF;
+    // hknp body IDs: lower 16 bits = body index, upper 16 bits = generation counter
+    static constexpr uint32_t HKNP_BODY_ID_INDEX_MASK = 0x0000FFFF;
+    static constexpr uint32_t MAX_REASONABLE_BODY_INDEX = 0x00100000;
+
+    inline bool IsInvalidBodyId(std::uint32_t bodyId)
+    {
+        return bodyId == 0 || bodyId == INVALID_BODY_ID || bodyId == INVALID_BODY_ID_ALT;
+    }
+
+    inline std::uint32_t GetBodyBufferIndex(std::uint32_t bodyId)
+    {
+        return bodyId & HKNP_BODY_ID_INDEX_MASK;
+    }
+
+    inline bool IsReasonableBodyIndex(std::uint32_t bodyIndex)
+    {
+        return bodyIndex != HKNP_BODY_ID_INDEX_MASK && bodyIndex < MAX_REASONABLE_BODY_INDEX;
+    }
+
+    inline std::uint32_t NormalizeShiftedBodyIdCandidate(std::uint32_t rawBodyId)
+    {
+        if (IsInvalidBodyId(rawBodyId)) {
+            return rawBodyId;
+        }
+
+        if (IsReasonableBodyIndex(GetBodyBufferIndex(rawBodyId))) {
+            return rawBodyId;
+        }
+
+        // Some VR character-controller reads surface as 0xXXXX0000 where the
+        // upper 16 bits are the actual body id and the low 16 bits are zero.
+        if ((rawBodyId & 0xFFFFu) == 0) {
+            const std::uint32_t shiftedBodyId = rawBodyId >> 16;
+            if (!IsInvalidBodyId(shiftedBodyId) &&
+                IsReasonableBodyIndex(GetBodyBufferIndex(shiftedBodyId))) {
+                return shiftedBodyId;
+            }
+        }
+
+        return rawBodyId;
+    }
 
     // hknpClosestHitCollector vtable address (VR offset from fo4_database.csv ID 1568866)
     // Format: id,fo4_addr,vr_addr,status,name
@@ -296,6 +349,17 @@ namespace heisenberg::Physics
         }
 
         return FindBodyIdRefWithSEH(worldNP, &bodyId);
+    }
+
+    RE::TESObjectREFR* GetRefrFromBodyId(void* bhkWorld, std::uint32_t bodyId)
+    {
+        if (!bhkWorld || bodyId == INVALID_BODY_ID || bodyId == INVALID_BODY_ID_ALT || bodyId == 0) {
+            return nullptr;
+        }
+
+        RE::hknpBodyId id{};
+        id.value = bodyId;
+        return GetRefrFromBodyId(reinterpret_cast<RE::bhkWorld*>(bhkWorld), id);
     }
 
     // Get BSReadWriteLock* from hknpBSWorld using raw offset
@@ -1632,87 +1696,290 @@ namespace heisenberg::Physics
 
     void DisableCollisionsBetween(void* hknpWorld, std::uint32_t bodyIdA, std::uint32_t bodyIdB)
     {
-        if (!hknpWorld) {
-            spdlog::warn("[PHYSICS] DisableCollisionsBetween: null world");
-            return;
+        // DEAD PATH (see DisableCollisionBetween): the engine pair-filter call
+        // hknpPairCollisionFilter::disableCollisionsBetween (0x196de70) faults on
+        // every invocation on F4VR 1.2.72 — wrong mechanism for this build. Unlike
+        // its SEH-guarded sibling, THIS variant has no __try, so a live call would
+        // hard-crash. Neutralized to a no-op. Collider-vs-player exclusion is done
+        // via the layer-43 / 0x000B002B filter approach instead.
+        (void)hknpWorld; (void)bodyIdA; (void)bodyIdB;
+        static std::atomic<bool> warned{ false };
+        if (!warned.exchange(true)) {
+            spdlog::warn("[PHYSICS] DisableCollisionsBetween is a no-op (engine pair-filter faults on F4VR; using layer-43 filtering instead)");
         }
-        
-        if (bodyIdA == INVALID_BODY_ID || bodyIdB == INVALID_BODY_ID) {
-            spdlog::warn("[PHYSICS] DisableCollisionsBetween: invalid body ID (A=0x{:08X}, B=0x{:08X})",
-                         bodyIdA, bodyIdB);
-            return;
+    }
+
+    // Saved original player collision filter info for restoration
+    // Thread safety: accessed from physics thread and main thread
+    static std::atomic<std::uint32_t> g_savedPlayerCollisionFilterInfo{0};
+    static std::atomic<bool> g_playerCollisionModified{false};
+    static std::atomic<std::uint32_t> g_playerBodyId{INVALID_BODY_ID};  // Cached player body ID
+
+    bool TryFindPlayerBodyAlternative(void* bhkWorld, void* hknpWorld, std::uint32_t& outBodyId);
+    bool TryReadBodyFilterInfo(void* hknpWorld, std::uint32_t bodyId, std::uint32_t& outFilterInfo);
+    bool TryReadMiddleHighCharControllerImpl(void* middleHigh, RE::bhkCharacterController*& outController);
+    bool TryGetCharacterControllerBodyId(RE::bhkCharacterController* charController, void* hknpWorld, std::uint32_t& outBodyId);
+    bool TryFindPlayerBodyViaProxyManager(RE::bhkWorld* bhkWorld, void* hknpWorld, std::uint32_t& outBodyId);
+
+    void InvalidatePlayerBodyId()
+    {
+        g_playerBodyId = INVALID_BODY_ID;
+    }
+
+    // bhkCharacterController::SetSupportBody(bhkNPCollisionObject*) — VR 0x1e23150.
+    // Ghidra-confirmed: the player character proxy caches its "ground" support body
+    // REFCOUNTED (refCount++ on set, refCount-- + DeleteThis() at 0 on replace). If we
+    // free one of our keyframed ROCK collider bodies while the proxy still caches it as
+    // support, the proxy is left with a dangling supportBody._ptr -> next-frame vf066
+    // reads the freed object's vtable -> the recurring bhkCharProxyController crash.
+    using SetSupportBody_t = void(*)(RE::bhkCharacterController*, void* /*bhkNPCollisionObject*/);
+    inline REL::Relocation<SetSupportBody_t> bhkCharacterController_SetSupportBody{ REL::Offset(0x1e23150) };
+
+    // Force the player character proxy to drop whatever it currently caches as its
+    // support body. MUST be called at the START of any ROCK collider-body teardown —
+    // before we release our own refs — so the proxy releases its ref (and runs the
+    // final DeleteThis itself if it held the last ref) while our body is still alive,
+    // instead of being left pointing at memory we are about to free. Safe to call any
+    // time (no-op if the proxy isn't holding a body). SEH-guarded: the engine setter
+    // dereferences the cached body's vtable on replace.
+    void ClearPlayerProxySupportBody()
+    {
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player) return;
+        auto* actor = static_cast<RE::Actor*>(player);
+        auto* process = actor ? actor->currentProcess : nullptr;
+        auto* middleHigh = process ? process->middleHigh : nullptr;
+        if (!middleHigh) return;
+        RE::bhkCharacterController* charController = nullptr;
+        TryReadMiddleHighCharControllerImpl(middleHigh, charController);
+        if (!charController) return;
+        __try {
+            bhkCharacterController_SetSupportBody(charController, nullptr);
         }
-        
-        // Call hknpPairCollisionFilter::disableCollisionsBetween
-        // This disables collision between the two bodies without affecting other collisions
-        hknpPairCollisionFilter_disableCollisionsBetween(hknpWorld, bodyIdA, bodyIdB);
-        
-        spdlog::debug("[PHYSICS] Disabled collisions between body 0x{:08X} and 0x{:08X}", bodyIdA, bodyIdB);
+        __except(EXCEPTION_EXECUTE_HANDLER) {
+            spdlog::error("[PHYSICS] Exception in ClearPlayerProxySupportBody");
+        }
+    }
+
+    // =====================================================================
+    // HELD-OBJECT MASS / INERTIA (1:1 with ROCK GrabConstraint.cpp)
+    // =====================================================================
+    // hknpMotion packs 4x bfloat16 (int16) at motion+0x20: [0..2] = inverse
+    // inertia diagonal, [3] = inverse mass. ROCK reads mass from packed[3] and
+    // clamps the inverse-inertia ratio so long/thin held objects don't spin
+    // wildly under the grab motor, then rebuilds the solver's derived mass props.
+    namespace {
+        constexpr std::ptrdiff_t kMotionPackedInertiaOffset = 0x20;
+
+        inline float UnpackBfloat16(std::int16_t packed)
+        {
+            std::uint32_t bits = static_cast<std::uint32_t>(static_cast<std::uint16_t>(packed)) << 16;
+            float f; std::memcpy(&f, &bits, sizeof(f)); return f;
+        }
+        inline std::int16_t RepackBfloat16(float value)
+        {
+            std::int32_t raw; std::memcpy(&raw, &value, sizeof(raw));
+            std::int32_t s = raw >> 16;
+            if (s > 32767) s = 32767;
+            if (s < -32768) s = -32768;
+            return static_cast<std::int16_t>(s);
+        }
+
+        // hknpWorld::rebuildMotionMassProperties(hknpMotionId) — VR 0x1546570 (Ghidra).
+        using RebuildMotionMassProperties_t = void(*)(void* hknpWorld, std::uint32_t motionId);
+        REL::Relocation<RebuildMotionMassProperties_t> hknpWorld_rebuildMotionMassProperties{ REL::Offset(0x1546570) };
+
+        // hknpBody field offsets (Ghidra-verified against AccessBody/setBodyLinearVelocity):
+        // AccessBody returns bodies.data + bodyId*0x90; in that body the MOTION INDEX is at
+        // +0x68 (NOT the +0x04 in Offsets::hknpBody_motionId, which is wrong and is why mass
+        // reads returned 0). accessMotion(world, motionIndex) -> motions.data + idx*0x80.
+        constexpr std::ptrdiff_t kHknpBody_motionIndex = 0x68;
+        // hknpMotion velocity offsets (Ghidra): linearVelocity @ +0x40, angularVelocity @ +0x50.
+        constexpr std::ptrdiff_t kHknpMotion_linearVelocity = 0x40;
+        constexpr std::ptrdiff_t kHknpMotion_angularVelocity = 0x50;
+
+        // Resolve writable hknpMotion + world + motionId for a collision object. False if static/invalid.
+        inline bool ResolveMotion(RE::bhkNPCollisionObject* obj, void*& outWorld, void*& outMotion, std::uint32_t& outMotionId)
+        {
+            outWorld = outMotion = nullptr; outMotionId = 0xFFFFFFFFu;
+            if (!obj) return false;
+            void* body = heisenberg::bhkNPCollisionObject_AccessBody(obj);
+            if (!body) return false;
+            std::uint32_t motionId = *reinterpret_cast<std::uint32_t*>(
+                reinterpret_cast<std::uintptr_t>(body) + kHknpBody_motionIndex);
+            if (motionId == 0xFFFFFFFFu || motionId > 0x00FFFFFFu) return false;  // static
+            void* world = heisenberg::bhkNPCollisionObject_AccessWorld(obj);
+            if (!world) return false;
+            void* motion = heisenberg::hknpBSWorld_accessMotion(world, motionId);
+            if (!motion || reinterpret_cast<std::uintptr_t>(motion) < 0x10000) return false;
+            outWorld = world; outMotion = motion; outMotionId = motionId; return true;
+        }
+
+        // Leaf SEH wrapper — engine call may deref freed/invalid state.
+        bool SafeRebuildMotionMass(void* world, std::uint32_t motionId)
+        {
+            __try { hknpWorld_rebuildMotionMassProperties(world, motionId); return true; }
+            __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+        }
+    }
+
+    float GetHeldObjectMass(RE::bhkNPCollisionObject* obj)
+    {
+        void *world, *motion; std::uint32_t motionId;
+        if (!ResolveMotion(obj, world, motion, motionId)) {
+            spdlog::info("[PHYSICS] GetHeldObjectMass: ResolveMotion failed (obj={:p})", (void*)obj);
+            return 0.0f;
+        }
+        auto* packed = reinterpret_cast<std::int16_t*>(reinterpret_cast<char*>(motion) + kMotionPackedInertiaOffset);
+        float invMass = UnpackBfloat16(packed[3]);
+        // Diagnostic: dump the raw packed inverse inertia/mass so we can tell whether a
+        // "mass=0" held object is genuinely immovable (invMass~0) or a read/timing issue.
+        spdlog::info("[PHYSICS] GetHeldObjectMass: motion={} packed=[{},{},{},{}] invI=[{:.3e},{:.3e},{:.3e}] invMass={:.4e}",
+                     motionId, packed[0], packed[1], packed[2], packed[3],
+                     UnpackBfloat16(packed[0]), UnpackBfloat16(packed[1]), UnpackBfloat16(packed[2]), invMass);
+        if (!std::isfinite(invMass) || invMass <= 0.0001f) return 0.0f;
+        return 1.0f / invMass;
+    }
+
+    // Read the held object's current linear + angular velocity (HAVOK units) from its
+    // hknpMotion (linearVelocity @ +0x40, angularVelocity @ +0x50). False if unresolved.
+    bool GetHeldObjectVelocity(RE::bhkNPCollisionObject* obj, RE::NiPoint3& outLinearHavok, RE::NiPoint3& outAngularHavok)
+    {
+        void *world, *motion; std::uint32_t motionId;
+        if (!ResolveMotion(obj, world, motion, motionId)) return false;
+        const float* lin = reinterpret_cast<const float*>(reinterpret_cast<char*>(motion) + kHknpMotion_linearVelocity);
+        const float* ang = reinterpret_cast<const float*>(reinterpret_cast<char*>(motion) + kHknpMotion_angularVelocity);
+        outLinearHavok = { lin[0], lin[1], lin[2] };
+        outAngularHavok = { ang[0], ang[1], ang[2] };
+        return std::isfinite(outLinearHavok.x) && std::isfinite(outAngularHavok.x);
+    }
+
+    // Clamp the inverse-inertia ratio to maxRatio (ROCK default 10). Returns true + saved[3]
+    // if it modified anything (so EndGrab can restore). No-op return false if ratio already OK.
+    bool NormalizeHeldObjectInertia(RE::bhkNPCollisionObject* obj, float maxRatio, std::int16_t savedOut[3])
+    {
+        void *world, *motion; std::uint32_t motionId;
+        if (!ResolveMotion(obj, world, motion, motionId)) return false;
+        auto* packed = reinterpret_cast<std::int16_t*>(reinterpret_cast<char*>(motion) + kMotionPackedInertiaOffset);
+        savedOut[0] = packed[0]; savedOut[1] = packed[1]; savedOut[2] = packed[2];
+        if (packed[0] <= 0 || packed[1] <= 0 || packed[2] <= 0) return false;
+        float invI[3] = { UnpackBfloat16(packed[0]), UnpackBfloat16(packed[1]), UnpackBfloat16(packed[2]) };
+        if (invI[0] <= 0.0f || invI[1] <= 0.0f || invI[2] <= 0.0f) return false;
+        const float minI = (std::min)({ invI[0], invI[1], invI[2] });
+        const float maxI = (std::max)({ invI[0], invI[1], invI[2] });
+        if (minI <= 0.0f || maxRatio <= 1.0f || (maxI / minI) <= maxRatio) return false;  // no clamp needed
+        const float maxAllowed = minI * maxRatio;
+        for (int i = 0; i < 3; ++i) if (invI[i] > maxAllowed) invI[i] = maxAllowed;
+        packed[0] = RepackBfloat16(invI[0]); packed[1] = RepackBfloat16(invI[1]); packed[2] = RepackBfloat16(invI[2]);
+        if (!SafeRebuildMotionMass(world, motionId)) return false;
+        spdlog::debug("[PHYSICS] Normalized held-object inertia ratio {:.1f}x -> {:.1f}x (motion {})",
+                      maxI / minI, maxRatio, motionId);
+        return true;
+    }
+
+    void RestoreHeldObjectInertia(RE::bhkNPCollisionObject* obj, const std::int16_t saved[3])
+    {
+        void *world, *motion; std::uint32_t motionId;
+        if (!ResolveMotion(obj, world, motion, motionId)) return;
+        auto* packed = reinterpret_cast<std::int16_t*>(reinterpret_cast<char*>(motion) + kMotionPackedInertiaOffset);
+        packed[0] = saved[0]; packed[1] = saved[1]; packed[2] = saved[2];
+        SafeRebuildMotionMass(world, motionId);
     }
 
     std::uint32_t GetPlayerBodyId()
     {
-        // Get player character controller and extract body ID
         auto* player = RE::PlayerCharacter::GetSingleton();
         if (!player) {
-            spdlog::warn("[PHYSICS] GetPlayerBodyId: No player singleton");
+            spdlog::debug("[PHYSICS] GetPlayerBodyId: No player singleton");
             return INVALID_BODY_ID;
         }
-        
-        // Cast to Actor to access currentProcess member
+
         auto* actor = static_cast<RE::Actor*>(player);
-        if (!actor) {
-            spdlog::warn("[PHYSICS] GetPlayerBodyId: Cast to Actor failed");
-            return INVALID_BODY_ID;
+        auto* cell = player->GetParentCell();
+        auto* bhkWorld = cell ? heisenberg::TESObjectCell_GetbhkWorld(cell) : nullptr;
+        void* hknpWorld = bhkWorld ? GetHknpWorldFromBhk(bhkWorld) : nullptr;
+
+        std::uint32_t cachedBodyId = g_playerBodyId.load();
+        std::uint32_t cachedFilterInfo = 0;
+        if (hknpWorld && !IsInvalidBodyId(cachedBodyId) && TryReadBodyFilterInfo(hknpWorld, cachedBodyId, cachedFilterInfo)) {
+            return cachedBodyId;
         }
-        
-        // Access AIProcess -> middleHigh -> charController
-        auto* process = actor->currentProcess;
-        if (!process) {
-            spdlog::warn("[PHYSICS] GetPlayerBodyId: No currentProcess");
-            return INVALID_BODY_ID;
+        if (hknpWorld && !IsInvalidBodyId(cachedBodyId)) {
+            g_playerBodyId = INVALID_BODY_ID;
         }
-        
-        auto* middleHigh = process->middleHigh;
-        if (!middleHigh) {
-            spdlog::warn("[PHYSICS] GetPlayerBodyId: No middleHigh process data");
-            return INVALID_BODY_ID;
+
+        auto* process = actor ? actor->currentProcess : nullptr;
+        auto* middleHigh = process ? process->middleHigh : nullptr;
+        if (middleHigh && hknpWorld) {
+            // VR: middleHigh->charController is at +0x3E8, NOT CommonLibF4's +0x3E0
+            RE::bhkCharacterController* charController = nullptr;
+            TryReadMiddleHighCharControllerImpl(middleHigh, charController);
+
+            if (!charController) {
+                static auto lastLog = std::chrono::steady_clock::now();
+                auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::seconds>(now - lastLog).count() >= 2) {
+                    spdlog::warn("[PHYSICS] GetPlayerBodyId: charController is null (middleHigh={:p})", (void*)middleHigh);
+                    lastLog = now;
+                }
+            } else {
+                // Try reading body ID directly from hknpCharacterProxy at charController+0x470
+                // The proxy stores m_shapePhantomBodyId at +0x34
+                __try {
+                    uintptr_t ctrlAddr = reinterpret_cast<uintptr_t>(charController);
+                    void* proxy = *reinterpret_cast<void**>(ctrlAddr + 0x470);
+                    if (proxy) {
+                        std::uint32_t proxyBodyId = *reinterpret_cast<std::uint32_t*>(
+                            reinterpret_cast<uintptr_t>(proxy) + 0x34);
+                        if (proxyBodyId != 0x7FFFFFFF && proxyBodyId != 0xFFFFFFFF && proxyBodyId != 0) {
+                            g_playerBodyId = proxyBodyId;
+                            spdlog::info("[PHYSICS] GetPlayerBodyId: Resolved via proxy body ID: 0x{:08X}", proxyBodyId);
+                            return proxyBodyId;
+                        }
+                    }
+                }
+                __except(EXCEPTION_EXECUTE_HANDLER) {}
+
+                // Fallback: try the complex resolution path
+                std::uint32_t controllerBodyId = INVALID_BODY_ID;
+                if (TryGetCharacterControllerBodyId(charController, hknpWorld, controllerBodyId)) {
+                    g_playerBodyId = controllerBodyId;
+                    spdlog::info("[PHYSICS] GetPlayerBodyId: Resolved via charController: 0x{:08X}", controllerBodyId);
+                    return controllerBodyId;
+                } else {
+                    static auto lastLog2 = std::chrono::steady_clock::now();
+                    auto now2 = std::chrono::steady_clock::now();
+                    if (std::chrono::duration_cast<std::chrono::seconds>(now2 - lastLog2).count() >= 2) {
+                        spdlog::warn("[PHYSICS] GetPlayerBodyId: charController found at {:p} but body ID resolution failed", (void*)charController);
+                        lastLog2 = now2;
+                    }
+                }
+            }
         }
-        
-        auto* charController = middleHigh->charController.get();
-        if (!charController) {
-            spdlog::warn("[PHYSICS] GetPlayerBodyId: No character controller");
-            return INVALID_BODY_ID;
+
+        if (bhkWorld && hknpWorld) {
+            std::uint32_t proxyManagerBodyId = INVALID_BODY_ID;
+            if (TryFindPlayerBodyViaProxyManager(bhkWorld, hknpWorld, proxyManagerBodyId)) {
+                g_playerBodyId = proxyManagerBodyId;
+                spdlog::info("[PHYSICS] GetPlayerBodyId: Found player body via proxy manager: 0x{:08X}", proxyManagerBodyId);
+                return proxyManagerBodyId;
+            }
+
+            std::uint32_t altBodyId = INVALID_BODY_ID;
+            if (TryFindPlayerBodyAlternative(bhkWorld, hknpWorld, altBodyId)) {
+                g_playerBodyId = altBodyId;
+                spdlog::info("[PHYSICS] GetPlayerBodyId: Found player body via NiNode search: 0x{:08X}", altBodyId);
+                return altBodyId;
+            }
         }
-        
-        // bhkCharacterController has GetBodyIdImpl virtual function
-        // But it's easier to get it from the collision object system
-        // The character controller IS a bhkNPCollisionObject
-        
-        // Character controller inherits from bhkNPCollisionObject
-        // It has spSystem (physics system) and systemBodyIdx
-        if (!charController->spSystem) {
-            spdlog::warn("[PHYSICS] GetPlayerBodyId: No physics system on character controller");
-            return INVALID_BODY_ID;
+
+        static auto lastLog = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - lastLog).count() >= 1) {
+            spdlog::debug("[PHYSICS] GetPlayerBodyId: No character controller and no alternative player body found yet");
+            lastLog = now;
         }
-        
-        std::uint32_t systemIdx = charController->systemBodyIdx;
-        void* physicsSystem = charController->spSystem.get();
-        
-        // Get body ID from physics system using the same method as HeldBodyGrab
-        std::uint32_t bodyId = INVALID_BODY_ID;
-        
-        // Use ConstraintFunctions::BhkPhysicsSystemGetBodyId if available
-        // For now, just use the system index directly (it usually maps 1:1)
-        // The actual body ID is stored in the physics system's body array
-        
-        // Simple approach: systemBodyIdx is often the body ID for single-body systems
-        bodyId = systemIdx;
-        
-        // TODO: Use proper BhkPhysicsSystemGetBodyId when constraint functions are available
-        
-        spdlog::debug("[PHYSICS] GetPlayerBodyId: systemIdx={}, bodyId=0x{:08X}", systemIdx, bodyId);
-        return bodyId;
+        return INVALID_BODY_ID;
     }
     
     // ==================================================================================
@@ -1734,13 +2001,550 @@ namespace heisenberg::Physics
     namespace hknpWorld_Offsets {
         constexpr std::ptrdiff_t bodyBuffer = 0x20;
     }
-    
-    // Saved original player collision filter info for restoration
-    // Thread safety: accessed from physics thread and main thread
-    static std::atomic<std::uint32_t> g_savedPlayerCollisionFilterInfo{0};
-    static std::atomic<bool> g_playerCollisionModified{false};
-    static std::atomic<std::uint32_t> g_playerBodyId{0xFFFFFFFF};  // Cached player body ID
 
+    constexpr std::size_t MIDDLEHIGHPROCESS_CHARCONTROLLER_OFFSET = 0x3E8;  // VR: +8 byte shift from flat FO4
+    constexpr std::size_t BHKWORLD_CHARPROXYMANAGER_OFFSET = 0x68;
+    constexpr std::size_t BHKCHARPROXYMANAGER_PROXYCONTROLLERS_OFFSET = 0x10;
+    constexpr std::size_t BHKCHARACTERCONTROLLER_USERDATA_OFFSET = 0x3E0;
+
+    struct BSTPointerArrayView
+    {
+        void* data = nullptr;
+        std::uint32_t capacity = 0;
+        std::uint32_t pad0 = 0;
+        std::uint32_t size = 0;
+        std::uint32_t pad1 = 0;
+    };
+    static_assert(sizeof(BSTPointerArrayView) == 0x18);
+
+    bool TryReadBodyFilterInfo(void* hknpWorld, std::uint32_t bodyId, std::uint32_t& outFilterInfo)
+    {
+        if (!hknpWorld || IsInvalidBodyId(bodyId)) {
+            return false;
+        }
+
+        const std::uint32_t bodyIndex = GetBodyBufferIndex(bodyId);
+        if (!IsReasonableBodyIndex(bodyIndex)) {
+            return false;
+        }
+
+        __try {
+            void* bodyBuffer = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(hknpWorld) + hknpWorld_Offsets::bodyBuffer);
+            if (!bodyBuffer) {
+                return false;
+            }
+
+            void* bodyPtr = reinterpret_cast<void*>(
+                reinterpret_cast<uintptr_t>(bodyBuffer) + static_cast<uintptr_t>(bodyIndex) * hknpBody_Offsets::stride
+            );
+            outFilterInfo = *reinterpret_cast<std::uint32_t*>(
+                reinterpret_cast<uintptr_t>(bodyPtr) + hknpBody_Offsets::collisionFilterInfo
+            );
+            return true;
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
+
+    // ROCK-style filter-info write. ROCK ORs bit 14 (kSuppressionNoCollideBit = 0x4000) into
+    // the body's collisionFilterInfo when suppressing collision for a held/grabbed body —
+    // the engine's collision filter rejects pairs with this bit set, including against the
+    // player character proxy. This is much more reliable than the pair-filter disable
+    // (which depends on resolving the volatile player body id every frame).
+    //
+    // NOTE: this writes the filter info field directly. Some engine paths re-derive collision
+    // pairs lazily, so the filter takes effect on the next broadphase iteration.
+    bool TryWriteBodyFilterInfo(void* hknpWorld, std::uint32_t bodyId, std::uint32_t filterInfo)
+    {
+        if (!hknpWorld || IsInvalidBodyId(bodyId)) {
+            return false;
+        }
+        const std::uint32_t bodyIndex = GetBodyBufferIndex(bodyId);
+        if (!IsReasonableBodyIndex(bodyIndex)) {
+            return false;
+        }
+
+        __try {
+            void* bodyBuffer = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(hknpWorld) + hknpWorld_Offsets::bodyBuffer);
+            if (!bodyBuffer) {
+                return false;
+            }
+            void* bodyPtr = reinterpret_cast<void*>(
+                reinterpret_cast<uintptr_t>(bodyBuffer) + static_cast<uintptr_t>(bodyIndex) * hknpBody_Offsets::stride
+            );
+            *reinterpret_cast<std::uint32_t*>(
+                reinterpret_cast<uintptr_t>(bodyPtr) + hknpBody_Offsets::collisionFilterInfo
+            ) = filterInfo;
+            return true;
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
+
+    constexpr std::uint32_t kSuppressionNoCollideBit = 1u << 14;  // ROCK match: 0x4000
+
+    bool SetBodyNoCollideBit(void* hknpWorld, std::uint32_t bodyId, bool enable, std::uint32_t* outOriginalFilter)
+    {
+        std::uint32_t cur = 0;
+        if (!TryReadBodyFilterInfo(hknpWorld, bodyId, cur)) return false;
+        if (outOriginalFilter) *outOriginalFilter = cur;
+        const std::uint32_t next = enable ? (cur | kSuppressionNoCollideBit) : (cur & ~kSuppressionNoCollideBit);
+        if (next == cur) return true;
+        return TryWriteBodyFilterInfo(hknpWorld, bodyId, next);
+    }
+
+    bool TryReadCharacterControllerSystemBodyIdxImpl(RE::bhkCharacterController* charController, std::uint32_t& outBodyId)
+    {
+        if (!charController) {
+            return false;
+        }
+
+        __try {
+            // Try multiple offsets to find systemBodyIdx
+            uintptr_t addr = reinterpret_cast<uintptr_t>(charController);
+
+            // Attempt 1: charController IS the base, systemBodyIdx at +0x28
+            std::uint32_t val1 = *reinterpret_cast<std::uint32_t*>(addr + 0x28);
+            // Attempt 2: charController is subobject at base+0x10, so base+0x28 = addr+0x18
+            std::uint32_t val2 = *reinterpret_cast<std::uint32_t*>(addr + 0x18);
+            // Attempt 3: CommonLibF4 systemBodyIdx offset on bhkNPCollisionObject
+            std::uint32_t val3 = charController->systemBodyIdx;
+
+            // Attempt 4: Read from hknpCharacterProxy at charController+0x470 (adjusted for subobject)
+            // The proxy has m_shapePhantomBodyId at offset +0x34
+            void* proxy = *reinterpret_cast<void**>(addr + 0x470);
+            std::uint32_t val4 = 0x7FFFFFFF;
+            if (proxy) {
+                val4 = *reinterpret_cast<std::uint32_t*>(reinterpret_cast<uintptr_t>(proxy) + 0x34);
+            }
+
+            static auto lastDiagLog = std::chrono::steady_clock::now();
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - lastDiagLog).count() >= 3) {
+                spdlog::info("[PHYSICS] systemBodyIdx diagnostic: addr={:p}, +0x28=0x{:08X}, +0x18=0x{:08X}, CommonLib=0x{:08X}, proxy={:p}, proxy+0x34=0x{:08X}",
+                             (void*)addr, val1, val2, val3, proxy, val4);
+                lastDiagLog = now;
+            }
+
+            // Try proxy body ID first — it's the most reliable for the character capsule.
+            // hknp body IDs have generation bits in upper bytes; pass full value to Havok.
+            if (val4 != 0x7FFFFFFF && val4 != 0xFFFFFFFF && val4 != 0) {
+                outBodyId = val4;
+                return true;
+            }
+            // Fallback: direct offset reads (may be 0 for proxy controllers)
+            if (val1 != 0x7FFFFFFF && val1 != 0xFFFFFFFF && val1 != 0 && IsReasonableBodyIndex(val1)) { outBodyId = val1; return true; }
+            if (val3 != 0x7FFFFFFF && val3 != 0xFFFFFFFF && val3 != 0 && IsReasonableBodyIndex(val3)) { outBodyId = val3; return true; }
+            return false;
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
+
+    bool TryReadMiddleHighCharControllerImpl(void* middleHigh, RE::bhkCharacterController*& outController)
+    {
+        outController = nullptr;
+        if (!middleHigh) {
+            return false;
+        }
+
+        __try {
+            void* rawPtr = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(middleHigh) + MIDDLEHIGHPROCESS_CHARCONTROLLER_OFFSET);
+            outController = reinterpret_cast<RE::bhkCharacterController*>(rawPtr);
+            return outController != nullptr;
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER) {
+            outController = nullptr;
+            return false;
+        }
+    }
+
+    bool TryReadCharacterControllerPhysicsSystemImpl(RE::bhkCharacterController* charController, void*& outPhysicsSystem)
+    {
+        outPhysicsSystem = nullptr;
+        if (!charController) {
+            return false;
+        }
+
+        __try {
+            outPhysicsSystem = charController->spSystem.get();
+            return outPhysicsSystem != nullptr;
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER) {
+            outPhysicsSystem = nullptr;
+            return false;
+        }
+    }
+
+    bool TryReadCharacterControllerBodyIdVirtualImpl(RE::bhkCharacterController* charController, std::uint32_t& outBodyId)
+    {
+        outBodyId = INVALID_BODY_ID;
+        if (!charController) {
+            return false;
+        }
+
+        __try {
+            using GetBodyIdImpl_t = std::uint32_t(__fastcall*)(const RE::bhkCharacterController*);
+            auto** vtable = *reinterpret_cast<GetBodyIdImpl_t***>(charController);
+            if (!vtable || !(*vtable)) {
+                return false;
+            }
+
+            // VR: vtable slot is 0x43 (+2 from flat FO4's 0x41)
+            // Also: charController is the subobject at base+0x10, so the vtable
+            // here is bhkCharacterController's vtable, which should have GetBodyIdImpl.
+            // BUT if this vtable doesn't have it at 0x43, use the base object instead.
+            constexpr std::size_t kGetBodyIdImplVtableSlot = 0x43;
+
+            // Try the subobject vtable first
+            GetBodyIdImpl_t getBodyIdImpl = reinterpret_cast<GetBodyIdImpl_t>(
+                reinterpret_cast<void**>(*reinterpret_cast<uintptr_t*>(charController))[kGetBodyIdImplVtableSlot]);
+            if (!getBodyIdImpl) {
+                return false;
+            }
+
+            outBodyId = getBodyIdImpl(charController);
+            return !IsInvalidBodyId(outBodyId);
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER) {
+            outBodyId = INVALID_BODY_ID;
+            return false;
+        }
+    }
+
+    bool TryReadPhysicsSystemBodyIdImpl(void* physicsSystem, std::uint32_t systemBodyIdx, std::uint32_t& outBodyId)
+    {
+        outBodyId = INVALID_BODY_ID;
+        if (!physicsSystem || IsInvalidBodyId(systemBodyIdx)) {
+            return false;
+        }
+
+        __try {
+            ConstraintFunctions::BhkPhysicsSystemGetBodyId(physicsSystem, &outBodyId, systemBodyIdx);
+            return !IsInvalidBodyId(outBodyId);
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER) {
+            outBodyId = INVALID_BODY_ID;
+            return false;
+        }
+    }
+
+    RE::bhkNPCollisionObject* TryResolveProxyTargetCollisionObject(RE::NiCollisionObject* collisionObject)
+    {
+        if (!collisionObject) {
+            return nullptr;
+        }
+
+        __try {
+            uintptr_t proxyAddr = reinterpret_cast<uintptr_t>(collisionObject);
+            constexpr std::ptrdiff_t kProxyTargetOffsets[] = { 0x20, 0x28, 0x30 };
+            for (std::ptrdiff_t offset : kProxyTargetOffsets) {
+                auto* target = *reinterpret_cast<RE::bhkNPCollisionObject**>(proxyAddr + offset);
+                if (target) {
+                    return target;
+                }
+            }
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER) {
+            return nullptr;
+        }
+
+        return nullptr;
+    }
+
+    RE::bhkNPCollisionObject* TryResolveNpcCollisionObjectImpl(RE::NiCollisionObject* collisionObject)
+    {
+        if (!collisionObject) {
+            return nullptr;
+        }
+
+        __try {
+            auto* rtti = collisionObject->GetRTTI();
+            const char* typeName = (rtti && rtti->GetName()) ? rtti->GetName() : nullptr;
+            if (!typeName) {
+                return nullptr;
+            }
+
+            if (std::strcmp(typeName, "bhkNPCollisionProxyObject") == 0) {
+                return TryResolveProxyTargetCollisionObject(collisionObject);
+            }
+
+            if (std::strcmp(typeName, "bhkNPCollisionObject") == 0) {
+                return reinterpret_cast<RE::bhkNPCollisionObject*>(collisionObject);
+            }
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER) {
+            return nullptr;
+        }
+
+        return nullptr;
+    }
+
+    bool TryResolveCollisionObjectBodyIdImpl(RE::NiCollisionObject* collisionObject, std::uint32_t& outBodyId)
+    {
+        outBodyId = INVALID_BODY_ID;
+
+        RE::bhkNPCollisionObject* npcCollisionObject = TryResolveNpcCollisionObjectImpl(collisionObject);
+        if (!npcCollisionObject) {
+            return false;
+        }
+
+        std::uint32_t systemBodyIdx = INVALID_BODY_ID;
+        void* physicsSystem = nullptr;
+        __try {
+            systemBodyIdx = npcCollisionObject->systemBodyIdx;
+            physicsSystem = npcCollisionObject->spSystem ? npcCollisionObject->spSystem.get() : nullptr;
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+
+        if (TryReadPhysicsSystemBodyIdImpl(physicsSystem, systemBodyIdx, outBodyId)) {
+            return true;
+        }
+
+        if (!IsInvalidBodyId(systemBodyIdx) && IsReasonableBodyIndex(systemBodyIdx)) {
+            outBodyId = systemBodyIdx;
+            return true;
+        }
+
+        return false;
+    }
+
+    bool TryReadCharacterControllerOwnerDataImpl(RE::bhkCharacterController* controller, void*& outOwnerData)
+    {
+        if (!controller) {
+            return false;
+        }
+
+        __try {
+            outOwnerData = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(controller) + BHKCHARACTERCONTROLLER_USERDATA_OFFSET);
+            return true;
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER) {
+            outOwnerData = nullptr;
+            return false;
+        }
+    }
+
+    bool TryReadCharacterControllerPositionImpl(RE::bhkCharacterController* controller, RE::hkVector4f& outPosition)
+    {
+        if (!controller) {
+            return false;
+        }
+
+        __try {
+            controller->GetPositionImpl(outPosition, false);
+            return true;
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
+
+    bool TryGetCharacterControllerBodyId(RE::bhkCharacterController* charController, void* hknpWorld, std::uint32_t& outBodyId)
+    {
+        if (!charController || !hknpWorld) {
+            return false;
+        }
+
+        std::uint32_t rawSystemBodyIdx = INVALID_BODY_ID;
+        TryReadCharacterControllerSystemBodyIdxImpl(charController, rawSystemBodyIdx);
+
+        const std::uint32_t systemBodyIdx = NormalizeShiftedBodyIdCandidate(rawSystemBodyIdx);
+        if (!IsInvalidBodyId(rawSystemBodyIdx) && systemBodyIdx != rawSystemBodyIdx) {
+            spdlog::debug("[PHYSICS] TryGetCharacterControllerBodyId: normalized shifted systemBodyIdx 0x{:08X} -> 0x{:08X}",
+                          rawSystemBodyIdx,
+                          systemBodyIdx);
+        }
+
+        void* physicsSystem = nullptr;
+        TryReadCharacterControllerPhysicsSystemImpl(charController, physicsSystem);
+
+        struct BodyCandidate
+        {
+            const char* source;
+            std::uint32_t bodyId;
+        };
+
+        BodyCandidate candidates[3] = {
+            { "GetBodyIdImpl", INVALID_BODY_ID },
+            { "physicsSystem", INVALID_BODY_ID },
+            { "systemBodyIdx", INVALID_BODY_ID }
+        };
+
+        TryReadCharacterControllerBodyIdVirtualImpl(charController, candidates[0].bodyId);
+        if (physicsSystem) {
+            TryReadPhysicsSystemBodyIdImpl(physicsSystem, systemBodyIdx, candidates[1].bodyId);
+        }
+        if (!IsInvalidBodyId(systemBodyIdx)) {
+            candidates[2].bodyId = systemBodyIdx;
+        }
+
+        auto tryCandidate = [&](int candidateIndex) {
+            const BodyCandidate& candidate = candidates[candidateIndex];
+            if (IsInvalidBodyId(candidate.bodyId)) {
+                return false;
+            }
+
+            for (int previousIndex = 0; previousIndex < candidateIndex; ++previousIndex) {
+                if (candidates[previousIndex].bodyId == candidate.bodyId) {
+                    return false;
+                }
+            }
+
+            const std::uint32_t bodyIndex = GetBodyBufferIndex(candidate.bodyId);
+            if (!IsReasonableBodyIndex(bodyIndex)) {
+                spdlog::debug("[PHYSICS] TryGetCharacterControllerBodyId: rejecting {} candidate 0x{:08X} (index 0x{:06X})",
+                              candidate.source,
+                              candidate.bodyId,
+                              bodyIndex);
+                return false;
+            }
+
+            std::uint32_t filterInfo = 0;
+            if (!TryReadBodyFilterInfo(hknpWorld, candidate.bodyId, filterInfo)) {
+                spdlog::debug("[PHYSICS] TryGetCharacterControllerBodyId: failed to read filter info for {} candidate 0x{:08X} (systemBodyIdx=0x{:08X})",
+                              candidate.source,
+                              candidate.bodyId,
+                              systemBodyIdx);
+                return false;
+            }
+
+            const std::uint32_t layer = filterInfo & 0x7F;
+            if (layer != 31) {
+                spdlog::debug("[PHYSICS] TryGetCharacterControllerBodyId: rejecting {} candidate 0x{:08X} (systemBodyIdx=0x{:08X}, layer={})",
+                              candidate.source,
+                              candidate.bodyId,
+                              systemBodyIdx,
+                              layer);
+                return false;
+            }
+
+            outBodyId = candidate.bodyId;
+            spdlog::debug("[PHYSICS] TryGetCharacterControllerBodyId: resolved player controller body 0x{:08X} via {} (systemBodyIdx=0x{:08X})",
+                          candidate.bodyId,
+                          candidate.source,
+                          systemBodyIdx);
+            return true;
+        };
+
+        for (int candidateIndex = 0; candidateIndex < 3; ++candidateIndex) {
+            if (tryCandidate(candidateIndex)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool TryFindPlayerBodyViaProxyManager(RE::bhkWorld* bhkWorld, void* hknpWorld, std::uint32_t& outBodyId)
+    {
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player || !bhkWorld || !hknpWorld) {
+            return false;
+        }
+
+        constexpr float kMaxPlayerProxyDistanceHavok = 32.0f;
+
+        WorldReadLock worldLock(bhkWorld);
+
+        auto* controllersView = reinterpret_cast<const BSTPointerArrayView*>(
+            reinterpret_cast<uintptr_t>(bhkWorld) + BHKWORLD_CHARPROXYMANAGER_OFFSET + BHKCHARPROXYMANAGER_PROXYCONTROLLERS_OFFSET);
+        if (!controllersView) {
+            return false;
+        }
+
+        auto* controllers = reinterpret_cast<RE::bhkCharacterController**>(controllersView->data);
+        const std::uint32_t controllerCount = controllersView->size;
+        if (!controllers || controllerCount == 0 || controllerCount > 256) {
+            return false;
+        }
+
+        const RE::NiPoint3 playerPos = player->GetPosition();
+        const RE::hkVector4f playerPosHavok(
+            playerPos.x * HAVOK_WORLD_SCALE,
+            playerPos.y * HAVOK_WORLD_SCALE,
+            playerPos.z * HAVOK_WORLD_SCALE,
+            0.0f);
+
+        std::uint32_t bestBodyId = INVALID_BODY_ID;
+        float bestScore = (std::numeric_limits<float>::max)();
+        std::uint32_t bestLayer = 0xFF;
+        bool bestOwnerMatch = false;
+
+        for (std::uint32_t i = 0; i < controllerCount; ++i) {
+            auto* controller = controllers[i];
+            if (!controller) {
+                continue;
+            }
+
+            std::uint32_t candidateBodyId = INVALID_BODY_ID;
+            if (!TryGetCharacterControllerBodyId(controller, hknpWorld, candidateBodyId)) {
+                continue;
+            }
+
+            if (!IsReasonableBodyIndex(GetBodyBufferIndex(candidateBodyId))) {
+                continue;
+            }
+
+            std::uint32_t filterInfo = 0;
+            const bool hasFilterInfo = TryReadBodyFilterInfo(hknpWorld, candidateBodyId, filterInfo);
+            if (!hasFilterInfo) {
+                continue;
+            }
+
+            void* ownerData = nullptr;
+            TryReadCharacterControllerOwnerDataImpl(controller, ownerData);
+
+            RE::hkVector4f controllerPos;
+            const bool positionValid = TryReadCharacterControllerPositionImpl(controller, controllerPos);
+            if (!positionValid) {
+                continue;
+            }
+
+            const float dx = controllerPos.x - playerPosHavok.x;
+            const float dy = controllerPos.y - playerPosHavok.y;
+            const float dz = controllerPos.z - playerPosHavok.z;
+            float score = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (score > kMaxPlayerProxyDistanceHavok) {
+                continue;
+            }
+
+            const bool ownerMatch = ownerData == player;
+            const std::uint32_t layer = filterInfo & 0x7F;
+            if (layer != 31) {
+                continue;
+            }
+            if (!ownerMatch) {
+                score += 5.0f;
+            }
+
+            if (score < bestScore) {
+                bestScore = score;
+                bestBodyId = candidateBodyId;
+                bestLayer = layer;
+                bestOwnerMatch = ownerMatch;
+            }
+        }
+
+        if (IsInvalidBodyId(bestBodyId)) {
+            return false;
+        }
+
+        outBodyId = bestBodyId;
+        spdlog::info(
+            "[PHYSICS] Proxy manager candidate body=0x{:08X} ownerMatch={} layer={} score={:.2f}",
+            bestBodyId,
+            bestOwnerMatch,
+            bestLayer,
+            bestScore);
+        return true;
+    }
+    
     // Alternative: Try to find player body through NiNode collision object
     bool TryFindPlayerBodyAlternative(void* bhkWorld, void* hknpWorld, std::uint32_t& outBodyId)
     {
@@ -1760,30 +2564,51 @@ namespace heisenberg::Physics
             return false;
         }
 
-        // Log what we find
-        spdlog::info("[PHYSICS] Searching for player collision body...");
-        spdlog::info("[PHYSICS]   Root node: {} @ {:x}", rootNode->name.c_str(), reinterpret_cast<uintptr_t>(rootNode));
+        static auto lastSearchLog = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+        auto searchLogNow = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(searchLogNow - lastSearchLog).count() >= 1) {
+            spdlog::debug("[PHYSICS] Searching for player collision body...");
+            spdlog::debug("[PHYSICS]   Root node: {} @ {:x}", rootNode->name.c_str(), reinterpret_cast<uintptr_t>(rootNode));
+            lastSearchLog = searchLogNow;
+        }
 
-        // Check if root node has collision object
-        if (rootNode->collisionObject.get()) {
-            auto* collObj = rootNode->collisionObject.get();
-            spdlog::info("[PHYSICS]   Found collision object @ {:x}", reinterpret_cast<uintptr_t>(collObj));
-            
-            // Try to get body ID from bhkNPCollisionObject
-            // In F4VR, bhkNPCollisionObject has systemBodyIdx at offset 0x28
-            std::uint32_t bodyIdx = *reinterpret_cast<std::uint32_t*>(reinterpret_cast<uintptr_t>(collObj) + 0x28);
-            spdlog::info("[PHYSICS]   Body index from collision object: {}", bodyIdx);
-            
-            if (bodyIdx != 0xFFFFFFFF && bodyIdx < 0x10000) {  // Sanity check
-                outBodyId = bodyIdx;
-                return true;
+        auto tryCollisionNode = [&](RE::NiAVObject* collisionNode) {
+            if (!collisionNode || !collisionNode->collisionObject) {
+                return false;
             }
+
+            std::uint32_t candidateBodyId = INVALID_BODY_ID;
+            if (!TryResolveCollisionObjectBodyIdImpl(collisionNode->collisionObject.get(), candidateBodyId)) {
+                return false;
+            }
+
+            std::uint32_t filterInfo = 0;
+            if (!TryReadBodyFilterInfo(hknpWorld, candidateBodyId, filterInfo)) {
+                return false;
+            }
+
+            const std::uint32_t layer = filterInfo & 0x7F;
+            spdlog::debug("[PHYSICS]   Collision candidate on '{}': body=0x{:08X}, layer={}",
+                          collisionNode->name.c_str(),
+                          candidateBodyId,
+                          layer);
+
+            if (layer != 31) {
+                return false;
+            }
+
+            outBodyId = candidateBodyId;
+            return true;
+        };
+
+        if (tryCollisionNode(rootNode)) {
+            return true;
         }
 
         // Try searching child nodes for collision
         // Uses index-based loop (not range-based) for SEH compatibility
         std::function<bool(RE::NiNode*, int)> searchNode = [&](RE::NiNode* node, int depth) -> bool {
-            if (depth > 3) return false;  // Limit depth
+            if (depth > 12) return false;  // Limit depth
 
             auto& children = node->children;
             uint32_t childCount = children.size();
@@ -1793,47 +2618,8 @@ namespace heisenberg::Physics
                 auto* childPtr = children[ci].get();
                 if (!childPtr) continue;
 
-                auto* collObjNi = childPtr->collisionObject.get();
-                if (collObjNi) {
-                    // SEH-protect raw memory reads on collision object
-                    std::uint32_t bodyIdx = 0xFFFFFFFF;
-                    bool readOk = false;
-                    __try {
-                        bodyIdx = *reinterpret_cast<std::uint32_t*>(reinterpret_cast<uintptr_t>(collObjNi) + 0x28);
-                        readOk = true;
-                    } __except(EXCEPTION_EXECUTE_HANDLER) {
-                        continue;  // Collision object was freed, skip
-                    }
-
-                    if (!readOk) continue;
-
-                    spdlog::info("[PHYSICS]   Found collision on '{}': bodyIdx={}",
-                        childPtr->name.c_str(), bodyIdx);
-
-                    if (bodyIdx != 0xFFFFFFFF && bodyIdx < 0x10000) {
-                        // SEH-protect body buffer reads
-                        std::uint32_t layer = 0xFF;
-                        __try {
-                            void* bodyBuffer = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(hknpWorld) + hknpWorld_Offsets::bodyBuffer);
-                            void* bodyPtr = reinterpret_cast<void*>(
-                                reinterpret_cast<uintptr_t>(bodyBuffer) + static_cast<uintptr_t>(bodyIdx) * hknpBody_Offsets::stride
-                            );
-                            std::uint32_t filterInfo = *reinterpret_cast<std::uint32_t*>(
-                                reinterpret_cast<uintptr_t>(bodyPtr) + hknpBody_Offsets::collisionFilterInfo
-                            );
-                            layer = filterInfo & 0x7F;
-                        } __except(EXCEPTION_EXECUTE_HANDLER) {
-                            continue;  // Body buffer stale, skip
-                        }
-
-                        spdlog::info("[PHYSICS]     layer={}", layer);
-
-                        // Layer 31 = kCharController in F4
-                        if (layer == 31) {
-                            outBodyId = bodyIdx;
-                            return true;
-                        }
-                    }
+                if (tryCollisionNode(childPtr)) {
+                    return true;
                 }
 
                 RE::NiNode* childNode = childPtr->IsNode();
@@ -1848,7 +2634,12 @@ namespace heisenberg::Physics
             return true;
         }
 
-        spdlog::warn("[PHYSICS] Could not find player body via NiNode search");
+        static auto lastLog = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - lastLog).count() >= 1) {
+            spdlog::warn("[PHYSICS] Could not find player body via NiNode search");
+            lastLog = now;
+        }
         return false;
     }
 
@@ -1884,50 +2675,18 @@ namespace heisenberg::Physics
             return false;
         }
         
-        // Try to get body ID - first via charController, then via NiNode search
-        std::uint32_t bodyId = 0xFFFFFFFF;
-        
-        // PRIMARY APPROACH: Via AIProcess -> middleHigh -> charController
-        auto* actor = static_cast<RE::Actor*>(player);
-        if (actor && actor->currentProcess && actor->currentProcess->middleHigh) {
-            auto* charController = actor->currentProcess->middleHigh->charController.get();
-            if (charController && charController->spSystem) {
-                bodyId = charController->systemBodyIdx;
-                spdlog::debug("[PHYSICS] Got player bodyId via charController: {}", bodyId);
+        std::uint32_t bodyId = GetPlayerBodyId();
+        if (IsInvalidBodyId(bodyId)) {
+            static auto lastLog = std::chrono::steady_clock::now();
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - lastLog).count() >= 5) {
+                spdlog::warn("[PHYSICS] SetPlayerCollisionEnabled: could not resolve player body via controller, proxy manager, or 3D scan");
+                lastLog = now;
             }
+            return false;
         }
         
-        // FALLBACK: Try NiNode collision search (only if we don't have a cached ID)
-        if (bodyId == 0xFFFFFFFF) {
-            // Check if we already found it before
-            if (g_playerBodyId != 0xFFFFFFFF) {
-                bodyId = g_playerBodyId;
-                spdlog::debug("[PHYSICS] Using cached player bodyId: {}", bodyId);
-            } else {
-                // Try the alternative search
-                static bool searchAttempted = false;
-                if (!searchAttempted) {
-                    searchAttempted = true;  // Only try once
-                    if (TryFindPlayerBodyAlternative(bhkWorld, hknpWorld, bodyId)) {
-                        g_playerBodyId = bodyId;  // Cache it
-                        spdlog::info("[PHYSICS] Found player body via NiNode search: bodyId={}", bodyId);
-                    } else {
-                        static auto lastLog = std::chrono::steady_clock::now();
-                        auto now = std::chrono::steady_clock::now();
-                        if (std::chrono::duration_cast<std::chrono::seconds>(now - lastLog).count() >= 5) {
-                            spdlog::warn("[PHYSICS] SetPlayerCollisionEnabled: could not find player body via any method");
-                            lastLog = now;
-                        }
-                        return false;
-                    }
-                } else {
-                    // Already tried and failed
-                    return false;
-                }
-            }
-        }
-        
-        if (bodyId == 0xFFFFFFFF) {
+        if (IsInvalidBodyId(bodyId)) {
             return false;
         }
         
@@ -1944,8 +2703,19 @@ namespace heisenberg::Physics
             return false;
         }
         
+        // Mask the bodyId index out of its packed Havok handle.
+        // Havok 2014 hknpBodyId encodes <generation:upper><index:lower 16>;
+        // multiplying the unmasked 32-bit value by stride dereferences gigabytes
+        // past the body buffer (crash on read at +0x44). Same mask the rest of
+        // the codebase uses (HandCollision.cpp / Physics.cpp:143).
+        std::uint32_t bodyIndex = GetBodyBufferIndex(bodyId);
+        if (!IsReasonableBodyIndex(bodyIndex)) {
+            spdlog::warn("[PHYSICS] SetPlayerCollisionEnabled: unreasonable bodyIndex {} (raw 0x{:08X})",
+                         bodyIndex, bodyId);
+            return false;
+        }
         void* bodyPtr = reinterpret_cast<void*>(
-            reinterpret_cast<uintptr_t>(bodyBuffer) + static_cast<uintptr_t>(bodyId) * hknpBody_Offsets::stride
+            reinterpret_cast<uintptr_t>(bodyBuffer) + static_cast<uintptr_t>(bodyIndex) * hknpBody_Offsets::stride
         );
         
         // Access collisionFilterInfo at offset 0x44
@@ -1984,5 +2754,64 @@ namespace heisenberg::Physics
     bool IsPlayerCollisionDisabled()
     {
         return g_playerCollisionModified;
+    }
+
+    bool DisableCollisionBetween(void* hknpWorld, std::uint32_t bodyIdA, std::uint32_t bodyIdB)
+    {
+        // DEAD PATH: hknpPairCollisionFilter::disableCollisionsBetween (0x196de70)
+        // FAULTS on every call on F4VR 1.2.72 — it is the wrong mechanism for this
+        // build (it produced ~50 SEH exceptions at load with zero effect, one per
+        // hand/body/weapon collider). Collider-vs-player exclusion is handled by the
+        // layer-43 / 0x000B002B filter approach, and the char-proxy dangling-body
+        // crash by ClearPlayerProxySupportBody(). Short-circuit to a no-op so we
+        // stop burning SEH at load. Callers already treat false as "not applied".
+        (void)hknpWorld; (void)bodyIdA; (void)bodyIdB;
+        static std::atomic<bool> warned{ false };
+        if (!warned.exchange(true)) {
+            spdlog::warn("[PHYSICS] DisableCollisionBetween is a no-op (engine pair-filter faults on F4VR; using layer-43 filtering + ClearPlayerProxySupportBody instead)");
+        }
+        return false;
+    }
+
+    void EnableCollisionBetween(void* hknpWorld, std::uint32_t bodyIdA, std::uint32_t bodyIdB)
+    {
+        if (!hknpWorld || bodyIdA == 0x7FFFFFFF || bodyIdB == 0x7FFFFFFF) return;
+        // Build the key the same way disableCollisionsBetween does: min first, max second
+        std::uint32_t lo = (bodyIdA < bodyIdB) ? bodyIdA : bodyIdB;
+        std::uint32_t hi = (bodyIdA < bodyIdB) ? bodyIdB : bodyIdA;
+        std::uint64_t key = static_cast<std::uint64_t>(lo) | (static_cast<std::uint64_t>(hi) << 32);
+
+        // The pair filter map is at hknpWorld offset determined by disableCollisionsBetween
+        // which accesses param_1 + 0x18 in the filter object. But disableCollisionsBetween
+        // takes the world as first param and finds the filter internally.
+        // For remove, we need the filter's map directly. The filter is accessed from the world.
+        // For now, use a SEH-protected approach.
+        __try {
+            // The pairCollisionFilter is found via the hknpWorld. The disableCollisionsBetween
+            // function accesses it internally. We need to find the same filter object.
+            // From Ghidra: disableCollisionsBetween's first param IS the filter object, not the world.
+            // The caller passes the filter. Let's find it from the world.
+            // hknpWorld has a collision filter at a known offset. For now, try the world directly
+            // since disableCollisionsBetween worked with it.
+            // Actually, looking at the decompilation more carefully:
+            // param_1 = pairCollisionFilter (NOT hknpWorld)
+            // param_2 = hknpWorld
+            // So we need the filter object. It lives at a fixed offset in hknpWorld.
+            // From the database name: "disableCollisionsBetween(hknpWorld*, hknpBodyId, hknpBodyId)"
+            // But the decompilation shows param_1 used as the filter (param_1 + 0x18 = map).
+            // This suggests the REL::Relocation wrapping adjusts the 'this' parameter.
+            // The remove function takes the map directly at filter + 0x18.
+            // Since disableCollisionsBetween works with (world, bodyA, bodyB), the function
+            // internally finds the filter. We can't easily get the filter object.
+            //
+            // WORKAROUND: Just call disableCollisionsBetween again — it's idempotent (increments count).
+            // To truly re-enable, we'd need to decrement to 0. But for our use case,
+            // we only disable once and clear on grab end. Use clearAll as last resort.
+            spdlog::debug("[PHYSICS] EnableCollisionBetween: pair filter selective remove not yet implemented");
+            spdlog::debug("[PHYSICS]   bodyA=0x{:08X}, bodyB=0x{:08X} — collision will restore on next physics reset", bodyIdA, bodyIdB);
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER) {
+            spdlog::error("[PHYSICS] Exception in EnableCollisionBetween");
+        }
     }
 }

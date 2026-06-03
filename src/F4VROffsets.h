@@ -3,7 +3,7 @@
 #include "VRInput.h"
 
 /**
- * F4VR-specific offsets and function relocations for Heisenberg.
+ * F4VR-specific offsets and function relocations.
  * Based on F4VRCommonFramework's F4VROffsets.h
  *
  * These offsets are for Fallout 4 VR version 1.2.72
@@ -937,4 +937,184 @@ namespace heisenberg
         RE::ProcessLists* processLists, RE::NiPoint3& a_point, float a_radius, RE::NiPointer<RE::Actor>& a_outActor);
     inline REL::Relocation<_ProcessLists_GetClosestActorWithinRangeOfPoint>
         ProcessLists_GetClosestActorWithinRangeOfPoint{ REL::Offset(0xf8e010) };
+
+    /**
+     * ProcessLists::GetActorsWithinRangeOfPoint(NiPoint3&, float, BSScrapArray<NiPointer<Actor>>&)
+     * Enumerates ALL actors within a radius of a world point. Used by the thrown-impact
+     * code to propagate the assault alarm to nearby faction-mates (Diamond City guards
+     * etc) so they aggro when a faction member is hit, even if the engine's normal
+     * SendAssaultAlarm path is silenced for protected actors.
+     * VR offset 0xf8e040 (ID 734562, status 4) — see project_processlists_offsets memory.
+     */
+    using _ProcessLists_GetActorsWithinRangeOfPoint = void(*)(
+        RE::ProcessLists* processLists, RE::NiPoint3& a_point, float a_radius,
+        RE::BSScrapArray<RE::NiPointer<RE::Actor>>& a_outActors);
+    inline REL::Relocation<_ProcessLists_GetActorsWithinRangeOfPoint>
+        ProcessLists_GetActorsWithinRangeOfPoint{ REL::Offset(0xf8e040) };
+
+    // =========================================================================
+    // GRABANDTHROW PORT - Impact damage / destruction / detection / hit events
+    // VR offsets verified via GhidrAssistMCP (April 2026)
+    // =========================================================================
+
+    /**
+     * bhkCharacterController::ProcessHurtfulBody
+     * Native function the game uses to apply impact damage to an actor's
+     * controller from a colliding rigid body. Handles damage, knockdown, and
+     * ragdoll based on fPhysicsDamage* GMSTs internally.
+     * VR offset: 0x1e24560
+     *
+     * @param thisCtrl   bhkCharacterController* of the target actor
+     * @param bodyId     Reference to the colliding body's hknpBodyId
+     * @param contactPt  Reference to the contact point (hkContactPoint, +0x10 = position)
+     */
+    using _bhkCharacterController_ProcessHurtfulBody = void(__fastcall*)(
+        void* thisCtrl, std::uint32_t& bodyId, void* contactPoint);
+    inline REL::Relocation<_bhkCharacterController_ProcessHurtfulBody>
+        bhkCharacterController_ProcessHurtfulBody{ REL::Offset(0x1e24560) };
+
+    /**
+     * bhkCharacterController::IsHurtfulBody
+     * Returns true if the given body is heavy/fast enough to apply damage.
+     * Internally checks mass × speed against fPhysicsDamage* GMSTs.
+     * VR offset: 0x1e240c0
+     */
+    using _bhkCharacterController_IsHurtfulBody = bool(__fastcall*)(
+        void* thisCtrl, void* hknpBody, void* hknpMotion);
+    inline REL::Relocation<_bhkCharacterController_IsHurtfulBody>
+        bhkCharacterController_IsHurtfulBody{ REL::Offset(0x1e240c0) };
+
+    /**
+     * bhkCharacterController::SetVelocityModifier
+     * Pushes the controller along a direction with a given magnitude.
+     * Verified via Ghidra decompile: the float param is DURATION (seconds),
+     * stored in `this->velocityTime`. The NiPoint3A holds velocity in havok u/s.
+     * Less reliable than KnockExplosion for actor reactions — kept available
+     * for direct-controller velocity nudges where ragdoll is undesirable.
+     *
+     * VR offset: 0x1e22fc0
+     */
+    using _bhkCharacterController_SetVelocityModifier = void(__fastcall*)(
+        void* thisCtrl, void* direction, float magnitude);
+    inline REL::Relocation<_bhkCharacterController_SetVelocityModifier>
+        bhkCharacterController_SetVelocityModifier{ REL::Offset(0x1e22fc0) };
+
+    /**
+     * AIProcess::KnockExplosion(Actor*, NiPoint3&, float)
+     * The native function `Game.PushActorAway` (Papyrus) calls internally —
+     * verified by decompiling GameScript::mem_ObjectReference_PushActorAway,
+     * which after argument marshalling lands here.
+     *
+     * Computes the push direction as (actor_position - source_location), then
+     * queues the knock through TaskQueueInterface::QueueActorKnockExplosion
+     * (game-thread-safe). Triggers ragdoll above magnitude ~3.0.
+     *
+     * VR offset: 0xec82a0 (PDB: AIProcess::KnockExplosion(Actor*, NiPoint3&, float))
+     *
+     * @param thisProc   AIProcess* (actor->currentProcess)
+     * @param actor      Actor* victim
+     * @param sourcePos  NiPoint3& push origin (actor moves away from this)
+     * @param magnitude  Push strength. Typical range 0.5 (mild) → 5.0 (ragdoll).
+     */
+    using _AIProcess_KnockExplosion = void(__fastcall*)(
+        void* thisProc, RE::Actor* actor, RE::NiPoint3* sourcePos, float magnitude);
+    inline REL::Relocation<_AIProcess_KnockExplosion>
+        AIProcess_KnockExplosion{ REL::Offset(0xec82a0) };
+
+    /**
+     * TaskQueueInterface::QueueUpdateDestructibleObject
+     * Queues a damage event on a destructible object. Engine handles
+     * stage transitions and breakage on its own.
+     * VR offset: 0xda9c60
+     *
+     * @param thisQueue   TaskQueueInterface singleton
+     * @param refr         Target ObjectRef (must have BGSDestructibleObjectForm)
+     * @param damage       Damage to apply (units = HP, applied directly)
+     * @param dmgAvif      ActorValueInfo* for damage type (nullptr = generic)
+     * @param ignoreScale  Some flag (likely "ignore scale" — pass false)
+     */
+    using _TaskQueueInterface_QueueUpdateDestructibleObject = void(__fastcall*)(
+        void* thisQueue, RE::TESObjectREFR* refr, float damage,
+        void* dmgAvif, bool ignoreScale);
+    inline REL::Relocation<_TaskQueueInterface_QueueUpdateDestructibleObject>
+        TaskQueueInterface_QueueUpdateDestructibleObject{ REL::Offset(0xda9c60) };
+
+    /**
+     * TaskQueueInterface::QueueActorStartCombat(Actor&, Actor&, bool)
+     * Game-thread-safe way to put an actor into combat with a target — used to
+     * aggro an NPC when it's hit by a thrown object.
+     * VR offset: 0xdaa620 (DB id 179777, status 4).
+     *
+     * @param thisQueue  TaskQueueInterface singleton
+     * @param combatant  Actor that should start fighting (the hit NPC)
+     * @param target     Actor to fight (the player)
+     * @param flag       Engine flag (pass true to start combat immediately)
+     */
+    using _TaskQueueInterface_QueueActorStartCombat = void(__fastcall*)(
+        void* thisQueue, RE::Actor* combatant, RE::Actor* target, bool flag);
+    inline REL::Relocation<_TaskQueueInterface_QueueActorStartCombat>
+        TaskQueueInterface_QueueActorStartCombat{ REL::Offset(0xdaa620) };
+
+    /**
+     * TESHavokUtilities::GetDamageForImpact
+     * Computes the damage scalar for a thrown-body impact (mass × speed
+     * against fPhysicsDamage* GMSTs). Used by the game for telekinesis throws.
+     * VR offset: 0x6268f0
+     *
+     * @param mass   Mass of the thrown body in havok units
+     * @param speed  Speed of the body at impact in havok units/sec
+     * @return Damage value (already scaled to game HP units)
+     */
+    using _TESHavokUtilities_GetDamageForImpact = float(__fastcall*)(float mass, float speed);
+    inline REL::Relocation<_TESHavokUtilities_GetDamageForImpact>
+        TESHavokUtilities_GetDamageForImpact{ REL::Offset(0x6268f0) };
+
+    /**
+     * TESHavokUtilities::SetTelekinesisObject
+     * Tags a refr as currently being telekinesis-controlled. Used so the
+     * engine can attribute damage from this body back to the player when it
+     * lands a hit (perks, faction reactions).
+     * VR offset: 0x626b60
+     */
+    using _TESHavokUtilities_SetTelekinesisObject = void(__fastcall*)(
+        RE::TESObjectREFR* refr, RE::TESObjectREFR* caster);
+    inline REL::Relocation<_TESHavokUtilities_SetTelekinesisObject>
+        TESHavokUtilities_SetTelekinesisObject{ REL::Offset(0x626b60) };
+
+    /**
+     * TESHavokUtilities::ClearTelekinesisObject
+     * Removes the telekinesis tag from a refr.
+     * VR offset: 0x626c10
+     */
+    using _TESHavokUtilities_ClearTelekinesisObject = void(__fastcall*)(RE::TESObjectREFR* refr);
+    inline REL::Relocation<_TESHavokUtilities_ClearTelekinesisObject>
+        TESHavokUtilities_ClearTelekinesisObject{ REL::Offset(0x626c10) };
+
+    /**
+     * AiFormulas::GetSoundLevelValue
+     * Converts a SOUND_LEVEL enum (silent/normal/loud/very-loud) into the
+     * detection event radius/intensity scalar.
+     * VR offset: 0x64aef0
+     */
+    using _AiFormulas_GetSoundLevelValue = float(__fastcall*)(int soundLevel);
+    inline REL::Relocation<_AiFormulas_GetSoundLevelValue>
+        AiFormulas_GetSoundLevelValue{ REL::Offset(0x64aef0) };
+
+    /**
+     * AIProcess::SetActorsDetectionEvent
+     * Tells the AI system to broadcast a detection event at a world position
+     * with a given intensity. NPCs in range will hear/see it and react.
+     * VR offset: 0xe8c190
+     *
+     * @param thisProcess   The player's MiddleHigh AIProcess
+     * @param actor         The "source" actor (usually the player)
+     * @param position      World position of the event
+     * @param soundLevel    Intensity scalar (from GetSoundLevelValue)
+     * @param sourceRefr    Optional sourcing refr (the thrown object, can be nullptr)
+     */
+    using _AIProcess_SetActorsDetectionEvent = void(__fastcall*)(
+        void* thisProcess, RE::Actor* actor, const RE::NiPoint3& position,
+        int soundLevel, RE::TESObjectREFR* sourceRefr);
+    inline REL::Relocation<_AIProcess_SetActorsDetectionEvent>
+        AIProcess_SetActorsDetectionEvent{ REL::Offset(0xe8c190) };
 }

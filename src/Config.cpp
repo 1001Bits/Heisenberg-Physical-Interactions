@@ -3,11 +3,16 @@
 
 #include <SimpleIni.h>
 #include <chrono>
+#include <fstream>
+#include <vector>
+#include <string>
+#include <utility>
 
 namespace heisenberg
 {
     static const char* kConfigPath = "Data/F4SE/Plugins/Heisenberg_F4VR.ini";
     static const char* kMCMSettingsPath = "Data/MCM/Settings/Heisenberg.ini";
+    static const char* kMCMConfigPath = "Data/MCM/Config/Heisenberg/config.json";
     
     // Conversion factor: 1 game unit = 1.4 cm, so 1 cm = 0.714 game units
     static constexpr float CM_TO_GAME_UNITS = 1.0f / 1.4f;  // ≈ 0.714
@@ -39,8 +44,8 @@ iWeaponEquipMode = 1
 bEnableVHHolstering = true
 
 ; Max telekinesis distance (in centimeters)
-; Objects beyond this distance cannot be grabbed via telekinesis (3cm default)
-fMaxGrabDistance = 3.0
+; Objects beyond this distance cannot be grabbed via telekinesis (500cm = 5m default)
+fMaxGrabDistance = 500.0
 
 ; Natural pickup distance threshold (in centimeters)
 ; Objects within this distance use natural pickup (picked up at touch point)
@@ -54,6 +59,14 @@ fNaturalGrabDistanceNoMatch = 10.0
 ; Palm Snap: When enabled, mid-range objects snap to palm center
 ; When disabled, all objects use natural pickup regardless of distance
 bEnablePalmSnap = true
+
+; Automatic hand placement: uses object geometry to place grabbed items HIGGS-style
+; When false, the existing saved item offset system is used
+bEnableAutomaticHandPlacement = true
+
+; Automatic finger curls: uses object geometry to calculate grab pose
+; When false, saved finger curl offsets are used instead
+bEnableAutomaticFingerCurls = true
 
 ; Throw velocity multiplier (1.0 = normal, 2.0 = double speed)
 fThrowVelocityBoostFactor = 1.0
@@ -85,31 +98,6 @@ bEnableItemPositioning = false
 ; 2 = Long Press A Button
 ; Press B to save position, use shortcut again to exit without saving
 iItemPositioningShortcut = 0
-
-[Throwables]
-; Enable grenade handling by the mod
-; When true: mod manages grenade input (remap, zones, blocking)
-; When false: game handles grenades natively (grip = throw, no mod interference)
-bEnableGrenadeHandling = true
-
-; Remap grenade button from Grip to A button (only if bEnableGrenadeHandling=true)
-; When enabled: A button readies throwables instead of grip
-bRemapGrenadeButtonToA = false
-
-; Enable throwable activation zone (only if bEnableGrenadeHandling=true)
-; 0 = Disabled (grenades work everywhere)
-; 1 = Enabled (grenades only work in the zone below)
-iThrowableActivationZone = 0
-
-; Radius of the throwable activation zone (in cm)
-fThrowableZoneRadius = 21.0
-
-; Throwable zone position relative to HMD
-; X = left(+) / right(-), Y = forward(+) / behind(-), Z = up(+) / down(-)
-; Default: chest level (below and slightly behind HMD)
-fThrowableZoneOffsetX = 0.0
-fThrowableZoneOffsetY = -5.0
-fThrowableZoneOffsetZ = -20.0
 
 [ItemStorage]
 ; Enable item storage zone system
@@ -158,7 +146,7 @@ bBlockConsumptionInPA = true
 
 ; Consumable To Hand: Press trigger on food/drink/chems in Pipboy
 ; to drop them to your hand instead of consuming them
-bConsumableToHand = false
+bConsumableToHand = true
 
 [DropToHand]
 ; Drop to Hand: Items dropped from inventory spawn in your hand instead of falling
@@ -185,7 +173,7 @@ bFavoritesToHand = false
 bEnableStealToHand = true
 
 ; Harvested flora items appear in your hand instead of going to inventory
-bEnableHarvestToHand = false
+bEnableHarvestToHand = true
 
 [Activators]
 ; Enable touch-based button/switch activation
@@ -230,15 +218,37 @@ bHideWandHUD = true
 ; Hide all wand HUD messages (actions AND item display) when pointing with wands
 bHideAllWandHUD = false
 
+[HeldBody]
+; Enable HIGGS-style HeldBody grabbing (object stays DYNAMIC)
+; Note: iGrabMode=0 still forces the original keyframed backend for testing.
+bUseHeldBodyGrab = true
+
+; HeldBody runtime mode:
+; 0 = dynamic spring held mode
+; 1 = custom 6-DOF constraint
+; 2 = native ragdoll constraint
+iHeldBodyMode = 0
+
+; Legacy fallback if iHeldBodyMode is absent
+bUseNativeRagdollConstraint = false
+
+; Use Bethesda CreateInstance path for HeldBody hand bodies
+bUseSimpleHandBodyCreation = true
+
 [Debug]
 ; Log level: 0=trace, 1=debug, 2=info, 3=warn, 4=error
-; Default: 3 (warn) for release builds
-iLogLevel = 4
+; Default: 2 (info)
+iLogLevel = 2
 )";
 
     void Config::Load()
     {
         spdlog::info("Loading config...");
+
+        // Make sure the MCM settings file lists every control at this build's default BEFORE we
+        // merge it below, so the menu display and the merged value agree (and the menu's OFF
+        // actually wins over a stale external-INI ON). Runs once per session.
+        SeedMCMDefaultsIfMissing();
 
         CSimpleIniA ini;
         ini.SetUnicode();
@@ -331,10 +341,18 @@ iLogLevel = 4
         showUnequipMessages = ini.GetBoolValue("ObjectPickup", "bShowUnequipMessages", showUnequipMessages);
         enableUnarmedAutoUnequip = ini.GetBoolValue("ObjectPickup", "bEnableUnarmedAutoUnequip", enableUnarmedAutoUnequip);
         disableGripWeaponDraw = ini.GetBoolValue("ObjectPickup", "bDisableGripWeaponDraw", disableGripWeaponDraw);
+        passGripToActivatorSecondary = ini.GetBoolValue("ObjectPickup", "bPassGripToActivatorSecondary", passGripToActivatorSecondary);
+        useGrenadeReadyHook = ini.GetBoolValue("ObjectPickup", "bUseGrenadeReadyHook", useGrenadeReadyHook);
         fingerPoseMode = static_cast<int>(ini.GetLongValue("ObjectPickup", "iFingerPoseMode", fingerPoseMode));
         fingerAnimCloseSpeed = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fFingerAnimCloseSpeed", fingerAnimCloseSpeed));
         fingerAnimOpenSpeed = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fFingerAnimOpenSpeed", fingerAnimOpenSpeed));
         grabMode = static_cast<int>(ini.GetLongValue("ObjectPickup", "iGrabMode", grabMode));
+        heldObjectCollidable = ini.GetBoolValue("ObjectPickup", "bHeldObjectCollidable", heldObjectCollidable);
+        heldObjectWallClamp = ini.GetBoolValue("ObjectPickup", "bHeldObjectWallClamp", heldObjectWallClamp);
+        blockActivateOnGrabSelection = ini.GetBoolValue("ObjectPickup", "bBlockActivateOnGrabSelection", blockActivateOnGrabSelection);
+        rockDynamicHandoff = ini.GetBoolValue("ObjectPickup", "bRockDynamicHandoff", rockDynamicHandoff);
+        useXForLeftGrab  = ini.GetBoolValue("ObjectPickup", "bUseXForLeftGrab",  useXForLeftGrab);
+        useAForRightGrab = ini.GetBoolValue("ObjectPickup", "bUseAForRightGrab", useAForRightGrab);
         grabStartSpeed = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fGrabStartSpeed", grabStartSpeed));
         grabStartAngularSpeed = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fGrabStartAngularSpeed", grabStartAngularSpeed));
         
@@ -346,10 +364,31 @@ iLogLevel = 4
         
         // Palm snap settings
         enablePalmSnap = ini.GetBoolValue("ObjectPickup", "bEnablePalmSnap", enablePalmSnap);
+        enableAutomaticHandPlacement = ini.GetBoolValue("ObjectPickup", "bEnableAutomaticHandPlacement", enableAutomaticHandPlacement);
+        enableAutomaticFingerCurls = ini.GetBoolValue("ObjectPickup", "bEnableAutomaticFingerCurls", enableAutomaticFingerCurls);
         saveNaturalGrabAsOffset = ini.GetBoolValue("ObjectPickup", "bSaveNaturalGrabAsOffset", saveNaturalGrabAsOffset);
+        enablePalmRayCastPlacement = ini.GetBoolValue("ObjectPickup", "bEnablePalmRayCastPlacement", enablePalmRayCastPlacement);
+        enableAxialPlacement = ini.GetBoolValue("ObjectPickup", "bEnableAxialPlacement", enableAxialPlacement);
+        axialPlacementClearance = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fAxialPlacementClearance", axialPlacementClearance));
+        grabMaxTriangleDistance = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fGrabMaxTriangleDistance", grabMaxTriangleDistance));
+        useRockFingerPose = ini.GetBoolValue("ObjectPickup", "bUseRockFingerPose", useRockFingerPose);
+        rockFingerRejectBackside = ini.GetBoolValue("ObjectPickup", "bRockFingerRejectBackside", rockFingerRejectBackside);
+        rockFingerSurfaceTolerance = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fRockFingerSurfaceTolerance", rockFingerSurfaceTolerance));
+        grabDirectionalWeight = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fGrabDirectionalWeight", grabDirectionalWeight));
+        grabLateralWeight = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fGrabLateralWeight", grabLateralWeight));
+        palmDepthOffset = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fPalmDepthOffset", palmDepthOffset));
+        enableAutomaticFingerCurlsPerFrame = ini.GetBoolValue("ObjectPickup", "bEnableAutomaticFingerCurlsPerFrame", enableAutomaticFingerCurlsPerFrame);
+        fingerCurlPerFrameInterval = static_cast<int>(ini.GetLongValue("ObjectPickup", "iFingerCurlPerFrameInterval", fingerCurlPerFrameInterval));
+        fingerCurlSmoothingAlpha = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fFingerCurlSmoothingAlpha", fingerCurlSmoothingAlpha));
         palmOffsetX = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fPalmOffsetX", palmOffsetX));
         palmOffsetY = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fPalmOffsetY", palmOffsetY));
         palmOffsetZ = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fPalmOffsetZ", palmOffsetZ));
+        palmVectorX = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fPalmVectorX", palmVectorX));
+        palmVectorY = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fPalmVectorY", palmVectorY));
+        palmVectorZ = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fPalmVectorZ", palmVectorZ));
+        palmPositionX = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fPalmPositionX", palmPositionX));
+        palmPositionY = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fPalmPositionY", palmPositionY));
+        palmPositionZ = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fPalmPositionZ", palmPositionZ));
         paGrabOffsetX = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fPAGrabOffsetX", paGrabOffsetX));
         paGrabOffsetY = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fPAGrabOffsetY", paGrabOffsetY));
         paGrabOffsetZ = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fPAGrabOffsetZ", paGrabOffsetZ));
@@ -366,21 +405,29 @@ iLogLevel = 4
             dropToHandMode = ini.GetBoolValue("DropToHand", "bEnableDropToHand", true) ? 1 : 0;
         }
         lootToHandMode = static_cast<int>(ini.GetLongValue("DropToHand", "iLootToHandMode", lootToHandMode));
+        lootToHandTakeAllThreshold = static_cast<int>(ini.GetLongValue("DropToHand", "iLootToHandTakeAllThreshold", lootToHandTakeAllThreshold));
         dropToHandPreferredHand = static_cast<int>(ini.GetLongValue("DropToHand", "iDropToHandPreferredHand", dropToHandPreferredHand));
         favoritesToHand = ini.GetBoolValue("DropToHand", "bFavoritesToHand", favoritesToHand);
         enableStealToHand = ini.GetBoolValue("DropToHand", "bEnableStealToHand", enableStealToHand);
         enableHarvestToHand = ini.GetBoolValue("DropToHand", "bEnableHarvestToHand", enableHarvestToHand);
 
-        // Native throwables (can be fully disabled for native game handling)
-        enableGrenadeHandling = ini.GetBoolValue("Throwables", "bEnableGrenadeHandling", enableGrenadeHandling);
-        throwableActivationZone = static_cast<int>(ini.GetLongValue("Throwables", "iThrowableActivationZone", throwableActivationZone));
-        throwableZoneRadius = static_cast<float>(ini.GetDoubleValue("Throwables", "fThrowableZoneRadius", throwableZoneRadius));
-        remapGrenadeButtonToA = ini.GetBoolValue("Throwables", "bRemapGrenadeButtonToA", remapGrenadeButtonToA);
-        // Throwable zone position (single zone)
-        throwableZoneOffsetX = static_cast<float>(ini.GetDoubleValue("Throwables", "fThrowableZoneOffsetX", throwableZoneOffsetX));
-        throwableZoneOffsetY = static_cast<float>(ini.GetDoubleValue("Throwables", "fThrowableZoneOffsetY", throwableZoneOffsetY));
-        throwableZoneOffsetZ = static_cast<float>(ini.GetDoubleValue("Throwables", "fThrowableZoneOffsetZ", throwableZoneOffsetZ));
-        
+        // Throwables: no longer user-configurable — locked to vanilla game behaviour.
+        // The [Throwables] INI section and its MCM page were removed; the fields keep
+        // their vanilla C++ defaults (grenade handling on for grip-vs-grab gating,
+        // zone disabled, remap off, hold 0.3s). Do NOT read them from the INI.
+
+        // Impact effects (GrabAndThrow port)
+        impactDamageEnabled = ini.GetBoolValue("Impact", "bImpactDamageEnabled", impactDamageEnabled);
+        impactDamageMult = static_cast<float>(ini.GetDoubleValue("Impact", "fImpactDamageMult", impactDamageMult));
+        impactDestroyEnabled = ini.GetBoolValue("Impact", "bImpactDestroyEnabled", impactDestroyEnabled);
+        impactMinDestroySpeed = static_cast<float>(ini.GetDoubleValue("Impact", "fImpactMinDestroySpeed", impactMinDestroySpeed));
+        impactDetectionEvent = ini.GetBoolValue("Impact", "bImpactDetectionEvent", impactDetectionEvent);
+        impactHitEvent = ini.GetBoolValue("Impact", "bImpactHitEvent", impactHitEvent);
+        impactMinDetectionSpeed = static_cast<float>(ini.GetDoubleValue("Impact", "fImpactMinDetectionSpeed", impactMinDetectionSpeed));
+        impactActorCooldown = static_cast<float>(ini.GetDoubleValue("Impact", "fImpactActorCooldown", impactActorCooldown));
+        impactMassScaledSound = ini.GetBoolValue("Impact", "bImpactMassScaledSound", impactMassScaledSound);
+        impactMassGate = ini.GetBoolValue("Impact", "bImpactMassGate", impactMassGate);
+
         // Companion / hand transfer
         enableDropToCompanion = ini.GetBoolValue("ItemStorage", "bEnableDropToCompanion", enableDropToCompanion);
         companionTransferRadius = static_cast<float>(ini.GetDoubleValue("ItemStorage", "fCompanionTransferRadius", companionTransferRadius));
@@ -401,13 +448,106 @@ iLogLevel = 4
         behindHeadTolerance = static_cast<float>(ini.GetDoubleValue("ItemStorage", "fBehindHeadTolerance", behindHeadTolerance));
         storageZoneHoldTime = static_cast<float>(ini.GetDoubleValue("ItemStorage", "fStorageZoneHoldTime", storageZoneHoldTime));
         
+        // ROCK integration
+        useRockPhysics = static_cast<int>(ini.GetLongValue("ROCK", "iUseRockPhysics", useRockPhysics));
+
         // Hand collision
         enableHandCollision = ini.GetBoolValue("ObjectPickup", "bEnableHandCollision", enableHandCollision);
         usePhysicsHandBodies = ini.GetBoolValue("ObjectPickup", "bUsePhysicsHandBodies", usePhysicsHandBodies);
+        useBethesdaPhysicsBody = ini.GetBoolValue("ObjectPickup", "bUseBethesdaPhysicsBody", useBethesdaPhysicsBody);
+
+        // ROCK integration toggles — section [RockIntegration]
+        rockCollisionSuppressionRegistry = ini.GetBoolValue("RockIntegration", "bCollisionSuppressionRegistry", rockCollisionSuppressionRegistry);
+        rockHandBoneColliderSet          = ini.GetBoolValue("RockIntegration", "bHandBoneColliderSet",          rockHandBoneColliderSet);
+        rockBodyBoneColliderSet          = ini.GetBoolValue("RockIntegration", "bBodyBoneColliderSet",          rockBodyBoneColliderSet);
+        rockWeaponCollision              = ini.GetBoolValue("RockIntegration", "bWeaponCollision",              rockWeaponCollision);
+        rockTwoHandedGrip                = ini.GetBoolValue("RockIntegration", "bTwoHandedGrip",                rockTwoHandedGrip);
+        spdlog::info("[Config] RockIntegration: CSR={} HBCS={} BBCS={} WC={} THG={}",
+                     rockCollisionSuppressionRegistry, rockHandBoneColliderSet, rockBodyBoneColliderSet,
+                     rockWeaponCollision, rockTwoHandedGrip);
         handCollisionRadius = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fHandCollisionRadius", handCollisionRadius));
+        handContactSlop = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fHandContactSlop", handContactSlop));
         handPushVelocityThreshold = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fHandPushVelocityThreshold", handPushVelocityThreshold));
         handPushForceMultiplier = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fHandPushForceMultiplier", handPushForceMultiplier));
-        
+        enableHandCollisionHaptics = ini.GetBoolValue("ObjectPickup", "bEnableHandCollisionHaptics", enableHandCollisionHaptics);
+        handCollisionHapticScale = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fHandCollisionHapticScale", handCollisionHapticScale));
+        enableFingerSegmentColliders = ini.GetBoolValue("ObjectPickup", "bEnableFingerSegmentColliders", enableFingerSegmentColliders);
+        fingerSegmentHalfExtentX = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fFingerSegmentHalfExtentX", fingerSegmentHalfExtentX));
+        fingerSegmentHalfExtentY = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fFingerSegmentHalfExtentY", fingerSegmentHalfExtentY));
+        fingerSegmentHalfExtentZ = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fFingerSegmentHalfExtentZ", fingerSegmentHalfExtentZ));
+        useCollisionOverlapForGrabCandidates = ini.GetBoolValue("ObjectPickup", "bUseCollisionOverlapForGrabCandidates", useCollisionOverlapForGrabCandidates);
+
+        // Hand wall-pushback
+        handWallPushbackMode    = static_cast<int>(ini.GetLongValue("ObjectPickup", "iHandWallPushbackMode", handWallPushbackMode));
+        handPushbackProbeRadius = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fHandPushbackProbeRadius", handPushbackProbeRadius));
+        handPushbackMaxPush     = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fHandPushbackMaxPush", handPushbackMaxPush));
+        handPushbackSmoothing   = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fHandPushbackSmoothing", handPushbackSmoothing));
+        handPushbackHardStop    = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fHandPushbackHardStop", handPushbackHardStop));
+        handPushbackScale       = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fHandPushbackScale", handPushbackScale));
+        spdlog::info("[Config] HandWallPushback mode={} (0=off,1=linear,2=rock) probeR={:.1f} maxPush={:.1f}",
+                     handWallPushbackMode, handPushbackProbeRadius, handPushbackMaxPush);
+        enableGrabApproachSubstates = ini.GetBoolValue("HeldBody", "bEnableGrabApproachSubstates", enableGrabApproachSubstates);
+        grabApproachRampSeconds = static_cast<float>(ini.GetDoubleValue("HeldBody", "fGrabApproachRampSeconds", grabApproachRampSeconds));
+
+        // Hand collision enabled — pair filter + proxy listener handle player capsule
+
+        // HeldBody constraint grab
+        if (ini.GetValue("HeldBody", "bUseHeldBodyGrab", nullptr)) {
+            useHeldBodyGrab = ini.GetBoolValue("HeldBody", "bUseHeldBodyGrab", useHeldBodyGrab);
+        } else {
+            useHeldBodyGrab = ini.GetBoolValue("ObjectPickup", "bUseHeldBodyGrab", useHeldBodyGrab);
+        }
+        if (ini.GetValue("HeldBody", "iHeldBodyMode", nullptr)) {
+            heldBodyMode = static_cast<int>(ini.GetLongValue("HeldBody", "iHeldBodyMode", heldBodyMode));
+        } else if (ini.GetValue("HeldBody", "bUseNativeRagdollConstraint", nullptr)) {
+            heldBodyMode = ini.GetBoolValue("HeldBody", "bUseNativeRagdollConstraint", useNativeRagdollConstraint)
+                ? static_cast<int>(HeldBodyMode::NativeConstraint)
+                : static_cast<int>(HeldBodyMode::Custom6DOF);
+        } else if (ini.GetValue("HeldBody", "bUse6DOFGrabConstraint", nullptr)) {
+            heldBodyMode = ini.GetBoolValue("HeldBody", "bUse6DOFGrabConstraint", false)
+                ? static_cast<int>(HeldBodyMode::Custom6DOF)
+                : static_cast<int>(HeldBodyMode::NativeConstraint);
+        }
+        heldBodyMode = static_cast<int>(GetHeldBodyMode());
+        useNativeRagdollConstraint = UseHeldBodyNativeConstraint();
+        if (ini.GetValue("HeldBody", "bUseSimpleHandBodyCreation", nullptr)) {
+            useSimpleHandBodyCreation = ini.GetBoolValue("HeldBody", "bUseSimpleHandBodyCreation", useSimpleHandBodyCreation);
+        } else {
+            useSimpleHandBodyCreation = ini.GetBoolValue("ObjectPickup", "bUseSimpleHandBodyCreation", useSimpleHandBodyCreation);
+        }
+        heldBodyTauLerpTime = static_cast<float>(ini.GetDoubleValue("HeldBody", "fTauLerpTime", heldBodyTauLerpTime));
+        grabConstraintAngularTauBodyStart = static_cast<float>(ini.GetDoubleValue("HeldBody", "fAngularTauBodyStart", grabConstraintAngularTauBodyStart));
+        grabConstraintAngularTauBody = static_cast<float>(ini.GetDoubleValue("HeldBody", "fAngularTauBody", grabConstraintAngularTauBody));
+        grabConstraintLinearTauBodyStart = static_cast<float>(ini.GetDoubleValue("HeldBody", "fLinearTauBodyStart", grabConstraintLinearTauBodyStart));
+        grabConstraintLinearTauBody = static_cast<float>(ini.GetDoubleValue("HeldBody", "fLinearTauBody", grabConstraintLinearTauBody));
+        grabConstraintAngularTau = static_cast<float>(ini.GetDoubleValue("HeldBody", "fAngularTau", grabConstraintAngularTau));
+        grabConstraintAngularDamping = static_cast<float>(ini.GetDoubleValue("HeldBody", "fAngularDamping", grabConstraintAngularDamping));
+        grabConstraintAngularMaxForce = static_cast<float>(ini.GetDoubleValue("HeldBody", "fAngularMaxForce", grabConstraintAngularMaxForce));
+        grabConstraintLinearTau = static_cast<float>(ini.GetDoubleValue("HeldBody", "fLinearTau", grabConstraintLinearTau));
+        grabConstraintLinearDamping = static_cast<float>(ini.GetDoubleValue("HeldBody", "fLinearDamping", grabConstraintLinearDamping));
+        grabConstraintLinearMaxForce = static_cast<float>(ini.GetDoubleValue("HeldBody", "fLinearMaxForce", grabConstraintLinearMaxForce));
+        grabConstraintAngularToLinearForceRatio = static_cast<float>(ini.GetDoubleValue("HeldBody", "fAngularToLinearForceRatio", grabConstraintAngularToLinearForceRatio));
+        grabConstraintEnableSoftLimits = ini.GetBoolValue("HeldBody", "bEnableSoftLimits", grabConstraintEnableSoftLimits);
+        grabConstraintLinearMaxStretch = static_cast<float>(ini.GetDoubleValue("HeldBody", "fLinearMaxStretch", grabConstraintLinearMaxStretch));
+        grabConstraintAngularMaxAngleDeg = static_cast<float>(ini.GetDoubleValue("HeldBody", "fAngularMaxAngleDeg", grabConstraintAngularMaxAngleDeg));
+        grabConstraintForceDynamicHeldBody = ini.GetBoolValue("HeldBody", "bForceDynamicHeldBody", grabConstraintForceDynamicHeldBody);
+
+        if (UseHeldBodyManagedGrab() && grabMode == 0) {
+            spdlog::info("[Config] iGrabMode=0 keeps the original keyframed backend even while bUseHeldBodyGrab=true");
+        }
+        if (UseHeldBodyManagedGrab() && (grabMode == 1 || grabMode == 2)) {
+            spdlog::info("[Config] iGrabMode={} is a legacy constraint mode; HeldBody will override it while bUseHeldBodyGrab=true", grabMode);
+        }
+        if (UseHeldBodyManagedGrab()) {
+            spdlog::info("[Config] HeldBody mode: {}", GetHeldBodyModeName());
+            if (UseHeldBodySpringMode() && (grabMode == 1 || grabMode == 2)) {
+                spdlog::info("[Config] HeldBody spring mode selected; iGrabMode={} will be overridden by the HeldBody dynamic spring backend", grabMode);
+            }
+        }
+        if (enableHandCollision && !usePhysicsHandBodies) {
+            spdlog::warn("[Config] Hand collision is enabled but bUsePhysicsHandBodies=false; only proximity fallback collision is active");
+        }
+
         // Consumable zones (mouth)
         consumableActivationZone = static_cast<int>(ini.GetLongValue("Consumables", "iConsumableActivationZone", consumableActivationZone));
         mouthOffsetX = static_cast<float>(ini.GetDoubleValue("Consumables", "fMouthOffsetX", mouthOffsetX));
@@ -560,7 +700,13 @@ iLogLevel = 4
         clampFloat(pullSpeed, 0.0f, 10000.0f, "fPullSpeed");
         clampFloat(snapDistance, 0.0f, 500.0f, "fSnapDistance");
         clampFloat(handCollisionRadius, 0.0f, 100.0f, "fHandCollisionRadius");
+        clampFloat(handContactSlop, 0.0f, 20.0f, "fHandContactSlop");
         clampFloat(throwableZoneRadius, 0.0f, 100.0f, "fThrowableZoneRadius");
+        clampFloat(throwableHoldDuration, 0.05f, 2.0f, "fThrowableHoldDuration");
+        clampFloat(impactDamageMult, 0.0f, 10.0f, "fImpactDamageMult");
+        clampFloat(impactMinDestroySpeed, 0.0f, 10000.0f, "fImpactMinDestroySpeed");
+        clampFloat(impactMinDetectionSpeed, 0.0f, 10000.0f, "fImpactMinDetectionSpeed");
+        clampFloat(impactActorCooldown, 0.0f, 10.0f, "fImpactActorCooldown");
         clampFloat(itemStorageZoneRadius, 0.0f, 100.0f, "fItemStorageZoneRadius");
         clampFloat(mouthRadius, 0.0f, 100.0f, "fMouthRadius");
         clampFloat(handInjectionRadius, 0.0f, 100.0f, "fHandInjectionRadius");
@@ -584,11 +730,12 @@ iLogLevel = 4
         clampFloat(collisionBaseHapticStrength, 0.0f, 1.0f, "fCollisionBaseHapticStrength");
 
         // Enum values
-        clampInt(grabMode, 0, 4, "iGrabMode");
+        clampInt(grabMode, 0, 5, "iGrabMode");
         clampInt(weaponEquipMode, 0, 2, "iWeaponEquipMode");
         clampInt(throwableActivationZone, 0, 1, "iThrowableActivationZone");
         clampInt(consumableActivationZone, 0, 1, "iConsumableActivationZone");
         clampInt(lootToHandMode, 0, 2, "iLootToHandMode");
+        clampInt(lootToHandTakeAllThreshold, 0, 99, "iLootToHandTakeAllThreshold");
         clampInt(dropToHandPreferredHand, 0, 2, "iDropToHandPreferredHand");
         clampInt(logLevel, 0, 4, "iLogLevel");
 
@@ -635,6 +782,17 @@ iLogLevel = 4
 
         CSimpleIniA ini;
         ini.SetUnicode();
+        BuildIni(&ini);
+
+        SI_Error rc = ini.SaveFile(kConfigPath);
+        if (rc < 0) {
+            spdlog::error("Failed to save config file");
+        }
+    }
+
+    void Config::BuildIni(void* iniPtr) const
+    {
+        CSimpleIniA& ini = *static_cast<CSimpleIniA*>(iniPtr);
 
         // Selection
         ini.SetDoubleValue("Selection", "fProximityRadius", proximityRadius, "; Game units - radius for proximity detection");
@@ -663,7 +821,16 @@ iLogLevel = 4
         ini.SetBoolValue("ObjectPickup", "bEnableVHHolstering", enableVHHolstering, "; Drop weapon on VH holster zone to holster");
         ini.SetBoolValue("ObjectPickup", "bEnableUnarmedAutoUnequip", enableUnarmedAutoUnequip, "; Auto-unequip Unarmed when grip pressed (disable if melee broken)");
         ini.SetBoolValue("ObjectPickup", "bDisableGripWeaponDraw", disableGripWeaponDraw, "; Prevent grip from drawing/sheathing weapons");
-        ini.SetLongValue("ObjectPickup", "iGrabMode", grabMode, "; 0=Keyframe, 3=VirtualSpring (recommended), 4=MouseSpring");
+        ini.SetBoolValue("ObjectPickup", "bPassGripToActivatorSecondary", passGripToActivatorSecondary, "; When grip-weapon-draw is off, still pass primary grip to the game when aiming at an activator/furniture (mod secondary actions)");
+        ini.SetBoolValue("ObjectPickup", "bUseGrenadeReadyHook", useGrenadeReadyHook, "; Control grenade readying at the game level (hook MeleeThrowHandler) instead of stripping grip input (fixes VirtualHolsters/reload/secondary)");
+        ini.SetBoolValue("ObjectPickup", "bShowHolsterMessages", showHolsterMessages, "; Show HUD message when holstering weapons");
+        ini.SetBoolValue("ObjectPickup", "bShowUnequipMessages", showUnequipMessages, "; Show HUD message when unequipping weapons");
+        ini.SetLongValue("ObjectPickup", "iGrabMode", grabMode, "; 0=Keyframe (always original backend), 1/2=Legacy constraint fallback, 3=Post-physics/HeldBody wrapper (recommended), 4=MouseSpring, 5=DynamicRock (self-contained ROCK-style dynamic hold: places at offset then holds dynamically so it collides with walls/NPCs; no ROCK.dll)");
+        ini.SetBoolValue("ObjectPickup", "bHeldObjectCollidable", heldObjectCollidable, "; Keyframed hold keeps object collidable so it can hit other objects (iGrabMode=0 only)");
+        ini.SetBoolValue("ObjectPickup", "bHeldObjectWallClamp", heldObjectWallClamp, "; Keyframed hold: sweep-cast the held object so it STOPS at walls and NPCs instead of clipping through (iGrabMode=0)");
+        ini.SetBoolValue("ObjectPickup", "bBlockActivateOnGrabSelection", blockActivateOnGrabSelection, "; Block A/activate looting an item just because you're aiming at it. OFF by default (ON broke A-looting + mod secondary actions). Only enable for a Grip>A SteamVR binding.");
+        ini.SetBoolValue("ObjectPickup", "bUseXForLeftGrab",  useXForLeftGrab,  "; Use X button instead of Grip for left hand grabbing");
+        ini.SetBoolValue("ObjectPickup", "bUseAForRightGrab", useAForRightGrab, "; Use A button instead of Grip for right hand grabbing");
         ini.SetDoubleValue("ObjectPickup", "fGrabStartSpeed", grabStartSpeed);
         ini.SetDoubleValue("ObjectPickup", "fGrabStartAngularSpeed", grabStartAngularSpeed);
         
@@ -677,9 +844,28 @@ iLogLevel = 4
         // Palm snap settings
         ini.SetBoolValue("ObjectPickup", "bEnablePalmSnap", enablePalmSnap, "; Snap objects to palm center for mid-range pickups");
         ini.SetBoolValue("ObjectPickup", "bSaveNaturalGrabAsOffset", saveNaturalGrabAsOffset, "; Auto-save natural pickup positions as item offsets (default off)");
+        ini.SetBoolValue("ObjectPickup", "bEnablePalmRayCastPlacement", enablePalmRayCastPlacement, "; Prefer palm-ray hit over closest-point for grip placement (handles/levers)");
+        ini.SetBoolValue("ObjectPickup", "bEnableAxialPlacement", enableAxialPlacement, "; Place object near-face at palm with small clearance, extending forward along palmDir");
+        ini.SetDoubleValue("ObjectPickup", "fAxialPlacementClearance", axialPlacementClearance, "; cm from palm to object near face when axial placement is enabled");
+        ini.SetDoubleValue("ObjectPickup", "fGrabMaxTriangleDistance", grabMaxTriangleDistance, "; Squared distance (game units) from closest-mesh-point to consider a triangle nearby for finger intersection (HIGGS default 100)");
+        ini.SetBoolValue("ObjectPickup", "bUseRockFingerPose", useRockFingerPose, "; Use ROCK's ported curl-disk finger solver instead of the HIGGS curve tables (A/B toggle, default false)");
+        ini.SetBoolValue("ObjectPickup", "bRockFingerRejectBackside", rockFingerRejectBackside, "; ROCK solver: reject finger hits behind the seated mesh surface plane (default false)");
+        ini.SetDoubleValue("ObjectPickup", "fRockFingerSurfaceTolerance", rockFingerSurfaceTolerance, "; ROCK solver back-face plane tolerance in game units (default 1.5)");
+        ini.SetDoubleValue("ObjectPickup", "fGrabDirectionalWeight", grabDirectionalWeight, "; Weight on directional distance squared when scoring closest-point-on-geometry (HIGGS default 0.4)");
+        ini.SetDoubleValue("ObjectPickup", "fGrabLateralWeight", grabLateralWeight, "; Weight on lateral distance squared when scoring closest-point-on-geometry (HIGGS default 0.6)");
+        ini.SetDoubleValue("ObjectPickup", "fPalmDepthOffset", palmDepthOffset, "; cm to shift palm anchor from knuckle centroid into palm cup (palmar side)");
+        ini.SetBoolValue("ObjectPickup", "bEnableAutomaticFingerCurlsPerFrame", enableAutomaticFingerCurlsPerFrame, "; Recompute geometry finger curl every N frames during hold");
+        ini.SetLongValue("ObjectPickup", "iFingerCurlPerFrameInterval", fingerCurlPerFrameInterval, "; Frames between per-frame finger curl re-evaluations (1=every frame)");
+        ini.SetDoubleValue("ObjectPickup", "fFingerCurlSmoothingAlpha", fingerCurlSmoothingAlpha, "; Lerp factor 0..1 for per-frame finger curl smoothing (lower=snappier)");
         ini.SetDoubleValue("ObjectPickup", "fPalmOffsetX", palmOffsetX, "; Game units - left/right offset (0 = centered)");
         ini.SetDoubleValue("ObjectPickup", "fPalmOffsetY", palmOffsetY, "; Game units - forward offset (toward fingers, ~5 = 5cm)");
         ini.SetDoubleValue("ObjectPickup", "fPalmOffsetZ", palmOffsetZ, "; Game units - up/down offset (~3.5 = 5cm up from wand)");
+        ini.SetDoubleValue("ObjectPickup", "fPalmVectorX", palmVectorX, "; Hand-local palm normal X (mirrored for left hand)");
+        ini.SetDoubleValue("ObjectPickup", "fPalmVectorY", palmVectorY, "; Hand-local palm normal Y (points out of palm toward grabbed object)");
+        ini.SetDoubleValue("ObjectPickup", "fPalmVectorZ", palmVectorZ, "; Hand-local palm normal Z");
+        ini.SetDoubleValue("ObjectPickup", "fPalmPositionX", palmPositionX, "; Hand-local palm center X (cm, mirrored for left hand)");
+        ini.SetDoubleValue("ObjectPickup", "fPalmPositionY", palmPositionY, "; Hand-local palm center Y (cm)");
+        ini.SetDoubleValue("ObjectPickup", "fPalmPositionZ", palmPositionZ, "; Hand-local palm center Z (cm)");
         ini.SetDoubleValue("ObjectPickup", "fPAGrabOffsetX", paGrabOffsetX, "; Game units - extra X offset when in power armor (0 = no shift)");
         ini.SetDoubleValue("ObjectPickup", "fPAGrabOffsetY", paGrabOffsetY, "; Game units - extra Y offset in PA (forward, out of glove)");
         ini.SetDoubleValue("ObjectPickup", "fPAGrabOffsetZ", paGrabOffsetZ, "; Game units - extra Z offset in PA (up, above palm)");
@@ -691,21 +877,27 @@ iLogLevel = 4
         // Drop to Hand
         ini.SetLongValue("DropToHand", "iDropToHandMode", dropToHandMode, "; 0=Off, 1=All Items, 2=Holotapes Only");
         ini.SetLongValue("DropToHand", "iLootToHandMode", lootToHandMode, "; 0=Off, 1=Hybrid (blocked->inventory), 2=Immersive (blocked->floor)");
+        ini.SetLongValue("DropToHand", "iLootToHandTakeAllThreshold", lootToHandTakeAllThreshold, "; Take-All guard: this many+ items from one container in one burst stay in inventory instead of dropping to the floor (0=off, default 3)");
         ini.SetLongValue("DropToHand", "iDropToHandPreferredHand", dropToHandPreferredHand, "; 0=Left, 1=Right, 2=Whichever is free");
         ini.SetBoolValue("DropToHand", "bFavoritesToHand", favoritesToHand, "; Consumables from Favorites go to hand");
         ini.SetBoolValue("DropToHand", "bEnableStealToHand", enableStealToHand, "; Items stolen from NPCs go to hand");
         ini.SetBoolValue("DropToHand", "bEnableHarvestToHand", enableHarvestToHand, "; Harvested flora goes to hand");
 
-        // Native Throwables (Grenades, Mines) - can be fully disabled for native game handling
-        ini.SetBoolValue("Throwables", "bEnableGrenadeHandling", enableGrenadeHandling, "; false = game handles grenades natively (no mod interference), true = mod manages grenade input");
-        ini.SetBoolValue("Throwables", "bRemapGrenadeButtonToA", remapGrenadeButtonToA, "; Remap grenade throw button from Grip to A (for Virtual Holsters compatibility)");;
-        ini.SetLongValue("Throwables", "iThrowableActivationZone", throwableActivationZone, "; 0=Disabled, 1=Enabled (use zone defined by XYZ offsets)");
-        ini.SetDoubleValue("Throwables", "fThrowableZoneRadius", throwableZoneRadius * GAME_UNITS_TO_CM, "; cm - radius of throwable activation zone");
-        // Throwable zone position (single zone)
-        ini.SetDoubleValue("Throwables", "fThrowableZoneOffsetX", throwableZoneOffsetX, "; game units - X offset (+ = left, - = right)");
-        ini.SetDoubleValue("Throwables", "fThrowableZoneOffsetY", throwableZoneOffsetY, "; game units - Y offset (+ = forward, - = behind)");
-        ini.SetDoubleValue("Throwables", "fThrowableZoneOffsetZ", throwableZoneOffsetZ, "; game units - Z offset (+ = up, - = down)");
-        
+        // Throwables: intentionally NOT written — locked to vanilla behaviour, no user tuning.
+        // (The [Throwables] INI section and its MCM page were removed.)
+
+        // Impact effects (GrabAndThrow port)
+        ini.SetBoolValue("Impact", "bImpactDamageEnabled", impactDamageEnabled, "; Thrown objects damage actors via native ProcessHurtfulBody");
+        ini.SetDoubleValue("Impact", "fImpactDamageMult", impactDamageMult, "; Multiplier on game-computed impact damage (1.0 = native)");
+        ini.SetBoolValue("Impact", "bImpactDestroyEnabled", impactDestroyEnabled, "; Thrown objects damage destructibles (bottles, glass, etc.)");
+        ini.SetDoubleValue("Impact", "fImpactMinDestroySpeed", impactMinDestroySpeed, "; Min impact speed (game units/sec) for destructible damage");
+        ini.SetBoolValue("Impact", "bImpactDetectionEvent", impactDetectionEvent, "; Throws fire AI detection events (NPCs hear them)");
+        ini.SetBoolValue("Impact", "bImpactHitEvent", impactHitEvent, "; Throws fire Papyrus OnHit/SendHitEvent on target");
+        ini.SetDoubleValue("Impact", "fImpactMinDetectionSpeed", impactMinDetectionSpeed, "; Min impact speed for AI detection event (lower than destroy)");
+        ini.SetDoubleValue("Impact", "fImpactActorCooldown", impactActorCooldown, "; Seconds between damage hits on the same actor");
+        ini.SetBoolValue("Impact", "bImpactMassScaledSound", impactMassScaledSound, "; Bin detection sound level by thrown mass (silent/normal/loud/very-loud)");
+        ini.SetBoolValue("Impact", "bImpactMassGate", impactMassGate, "; Skip damaging hit destructible if thrown weight < target weight");
+
         // Item Storage Zone
         ini.SetBoolValue("ItemStorage", "bEnableItemStorageZones", enableItemStorageZones, "; Enable item storage zone system");
         ini.SetBoolValue("ItemStorage", "bEnableStorageZoneConfigMode", enableStorageZoneConfigMode, 
@@ -722,6 +914,7 @@ iLogLevel = 4
         ini.SetDoubleValue("ItemStorage", "fCompanionTransferRadius", companionTransferRadius, "; Game units - proximity to detect companion");
         ini.SetDoubleValue("ItemStorage", "fHandTransferRadius", handTransferRadius, "; CM - skip companion/storage when hands this close");
         ini.SetBoolValue("ItemStorage", "bEnableAutoStorage", enableAutoStorage, "; Auto-store after holding in zone for duration");
+        ini.SetBoolValue("ItemStorage", "bShowStorageMessages", showStorageMessages, "; Show HUD message when storing items");
         
         // Consumables (Mouth zone) - convert back to cm for INI
         ini.SetLongValue("Consumables", "iConsumableActivationZone", consumableActivationZone, "; 0=Disabled, 1=Mouth/Face");
@@ -732,6 +925,7 @@ iLogLevel = 4
         ini.SetDoubleValue("Consumables", "fMouthVelocityThreshold", mouthVelocityThreshold, "; m/s - must be moving slower than this to consume");
         ini.SetDoubleValue("Consumables", "fMouthHapticStrength", mouthDropHapticStrength, "; Haptic strength when consuming at mouth (0.0-1.0)");
         ini.SetBoolValue("Consumables", "bBlockConsumptionInPA", blockConsumptionInPA, "; Block manual consumption/chem use while in Power Armor");
+        ini.SetBoolValue("Consumables", "bShowConsumeMessages", showConsumeMessages, "; Show HUD message when consuming items");
         ini.SetBoolValue("Consumables", "bConsumableToHand", consumableToHand, "; Redirect Pipboy consume to drop-to-hand");
         ini.SetBoolValue("Consumables", "bHolotapeToHand", holotapeToHand, "; Redirect Pipboy holotape play to drop-to-hand");
 
@@ -747,12 +941,47 @@ iLogLevel = 4
         ini.SetDoubleValue("Equipping", "fHeadZoneRadius", headZoneRadius * GAME_UNITS_TO_CM, "; cm - head zone radius for glasses/hats/helmets");
         ini.SetDoubleValue("Equipping", "fChestZoneRadius", chestZoneRadius * GAME_UNITS_TO_CM, "; cm - chest zone radius for shirts/armor");
         
+        // ROCK integration
+        ini.SetLongValue("ROCK", "iUseRockPhysics", useRockPhysics, "; -1=auto (on if ROCK.dll present), 0=force off (built-in fallback), 1=force on");
+
         // Hand collision
         ini.SetBoolValue("ObjectPickup", "bEnableHandCollision", enableHandCollision, "; Enable hand collision with world");
-        ini.SetBoolValue("ObjectPickup", "bUsePhysicsHandBodies", usePhysicsHandBodies, "; Use actual physics bodies for hands (experimental - may crash)");
-        ini.SetDoubleValue("ObjectPickup", "fHandCollisionRadius", handCollisionRadius, "; Game units - radius of hand collision sphere");
+        ini.SetBoolValue("ObjectPickup", "bUsePhysicsHandBodies", usePhysicsHandBodies, "; Use actual physics bodies for hands (required for full physical hand collision)");
+        ini.SetDoubleValue("ObjectPickup", "fHandCollisionRadius", handCollisionRadius, "; Game units - radius of hand collision sphere (broadphase reach)");
+        ini.SetDoubleValue("ObjectPickup", "fHandContactSlop", handContactSlop, "; Game units - bone-to-mesh distance counted as TRUE contact (push trigger); ~finger flesh radius, smaller = must touch closer");
         ini.SetDoubleValue("ObjectPickup", "fHandPushVelocityThreshold", handPushVelocityThreshold, "; Min hand speed to push objects (lower = more sensitive)");
         ini.SetDoubleValue("ObjectPickup", "fHandPushForceMultiplier", handPushForceMultiplier, "; Push force multiplier (higher = stronger)");
+        ini.SetBoolValue("ObjectPickup", "bEnableHandCollisionHaptics", enableHandCollisionHaptics, "; Controller buzz on hand-object contact");
+        ini.SetDoubleValue("ObjectPickup", "fHandCollisionHapticScale", handCollisionHapticScale, "; Microseconds per mass-speed unit for haptic pulse");
+        ini.SetBoolValue("ObjectPickup", "bEnableFingerSegmentColliders", enableFingerSegmentColliders, "; Per-finger KEYFRAMED bodies (experimental)");
+        ini.SetDoubleValue("ObjectPickup", "fFingerSegmentHalfExtentX", fingerSegmentHalfExtentX, "; Finger collider half-extent along finger X axis");
+        ini.SetDoubleValue("ObjectPickup", "fFingerSegmentHalfExtentY", fingerSegmentHalfExtentY, "; Finger collider half-extent along finger Y axis (length)");
+        ini.SetDoubleValue("ObjectPickup", "fFingerSegmentHalfExtentZ", fingerSegmentHalfExtentZ, "; Finger collider half-extent along finger Z axis");
+        ini.SetBoolValue("ObjectPickup", "bUseCollisionOverlapForGrabCandidates", useCollisionOverlapForGrabCandidates, "; HIGGS-style collision-driven grab candidate pool");
+        ini.SetBoolValue("HeldBody", "bEnableGrabApproachSubstates", enableGrabApproachSubstates, "; Approach/Contact/Grip FSM smoothing");
+        ini.SetDoubleValue("HeldBody", "fGrabApproachRampSeconds", grabApproachRampSeconds, "; Seconds to ramp motor tau on grab onset");
+
+        // HeldBody constraint grab
+        ini.SetBoolValue("HeldBody", "bUseHeldBodyGrab", useHeldBodyGrab, "; HIGGS-style HeldBody grab (object stays DYNAMIC)");
+        ini.SetLongValue("HeldBody", "iHeldBodyMode", static_cast<long>(static_cast<int>(GetHeldBodyMode())), "; 0=Dynamic spring, 1=Custom 6-DOF, 2=Native ragdoll constraint");
+        ini.SetBoolValue("HeldBody", "bUseNativeRagdollConstraint", UseHeldBodyNativeConstraint(), "; Legacy fallback if iHeldBodyMode is absent");
+        ini.SetBoolValue("HeldBody", "bUseSimpleHandBodyCreation", useSimpleHandBodyCreation, "; Use Bethesda CreateInstance path for HeldBody hand bodies");
+        ini.SetDoubleValue("HeldBody", "fTauLerpTime", heldBodyTauLerpTime, "; Seconds to lerp spring strength from start to target");
+        ini.SetDoubleValue("HeldBody", "fAngularTau", grabConstraintAngularTau, "; Angular resting tau (0=soft, 1=hard)");
+        ini.SetDoubleValue("HeldBody", "fAngularTauBody", grabConstraintAngularTauBody, "; Angular steady-state tau for held bodies");
+        ini.SetDoubleValue("HeldBody", "fAngularTauBodyStart", grabConstraintAngularTauBodyStart, "; Angular tau at grab start");
+        ini.SetDoubleValue("HeldBody", "fAngularDamping", grabConstraintAngularDamping, "; Angular damping factor");
+        ini.SetDoubleValue("HeldBody", "fAngularMaxForce", grabConstraintAngularMaxForce, "; Max angular force");
+        ini.SetDoubleValue("HeldBody", "fLinearTau", grabConstraintLinearTau, "; Linear resting tau");
+        ini.SetDoubleValue("HeldBody", "fLinearTauBody", grabConstraintLinearTauBody, "; Linear steady-state tau for held bodies");
+        ini.SetDoubleValue("HeldBody", "fLinearTauBodyStart", grabConstraintLinearTauBodyStart, "; Linear tau at grab start");
+        ini.SetDoubleValue("HeldBody", "fLinearDamping", grabConstraintLinearDamping, "; Linear damping factor");
+        ini.SetDoubleValue("HeldBody", "fLinearMaxForce", grabConstraintLinearMaxForce, "; Max linear force");
+        ini.SetDoubleValue("HeldBody", "fAngularToLinearForceRatio", grabConstraintAngularToLinearForceRatio, "; Force ratio between angular and linear");
+        ini.SetBoolValue("HeldBody",   "bEnableSoftLimits", grabConstraintEnableSoftLimits, "; Clamp motor targets to prevent runaway stretch/twist (soft 6DOF limits)");
+        ini.SetDoubleValue("HeldBody", "fLinearMaxStretch", grabConstraintLinearMaxStretch, "; Max distance (game units) grabbed object can drift from hand when soft limits on");
+        ini.SetDoubleValue("HeldBody", "fAngularMaxAngleDeg", grabConstraintAngularMaxAngleDeg, "; Max angular deviation (degrees) from initial grab orientation when soft limits on");
+        ini.SetBoolValue("HeldBody",   "bForceDynamicHeldBody", grabConstraintForceDynamicHeldBody, "; Guard: never KEYFRAME the grabbed body while motor constraint is active");
 
         // Throw
         ini.SetDoubleValue("Throw", "fThrowVelocityThreshold", throwVelocityThreshold);
@@ -824,10 +1053,67 @@ iLogLevel = 4
         ini.SetBoolValue("Debug", "bDebugDrawControllers", debugDrawControllers);
         ini.SetBoolValue("Debug", "bDebugLogging", debugLogging, "; Enable verbose debug logging (PERFORMANCE IMPACT!)");
         ini.SetLongValue("Debug", "iLogLevel", logLevel, "; 0=trace, 1=debug, 2=info, 3=warn, 4=error");
+    }
 
-        SI_Error rc = ini.SaveFile(kConfigPath);
-        if (rc < 0) {
-            spdlog::error("Failed to save config file");
+    // Seed the MCM settings file with field defaults for any MCM-exposed control it lacks, so the
+    // menu and engine agree. Runs once per session. Without it, a control absent from the MCM file
+    // falls through to the (possibly stale) external INI — so a toggle can read OFF in the menu yet
+    // behave ON until the user toggles it ON then OFF to force an explicit MCM entry.
+    void Config::SeedMCMDefaultsIfMissing()
+    {
+        static bool s_seeded = false;
+        if (s_seeded) return;
+        s_seeded = true;
+
+        // Read config.json and collect every control id ("key:section").
+        std::ifstream f(kMCMConfigPath);
+        if (!f) {
+            spdlog::debug("[Config] No MCM config.json at {} - skipping default seeding", kMCMConfigPath);
+            return;
+        }
+        std::string json((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+
+        std::vector<std::pair<std::string, std::string>> mcmKeys;  // (section, key)
+        size_t pos = 0;
+        while ((pos = json.find("\"id\"", pos)) != std::string::npos) {
+            size_t q1 = json.find('"', json.find(':', pos + 4));
+            if (q1 == std::string::npos) break;
+            size_t q2 = json.find('"', q1 + 1);
+            if (q2 == std::string::npos) break;
+            std::string id = json.substr(q1 + 1, q2 - q1 - 1);  // "key:section"
+            pos = q2 + 1;
+            size_t sep = id.find(':');
+            if (sep == std::string::npos) continue;
+            mcmKeys.emplace_back(id.substr(sep + 1), id.substr(0, sep));
+        }
+        if (mcmKeys.empty()) return;
+
+        // Field defaults from a freshly-constructed Config.
+        Config def;
+        CSimpleIniA defIni;
+        defIni.SetUnicode();
+        def.BuildIni(&defIni);
+
+        CSimpleIniA mcm;
+        mcm.SetUnicode();
+        mcm.LoadFile(kMCMSettingsPath);  // ok if absent
+
+        int wrote = 0;
+        for (const auto& [section, key] : mcmKeys) {
+            if (mcm.GetValue(section.c_str(), key.c_str(), nullptr) != nullptr) continue;  // user already set it
+            const char* defVal = defIni.GetValue(section.c_str(), key.c_str(), nullptr);
+            if (!defVal) continue;  // control id with no matching serialized setting
+            // MCM stores bools as 1/0, not true/false (SetBoolValue's output) — convert so the
+            // menu (and F4SE's GetModSettingBool) reads the seeded default correctly.
+            std::string v = defVal;
+            if (v == "true") v = "1";
+            else if (v == "false") v = "0";
+            mcm.SetValue(section.c_str(), key.c_str(), v.c_str());
+            ++wrote;
+        }
+        if (wrote > 0) {
+            mcm.SaveFile(kMCMSettingsPath);
+            spdlog::info("[Config] Seeded {} missing MCM default(s) into {}", wrote, kMCMSettingsPath);
         }
     }
 
