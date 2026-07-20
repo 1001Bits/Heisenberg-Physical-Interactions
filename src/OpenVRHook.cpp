@@ -1,7 +1,9 @@
 #include "OpenVRHook.h"
+#include "Config.h"
 #include <spdlog/spdlog.h>
 #include <Windows.h>
 #include <DbgHelp.h>
+#include <intrin.h>  // _ReturnAddress — per-consumer input routing (audit rank 1)
 
 #pragma comment(lib, "DbgHelp.lib")
 
@@ -82,6 +84,14 @@ namespace heisenberg
             pOutputControllerState->ulButtonTouched &= mask;
         }
 
+        // THUMB-TWITCH FIX (Jul 19): FRIK maps all three thumb bones to the thumbstick's
+        // capacitive TOUCH bit (k_EButton_SteamVR_Touchpad in setHandPose) — any stick
+        // edge-graze bends the thumb mid-grab. Strip the touch bit only; presses and axis
+        // values (locomotion, Pip-Boy) are untouched.
+        if (g_config.suppressThumbstickTouch) {
+            pOutputControllerState->ulButtonTouched &= ~vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Touchpad);
+        }
+
         return true;  // Continue processing
     }
     
@@ -158,28 +168,29 @@ namespace heisenberg
     // GetControllerState - THE KEY INTERCEPTION POINT
     // ============================================================
 
-    bool VRSystemWrapper::GetControllerState(vr::TrackedDeviceIndex_t unControllerDeviceIndex, 
-                                              vr::VRControllerState_t* pControllerState, 
+    // Defined below near the vtable hooks (audit rank 1 — per-consumer input routing).
+    static bool IsCallerInOwnModule(const void* returnAddress);
+
+    bool VRSystemWrapper::GetControllerState(vr::TrackedDeviceIndex_t unControllerDeviceIndex,
+                                              vr::VRControllerState_t* pControllerState,
                                               uint32_t unControllerStateSize)
     {
+        const void* callerRa = _ReturnAddress();
         // Get real state first
         bool result = m_realSystem->GetControllerState(unControllerDeviceIndex, pControllerState, unControllerStateSize);
-        
-        if (result && pControllerState) {
-            // Determine if this is left or right controller
-            bool isLeft = IsLeftController(unControllerDeviceIndex);
 
-            // Copy-under-lock: snapshot callbacks to avoid holding mutex during execution
-            std::vector<ControllerStateCallback> callbacksCopy;
-            {
-                std::lock_guard<std::mutex> lock(m_callbackMutex);
-                callbacksCopy = m_callbacks;
-            }
-            for (auto& callback : callbacksCopy) {
-                uint64_t mask = callback(isLeft, pControllerState);
-                pControllerState->ulButtonPressed &= mask;
-                pControllerState->ulButtonTouched &= mask;
-            }
+        if (result && pControllerState && !IsCallerInOwnModule(callerRa)) {
+            // Apply the SHARED OpenVRHook callback list (audit rank 1 fix). In IAT-patch mode
+            // the game reads through THIS wrapper, which forwards to the (separately) patched
+            // real vtable — whose Hooked_ handler now sees the wrapper's own-module return
+            // address and skips filtering to avoid double-application. So the wrapper is the
+            // single point that must apply the game-facing callbacks (A+Grip block, A/X
+            // hold-to-grab, sticky-grab, holotape/throwable strips). The wrapper's own
+            // m_callbacks is empty whenever the vtable hook succeeded (registration is skipped
+            // then), and populated only in the vtable-hook-failed fallback — but every callback
+            // is ALSO in OpenVRHook::m_callbacks, so the shared list is correct in both cases.
+            bool isLeft = IsLeftController(unControllerDeviceIndex);
+            OpenVRHook::GetSingleton().ApplyCallbacksToState(isLeft, pControllerState);
         }
 
         return result;
@@ -191,26 +202,17 @@ namespace heisenberg
                                                       uint32_t unControllerStateSize,
                                                       vr::TrackedDevicePose_t* pTrackedDevicePose)
     {
+        const void* callerRa = _ReturnAddress();
         // Get real state first
         bool result = m_realSystem->GetControllerStateWithPose(eOrigin, unControllerDeviceIndex,
                                                                 pControllerState, unControllerStateSize,
                                                                 pTrackedDevicePose);
 
-        if (result && pControllerState) {
-            // Determine if this is left or right controller
+        if (result && pControllerState && !IsCallerInOwnModule(callerRa)) {
+            // Apply the SHARED OpenVRHook callback list (audit rank 1 fix — see the
+            // GetControllerState twin above for the full rationale).
             bool isLeft = IsLeftController(unControllerDeviceIndex);
-
-            // Copy-under-lock: snapshot callbacks to avoid holding mutex during execution
-            std::vector<ControllerStateCallback> callbacksCopy;
-            {
-                std::lock_guard<std::mutex> lock(m_callbackMutex);
-                callbacksCopy = m_callbacks;
-            }
-            for (auto& callback : callbacksCopy) {
-                uint64_t mask = callback(isLeft, pControllerState);
-                pControllerState->ulButtonPressed &= mask;
-                pControllerState->ulButtonTouched &= mask;
-            }
+            OpenVRHook::GetSingleton().ApplyCallbacksToState(isLeft, pControllerState);
         }
 
         return result;
@@ -719,6 +721,11 @@ namespace heisenberg
             state->ulButtonPressed &= mask;
             state->ulButtonTouched &= mask;
         }
+
+        // THUMB-TWITCH FIX (Jul 19): see the FO4VRTools-path strip above — same rationale.
+        if (g_config.suppressThumbstickTouch) {
+            state->ulButtonTouched &= ~vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Touchpad);
+        }
     }
     
     void OpenVRHook::UpdateControllerIndices(vr::IVRSystem* vrSystem)
@@ -740,6 +747,39 @@ namespace heisenberg
     
     // Global pointer to OpenVRHook for the hook functions
     static OpenVRHook* g_openVRHookInstance = nullptr;
+
+    // FAITHFULNESS FIX (2026-07-05 audit rank 1): per-consumer input routing. The embedded
+    // ROCK engine's framework polls GetControllerState(WithPose) through this SAME patched
+    // vtable, so Heisenberg's A+Grip strip (armed while a hand is grabbing / in post-drop
+    // cooldown) reached ROCK's two-handed support-grip reader — standalone ROCK always reads
+    // clean hardware state (its own input filter zeroes GAME-exe callers only). Exempt
+    // callers inside OUR OWN module (embedded ROCK + Heisenberg itself) from the callback
+    // masking; the game and third-party mods (FRIK, Virtual Holsters) keep the filtered
+    // view they get today. Return-address module check, resolved once.
+    static bool IsCallerInOwnModule(const void* returnAddress)
+    {
+        static uintptr_t s_base = 0;
+        static uintptr_t s_size = 0;
+        static bool s_resolved = false;
+        if (!s_resolved) {
+            HMODULE mod = nullptr;
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCSTR>(&IsCallerInOwnModule), &mod) && mod) {
+                const auto base = reinterpret_cast<uintptr_t>(mod);
+                const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+                if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+                    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+                    if (nt->Signature == IMAGE_NT_SIGNATURE) {
+                        s_base = base;
+                        s_size = nt->OptionalHeader.SizeOfImage;
+                    }
+                }
+            }
+            s_resolved = true;
+        }
+        const auto ra = reinterpret_cast<uintptr_t>(returnAddress);
+        return s_base != 0 && ra >= s_base && ra < s_base + s_size;
+    }
     
     // Our hooked GetControllerState - called instead of the real one
     static bool __fastcall Hooked_GetControllerState(vr::IVRSystem* thisPtr,
@@ -747,25 +787,29 @@ namespace heisenberg
                                                       vr::VRControllerState_t* pControllerState,
                                                       uint32_t unControllerStateSize)
     {
+        const void* callerRa = _ReturnAddress();
         if (!g_openVRHookInstance || !g_openVRHookInstance->m_originalGetControllerState) {
             return false;
         }
-        
+
         // Call the original function
         bool result = g_openVRHookInstance->m_originalGetControllerState(
             thisPtr, unControllerDeviceIndex, pControllerState, unControllerStateSize);
-        
+
         if (result && pControllerState) {
             // Update controller indices if needed
             if (g_openVRHookInstance->m_leftControllerIndex == vr::k_unTrackedDeviceIndexInvalid) {
                 g_openVRHookInstance->UpdateControllerIndices(thisPtr);
             }
-            
-            // Determine hand and apply callbacks
-            bool isLeft = g_openVRHookInstance->IsLeftController(unControllerDeviceIndex);
-            g_openVRHookInstance->ApplyCallbacksToState(isLeft, pControllerState);
+
+            // Determine hand and apply callbacks — but NOT for our own module's reads
+            // (embedded ROCK must see raw hardware grip, like standalone; audit rank 1).
+            if (!IsCallerInOwnModule(callerRa)) {
+                bool isLeft = g_openVRHookInstance->IsLeftController(unControllerDeviceIndex);
+                g_openVRHookInstance->ApplyCallbacksToState(isLeft, pControllerState);
+            }
         }
-        
+
         return result;
     }
     
@@ -777,10 +821,11 @@ namespace heisenberg
                                                               uint32_t unControllerStateSize,
                                                               vr::TrackedDevicePose_t* pTrackedDevicePose)
     {
+        const void* callerRa = _ReturnAddress();
         if (!g_openVRHookInstance || !g_openVRHookInstance->m_originalGetControllerStateWithPose) {
             return false;
         }
-        
+
         // Call the original function
         bool result = g_openVRHookInstance->m_originalGetControllerStateWithPose(
             thisPtr, eOrigin, unControllerDeviceIndex, pControllerState, unControllerStateSize, pTrackedDevicePose);
@@ -790,15 +835,18 @@ namespace heisenberg
             if (g_openVRHookInstance->m_leftControllerIndex == vr::k_unTrackedDeviceIndexInvalid) {
                 g_openVRHookInstance->UpdateControllerIndices(thisPtr);
             }
-            
-            // Determine hand and apply callbacks
-            bool isLeft = g_openVRHookInstance->IsLeftController(unControllerDeviceIndex);
-            g_openVRHookInstance->ApplyCallbacksToState(isLeft, pControllerState);
+
+            // Determine hand and apply callbacks — but NOT for our own module's reads
+            // (embedded ROCK must see raw hardware grip, like standalone; audit rank 1).
+            if (!IsCallerInOwnModule(callerRa)) {
+                bool isLeft = g_openVRHookInstance->IsLeftController(unControllerDeviceIndex);
+                g_openVRHookInstance->ApplyCallbacksToState(isLeft, pControllerState);
+            }
         }
-        
+
         return result;
     }
-    
+
     bool OpenVRHook::HookRealVRSystemVtable(vr::IVRSystem* realSystem)
     {
         if (m_vtableHooked || !realSystem) {

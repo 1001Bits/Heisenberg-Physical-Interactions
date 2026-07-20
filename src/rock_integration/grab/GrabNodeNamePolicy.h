@@ -5,7 +5,7 @@
 #include <string>
 #include <string_view>
 
-namespace rock::grab_node_name_policy
+namespace heisenberg::rock_core::grab_node_name_policy
 {
     /*
      * NIF marker names are part of ROCK's FO4VR asset contract. Keeping that

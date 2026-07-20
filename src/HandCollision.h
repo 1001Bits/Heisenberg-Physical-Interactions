@@ -246,6 +246,16 @@ namespace heisenberg
         /** Called from step listener — runs inside bhkWorld::Update, before physics step */
         void OnPrePhysicsStep();
 
+        /** Push loose clutter that a moving HELD object is ramming into, using the same proven
+         *  proximity mechanism the hand uses (SetLinearVelocity + wake). The keyframed-body physics
+         *  push never engaged reliably, so a held object drives this directly each frame.
+         *  @param center   world centre of the held object
+         *  @param velocity world velocity of the held object (game units/s)
+         *  @param radius   query radius around the held object
+         *  @param ignore   the held object itself (never push it) */
+        void PushObjectsToward(const RE::NiPoint3& center, const RE::NiPoint3& velocity,
+                               float radius, RE::TESObjectREFR* ignore);
+
         HandCollisionStepListener _stepListener;
 
     private:

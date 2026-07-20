@@ -1,6 +1,8 @@
 #include "Hooks.h"
 
 #include "Heisenberg.h"
+#include "HandBumpHook.h"
+#include "HavokTimingFix.h"
 #include "VRInput.h"
 #include "WandNodeHelper.h"
 #include "Grab.h"
@@ -21,6 +23,9 @@
 #include "Physics.h"
 #include "ThrownObjectTracker.h"
 #include "HandWallPushback.h"
+#include "HandAuthority.h"
+#include "FrikArmGoalHook.h"
+#include "../external/ROCK/src/ROCKMain.h"
 #include "rock_integration/HandBoneColliderSet.h"
 #include "rock_integration/BodyBoneColliderSet.h"
 #include "rock_integration/WeaponCollision.h"
@@ -250,6 +255,49 @@ namespace heisenberg::Hooks
                 g_originalPostPhysics(rcx);
             }
 
+            // FRAME-ORDER SEAM (Jul 19): the U1PA shim publishes clean pass-1 controller
+            // hands from inside FRIK, before its authority pass. Do not overwrite that
+            // loop-free snapshot here with the post-authority skinned support hand; doing so
+            // feeds ROCK's prior output back into the next weapon solve and makes a scope
+            // wander while walking. If the shim did not publish this frame (inactive,
+            // disarmed, or temporarily bypassed), the skinned result is the fallback.
+            if (heisenberg::IsRockEngineHosted()) {
+                const bool cleanTruthPublished =
+                    heisenberg::FrikArmGoalHook::ConsumeCleanTruthPublished();
+                if (!cleanTruthPublished) {
+                    RE::NiTransform preL, preR;
+                    if (heisenberg::HandAuthority::GetSkinnedHandWorld(true, preL) &&
+                        heisenberg::HandAuthority::GetSkinnedHandWorld(false, preR)) {
+                        rock::HostSetPreAuthorityHandWorlds(preL, preR);
+                        RE::NiPoint3 shoulder{};
+                        float maxReach = 0.0f;
+                        if (heisenberg::HandAuthority::GetArmReachSphere(true, shoulder, maxReach)) {
+                            rock::HostSetPreAuthorityArmReach(true, shoulder, maxReach);
+                        }
+                        if (heisenberg::HandAuthority::GetArmReachSphere(false, shoulder, maxReach)) {
+                            rock::HostSetPreAuthorityArmReach(false, shoulder, maxReach);
+                        }
+                    }
+                }
+            }
+
+            // HOST API leases (Jul 19, Virtual Reloads): push the effective external
+            // weapon-collision / two-handing state into the embedded engine every frame —
+            // the 5s lease TTL is evaluated host-side, so a caller that never re-enables
+            // self-heals here.
+            if (heisenberg::IsRockEngineHosted()) {
+                rock::HostSetWeaponCollisionSuppressed(HeisenbergPluginAPI::IsWeaponCollisionDisabledByAPI());
+                rock::HostSetTwoHandedGripBlocked(HeisenbergPluginAPI::IsOffHandGripBlockedByAPI());
+                rock::HostSetHandCollisionSuppressed(true, HeisenbergPluginAPI::IsHandCollisionDisabledByAPI(true));
+                rock::HostSetHandCollisionSuppressed(false, HeisenbergPluginAPI::IsHandCollisionDisabledByAPI(false));
+                rock::HostSetHandHoldingObject(true, heisenberg::GrabManager::GetSingleton().IsGrabbing(true));
+                rock::HostSetHandHoldingObject(false, heisenberg::GrabManager::GetSingleton().IsGrabbing(false));
+            }
+
+            // Two-handed support-hand finger pose (Jul 19): drive FRIK's base finger API
+            // from ROCK's grip pose or the geometry solver while a support grip is engaged.
+            heisenberg::UpdateTwoHandedSupportFingerPose();
+
             constexpr bool DEBUG_DISABLE_ALL_PROCESSING = false;
             if (DEBUG_DISABLE_ALL_PROCESSING) {
                 return;
@@ -268,6 +316,15 @@ namespace heisenberg::Hooks
             GrabManager::GetSingleton().PostPhysicsGrabUpdate();
             g_heisenberg.OnInputUpdate();
             g_heisenberg.OnGrabUpdate();
+
+            // Plugin-side hand authority (Jul 19 frame-order audit): when the embedded ROCK
+            // engine is hosted, ApplyWinners runs via rock::HostSetPostUpdateCallback at the
+            // TAIL of ROCK's onFrameUpdate — AFTER ROCK writes the weapon node the renderer
+            // consumes (applying here would solve the hand against FRIK's pre-aim weapon pose
+            // that never renders = the chewing-gum offset). Non-embed sessions apply here.
+            if (!heisenberg::IsRockEngineHosted()) {
+                heisenberg::HandAuthority::ApplyWinners();
+            }
 
             // Fire post-physics callbacks for external plugins
             heisenberg::HandCollision::GetSingleton().FlushPendingHaptics();
@@ -313,20 +370,22 @@ namespace heisenberg::Hooks
                 g_originalPlayerCharacterUpdate(player, delta);
             }
 
-            // Skip during loading
+            // Skip during loading.
+            // NOTE: a single latch declared before the branch. The previous code declared
+            // two separate function-local statics (one per branch) that shadowed each other,
+            // so the loading-edge Shutdown only ever fired on the FIRST loading screen of the
+            // process; every cell-transition load afterward left stale KEYFRAMED bodies that
+            // crash the engine physics step during teardown.
+            static bool s_pcuWasLoading = false;
             if (MenuChecker::GetSingleton().IsLoading()) {
-                // Destroy hand collision bodies immediately when loading starts
-                // The engine's physics step will crash on stale KEYFRAMED bodies during teardown
-                static bool wasLoading = false;
-                if (!wasLoading) {
+                // Destroy hand collision bodies immediately when loading starts.
+                if (!s_pcuWasLoading) {
                     heisenberg::HandCollision::GetSingleton().Shutdown();
-                    wasLoading = true;
+                    s_pcuWasLoading = true;
                 }
                 return;
-            } else {
-                static bool wasLoading = false;
-                wasLoading = false;
             }
+            s_pcuWasLoading = false;
 
             // Hand collision body creation
             static int frameCount = 0;
@@ -344,24 +403,68 @@ namespace heisenberg::Hooks
         // Uses WorldWriteLock (C++ RAII) which can't be in __try functions.
         void UpdateHandCollisionBodies(HandCollisionUpdatePhase phase)
         {
-            // ROCK integration: when ROCK integration is active, Heisenberg must
-            // NEVER run its own hand collision. Only ONE mod may drive hand bodies
-            // / modify object transforms per frame — running both (e.g. during
-            // ROCK's not-yet-ready startup window) races on hknpWorld::setBodyPosition
-            // and crashes in updateMotionAndAttachedBodiesAfterModifyingTransform.
-            // So we gate on IsActive() alone, NOT physics-ready. If ROCK is present
-            // but disabled (e.g. FRIK API mismatch), there is briefly no hand push;
-            // set [ROCK] iUseRockPhysics=0 to force the built-in fallback instead.
-            {
-                auto& rock = heisenberg::RockBridge::GetSingleton();
-                if (rock.IsActive()) {
-                    static bool loggedRock = false;
-                    if (!loggedRock) {
-                        spdlog::info("[HOOKS] ROCK integration active — built-in hand collision disabled (ROCK owns hand physics).");
-                        loggedRock = true;
-                    }
-                    return;
+            // ROCK integration — AUTOMATIC hand-collision ownership:
+            //   * External ROCK present AND actually running its physics (IsRunning) -> ROCK
+            //     owns hands; Heisenberg's hand collision is OFF (return here).
+            //   * Embedded ROCK -> its real hand/arm collider bodies remain the sole physics
+            //     bodies, but Heisenberg's old body-less proximity/depenetration push may coexist
+            //     when explicitly enabled and bUsePhysicsHandBodies=false.
+            //   * ROCK present but DISABLED / torn down at runtime -> Heisenberg reclaims
+            //     hands automatically (fall through to the proximity push below). No INI
+            //     change needed — this is the "turn ROCK off, get our push back" case.
+            //   * ROCK absent -> Heisenberg owns hands.
+            // SAFETY: only ONE mod may create hand BODIES per frame — running both during
+            // ROCK's startup races hknpWorld::setBodyPosition and crashes. So while ROCK is
+            // merely PRESENT (loaded) we NEVER create our own physics hand bodies (see the
+            // usePhysicsBodies gate below). The auto-reclaim path uses PROXIMITY push only,
+            // which creates no bodies and is safe to run during ROCK's startup window.
+            auto& rock = heisenberg::RockBridge::GetSingleton();
+            const bool embeddedRockHosted = heisenberg::IsRockEngineHosted();
+            const bool useEmbeddedBodylessProximity =
+                embeddedRockHosted &&
+                heisenberg::g_config.enableHandCollision &&
+                !heisenberg::g_config.usePhysicsHandBodies;
+
+            // Tell only the embedded engine to stand down its scripted HAND push while the
+            // old proximity path supplies that impulse. ROCK's actual collision bodies,
+            // semantic contacts, haptics, and weapon DynamicPushAssist all stay enabled.
+            if (embeddedRockHosted) {
+                rock::HostSetHandDynamicPushAssistSuppressed(useEmbeddedBodylessProximity);
+            }
+
+            if (rock.IsRunning() || (embeddedRockHosted && !useEmbeddedBodylessProximity)) {
+                static bool loggedRock = false;
+                if (!loggedRock) {
+                    spdlog::info("[HOOKS] ROCK owns hand physics ({}) — built-in hand collision disabled.",
+                                 rock.IsRunning() ? "external ROCK.dll" : "embedded ROCK engine");
+                    loggedRock = true;
                 }
+                return;
+            }
+
+            if (useEmbeddedBodylessProximity) {
+                static bool loggedCoexistence = false;
+                if (!loggedCoexistence) {
+                    spdlog::info("[HOOKS] Embedded ROCK collision bodies active; enabling body-less "
+                                 "Heisenberg hand proximity push (ROCK hand DynamicPushAssist suppressed).");
+                    loggedCoexistence = true;
+                }
+            }
+
+            // [RockIntegration] collider/grip modules tick HERE, before the enableHandCollision
+            // gate, so each runs whenever its own [RockIntegration] toggle is on — independent of
+            // the cup/finger hand-collision setting (bEnableHandCollision). Previously these lived
+            // inside HandCollision::Update, which is unreachable past the !enableHandCollision
+            // return below, so BodyBoneCollider/WeaponCollision/TwoHandedGrip could never tick
+            // unless an unrelated flag was also set. Each self-gates via IsActive() (a no-op when
+            // its toggle is off); HandBoneColliderSet keeps its own enableHandCollision dependency
+            // inside IsActive(). Kept BELOW the ROCK.dll IsRunning() return: when ROCK.dll runs it
+            // owns these colliders. PostPhysics-only so they tick exactly once per frame.
+            if (!embeddedRockHosted && phase == HandCollisionUpdatePhase::PostPhysics) {
+                heisenberg::rock_hand_collider::Update();
+                heisenberg::rock_body_collider::Update();
+                heisenberg::rock_weapon_collision::Update();
+                heisenberg::rock_two_handed_grip::Update();
             }
 
             if (!heisenberg::g_config.enableHandCollision) {
@@ -369,7 +472,8 @@ namespace heisenberg::Hooks
                 if (!loggedOnce) {
                     spdlog::warn("[HOOKS] Hand collision disabled (bEnableHandCollision=false) — "
                                  "hand strikes won't push objects. Set bEnableHandCollision=true in "
-                                 "Heisenberg_F4VR.ini or via MCM to enable.");
+                                 "Heisenberg_F4VR.ini or via MCM to enable. (ROCK collider modules "
+                                 "above still tick independently when their own toggles are on.)");
                     loggedOnce = true;
                 }
                 return;
@@ -391,7 +495,14 @@ namespace heisenberg::Hooks
             // Physics-body path (full Havok hand bodies) is opt-in and gated separately;
             // proximity-based push always runs when enableHandCollision is true so a
             // user with usePhysicsHandBodies=false still gets hand-strike impulse.
-            const bool usePhysicsBodies = heisenberg::g_config.usePhysicsHandBodies;
+            // Never create our own physics hand bodies while external ROCK is loaded OR the
+            // embedded engine is hosted. The explicit embedded check is defense-in-depth:
+            // RockBridge cannot see the in-process engine, so !rock.IsActive() alone is true
+            // in the embed. Proximity push (no bodies) is the only allowed coexistence path.
+            const bool usePhysicsBodies =
+                heisenberg::g_config.usePhysicsHandBodies &&
+                !rock.IsActive() &&
+                !embeddedRockHosted;
             if (usePhysicsBodies && phase == HandCollisionUpdatePhase::PrePhysics) {
                 hc.CreateBodiesIfNeeded(leftWand->world.translate, rightWand->world.translate);
                 hc.ApplyPlayerPairFilterIfNeeded();
@@ -543,11 +654,26 @@ namespace heisenberg::Hooks
             return;
         }
 
-        // Allocate trampoline space
-        F4SE::AllocTrampoline(1024);
+        // Allocate trampoline space. Sized to cover BOTH Heisenberg's own hooks AND the embedded
+        // ROCK engine's hooks (its main-loop write_call, etc). CommonLibF4's AllocTrampoline calls
+        // set_trampoline()->release(), which FREES any previously-allocated trampoline buffer — so
+        // there must be exactly ONE AllocTrampoline for the whole DLL. rock::HostLoad therefore does
+        // NOT allocate its own; it appends to THIS shared trampoline via F4SE::GetTrampoline().
+        // (A second alloc freed this buffer mid-session → dangling Heisenberg hook stubs → execute-AV
+        //  when a per-frame PlayerUpdateEvent sink first fired after the player spawned.)
+        F4SE::AllocTrampoline(4096);
 
         // Initialize VR input
         g_vrInput.Initialize();
+
+        // Install the HandleBumpedCharacter guard (CTD protection for ROCK-style
+        // physics hand bodies). Installed always; suppression toggled on only while
+        // physics hand bodies are active (see HandBumpHook::SetEnabled).
+        heisenberg::HandBumpHook::Install();
+
+        // Install the ROCK Havok timing-fix call-site hook (bhkWorld::SetDeltaTime substep
+        // override). Installed always; the override is gated on via config (bHavokTimingFix).
+        heisenberg::HavokTimingFix::Install();
 
         auto& trampoline = F4SE::GetTrampoline();
 
@@ -626,7 +752,11 @@ namespace heisenberg::Hooks
 
         // ActorEquipManager::EquipObject hook - intercept consumable equips from
         // Pipboy/Favorites menus and redirect to drop-to-hand when configured
-        if (g_config.consumableToHand || g_config.favoritesToHand || g_config.holotapeToHand) {
+        // Also install when drop-to-hand is on: the hook tells a consumable USE apart from a DROP
+        // (only a USE goes through EquipObject), so DropToHand can skip consumes — needed even when
+        // consume-to-hand itself is off.
+        if (g_config.consumableToHand || g_config.favoritesToHand || g_config.holotapeToHand
+            || g_config.dropToHandMode > 0) {
             InstallEquipObjectHook();
         }
 
@@ -860,9 +990,27 @@ namespace heisenberg::Hooks
         if (g_blockAllWeaponDrawFrames.load(std::memory_order_relaxed) > 0) {
             if (a_event) {
                 auto* player = f4vr::getPlayer();
-                if (!player || !player->actorState.IsWeaponDrawn()) {
+                if (!player || !player->GetWeaponMagicDrawn()) {
                     // Weapon not drawn — block the draw event to prevent re-equip
                     spdlog::debug("[GripHook] Blocked weapon draw (post-unequip cooldown)");
+                    return;
+                }
+            }
+        }
+
+        // Block the ready-weapon handler ONLY when the WEAPON (primary) hand is holding an
+        // object and the weapon is holstered. Ghidra (vf011 @ 0xFC9220) shows a TRIGGER
+        // auto-ready path here (held-duration >= DAT_1437d5d58 -> DrawWeaponMagicHands) that
+        // would unsheathe the weapon THROUGH the held item. We gate on the PRIMARY hand only:
+        // if you're holding something in the OFF hand, the weapon hand is free, so its trigger
+        // must still draw normally. When a weapon is already drawn, behave normally.
+        if (a_event) {
+            const bool primaryIsLeft = heisenberg::VRInput::GetSingleton().IsLeftHandedMode();
+            auto& grabMgr = heisenberg::GrabManager::GetSingleton();
+            if (grabMgr.IsGrabbing(primaryIsLeft)) {
+                auto* player = f4vr::getPlayer();
+                if (!player || !player->GetWeaponMagicDrawn()) {
+                    spdlog::debug("[GripHook] Blocked ready-weapon draw (weapon hand holding object, weapon holstered)");
                     return;
                 }
             }
@@ -893,7 +1041,7 @@ namespace heisenberg::Hooks
                     spdlog::debug("[GripHook] ScopeMenu open - skipping ReadyWeaponHandler (hold breath)");
                     return;
                 }
-                if (player && player->actorState.IsWeaponDrawn()) {
+                if (player && player->GetWeaponMagicDrawn()) {
                     spdlog::debug("[GripHook] Weapon drawn - passing WandGrip through (reload/holster)");
                 } else {
                     // Weapon holstered: normally block WandGrip here so grip doesn't draw the
@@ -1737,6 +1885,12 @@ namespace heisenberg::Hooks
                     return true;  // Skip — already redirected
                 }
 
+                // Mark this consumable as handled-via-equip so DropToHand's drop path won't ALSO
+                // yank it to the hand: USING a chem/food/drink fires the same old=player->new=0
+                // container event as a DROP. A real DROP never goes through EquipObject, so it's
+                // never marked and still grabs normally.
+                DropToHand::GetSingleton().MarkAsRecentlyStored(baseForm->formID);
+
                 auto& menuChecker = MenuChecker::GetSingleton();
                 bool shouldRedirect = false;
                 const char* source = nullptr;
@@ -1807,11 +1961,26 @@ namespace heisenberg::Hooks
                     spdlog::debug("[EquipHook] Blocked holotape equip during active game playback");
                     return true;  // Swallow — don't redirect, don't play
                 }
-                // Block if this holotape is already loaded in the tape deck
+                // Selecting the loaded intro tape means "take it out". It already exists
+                // in player inventory as the deck's backing item, so swallowing this equip
+                // made it impossible to retrieve through the Pip-Boy menu.
                 if (pipboy.HasHolotapeLoaded() && pipboy.GetLoadedHolotapeFormID() == baseForm->formID) {
-                    spdlog::debug("[EquipHook] Holotape {:08X} already in tape deck — ignoring inventory activation",
-                        baseForm->formID);
-                    return true;  // Swallow — holotape is already inserted
+                    if (pipboy.IsIntroHolotape(baseForm->formID)) {
+                        const bool queued = pipboy.TakeLoadedIntroHolotapeToRightHand(baseForm->formID);
+                        if (queued) {
+                            // Suppress any secondary holotape-menu path fired by the same UI action.
+                            s_holotapeRedirectTick = GetTickCount64();
+                            spdlog::info("[EquipHook] Loaded intro holotape {:08X} moved from deck to right hand",
+                                         baseForm->formID);
+                        } else {
+                            spdlog::warn("[EquipHook] Loaded intro holotape {:08X} could not be moved to hand",
+                                         baseForm->formID);
+                        }
+                    } else {
+                        spdlog::debug("[EquipHook] Holotape {:08X} already in tape deck — ignoring inventory activation",
+                                     baseForm->formID);
+                    }
+                    return true;
                 }
                 if (g_config.holotapeToHand) {
                 auto& menuChecker = MenuChecker::GetSingleton();
@@ -1860,7 +2029,7 @@ namespace heisenberg::Hooks
 
                     // Holster weapon if drawn (vrPlayer for state check, RE player for vtable call)
                     auto* vrPlayer = f4vr::getPlayer();
-                    if (vrPlayer && vrPlayer->actorState.IsWeaponDrawn()) {
+                    if (vrPlayer && vrPlayer->GetWeaponMagicDrawn()) {
                         player->DrawWeaponMagicHands(false);
                         spdlog::debug("[EquipHook] Holstered weapon for holotape '{}'", itemName);
                     }

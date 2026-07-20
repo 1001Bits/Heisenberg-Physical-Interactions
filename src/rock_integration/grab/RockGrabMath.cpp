@@ -1,6 +1,6 @@
 // ROCK grab math/policy — Heisenberg port (tasks #111/#112 foundation).
 //
-// Self-contained, header-only math/policy ported verbatim (namespaces kept rock::*):
+// Self-contained, header-only math/policy ported verbatim (namespaces kept heisenberg::rock_core::*):
 //   - TransformMath        : templated transform/vector/quat math (shared infra, #111)
 //   - GrabConstraintMath   : grab constraint target/error math (#111)
 //   - GrabNodeInfoMath     : per-weapon grab-node anchor geometry (#112)
@@ -20,6 +20,6 @@ namespace heisenberg::rock_grab
     // Compile-anchor: forces the ported headers to instantiate. Runtime wiring follows.
     bool GrabMathHeadersCompiled()
     {
-        return !rock::grab_node_name_policy::defaultGrabNodeName(true).empty();
+        return !heisenberg::rock_core::grab_node_name_policy::defaultGrabNodeName(true).empty();
     }
 }

@@ -14,6 +14,7 @@
 #include "rock_integration/WeaponCollision.h"
 #include "rock_integration/CollisionLayerPolicy.h"
 #include "rock_integration/TwoHandedGrip.h"
+#include "rock_integration/PushAssist.h"
 #include "Utils.h"
 #include "VRInput.h"
 #include "f4vr/PlayerNodes.h"
@@ -25,1311 +26,6 @@
 #include <limits>
 #include <vector>
 
-// Temporarily disable the HandCollision implementation without deleting it.
-#if 0
-
-// =====================================================================
-// bhkNPCollisionProxyObject - Proxy collision object structure
-// Inherits from bhkNPCollisionObjectBase (NOT bhkNPCollisionObject!)
-// =====================================================================
-// Helper to get the target collision object from a proxy
-inline RE::bhkNPCollisionObject* GetProxyTarget(RE::NiCollisionObject* proxyObj)
-{
-    if (!proxyObj) return nullptr;
-    
-    uintptr_t proxyAddr = reinterpret_cast<uintptr_t>(proxyObj);
-    
-    // Try offset 0x20 first
-    RE::bhkNPCollisionObject** targetPtrAt20 = reinterpret_cast<RE::bhkNPCollisionObject**>(proxyAddr + 0x20);
-    if (*targetPtrAt20) return *targetPtrAt20;
-    
-    // Try offset 0x28
-    RE::bhkNPCollisionObject** targetPtrAt28 = reinterpret_cast<RE::bhkNPCollisionObject**>(proxyAddr + 0x28);
-    if (*targetPtrAt28) return *targetPtrAt28;
-    
-    // Try offset 0x30 
-    RE::bhkNPCollisionObject** targetPtrAt30 = reinterpret_cast<RE::bhkNPCollisionObject**>(proxyAddr + 0x30);
-    if (*targetPtrAt30) return *targetPtrAt30;
-    
-    return nullptr;
-}
-
-// =========================================================================
-// SEH HELPER FUNCTIONS (Must be in separate functions with no C++ objects)
-// These use raw function pointers to avoid any C++ object creation
-// =========================================================================
-
-// Flag to track if SEH caught an exception (can't use C++ objects in SEH functions)
-static volatile bool g_sehExceptionCaught = false;
-
-// Helper to safely call hknpWorld::createBody
-// CORRECT signature: int* hknpWorld_createBody(void* world, int* outBodyId, hknpBodyCinfo* cinfo, int additionMode, char flags)
-// param_2 is an OUTPUT parameter — the bodyId is written there
-// Returns bodyId on success, 0x7FFFFFFE on SEH exception
-static std::uint32_t SafeCallCreateBody(void* funcPtr, void* hknpWorld, void* bodyCinfo)
-{
-    using Func_t = std::int32_t*(__fastcall*)(void*, std::int32_t*, void*, int, unsigned char);
-    g_sehExceptionCaught = false;
-    __try {
-        std::int32_t outBodyId = 0x7FFFFFFF;
-        ((Func_t)funcPtr)(hknpWorld, &outBodyId, bodyCinfo, 0, 0);
-        return static_cast<std::uint32_t>(outBodyId);
-    }
-    __except(EXCEPTION_EXECUTE_HANDLER) {
-        g_sehExceptionCaught = true;
-        return 0x7FFFFFFE;
-    }
-}
-
-// Helper to safely read vtable from a pointer
-static void* SafeReadVtable(void* ptr)
-{
-    __try {
-        return *reinterpret_cast<void**>(ptr);
-    }
-    __except(EXCEPTION_EXECUTE_HANDLER) {
-        return nullptr;
-    }
-}
-
-// Helper to safely call hknpBSWorld::applyHardKeyFrame for moving bodies
-static bool SafeCallApplyHardKeyFrame(void* funcPtr, void* world, std::uint32_t bodyId, void* position, void* orientation, float deltaTime)
-{
-    using Func_t = void(__fastcall*)(void*, std::uint32_t, void*, void*, float);
-    __try {
-        ((Func_t)funcPtr)(world, bodyId, position, orientation, deltaTime);
-        return true;
-    }
-    __except(EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-// Helper to safely call hknpWorld::destroyBodies
-static bool SafeCallDestroyBodies(void* funcPtr, void* hknpWorld, std::uint32_t* bodyIds, int count)
-{
-    using Func_t = void(__fastcall*)(void*, const std::uint32_t*, int, int);
-    __try {
-        ((Func_t)funcPtr)(hknpWorld, bodyIds, count, 0);
-        return true;
-    }
-    __except(EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-// Helper to safely call bhkNPCollisionObject::AddToWorld
-static bool SafeCallAddToWorld(void* funcPtr, void* collisionObject, void* bhkWorld)
-{
-    using Func_t = void(__fastcall*)(void*, void*);
-    __try {
-        ((Func_t)funcPtr)(collisionObject, bhkWorld);
-        return true;
-    }
-    __except(EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-// Helper to safely call bhkNPCollisionObject::SetMotionType
-static bool SafeCallSetMotionType(void* funcPtr, void* collisionObject, int motionType)
-{
-    using Func_t = void(__fastcall*)(void*, int);
-    __try {
-        ((Func_t)funcPtr)(collisionObject, motionType);
-        return true;
-    }
-    __except(EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-static bool SafeCallSetBodyCollisionFilterInfo(void* funcPtr, void* hknpWorld, std::uint32_t bodyId, std::uint32_t filterInfo)
-{
-    using Func_t = void(__fastcall*)(void*, std::uint32_t, std::uint32_t);
-    __try {
-        ((Func_t)funcPtr)(hknpWorld, bodyId, filterInfo);
-        return true;
-    }
-    __except(EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-namespace heisenberg
-{
-    namespace
-    {
-        constexpr double kHandBodyCreationSettleDelaySeconds = 0.75;
-        constexpr double kPlayerBodyRetryCooldownSeconds = 3.0;
-        constexpr double kHandBodyPostCreateMoveDelaySeconds = 0.10;
-        constexpr double kHandBodyCollisionEnableDelaySeconds = 0.30;
-        // Use kClutter (layer 4) with proper F4VR filter format (0x02EF prefix)
-        // This collides with world objects but the proxy listener handles player capsule
-        // hknpGroupCollisionFilter Config<5,5,5,16>:
-        //   bits 0-4:   layer (5 bits)
-        //   bits 5-9:   system group (5 bits)
-        //   bits 10-14: sub-system ID (5 bits)
-        //   bits 15-30: sub-system don't-collide mask (16 bits)
-        // Bodies in the SAME system group with matching sub-system mask DON'T collide.
-        constexpr std::uint32_t kHandCollisionLayer = 4;  // kClutter
-        constexpr std::uint32_t kHandCollisionDisabledBit = (1u << 14);
-        constexpr std::uint32_t kSystemGroupMask = (0x1Fu << 5);   // bits 5-9
-        constexpr std::uint32_t kSubSystemMask = (0x1Fu << 10);    // bits 10-14
-        constexpr std::uint32_t kSubSystemDontCollideMask = (0xFFFFu << 15); // bits 15-30
-
-        // Helper to get bhkWorld from cell (avoids REL::Relocation in __try blocks)
-        using GetbhkWorld_t = void*(*)(RE::TESObjectCELL*);
-        static REL::Relocation<GetbhkWorld_t> g_GetbhkWorld{ REL::Offset(0x39b070) };
-        void* GetbhkWorldForCell(RE::TESObjectCELL* cell) {
-            return cell ? g_GetbhkWorld(cell) : nullptr;
-        }
-
-        // Cached player collision group — read once, reused
-        static std::uint32_t g_playerCollisionFilterInfo = 0;
-        static bool g_playerFilterCached = false;
-
-        std::uint32_t ReadPlayerCollisionFilterInfo()
-        {
-            if (g_playerFilterCached && g_playerCollisionFilterInfo != 0) {
-                return g_playerCollisionFilterInfo;
-            }
-
-            // Read from the player proxy body via the body buffer
-            std::uint32_t playerBodyId = heisenberg::Physics::GetPlayerBodyId();
-            if (playerBodyId == 0x7FFFFFFF || playerBodyId == 0) {
-                return 0;
-            }
-
-            auto* player = RE::PlayerCharacter::GetSingleton();
-            if (!player || !player->parentCell) return 0;
-            void* bhkWorld = GetbhkWorldForCell(player->parentCell);
-            if (!bhkWorld) return 0;
-            void* hknpWorld = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(bhkWorld) + 0x60);
-            if (!hknpWorld) return 0;
-
-            // Read filter from body buffer: body buffer at hknpWorld+0x20, stride 0x90, filterInfo at +0x40
-            __try {
-                void* bodyBuffer = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(hknpWorld) + 0x20);
-                if (!bodyBuffer) return 0;
-                std::uint32_t bodyIndex = playerBodyId & 0xFFFF;
-                std::uint32_t filterInfo = *reinterpret_cast<std::uint32_t*>(
-                    reinterpret_cast<uintptr_t>(bodyBuffer) + bodyIndex * 0x90 + 0x40);
-                g_playerCollisionFilterInfo = filterInfo;
-                g_playerFilterCached = true;
-                spdlog::info("[HAND_COLLISION] Read player collision filter: 0x{:08X} (group={}, layer={})",
-                             filterInfo, (filterInfo >> 5) & 0x1F, filterInfo & 0x1F);
-                return filterInfo;
-            }
-            __except(EXCEPTION_EXECUTE_HANDLER) {
-                return 0;
-            }
-        }
-
-        std::uint32_t BuildHandCollisionFilter(bool /*isLeft*/, bool collisionEnabled)
-        {
-            // Start with kClutter layer
-            std::uint32_t filterInfo = kHandCollisionLayer;
-
-            // Copy player's system group so hand doesn't collide with player
-            // (HIGGS pattern: same group = no collision)
-            std::uint32_t playerFilter = ReadPlayerCollisionFilterInfo();
-            if (playerFilter != 0) {
-                // Copy system group bits (5-9) from player
-                filterInfo |= (playerFilter & kSystemGroupMask);
-                // Copy sub-system bits (10-14) from player
-                filterInfo |= (playerFilter & kSubSystemMask);
-                // Copy don't-collide mask (15-30) from player
-                filterInfo |= (playerFilter & kSubSystemDontCollideMask);
-            } else {
-                // Fallback: use a known working filter format with disabled bit
-                filterInfo = 0x02EF0004;
-            }
-
-            if (!collisionEnabled) {
-                filterInfo |= kHandCollisionDisabledBit;
-            }
-
-            return filterInfo;
-        }
-
-        void ResetPlayerFilterCache()
-        {
-            g_playerFilterCached = false;
-            g_playerCollisionFilterInfo = 0;
-        }
-
-        void MatrixToQuaternion(const RE::NiMatrix3& m, RE::NiPoint4& outQuat)
-        {
-            float trace = m.entry[0][0] + m.entry[1][1] + m.entry[2][2];
-
-            if (trace > 0.0f) {
-                float s = 0.5f / sqrtf(trace + 1.0f);
-                outQuat.w = 0.25f / s;
-                outQuat.x = (m.entry[2][1] - m.entry[1][2]) * s;
-                outQuat.y = (m.entry[0][2] - m.entry[2][0]) * s;
-                outQuat.z = (m.entry[1][0] - m.entry[0][1]) * s;
-            } else if (m.entry[0][0] > m.entry[1][1] && m.entry[0][0] > m.entry[2][2]) {
-                float s = 2.0f * sqrtf(1.0f + m.entry[0][0] - m.entry[1][1] - m.entry[2][2]);
-                outQuat.w = (m.entry[2][1] - m.entry[1][2]) / s;
-                outQuat.x = 0.25f * s;
-                outQuat.y = (m.entry[0][1] + m.entry[1][0]) / s;
-                outQuat.z = (m.entry[0][2] + m.entry[2][0]) / s;
-            } else if (m.entry[1][1] > m.entry[2][2]) {
-                float s = 2.0f * sqrtf(1.0f + m.entry[1][1] - m.entry[0][0] - m.entry[2][2]);
-                outQuat.w = (m.entry[0][2] - m.entry[2][0]) / s;
-                outQuat.x = (m.entry[0][1] + m.entry[1][0]) / s;
-                outQuat.y = 0.25f * s;
-                outQuat.z = (m.entry[1][2] + m.entry[2][1]) / s;
-            } else {
-                float s = 2.0f * sqrtf(1.0f + m.entry[2][2] - m.entry[0][0] - m.entry[1][1]);
-                outQuat.w = (m.entry[1][0] - m.entry[0][1]) / s;
-                outQuat.x = (m.entry[0][2] + m.entry[2][0]) / s;
-                outQuat.y = (m.entry[1][2] + m.entry[2][1]) / s;
-                outQuat.z = 0.25f * s;
-            }
-        }
-    }
-
-    // =========================================================================
-    // INITIALIZATION
-    // =========================================================================
-
-    bool HandCollision::Initialize()
-    {
-        if (_initialized) {
-            return true;
-        }
-
-        spdlog::info("[HAND_COLLISION] Physics-based hand collision system initializing...");
-        
-        // Clear state
-        _leftHandBody.Invalidate();
-        _rightHandBody.Invalidate();
-        _leftContact.reset();
-        _rightContact.reset();
-        _bodyCreationBlockedUntil = Utils::GetTime() + kHandBodyCreationSettleDelaySeconds;
-        _playerBodyRetryBlockedUntil = 0.0;
-
-        // The custom proxy-listener vtable is still incomplete in VR.
-        // During real trigger-volume callbacks the engine dispatches additional
-        // listener methods beyond processConstraintsCallback, which makes the
-        // synthetic listener crash inside hknpCharacterProxyInternals.
-        // Keep hand collision on the safer pair-filter path until the full
-        // hknpCharacterProxyListener ABI is mapped.
-        spdlog::info("[HAND_COLLISION] Player proxy listener registration is disabled; using player-body pair filtering only");
-
-        _initialized = true;
-        spdlog::info("[HAND_COLLISION] Hand collision system initialized (bodies will be created on first update)");
-        return true;
-    }
-
-    void HandCollision::Shutdown()
-    {
-        spdlog::info("[HAND_COLLISION] Shutting down hand collision system...");
-
-        // Invalidate hand bodies — don't try to destroy them.
-        // During save/load the physics world may already be torn down,
-        // and calling DestroyBodies on a dead world crashes.
-        {
-            std::scoped_lock lock(_handBodyMutex);
-            _leftHandBody.Invalidate();
-            _rightHandBody.Invalidate();
-        }
-
-        _leftContact.reset();
-        _rightContact.reset();
-        _bodyCreationBlockedUntil = Utils::GetTime() + kHandBodyCreationSettleDelaySeconds;
-        _playerBodyRetryBlockedUntil = 0.0;
-        ResetPlayerFilterCache();
-
-        _initialized = false;
-    }
-
-    // =========================================================================
-    // BODY CREATION (called from HookEndUpdate)
-    // =========================================================================
-
-    void HandCollision::CreateBodiesIfNeeded(const RE::NiPoint3& leftHandPos, const RE::NiPoint3& rightHandPos)
-    {
-        if (!g_config.enableHandCollision || !g_config.usePhysicsHandBodies) {
-            return;
-        }
-
-        if (!_initialized) {
-            Initialize();
-        }
-
-        auto player = RE::PlayerCharacter::GetSingleton();
-        if (!player || !player->parentCell) {
-            return;
-        }
-
-        void* hknpWorld = GetCurrentHknpWorld();
-        void* bhkWorld = GetCurrentBhkWorld();
-        if (!hknpWorld || !bhkWorld) {
-            return;
-        }
-
-        // Check if bodies need creation
-        bool needsCreation = false;
-        {
-            std::scoped_lock lock(_handBodyMutex);
-            bool worldChanged = (_leftHandBody.IsValid() && _leftHandBody.hknpWorld != hknpWorld) ||
-                                (_rightHandBody.IsValid() && _rightHandBody.hknpWorld != hknpWorld);
-            if (worldChanged) {
-                spdlog::info("[HAND_COLLISION] Physics world changed — invalidating old hand bodies (old world already cleaned them up)");
-                // Don't call DestroyPhysicsHandBody — the old world is gone.
-                // Just reset our tracking state.
-                _leftHandBody.Invalidate();
-                _rightHandBody.Invalidate();
-                ResetPlayerFilterCache();
-            }
-            needsCreation = !_leftHandBody.IsValid() || !_rightHandBody.IsValid();
-        }
-
-        if (!needsCreation) {
-            return;
-        }
-
-        if (!CanCreatePhysicsHandBodiesNow()) {
-            return;
-        }
-
-        std::scoped_lock lock(_handBodyMutex);
-        Physics::WorldWriteLock worldLock(reinterpret_cast<RE::bhkWorld*>(bhkWorld));
-        if (!worldLock.IsLocked()) {
-            spdlog::warn("[HAND_COLLISION] Failed to acquire world write lock; skipping physics hand body creation");
-            return;
-        }
-
-        if (!_leftHandBody.IsValid()) {
-            spdlog::info("[HAND_COLLISION] Creating LEFT hand body at ({:.1f}, {:.1f}, {:.1f})",
-                         leftHandPos.x, leftHandPos.y, leftHandPos.z);
-            if (!CreatePhysicsHandBody(_leftHandBody, hknpWorld, bhkWorld, leftHandPos, true)) {
-                return;
-            }
-        }
-
-        if (!_rightHandBody.IsValid()) {
-            spdlog::info("[HAND_COLLISION] Creating RIGHT hand body at ({:.1f}, {:.1f}, {:.1f})",
-                         rightHandPos.x, rightHandPos.y, rightHandPos.z);
-            if (!CreatePhysicsHandBody(_rightHandBody, hknpWorld, bhkWorld, rightHandPos, false)) {
-                return;
-            }
-        }
-    }
-
-    // =========================================================================
-    // PAIR FILTER (called from EndUpdate — no physics locks)
-    // =========================================================================
-
-    void HandCollision::ApplyPlayerPairFilterIfNeeded()
-    {
-        if (!_initialized || !g_config.enableHandCollision || !g_config.usePhysicsHandBodies) {
-            return;
-        }
-
-        std::scoped_lock lock(_handBodyMutex);
-
-        // Skip if both hands already have the pair filter applied
-        if ((!_leftHandBody.IsValid() || _leftHandBody.playerPairFilterApplied) &&
-            (!_rightHandBody.IsValid() || _rightHandBody.playerPairFilterApplied)) {
-            return;
-        }
-
-        std::uint32_t playerBodyId = Physics::GetPlayerBodyId();
-        if (playerBodyId == 0x7FFFFFFF || playerBodyId == 0) {
-            return;
-        }
-
-        void* hknpWorld = GetCurrentHknpWorld();
-        if (!hknpWorld) {
-            return;
-        }
-
-        // CRITICAL: if the pair filter call throws, the hand body and the player
-        // capsule both stay in the world with mutual collision active. The next
-        // physics step then immediately shoves the player away from wherever the
-        // hand body was created, which the user perceives as being teleported on
-        // load. Tear the body down rather than leave it as a permanent shover.
-        //
-        // Note: collision-enable is NOT toggled here. HIGGS-style: bodies spawn
-        // with bit 14 set (no collision) and stay that way until per-frame Update
-        // turns it on after kHandBodyCollisionEnableDelaySeconds, giving the world
-        // time to settle and the body time to receive its first keyframe move.
-        // Enabling immediately here was the load-shove regression.
-        if (_leftHandBody.IsValid() && !_leftHandBody.playerPairFilterApplied) {
-            if (Physics::DisableCollisionBetween(hknpWorld, _leftHandBody.bodyId, playerBodyId)) {
-                _leftHandBody.playerPairFilterApplied = true;
-                spdlog::info("[HAND_COLLISION] Applied player pair filter to LEFT hand body 0x{:08X} vs player 0x{:08X}",
-                             _leftHandBody.bodyId, playerBodyId);
-            } else {
-                spdlog::error("[HAND_COLLISION] LEFT pair filter FAILED — destroying body 0x{:08X} so it can't shove the player",
-                              _leftHandBody.bodyId);
-                DestroyPhysicsHandBody(_leftHandBody);
-            }
-        }
-
-        if (_rightHandBody.IsValid() && !_rightHandBody.playerPairFilterApplied) {
-            if (Physics::DisableCollisionBetween(hknpWorld, _rightHandBody.bodyId, playerBodyId)) {
-                _rightHandBody.playerPairFilterApplied = true;
-                spdlog::info("[HAND_COLLISION] Applied player pair filter to RIGHT hand body 0x{:08X} vs player 0x{:08X}",
-                             _rightHandBody.bodyId, playerBodyId);
-            } else {
-                spdlog::error("[HAND_COLLISION] RIGHT pair filter FAILED — destroying body 0x{:08X} so it can't shove the player",
-                              _rightHandBody.bodyId);
-                DestroyPhysicsHandBody(_rightHandBody);
-            }
-        }
-    }
-
-    // =========================================================================
-    // MAIN UPDATE (called from post-physics hook — position updates only)
-    // =========================================================================
-
-    void HandCollision::Update(const RE::NiPoint3& leftHandPos, const RE::NiPoint3& rightHandPos,
-                                const RE::NiPoint3& leftHandVel, const RE::NiPoint3& rightHandVel,
-                                const RE::NiMatrix3& leftHandRot, const RE::NiMatrix3& rightHandRot,
-                                float deltaTime)
-    {
-        if (!g_config.enableHandCollision) {
-            return;
-        }
-
-        // Store hand state for any external readers
-        _leftHandPos = leftHandPos;
-        _rightHandPos = rightHandPos;
-        _leftHandVel = leftHandVel;
-        _rightHandVel = rightHandVel;
-
-        if (!g_config.usePhysicsHandBodies) {
-            return;
-        }
-
-        void* hknpWorld = GetCurrentHknpWorld();
-        if (!hknpWorld) {
-            return;
-        }
-
-        const double now = Utils::GetTime();
-        std::scoped_lock lock(_handBodyMutex);
-
-        // Per-hand HIGGS-style update lambda. Mirrors hand.cpp:UpdateHandCollision
-        // verbatim — toggle collision based on grab state, then move via keyframe.
-        auto updateOne = [&](PhysicsHandBody& body,
-                             const RE::NiPoint3& pos,
-                             const RE::NiMatrix3& rot,
-                             bool isLeft)
-        {
-            if (!body.IsValid() || body.hknpWorld != hknpWorld) {
-                return;
-            }
-            // Pair filter must succeed before we ever turn collision on, otherwise
-            // enabling collision shoves the player.
-            if (!body.playerPairFilterApplied) {
-                UpdateHandBodyPosition(body, pos, rot, deltaTime);
-                return;
-            }
-
-            // HIGGS hand.cpp:658 — disable hand collision while physically held
-            // (HeldBody) or while two-handing a long weapon. We match the spirit
-            // even if Heisenberg's grab/two-hand state lives elsewhere.
-            const auto& grabMgr = GrabManager::GetSingleton();
-            const auto& thisGrab  = grabMgr.GetGrabState(isLeft);
-            const auto& otherGrab = grabMgr.GetGrabState(!isLeft);
-            const bool inHeldBody = thisGrab.usingHeldBodyGrab || thisGrab.heldBodyConstraintActive;
-            auto thisRefr  = thisGrab.refrHandle.get();
-            auto otherRefr = otherGrab.refrHandle.get();
-            const bool isTwoHanding = thisGrab.active && otherGrab.active &&
-                                      thisRefr.get() && thisRefr.get() == otherRefr.get();
-            const bool shouldDisableCollision = inHeldBody || isTwoHanding;
-
-            if (shouldDisableCollision) {
-                if (body.collisionEnabled) {
-                    SetHandCollisionEnabled(body, false);
-                }
-            } else {
-                // HIGGS hand.cpp:669 — only enable once the post-create settle
-                // window has elapsed. handCollisionCreatedTime is `createdTime`
-                // here; kHandBodyCollisionEnableDelaySeconds is the F4VR analogue
-                // of Config::options.handWeaponCollisionEnableDelay.
-                if (!body.collisionEnabled
-                    && (now - body.createdTime) >= kHandBodyCollisionEnableDelaySeconds)
-                {
-                    SetHandCollisionEnabled(body, true);
-                }
-            }
-
-            // Move body via keyframed velocity (HIGGS ApplyHardKeyframeVelocityClamped).
-            UpdateHandBodyPosition(body, pos, rot, deltaTime);
-        };
-
-        updateOne(_leftHandBody,  leftHandPos,  leftHandRot,  true);
-        updateOne(_rightHandBody, rightHandPos, rightHandRot, false);
-
-        // Heartbeat (~3s) so we can confirm Update is reaching the body-update path.
-        static double lastUpdateLog = 0.0;
-        if (now - lastUpdateLog > 3.0) {
-            spdlog::info("[HAND_COLLISION] Update tick: L valid={} pairFilter={} colOn={}, R valid={} pairFilter={} colOn={}",
-                         _leftHandBody.IsValid(),  _leftHandBody.playerPairFilterApplied,  _leftHandBody.collisionEnabled,
-                         _rightHandBody.IsValid(), _rightHandBody.playerPairFilterApplied, _rightHandBody.collisionEnabled);
-            lastUpdateLog = now;
-        }
-    }
-
-#if 0  // OLD UPDATE CODE — body creation/pair filter moved to HookPlayerCharacterUpdate
-        if (false && hknpWorld && bhkWorld) {
-            std::uint32_t playerBodyId = 0x7FFFFFFF;
-            bool needsPlayerCollisionState = false;
-            bool haveHandBodies = false;
-
-            {
-                std::scoped_lock lock(_handBodyMutex);
-
-                bool worldChanged = (_leftHandBody.IsValid() && _leftHandBody.hknpWorld != hknpWorld) ||
-                                    (_rightHandBody.IsValid() && _rightHandBody.hknpWorld != hknpWorld);
-
-                if (worldChanged) {
-                    spdlog::info("[HAND_COLLISION] Physics world changed, recreating hand bodies");
-                    DestroyPhysicsHandBody(_leftHandBody);
-                    DestroyPhysicsHandBody(_rightHandBody);
-                }
-
-                needsPlayerCollisionState =
-                    (_leftHandBody.IsValid() && !_leftHandBody.playerPairFilterApplied) ||
-                    (_rightHandBody.IsValid() && !_rightHandBody.playerPairFilterApplied);
-
-                haveHandBodies = _leftHandBody.IsValid() || _rightHandBody.IsValid();
-            }
-
-            const bool shouldResolvePlayerCollisionNow =
-                needsPlayerCollisionState && (!haveHandBodies || now >= _playerBodyRetryBlockedUntil);
-
-            if (CanCreatePhysicsHandBodiesNow(shouldResolvePlayerCollisionNow ? &playerBodyId : nullptr)) {
-                const bool playerCollisionReady =
-                    playerBodyId != 0 && playerBodyId != 0x7FFFFFFF && playerBodyId != 0xFFFFFFFF;
-
-                if (playerCollisionReady) {
-                    _playerBodyRetryBlockedUntil = 0.0;
-                } else if (needsPlayerCollisionState && shouldResolvePlayerCollisionNow) {
-                    _playerBodyRetryBlockedUntil = now + kPlayerBodyRetryCooldownSeconds;
-                }
-
-                if (!playerCollisionReady && shouldResolvePlayerCollisionNow && needsPlayerCollisionState) {
-                    static double lastUnfilteredHandBodyLogTime = 0.0;
-                    if (now - lastUnfilteredHandBodyLogTime >= 1.0) {
-                        spdlog::warn("[HAND_COLLISION] No player controller body is exposed in this VR runtime; keeping physics hand bodies non-collidable until player filtering is available");
-                        lastUnfilteredHandBodyLogTime = now;
-                    }
-                }
-
-                if (GetCurrentBhkWorld() == bhkWorld && GetCurrentHknpWorld() == hknpWorld) {
-                    std::scoped_lock lock(_handBodyMutex);
-                    auto& proxyListener = PlayerCharacterProxyListener::GetSingleton();
-
-                    if (_leftHandBody.IsValid() && !_leftHandBody.proxyRegistered) {
-                        proxyListener.RegisterHandBodyId(_leftHandBody.bodyId);
-                        _leftHandBody.proxyRegistered = true;
-                    }
-
-                    if (_rightHandBody.IsValid() && !_rightHandBody.proxyRegistered) {
-                        proxyListener.RegisterHandBodyId(_rightHandBody.bodyId);
-                        _rightHandBody.proxyRegistered = true;
-                    }
-
-                    if (_leftHandBody.IsValid() && !_leftHandBody.playerPairFilterApplied && playerCollisionReady) {
-                        if (!TryDisableCollisionWithPlayer(_leftHandBody, playerBodyId)) {
-                            static double lastLeftPairFilterLogTime = 0.0;
-                            if (now - lastLeftPairFilterLogTime >= 1.0) {
-                                spdlog::warn("[HAND_COLLISION] Waiting to apply player collision filter to LEFT hand body 0x{:08X}",
-                                             _leftHandBody.bodyId);
-                                lastLeftPairFilterLogTime = now;
-                            }
-                        }
-                    }
-
-                    if (_rightHandBody.IsValid() && !_rightHandBody.playerPairFilterApplied && playerCollisionReady) {
-                        if (!TryDisableCollisionWithPlayer(_rightHandBody, playerBodyId)) {
-                            static double lastRightPairFilterLogTime = 0.0;
-                            if (now - lastRightPairFilterLogTime >= 1.0) {
-                                spdlog::warn("[HAND_COLLISION] Waiting to apply player collision filter to RIGHT hand body 0x{:08X}",
-                                             _rightHandBody.bodyId);
-                                lastRightPairFilterLogTime = now;
-                            }
-                        }
-                    }
-                }
-
-                if (GetCurrentBhkWorld() == bhkWorld && GetCurrentHknpWorld() == hknpWorld) {
-                    std::scoped_lock lock(_handBodyMutex);
-                    const bool leftReadyForMovement =
-                        _leftHandBody.IsValid() &&
-                        (_leftHandBody.playerPairFilterApplied || !playerCollisionReady) &&
-                        (now - _leftHandBody.createdTime >= kHandBodyPostCreateMoveDelaySeconds);
-                    const bool rightReadyForMovement =
-                        _rightHandBody.IsValid() &&
-                        (_rightHandBody.playerPairFilterApplied || !playerCollisionReady) &&
-                        (now - _rightHandBody.createdTime >= kHandBodyPostCreateMoveDelaySeconds);
-
-                    if (!leftReadyForMovement && !rightReadyForMovement) {
-                        if (_leftHandBody.IsValid() || _rightHandBody.IsValid()) {
-                            static double lastPostCreateDelayLogTime = 0.0;
-                            if (now - lastPostCreateDelayLogTime >= 1.0) {
-                                spdlog::info("[HAND_COLLISION] Waiting briefly before first keyframe update of newly created hand bodies");
-                                lastPostCreateDelayLogTime = now;
-                            }
-                        }
-                    } else {
-                        Physics::WorldWriteLock moveWorldLock(reinterpret_cast<RE::bhkWorld*>(bhkWorld));
-                        if (!moveWorldLock.IsLocked()) {
-                            spdlog::warn("[HAND_COLLISION] Failed to reacquire world write lock; skipping hand body movement");
-                        } else {
-                            if (leftReadyForMovement) {
-                                UpdateHandBodyPosition(_leftHandBody, leftHandPos, leftHandRot, deltaTime);
-
-                                if (!_leftHandBody.collisionEnabled &&
-                                    _leftHandBody.playerPairFilterApplied &&
-                                    (now - _leftHandBody.createdTime >= kHandBodyCollisionEnableDelaySeconds)) {
-                                    SetHandCollisionEnabled(_leftHandBody, true);
-                                }
-                            }
-
-                            if (rightReadyForMovement) {
-                                UpdateHandBodyPosition(_rightHandBody, rightHandPos, rightHandRot, deltaTime);
-
-                                if (!_rightHandBody.collisionEnabled &&
-                                    _rightHandBody.playerPairFilterApplied &&
-                                    (now - _rightHandBody.createdTime >= kHandBodyCollisionEnableDelaySeconds)) {
-                                    SetHandCollisionEnabled(_rightHandBody, true);
-                                }
-                            }
-
-                            if ((_leftHandBody.IsValid() && !_leftHandBody.collisionEnabled && !_leftHandBody.playerPairFilterApplied) ||
-                                (_rightHandBody.IsValid() && !_rightHandBody.collisionEnabled && !_rightHandBody.playerPairFilterApplied)) {
-                                static double lastCollisionDeferralLogTime = 0.0;
-                                if (now - lastCollisionDeferralLogTime >= 1.0) {
-                                    if (playerCollisionReady) {
-                                        spdlog::warn("[HAND_COLLISION] Keeping native hand-body collision staged OFF until player pair filtering is available; proximity fallback remains active");
-                                    } else {
-                                        spdlog::warn("[HAND_COLLISION] Keeping native hand-body collision staged OFF because no player controller body is exposed in this VR runtime; proximity fallback remains active");
-                                    }
-                                    lastCollisionDeferralLogTime = now;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Proximity-based collision as supplement
-        CheckProximityCollisions(leftHandPos, leftHandVel, true);
-        CheckProximityCollisions(rightHandPos, rightHandVel, false);
-    }
-
-#endif  // OLD UPDATE CODE
-
-    // Old Update body creation code also disabled below
-        ConstraintFunctions::PhysicsSystemDataCtor(systemDataMem);
-
-        void* materialMem = _aligned_malloc(sizeof(hknpMaterialDescriptor), 16);
-        if (!materialMem) {
-            spdlog::error("[HAND_COLLISION] Failed to allocate hknpMaterialDescriptor");
-            _aligned_free(systemDataMem);
-            return false;
-        }
-        std::memset(materialMem, 0, sizeof(hknpMaterialDescriptor));
-
-        void* bodyCinfoMem = _aligned_malloc(sizeof(hknpBodyCinfo), 16);
-        if (!bodyCinfoMem) {
-            spdlog::error("[HAND_COLLISION] Failed to allocate hknpBodyCinfo");
-            _aligned_free(materialMem);
-            _aligned_free(systemDataMem);
-            return false;
-        }
-        auto* bodyCinfo = reinterpret_cast<hknpBodyCinfo*>(bodyCinfoMem);
-        ConstraintFunctions::BodyCinfoCtor(bodyCinfo);
-        bodyCinfo->shape = shape;
-        bodyCinfo->position = RE::NiPoint4(
-            position.x * HAVOK_WORLD_SCALE_COLLISION,
-            position.y * HAVOK_WORLD_SCALE_COLLISION,
-            position.z * HAVOK_WORLD_SCALE_COLLISION,
-            0.0f
-        );
-        bodyCinfo->orientation = RE::NiPoint4(0.0f, 0.0f, 0.0f, 1.0f);
-        bodyCinfo->qualityId = static_cast<std::uint8_t>(hknpMotionPropertiesId::KEYFRAMED);
-        bodyCinfo->materialId = 0;
-        bodyCinfo->collisionFilterInfo = filterInfo;
-        bodyCinfo->flags = 0;
-
-        spdlog::info("[HAND_COLLISION] Body cinfo: qualityId={}, filterInfo=0x{:08X}, shape={:p}",
-                     bodyCinfo->qualityId, filterInfo, bodyCinfo->shape);
-        spdlog::info("[HAND_COLLISION] hknpWorld={:p}, bhkWorld={:p}", hknpWorld, bhkWorld);
-
-        std::uint8_t* systemDataBytes = reinterpret_cast<std::uint8_t*>(systemDataMem);
-        *reinterpret_cast<void**>(systemDataBytes + 0x10) = materialMem;
-        *reinterpret_cast<std::uint32_t*>(systemDataBytes + 0x18) = 1;
-        *reinterpret_cast<std::uint32_t*>(systemDataBytes + 0x1C) = 0x80000001;
-        *reinterpret_cast<void**>(systemDataBytes + 0x40) = bodyCinfo;
-        *reinterpret_cast<std::uint32_t*>(systemDataBytes + 0x48) = 1;
-        *reinterpret_cast<std::uint32_t*>(systemDataBytes + 0x4C) = 0x80000001;
-
-        // =====================================================================
-        // 3. CREATE BETHESDA WRAPPERS AND ADD BODY TO WORLD
-        // =====================================================================
-
-        void* physicsSystemMem = _aligned_malloc(0x30, 16);
-        if (!physicsSystemMem) {
-            spdlog::error("[HAND_COLLISION] Failed to allocate bhkPhysicsSystem");
-            _aligned_free(bodyCinfoMem);
-            _aligned_free(materialMem);
-            _aligned_free(systemDataMem);
-            return false;
-        }
-        std::memset(physicsSystemMem, 0, 0x30);
-        ConstraintFunctions::BhkPhysicsSystemCtor(physicsSystemMem, systemDataMem);
-
-        alignas(16) std::uint8_t identityTransform[0x40] = {};
-        reinterpret_cast<float*>(identityTransform)[0] = 1.0f;
-        reinterpret_cast<float*>(identityTransform)[5] = 1.0f;
-        reinterpret_cast<float*>(identityTransform)[10] = 1.0f;
-        reinterpret_cast<float*>(identityTransform)[15] = 1.0f;
-
-        spdlog::info("[HAND_COLLISION] Calling BhkPhysicsSystemCreateInstance...");
-        ConstraintFunctions::BhkPhysicsSystemCreateInstance(physicsSystemMem, bhkWorld, identityTransform);
-
-        void* collisionObjMem = _aligned_malloc(0x30, 16);
-        if (!collisionObjMem) {
-            spdlog::error("[HAND_COLLISION] Failed to allocate bhkNPCollisionObject");
-            _aligned_free(physicsSystemMem);
-            _aligned_free(bodyCinfoMem);
-            _aligned_free(materialMem);
-            _aligned_free(systemDataMem);
-            return false;
-        }
-        std::memset(collisionObjMem, 0, 0x30);
-        ConstraintFunctions::BhkNPCollisionObjectCtor(collisionObjMem, 0, physicsSystemMem);
-
-        if (!SafeCallAddToWorld((void*)ConstraintFunctions::BhkNPCollisionObjectAddToWorld.address(), collisionObjMem, bhkWorld)) {
-            spdlog::error("[HAND_COLLISION] bhkNPCollisionObject::AddToWorld CRASHED");
-            _aligned_free(collisionObjMem);
-            _aligned_free(physicsSystemMem);
-            _aligned_free(bodyCinfoMem);
-            _aligned_free(materialMem);
-            _aligned_free(systemDataMem);
-            return false;
-        }
-
-        std::uint32_t bodyId = 0x7FFFFFFF;
-        ConstraintFunctions::BhkPhysicsSystemGetBodyId(physicsSystemMem, &bodyId, 0);
-        if (bodyId == 0x7FFFFFFF) {
-            spdlog::error("[HAND_COLLISION] Failed to get body ID from bhkPhysicsSystem");
-            _aligned_free(collisionObjMem);
-            _aligned_free(physicsSystemMem);
-            _aligned_free(bodyCinfoMem);
-            _aligned_free(materialMem);
-            _aligned_free(systemDataMem);
-            return false;
-        }
-
-        if (!SafeCallSetMotionType((void*)ConstraintFunctions::BhkNPCollisionObjectSetMotionType.address(), collisionObjMem, 2)) {
-            spdlog::warn("[HAND_COLLISION] SetMotionType(KEYFRAMED) threw SEH exception - continuing");
-        }
-
-        ConstraintFunctions::hknpWorld_commitAddBodies(hknpWorld);
-        ConstraintFunctions::hknpWorld_activateBody(hknpWorld, bodyId);
-
-        spdlog::info("[HAND_COLLISION] SUCCESS! Created {} hand body with ID: 0x{:08X}",
-                     isLeft ? "LEFT" : "RIGHT", bodyId);
-
-        // =====================================================================
-        // 4. STORE RESULTS
-        // =====================================================================
-
-        handBody.bodyId = bodyId;
-        handBody.shape = shape;
-        handBody.hknpWorld = hknpWorld;
-        handBody.bhkWorld = bhkWorld;
-        handBody.physicsSystem = physicsSystemMem;
-        handBody.collisionObject = collisionObjMem;
-        handBody.alignedSystemDataMem = systemDataMem;
-        handBody.alignedBodyCinfoMem = bodyCinfoMem;
-        handBody.alignedMaterialMem = materialMem;
-        handBody.alignedPhysicsSystemMem = physicsSystemMem;
-        handBody.alignedCollisionObjMem = collisionObjMem;
-        handBody.valid = true;
-        handBody.collisionEnabled = false;
-        handBody.proxyRegistered = false;
-        handBody.playerPairFilterApplied = false;
-        handBody.collisionFilterInfo = filterInfo;
-        handBody.createdTime = Utils::GetTime();
-
-        spdlog::info("[HAND_COLLISION] Created {} hand body 0x{:08X} with collision staged OFF (filter=0x{:08X})",
-                     isLeft ? "LEFT" : "RIGHT", bodyId, filterInfo);
-        
-        return true;
-    }
-
-    void HandCollision::DestroyPhysicsHandBody(PhysicsHandBody& handBody)
-    {
-        if (!handBody.IsValid()) {
-            return;
-        }
-        
-        spdlog::info("[HAND_COLLISION] Destroying hand body id=0x{:08X}", handBody.bodyId);
-
-        PlayerCharacterProxyListener::GetSingleton().UnregisterHandBodyId(handBody.bodyId);
-        
-        // NEW PATH: if this body was created via BethesdaPhysicsBody, route destruction
-        // through its own Destroy() (RemovePhysicsSystem + refcount-release). The aligned*
-        // fields will all be nullptr so the legacy _aligned_free calls become no-ops.
-        // Cup-shape has 3 bodies — palm + 2 walls. Destroy all.
-        if (handBody.bethesdaBody) {
-            auto destroyBb = [&](void*& slot) {
-                if (!slot) return;
-                auto* bb = reinterpret_cast<heisenberg::bethesda_physics_body::BethesdaPhysicsBody*>(slot);
-                bb->Destroy(handBody.bhkWorld);
-                delete bb;
-                slot = nullptr;
-            };
-            destroyBb(handBody.bethesdaBody_wallA);
-            destroyBb(handBody.bethesdaBody_wallB);
-            destroyBb(handBody.bethesdaBody);
-        } else if (handBody.hknpWorld) {
-            std::uint32_t bodyId = handBody.bodyId;
-            SafeCallDestroyBodies((void*)ConstraintFunctions::DestroyBodies.address(), handBody.hknpWorld, &bodyId, 1);
-        }
-
-        if (handBody.alignedCollisionObjMem) _aligned_free(handBody.alignedCollisionObjMem);
-        if (handBody.alignedPhysicsSystemMem) _aligned_free(handBody.alignedPhysicsSystemMem);
-        if (handBody.alignedBodyCinfoMem) _aligned_free(handBody.alignedBodyCinfoMem);
-        if (handBody.alignedMaterialMem) _aligned_free(handBody.alignedMaterialMem);
-        if (handBody.alignedSystemDataMem) _aligned_free(handBody.alignedSystemDataMem);
-
-        handBody.Invalidate();
-    }
-
-    void HandCollision::UpdateHandBodyPosition(PhysicsHandBody& handBody, 
-                                                const RE::NiPoint3& position,
-                                                const RE::NiMatrix3& rotation,
-                                                float deltaTime)
-    {
-        if (!handBody.IsValid() || !handBody.hknpWorld) {
-            return;
-        }
-        
-        // Static-lifetime aligned scratch — MSVC doesn't reliably honor
-        // alignas(16) on stack NiPoint4 locals; statics do respect alignas.
-        struct alignas(16) UpdatePosScratch {
-            float hkPosition[4];
-            float hkOrientation[4];
-        };
-        static UpdatePosScratch s_updScratch;
-        s_updScratch.hkPosition[0] = position.x * HAVOK_WORLD_SCALE_COLLISION;
-        s_updScratch.hkPosition[1] = position.y * HAVOK_WORLD_SCALE_COLLISION;
-        s_updScratch.hkPosition[2] = position.z * HAVOK_WORLD_SCALE_COLLISION;
-        s_updScratch.hkPosition[3] = 0.0f;
-
-        auto& hkOrient = *reinterpret_cast<RE::NiPoint4*>(s_updScratch.hkOrientation);
-        MatrixToQuaternion(rotation, hkOrient);
-
-        float invDeltaTime = (deltaTime > 0.0001f) ? (1.0f / deltaTime) : 90.0f;
-        if (!SafeCallApplyHardKeyFrame(
-                (void*)ConstraintFunctions::ApplyHardKeyFrameBodyId.address(),
-                handBody.hknpWorld,
-                handBody.bodyId,
-                reinterpret_cast<RE::NiPoint4*>(s_updScratch.hkPosition),
-                reinterpret_cast<RE::NiPoint4*>(s_updScratch.hkOrientation),
-                invDeltaTime)) {
-            spdlog::error("[HAND_COLLISION] Exception in applyHardKeyFrame");
-        }
-    }
-
-    void HandCollision::SetHandCollisionEnabled(PhysicsHandBody& handBody, bool enabled)
-    {
-        if (!handBody.IsValid()) {
-            return;
-        }
-
-        if (!handBody.hknpWorld || handBody.collisionEnabled == enabled) {
-            return;
-        }
-
-        using SetFilterFn = void(__fastcall*)(void*, std::uint32_t, std::uint32_t);
-        static REL::Relocation<SetFilterFn> setFilter{ REL::Offset(0x153af00) };
-
-        std::uint32_t newFilter = handBody.collisionFilterInfo;
-        if (enabled) {
-            newFilter &= ~kHandCollisionDisabledBit;
-        } else {
-            newFilter |= kHandCollisionDisabledBit;
-        }
-        if (!SafeCallSetBodyCollisionFilterInfo((void*)setFilter.address(), handBody.hknpWorld, handBody.bodyId, newFilter)) {
-            spdlog::warn("[HAND_COLLISION] Failed to {} collision for hand body 0x{:08X}",
-                         enabled ? "enable" : "disable", handBody.bodyId);
-            return;
-        }
-
-        handBody.collisionFilterInfo = newFilter;
-        handBody.collisionEnabled = enabled;
-
-        spdlog::info("[HAND_COLLISION] Collision {} for hand body 0x{:08X} (filter=0x{:08X})",
-                     enabled ? "ENABLED" : "DISABLED", handBody.bodyId, newFilter);
-    }
-
-    bool HandCollision::ResolveReadyPlayerCollisionState(std::uint32_t& playerBodyId) const
-    {
-        playerBodyId = Physics::GetPlayerBodyId();
-        if (playerBodyId == 0 || playerBodyId == 0x7FFFFFFF || playerBodyId == 0xFFFFFFFF) {
-            static double lastBodyWaitLogTime = 0.0;
-            double now = Utils::GetTime();
-            if (now - lastBodyWaitLogTime >= 1.0) {
-                spdlog::info("[HAND_COLLISION] Waiting for player controller body before applying player pair filtering to physics hand bodies");
-                lastBodyWaitLogTime = now;
-            }
-            return false;
-        }
-
-        return true;
-    }
-
-    bool HandCollision::CanCreatePhysicsHandBodiesNow(std::uint32_t* playerBodyId) const
-    {
-        double now = Utils::GetTime();
-        if (MenuChecker::GetSingleton().IsLoading()) {
-            static double lastLoadingLogTime = 0.0;
-            if (now - lastLoadingLogTime >= 0.5) {
-                spdlog::info("[HAND_COLLISION] Delaying physics hand body creation while LoadingMenu is open");
-                lastLoadingLogTime = now;
-            }
-            return false;
-        }
-
-        if (now < _bodyCreationBlockedUntil) {
-            static double lastSettleLogTime = 0.0;
-            if (now - lastSettleLogTime >= 0.5) {
-                spdlog::info("[HAND_COLLISION] Delaying physics hand body creation for post-load settle window ({:.0f} ms remaining)",
-                             (_bodyCreationBlockedUntil - now) * 1000.0);
-                lastSettleLogTime = now;
-            }
-            return false;
-        }
-
-        if (playerBodyId) {
-            std::uint32_t resolvedPlayerBodyId = 0x7FFFFFFF;
-            if (ResolveReadyPlayerCollisionState(resolvedPlayerBodyId)) {
-                *playerBodyId = resolvedPlayerBodyId;
-            } else {
-                *playerBodyId = 0x7FFFFFFF;
-            }
-        }
-
-        return true;
-    }
-
-    bool HandCollision::TryDisableCollisionWithPlayer(PhysicsHandBody& handBody, std::uint32_t playerBodyId)
-    {
-        if (!handBody.IsValid() || !handBody.hknpWorld || handBody.playerPairFilterApplied) {
-            return handBody.playerPairFilterApplied;
-        }
-
-        if (playerBodyId == 0 || playerBodyId == 0x7FFFFFFF || playerBodyId == 0xFFFFFFFF || playerBodyId == handBody.bodyId) {
-            return false;
-        }
-
-        spdlog::info("[HAND_COLLISION] Calling DisableCollisionsBetween for hand body 0x{:08X} against player body 0x{:08X}",
-                     handBody.bodyId, playerBodyId);
-        Physics::DisableCollisionsBetween(handBody.hknpWorld, handBody.bodyId, playerBodyId);
-        handBody.playerPairFilterApplied = true;
-
-        spdlog::info("[HAND_COLLISION] Disabled player collision for hand body 0x{:08X} against player body 0x{:08X}",
-                     handBody.bodyId, playerBodyId);
-        return true;
-    }
-
-    // =========================================================================
-    // WORLD ACCESS
-    // =========================================================================
-
-    void* HandCollision::GetCurrentHknpWorld()
-    {
-        auto player = RE::PlayerCharacter::GetSingleton();
-        if (!player || !player->parentCell) {
-            return nullptr;
-        }
-        
-        auto* cell = player->parentCell;
-        using GetbhkWorld_t = void*(*)(RE::TESObjectCELL*);
-        static REL::Relocation<GetbhkWorld_t> GetbhkWorld{ REL::Offset(0x39b070) };
-        
-        void* bhkWorld = GetbhkWorld(cell);
-        if (!bhkWorld) {
-            return nullptr;
-        }
-        
-        void* hknpWorld = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(bhkWorld) + 0x60);
-        return hknpWorld;
-    }
-
-    void* HandCollision::GetCurrentBhkWorld()
-    {
-        auto player = RE::PlayerCharacter::GetSingleton();
-        if (!player || !player->parentCell) {
-            return nullptr;
-        }
-        
-        auto* cell = player->parentCell;
-        using GetbhkWorld_t = void*(*)(RE::TESObjectCELL*);
-        static REL::Relocation<GetbhkWorld_t> GetbhkWorld{ REL::Offset(0x39b070) };
-        
-        return GetbhkWorld(cell);
-    }
-
-    // =========================================================================
-    // COLLISION HANDLING
-    // =========================================================================
-
-    void HandCollision::CheckProximityCollisions(const RE::NiPoint3& handPos,
-                                                  const RE::NiPoint3& handVel,
-                                                  bool isLeft)
-    {
-        // Entry beacon — fires once every 3s regardless of state so we can tell
-        // whether this function is running at all in the user's session. If you
-        // never see this log, Update() isn't reaching here.
-        {
-            static double lastEntryLog = 0.0;
-            double nowEntry = Utils::GetTime();
-            if (nowEntry - lastEntryLog > 3.0) {
-                spdlog::info("[HAND_COLLISION] CheckProximityCollisions entered ({} hand) handPos=({:.0f},{:.0f},{:.0f}) handVel=({:.1f},{:.1f},{:.1f}) radius={:.1f} thresh={:.1f}",
-                             isLeft ? "L" : "R",
-                             handPos.x, handPos.y, handPos.z,
-                             handVel.x, handVel.y, handVel.z,
-                             g_config.handCollisionRadius,
-                             g_config.handPushVelocityThreshold);
-                lastEntryLog = nowEntry;
-            }
-        }
-
-        auto player = RE::PlayerCharacter::GetSingleton();
-        if (!player) {
-            static double lastNoPlayerLog = 0.0;
-            double now = Utils::GetTime();
-            if (now - lastNoPlayerLog > 5.0) {
-                spdlog::warn("[HAND_COLLISION] CheckProximityCollisions: no player singleton — early return");
-                lastNoPlayerLog = now;
-            }
-            return;
-        }
-
-        float collisionRadius = g_config.handCollisionRadius;
-
-        if (isLeft) {
-            _leftContact.reset();
-        } else {
-            _rightContact.reset();
-        }
-
-        // SEH-protect the radius query — Havok can throw access violations during
-        // load/unload transitions; an unhandled SEH would silently kill the whole
-        // function so even the heartbeat below wouldn't fire.
-        std::vector<RE::TESObjectREFR*> nearby;
-        bool getObjectsThrew = false;
-        __try {
-            nearby = Physics::GetObjectsInRadius(handPos, collisionRadius, player);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            getObjectsThrew = true;
-        }
-        if (getObjectsThrew) {
-            static double lastThrewLog = 0.0;
-            double now = Utils::GetTime();
-            if (now - lastThrewLog > 1.0) {
-                spdlog::error("[HAND_COLLISION] GetObjectsInRadius threw SEH ({} hand) handPos=({:.0f},{:.0f},{:.0f}) — proximity push disabled this frame",
-                             isLeft ? "L" : "R", handPos.x, handPos.y, handPos.z);
-                lastThrewLog = now;
-            }
-            return;
-        }
-        const float velMag = sqrtf(handVel.x * handVel.x + handVel.y * handVel.y + handVel.z * handVel.z);
-
-        // Throttle proximity diagnostic — only log when something interesting happens
-        // (object found AND moving). Otherwise this would spam every frame.
-        bool anyGrabbable = false;
-        for (auto* refr : nearby) {
-            if (refr && Physics::IsGrabbable(refr)) {
-                anyGrabbable = true;
-                if (isLeft) {
-                    _leftContact = RE::ObjectRefHandle(refr);
-                } else {
-                    _rightContact = RE::ObjectRefHandle(refr);
-                }
-                if (velMag > g_config.handPushVelocityThreshold) {
-                    spdlog::info("[HAND_COLLISION] Push {} hand → refr {:08X} velMag={:.1f} (thresh={:.1f}) handPos=({:.0f},{:.0f},{:.0f})",
-                                 isLeft ? "L" : "R", refr->formID, velMag,
-                                 g_config.handPushVelocityThreshold, handPos.x, handPos.y, handPos.z);
-                    ApplyPushForce(refr, handPos, handVel, 1.0f / 90.0f);
-                } else {
-                    static double lastBelowThreshLog = 0.0;
-                    double now = Utils::GetTime();
-                    if (now - lastBelowThreshLog > 1.0) {
-                        spdlog::info("[HAND_COLLISION] {} hand near refr {:08X} but velMag={:.1f} < thresh {:.1f} — no push",
-                                     isLeft ? "L" : "R", refr->formID, velMag, g_config.handPushVelocityThreshold);
-                        lastBelowThreshLog = now;
-                    }
-                }
-                break;
-            }
-        }
-        // Heartbeat (rare) so we can confirm CheckProximityCollisions is running at all.
-        if (!anyGrabbable) {
-            static double lastEmpty = 0.0;
-            double now = Utils::GetTime();
-            if (now - lastEmpty > 5.0) {
-                spdlog::info("[HAND_COLLISION] Proximity scan running ({} hand): {} candidates, none grabbable, velMag={:.1f}",
-                             isLeft ? "L" : "R", nearby.size(), velMag);
-                lastEmpty = now;
-            }
-        }
-    }
-
-    // Helper to safely cast collision objects - follows bhkNPCollisionProxyObject to its target
-    // since proxy objects don't have their own physics system
-    static RE::bhkNPCollisionObject* SafeCastCollisionObject(RE::NiCollisionObject* collObj)
-    {
-        if (!collObj) return nullptr;
-        
-        auto* rtti = collObj->GetRTTI();
-        if (!rtti || !rtti->GetName()) {
-            return nullptr;
-        }
-        
-        const char* typeName = rtti->GetName();
-        
-        if (std::strcmp(typeName, "bhkNPCollisionProxyObject") == 0) {
-            spdlog::trace("[HAND_COLLISION] Found ProxyObject - following target pointer");
-            RE::bhkNPCollisionObject* target = GetProxyTarget(collObj);
-            if (!target) {
-                spdlog::trace("[HAND_COLLISION] ProxyObject has null target!");
-                return nullptr;
-            }
-            return target;
-        }
-        
-        if (std::strcmp(typeName, "bhkNPCollisionObject") == 0) {
-            return reinterpret_cast<RE::bhkNPCollisionObject*>(collObj);
-        }
-        
-        for (auto iter = rtti; iter; iter = iter->GetBaseRTTI()) {
-            if (iter->GetName() && std::strcmp(iter->GetName(), "bhkNPCollisionObject") == 0) {
-                return reinterpret_cast<RE::bhkNPCollisionObject*>(collObj);
-            }
-        }
-        
-        return nullptr;
-    }
-
-    void HandCollision::ApplyPushForce(RE::TESObjectREFR* refr, const RE::NiPoint3& handPos,
-                                        const RE::NiPoint3& handVel, float /*deltaTime*/)
-    {
-        if (!refr) return;
-
-        // Get the collision object
-        auto* node = refr->Get3D();
-        if (!node) return;
-
-        RE::bhkNPCollisionObject* colObj = nullptr;
-        
-        // Try to get collision object from the node directly - with safe casting
-        if (node->collisionObject) {
-            colObj = SafeCastCollisionObject(node->collisionObject.get());
-        }
-        
-        // If not found, try children (for NiNode)
-        if (!colObj && node->IsNode()) {
-            auto* asNode = static_cast<RE::NiNode*>(node);
-            // Safety bound to prevent infinite loop if children array is corrupted
-            uint32_t childCount = asNode->children.size();
-            if (childCount > 100) childCount = 100;
-            for (uint32_t i = 0; i < childCount; ++i) {
-                auto* child = asNode->children[i].get();
-                if (child && child->collisionObject) {
-                    colObj = SafeCastCollisionObject(child->collisionObject.get());
-                    if (colObj) break;
-                }
-            }
-        }
-
-        if (!colObj) return;
-
-        // Validate physics system
-        if (!colObj->spSystem) {
-            spdlog::trace("[HAND_COLLISION] Object {:08X} has no physics system, skipping push", refr->formID);
-            return;
-        }
-
-        // Apply velocity in direction hand is moving
-        float pushMultiplier = g_config.handPushForceMultiplier;
-        struct alignas(16) PushScratch { float pushVel[4]; };
-        static PushScratch s_pushScratch;
-        s_pushScratch.pushVel[0] = handVel.x * HAVOK_WORLD_SCALE_COLLISION * pushMultiplier;
-        s_pushScratch.pushVel[1] = handVel.y * HAVOK_WORLD_SCALE_COLLISION * pushMultiplier;
-        s_pushScratch.pushVel[2] = handVel.z * HAVOK_WORLD_SCALE_COLLISION * pushMultiplier;
-        s_pushScratch.pushVel[3] = 0.0f;
-        auto& pushVel = *reinterpret_cast<RE::NiPoint4*>(s_pushScratch.pushVel);
-
-        if (CollisionFunctions::IsCollisionObjectValid(colObj)) {
-            CollisionFunctions::SetLinearVelocity(colObj, pushVel);
-            spdlog::info("[HAND_COLLISION] SetLinearVelocity refr {:08X} hkVel=({:.2f},{:.2f},{:.2f}) (game handVel=({:.1f},{:.1f},{:.1f}) mult={:.2f})",
-                         refr->formID, s_pushScratch.pushVel[0], s_pushScratch.pushVel[1], s_pushScratch.pushVel[2],
-                         handVel.x, handVel.y, handVel.z, pushMultiplier);
-        } else {
-            spdlog::warn("[HAND_COLLISION] Push: collision object invalid for refr {:08X}", refr->formID);
-        }
-    }
-
-    // =========================================================================
-    // ACCESSORS
-    // =========================================================================
-
-    bool HandCollision::IsInContact(bool isLeft) const
-    {
-        const auto& handle = isLeft ? _leftContact : _rightContact;
-        return static_cast<bool>(handle);
-    }
-
-    RE::TESObjectREFR* HandCollision::GetContactObject(bool isLeft) const
-    {
-        const auto& handle = isLeft ? _leftContact : _rightContact;
-        if (!handle) return nullptr;
-        RE::NiPointer<RE::TESObjectREFR> refPtr = handle.get();
-        return refPtr.get();
-    }
-
-    const PhysicsHandBody& HandCollision::GetHandBody(bool isLeft) const
-    {
-        return isLeft ? _leftHandBody : _rightHandBody;
-    }
-
-    void HandCollision::TriggerCollisionHaptics(bool isLeft, float intensity, float duration)
-    {
-        if (!g_config.enableHandCollisionHaptics) {
-            return;
-        }
-
-        // Map (intensity, duration) to SteamVR's TriggerHapticPulse duration.
-        // Havok gives us a rough mass × speed product via ProcessHandCollision;
-        // TriggerHapticPulse accepts microseconds (max ~3999 per pulse). Scale
-        // the product into 300–3500µs so that a light tap is a gentle click and
-        // a heavy impact buzzes more firmly without saturating the controller.
-        float product = std::max(0.0f, intensity) * std::max(0.0f, duration);
-        float scaled = 300.0f + product * g_config.handCollisionHapticScale;
-        if (scaled > 3500.0f) scaled = 3500.0f;
-        if (scaled < 200.0f) scaled = 200.0f;
-
-        g_vrInput.TriggerHaptic(isLeft, static_cast<unsigned short>(scaled));
-    }
-}
-#endif
 
 // =====================================================================
 // CLEAN HAND COLLISION IMPLEMENTATION — ROCK-style patterns
@@ -1363,7 +59,7 @@ namespace heisenberg
         // verified bit-identical to ROCK's long-standing hand mask 0x000070AFBFFF7F3E;
         // applyLayerExpectedMask writes the row + symmetric column bits. (Weapon layer 44 /
         // body layer 47 are registered by their own collider modules when those are ported on.)
-        namespace clp = rock::collision_layer_policy;
+        namespace clp = heisenberg::rock_core::collision_layer_policy;
         const uint64_t handMask = clp::buildRockHandExpectedMask(/*includeWeaponLayer*/ true, /*includeStaticWorld*/ true);
         if (matrix[clp::ROCK_LAYER_HAND] != handMask) {
             clp::applyLayerExpectedMask(matrix, clp::ROCK_LAYER_HAND, handMask);
@@ -1660,12 +356,74 @@ namespace heisenberg
         s_pushScratch.pushVel[3] = 0.0f;
 
         auto& pushVel = *reinterpret_cast<RE::NiPoint4*>(s_pushScratch.pushVel);
+
+        // ROCK PushAssist model (toggle bPushAssist): instead of replacing the object's
+        // velocity, compute a push IMPULSE along the hand velocity (clamped + layer-scaled,
+        // gated by min speed) and ACCUMULATE it onto the object's current velocity, so the
+        // object's existing motion is preserved. 1:1 with rock::push_assist::computePushImpulse.
+        if (g_config.rockPushAssist) {
+            heisenberg::rock_push_assist::PushAssistInput<RE::NiPoint3> pin{};
+            pin.sourceVelocity = RE::NiPoint3(handVel.x * kGameToHavok, handVel.y * kGameToHavok, handVel.z * kGameToHavok);
+            pin.minSpeed = g_config.handPushVelocityThreshold * kGameToHavok;
+            pin.maxImpulse = g_config.pushAssistMaxImpulse;
+            pin.layerMultiplier = pushMultiplier;
+            const auto pa = heisenberg::rock_push_assist::computePushImpulse(pin);
+            if (!pa.apply) {
+                return;  // below threshold / invalid — no push this frame
+            }
+            s_pushScratch.pushVel[0] = s_curScratch.v[0] + pa.impulse.x;
+            s_pushScratch.pushVel[1] = s_curScratch.v[1] + pa.impulse.y;
+            s_pushScratch.pushVel[2] = s_curScratch.v[2] + pa.impulse.z;
+            s_pushScratch.pushVel[3] = 0.0f;
+        }
+
         CollisionFunctions::SetLinearVelocity(colObj, pushVel);
+
+        // WAKE the pushed object — a settled (asleep) body ignores SetLinearVelocity, which is the
+        // "sometimes pushes, sometimes not". The per-frame hand wake only covers ~15u around the
+        // wand; a large object's body centre can sit outside that box, so wake THIS object directly.
+        if (node) {
+            if (void* hknpW = GetCurrentHknpWorld()) {
+                auto activateInAabb = reinterpret_cast<void(__fastcall*)(void*, void*)>(
+                    REL::Module::get().base() + 0x1546f80);
+                const RE::NiPoint3& op = node->world.translate;
+                const float wr = 12.0f * kGameToHavok;
+                const float ox = op.x * kGameToHavok, oy = op.y * kGameToHavok, oz = op.z * kGameToHavok;
+                alignas(16) float aabb[8] = { ox - wr, oy - wr, oz - wr, 0.0f, ox + wr, oy + wr, oz + wr, 0.0f };
+                activateInAabb(hknpW, aabb);
+            }
+        }
 
         spdlog::debug("[HAND_COLLISION] Swept push refr {:08X} from ({:.1f},{:.1f},{:.1f}) hkVel=({:.2f},{:.2f},{:.2f}) preservedZ={:.2f}",
                       refr->formID, handPos.x, handPos.y, handPos.z,
                       s_pushScratch.pushVel[0], s_pushScratch.pushVel[1], s_pushScratch.pushVel[2],
                       curZ_hk);
+    }
+
+    void HandCollision::PushObjectsToward(const RE::NiPoint3& center, const RE::NiPoint3& velocity,
+                                          float radius, RE::TESObjectREFR* ignore)
+    {
+        const float speed = Length(velocity);
+        if (speed < 5.0f) return;  // held object barely moving — nothing to shove
+
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player) return;
+
+        std::vector<RE::TESObjectREFR*> nearby = Physics::GetObjectsInRadius(center, radius, player);
+        for (auto* refr : nearby) {
+            if (!refr || refr == ignore || !Physics::IsGrabbable(refr)) continue;
+            RE::NiPoint3 c;
+            float r = 0.0f;
+            if (!GetObjectBounds(refr, c, r)) continue;
+            const RE::NiPoint3 sep = c - center;
+            const float dist = Length(sep);
+            if (dist > radius) continue;
+            const RE::NiPoint3 toClutter = NormalizeOrZero(sep);
+            // Only shove clutter the held object is moving TOWARD — what's in front of it.
+            const float into = Dot(velocity, toClutter);
+            if (into < 1.0f) continue;
+            ApplyPushForce(refr, c, toClutter * into, 1.0f / 90.0f);  // SetLinearVelocity + wake
+        }
     }
 
     void HandCollision::CheckProximityCollisions(const RE::NiPoint3& handPos,
@@ -1723,13 +481,14 @@ namespace heisenberg
 
         // Preferred: real rendered finger bones → cloud follows the visible hand pose, so contact
         // is measured from where the player actually sees their fingers (no controller-relative gap).
+        // (Restored from 0.8 per user — the cup pushed reliably with this cloud.)
         {
             static const char* const kFingerTipBones[2][5] = {
                 { "RArm_Finger13", "RArm_Finger23", "RArm_Finger33", "RArm_Finger43", "RArm_Finger53" },
                 { "LArm_Finger13", "LArm_Finger23", "LArm_Finger33", "LArm_Finger43", "LArm_Finger53" },
             };
             auto* pl = f4vr::getPlayer();
-            RE::NiAVObject* root = (pl && pl->firstPersonSkeleton) ? pl->firstPersonSkeleton : nullptr;
+            RE::NiAVObject* root = (pl && pl->firstPerson3D.get()) ? pl->firstPerson3D.get() : nullptr;
             if (root) {
                 const char* const* names = kFingerTipBones[isLeft ? 1 : 0];
                 RE::NiPoint3 tipSum(0.0f, 0.0f, 0.0f);
@@ -1772,25 +531,62 @@ namespace heisenberg
             }
         }
 
-        RE::NiPoint3 handCentroid(0.0f, 0.0f, 0.0f);
-        for (int i = 0; i < handPtCount; ++i) {
-            handCentroid = handCentroid + handPts[i];
-        }
-        handCentroid = handCentroid * (1.0f / static_cast<float>(handPtCount));
+        // SWEPT CONTACT: a single-frame snapshot of the hand points tunnels straight through a small
+        // object on a FAST swipe (the hand teleports past it between frames, so no sample ever lands
+        // on it). Densify the cloud along the hand's MOTION since last frame — interpolate each point
+        // from its previous-frame position to its current one, with more sub-steps the further the
+        // hand moved. All the contact tests below run on this swept set, so a fast pass still drops a
+        // sample onto the object.
+        const int handIdx = isLeft ? 1 : 0;
+        static RE::NiPoint3 s_prevHandPts[2][16];
+        static int s_prevHandPtCount[2] = { 0, 0 };
 
-        // Broadphase query encloses the whole point cloud plus a margin.
+        RE::NiPoint3 sweptPts[16 * 16];
+        int sweptCount = 0;
+        if (s_prevHandPtCount[handIdx] == handPtCount && handPtCount > 0) {
+            float maxDisp = 0.0f;
+            for (int i = 0; i < handPtCount; ++i) {
+                maxDisp = (std::max)(maxDisp, Length(handPts[i] - s_prevHandPts[handIdx][i]));
+            }
+            // ~2 game-unit spacing along the sweep so nothing slips between samples; 1..6 sub-steps.
+            // ~1.5 game-unit spacing along the sweep, up to 16 sub-steps, so even a fast swipe never
+            // skips over a SMALL object (the coffee cup). The triangle cap now bounds the per-object
+            // cost, so dense swept sampling is affordable. handPtCount(≤16)*steps(≤16) ≤ 256 = array.
+            const int steps = (std::clamp)(static_cast<int>(std::ceil(maxDisp / 1.5f)), 1, 16);
+            for (int i = 0; i < handPtCount; ++i) {
+                for (int st = 0; st < steps; ++st) {
+                    const float t = (steps > 1) ? static_cast<float>(st) / static_cast<float>(steps - 1) : 1.0f;
+                    sweptPts[sweptCount++] = s_prevHandPts[handIdx][i] * (1.0f - t) + handPts[i] * t;
+                }
+            }
+        } else {
+            // No usable history (first frame, or the cloud shape changed) — just use current points.
+            for (int i = 0; i < handPtCount; ++i) sweptPts[sweptCount++] = handPts[i];
+        }
+        // Remember this frame's cloud for next frame's sweep.
+        for (int i = 0; i < handPtCount; ++i) s_prevHandPts[handIdx][i] = handPts[i];
+        s_prevHandPtCount[handIdx] = handPtCount;
+
+        RE::NiPoint3 handCentroid(0.0f, 0.0f, 0.0f);
+        for (int i = 0; i < sweptCount; ++i) {
+            handCentroid = handCentroid + sweptPts[i];
+        }
+        handCentroid = handCentroid * (1.0f / static_cast<float>(sweptCount));
+
+        // Broadphase query encloses the whole SWEPT point cloud plus a margin.
         float spread = 0.0f;
-        for (int i = 0; i < handPtCount; ++i) {
-            spread = (std::max)(spread, Length(handPts[i] - handCentroid));
+        for (int i = 0; i < sweptCount; ++i) {
+            spread = (std::max)(spread, Length(sweptPts[i] - handCentroid));
         }
         std::vector<RE::TESObjectREFR*> nearby =
             Physics::GetObjectsInRadius(handCentroid, spread + handRadius + 80.0f, player);
 
-        RE::TESObjectREFR* bestRefr = nullptr;
-        RE::NiPoint3 bestCenter;
-        RE::NiPoint3 bestHandPt;
+        RE::TESObjectREFR* bestRefr = nullptr;   // nearest TOUCHED object — drives the haptic pulse
         float bestScore = (std::numeric_limits<float>::max)();
+        int pushedCount = 0;
 
+        // Push EVERY object the hand cloud is genuinely touching — not just the closest. Pushing
+        // only the single nearest was the "pot pushes but the cup right next to it doesn't" report.
         for (auto* refr : nearby) {
             if (!refr || !Physics::IsGrabbable(refr)) {
                 continue;
@@ -1803,104 +599,120 @@ namespace heisenberg
             objectRadius = (std::clamp)(objectRadius, 2.0f, 80.0f);
             const float triggerDist = handRadius + objectRadius;
 
-            // Nearest hand point to this object's bounds center — ANY part of the hand counts.
-            RE::NiPoint3 closestHandPt = handPts[0];
+            // Nearest SWEPT hand point to this object's bounds center — ANY point on the hand's
+            // path this frame counts (so a fast pass still registers).
+            RE::NiPoint3 closestHandPt = sweptPts[0];
             float distSq = (std::numeric_limits<float>::max)();
-            for (int i = 0; i < handPtCount; ++i) {
-                const float d = LengthSq(center - handPts[i]);
-                if (d < distSq) { distSq = d; closestHandPt = handPts[i]; }
+            for (int i = 0; i < sweptCount; ++i) {
+                const float d = LengthSq(center - sweptPts[i]);
+                if (d < distSq) { distSq = d; closestHandPt = sweptPts[i]; }
             }
             if (distSq > triggerDist * triggerDist) {
-                continue;
+                continue;  // hand not near this object's bounds
             }
-            if (distSq < bestScore) {
-                bestScore = distSq;
-                bestRefr = refr;
-                bestCenter = center;
-                bestHandPt = closestHandPt;
-            }
-        }
 
-        if (!bestRefr) {
-            ClearContactObject(isLeft);
-            return;
-        }
-
-        // TRUE TOUCH: require a hand sample (a real finger bone) within handContactSlop of the
-        // object's actual OUTER MESH surface. Test every hand point and keep the nearest, so any
-        // finger / edge / palm contact registers. We push from the MESH point — never the
-        // node/bounds centre — so contact MUST be verified against real triangles; if the mesh
-        // can't be extracted, we do not push at all (the hand only shoves the visible surface).
-        RE::NiPoint3 touchHandPt = bestHandPt;
-        RE::NiPoint3 contactPt(0.0f, 0.0f, 0.0f);
-        bool haveContact = false;
-        {
-            auto* bestNode = bestRefr->Get3D();
-            if (bestNode) {
+            // TRUE TOUCH for THIS object: require a hand sample within handContactSlop of its OUTER
+            // MESH. Push from the mesh point — never the node/bounds centre — so contact MUST be
+            // verified against real triangles; if the mesh can't be extracted, don't push it.
+            RE::NiPoint3 touchHandPt = closestHandPt;
+            RE::NiPoint3 contactPt(0.0f, 0.0f, 0.0f);
+            bool haveContact = false;
+            float bestMeshDist = (std::numeric_limits<float>::max)();  // hoisted — used by depenetration
+            if (auto* objNode = refr->Get3D()) {
                 std::vector<heisenberg::TriangleData> tris;
                 tris.reserve(256);
-                heisenberg::GetTriangles(bestNode, tris);
+                heisenberg::GetTriangles(objNode, tris, 4000);  // perf cap — high-poly meshes froze the game
                 if (!tris.empty()) {
-                    float bestMeshDist = (std::numeric_limits<float>::max)();
                     RE::NiPoint3 meshPt;
                     float md = -1.0f;
-                    for (int i = 0; i < handPtCount; ++i) {
-                        if (heisenberg::GetClosestMeshPointToPoint(tris, handPts[i], meshPt, md) && md < bestMeshDist) {
+                    for (int i = 0; i < sweptCount; ++i) {
+                        if (heisenberg::GetClosestMeshPointToPoint(tris, sweptPts[i], meshPt, md) && md < bestMeshDist) {
                             bestMeshDist = md;
-                            touchHandPt = handPts[i];
-                            contactPt = meshPt;     // WHERE on the outer mesh we touched
+                            touchHandPt = sweptPts[i];
+                            contactPt = meshPt;
                             haveContact = true;
                         }
                     }
-                    // Within handContactSlop of the real surface = genuine touch. Beyond it the
-                    // hand hasn't reached the mesh yet (was the "pushes before contact" cause).
                     if (bestMeshDist > g_config.handContactSlop) {
-                        haveContact = false;
+                        haveContact = false;  // hand hasn't reached the real surface yet
                     }
+                }
+            }
+            // BOUNDS FALLBACK for SMALL objects (the coffee cup): the precise per-triangle mesh test
+            // can miss a small/thin-walled object — the swept samples land just outside the contact
+            // band, or between the cup's walls — so the hand "passes through" it. When the hand is
+            // clearly inside a SMALL object's bounds sphere, push from the bounds surface instead.
+            // Restricted to small objects (objectRadius small) so large objects still require the
+            // precise mesh test and can't be shoved from a distance.
+            if (!haveContact && objectRadius <= 9.0f) {
+                const RE::NiPoint3 toCenter = center - closestHandPt;
+                const float dC = Length(toCenter);
+                if (dC <= objectRadius + g_config.handContactSlop) {
+                    const RE::NiPoint3 nrm = NormalizeOrZero(toCenter);
+                    contactPt   = center - nrm * objectRadius;  // bounds surface nearest the hand
+                    touchHandPt = closestHandPt;
+                    haveContact = true;
+                }
+            }
+
+            if (!haveContact) {
+                continue;  // no verified outer-mesh contact → don't push this object
+            }
+
+            // Nearest touched object drives the haptic/contact pulse.
+            if (distSq < bestScore) { bestScore = distSq; bestRefr = refr; }
+
+            // DIRECTIONAL NORMAL PUSH. Shove the object ONLY along the contact normal (swept hand
+            // sample → mesh point), by the hand's speed INTO that surface. The into-surface test is
+            // what makes lateral motion and the RETURN stroke impart nothing (no sticky drag /
+            // follow-back) — on retract handVel points away from the surface so intoContact goes < 0.
+            // We deliberately do NOT gate on a wand→contact "approach" here: on a FAST swipe the wand
+            // overshoots the object by the time we detect the swept contact, which would (wrongly)
+            // read as moving away and skip the push. intoContact (computed at the contact sample) is
+            // the correct, swept-safe gate. The velocity is direction-resolved here; ApplyPushForce
+            // just scales it into Havok space and wakes the body.
+            // PUSH = swat + depenetration, ALWAYS along the contact normal (swept hand sample → mesh
+            // point) so it is only ever directed AWAY from the hand:
+            //  - SWAT: a fast hit INTO the surface (hand speed along the normal) knocks the object
+            //    flying — the satisfying fast-hand knock.
+            //  - DEPENETRATION: while the hand is within the contact band, eject the object out of the
+            //    hand proportional to how far IN the hand is, INDEPENDENT of hand speed. This is what
+            //    stops a SLOW hand clipping through, and because it is purely outward it can NEVER
+            //    pull the object back on the retract stroke (the old velocity-only push did when the
+            //    hand was penetrating).
+            const RE::NiPoint3 toContact = contactPt - touchHandPt;
+            if (LengthSq(toContact) > 1.0e-4f) {
+                const RE::NiPoint3 dir = NormalizeOrZero(toContact);  // hand → surface = away from hand
+                float pushMag = 0.0f;
+                const float intoContact = Dot(handVel, dir);
+                if (intoContact >= 1.0f) {
+                    pushMag += intoContact;  // swat (fast hand into the surface)
+                }
+                const float penetration = g_config.handContactSlop - bestMeshDist;  // >0 inside the band
+                if (penetration > 0.0f) {
+                    constexpr float kDepenStiffness = 25.0f;  // 1/s — eject rate for slow/penetrating
+                    pushMag += penetration * kDepenStiffness;
+                }
+                if (pushMag > 0.0f) {
+                    ApplyPushForce(refr, contactPt, dir * pushMag, deltaTime);
+                    ++pushedCount;
                 }
             }
         }
 
-        if (!haveContact) {
-            // No verified OUTER-MESH contact (too far, or mesh not extractable). Do NOT fall back
-            // to pushing from the node / bounds centre — that's the "pushes nodes not the mesh"
-            // complaint. No contact → no push.
+        if (bestRefr) {
+            SetContactObject(isLeft, bestRefr);
+        } else {
             ClearContactObject(isLeft);
-            return;
         }
 
-        SetContactObject(isLeft, bestRefr);
-
-        // OVERALL-APPROACH GATE: only push while the HAND AS A WHOLE is closing on the object.
-        // The per-point normal test below isn't enough on its own — on the RETURN stroke the
-        // closest hand sample can flip to one whose local surface normal happens to align with
-        // the backward motion, so intoContact goes positive again and the object gets shoved
-        // toward the player. That is the "empty hand pushes the object, then it follows my hand
-        // back" report. Gating on the wand→object-centre approach makes a retract impart nothing,
-        // no matter which sample is closest.
-        // Use the WAND→contact-point vector (handPos is the stable wand centre) rather than the
-        // per-sample touchHandPt, which is what flips on the return stroke.
-        const RE::NiPoint3 toContactFromWand = contactPt - handPos;
-        const float overallApproach = Dot(handVel, NormalizeOrZero(toContactFromWand));
-
-        // DIRECTIONAL NORMAL PUSH: shove the object ALONG the contact normal (hand point → mesh
-        // point) by ONLY the hand's speed INTO that surface. Passing the raw handVel made the
-        // object inherit the hand's whole velocity vector, so it dragged sideways and followed the
-        // hand back out of contact (the "sticky" drag). Projecting handVel onto the contact normal
-        // means lateral motion and the RETURN stroke impart nothing — when the hand pulls back,
-        // intoContact goes <= 0 and the push stops immediately, so the object stays put.
-        const RE::NiPoint3 toContact = contactPt - touchHandPt;
-        if (overallApproach > 0.0f && LengthSq(toContact) > 1.0e-4f) {
-            const RE::NiPoint3 dir = NormalizeOrZero(toContact);
-            const float intoContact = Dot(handVel, dir);
-            if (intoContact >= 1.0f) {
-                const RE::NiPoint3 pushVel = dir * intoContact;  // normal-only, no lateral/return drag
-                ApplyPushForce(bestRefr, contactPt, pushVel, deltaTime);
+        if (pushedCount > 0) {
+            static int s_proxPushLog = 0;
+            if ((s_proxPushLog++ % 90) == 0) {
+                spdlog::info("[HAND_COLLISION] {} hand pushing {} object(s) speed={:.1f}",
+                             isLeft ? "left" : "right", pushedCount, handSpeed);
             }
         }
-
-        spdlog::trace("[HAND_COLLISION] Full-hand proximity {} hand -> {:08X} speed={:.1f} bestDist={:.1f}",
-                      isLeft ? "left" : "right", bestRefr->formID, handSpeed, std::sqrt(bestScore));
     }
 
     // SEH leaf (NO C++ objects) — set the body STATIC then remove it from the world.
@@ -1929,6 +741,14 @@ namespace heisenberg
     // This is the single correct release for all live teardown sites. Safe on invalid input.
     static void ReleaseCupBody(PhysicsHandBody& hb)
     {
+        // CRITICAL (char-proxy dangling-support crash): the player char-proxy caches its
+        // "ground" support body REFCOUNTED (SetSupportBody 0x1e23150). These cup/finger bodies
+        // are keyframed on layer 43 — the proxy can pick them up as support exactly like the
+        // ROCK collider bodies — so freeing one the proxy still references dangles supportBody._ptr
+        // → next-frame vf066 faults. Null the cached support body FIRST, mirroring
+        // HandBoneColliderSet::DestroyHand / BodyBoneColliderSet / WeaponCollision teardown.
+        heisenberg::Physics::ClearPlayerProxySupportBody();
+
         // Bethesda pipeline (default/live): each BPB owns its engine-heap allocations and
         // Destroy() does RemovePhysicsSystemInstance + refcount-release (SEH-guarded inside).
         // physicsSystem/collisionObject belong to the BPB — never _aligned_free them here.
@@ -2610,7 +1430,11 @@ namespace heisenberg
                 ContactImpulseListener::GetSingleton().UnsubscribeBody(isLeft);
                 HandCollision::GetSingleton().ClearContactObject(isLeft);
             }
-            hb.Invalidate();
+            // Fully release (Destroy + remove-from-world + delete), not just NULL the pointers.
+            // Invalidate() alone leaks the three BethesdaPhysicsBody wrappers and orphans their
+            // hknp bodies in the world. ReleaseCupBody is SEH-guarded internally, clears the
+            // char-proxy support body first, and ends by invalidating hb.
+            ReleaseCupBody(hb);
         }
     }
 
@@ -2629,8 +1453,8 @@ namespace heisenberg
     static RE::NiAVObject* GetPlayerSkeletonRoot()
     {
         auto* player = f4vr::getPlayer();
-        if (!player || !player->firstPersonSkeleton) return nullptr;
-        return player->firstPersonSkeleton;
+        if (!player || !player->firstPerson3D.get()) return nullptr;
+        return player->firstPerson3D.get();
     }
 
     void HandCollision::DestroyFingerSegments(bool isLeft)
@@ -2751,15 +1575,12 @@ namespace heisenberg
             CheckProximityCollisions(rightHandPos, rightHandVel, false, deltaTime);
         }
 
-        // ROCK integration per-frame entry points. Each self-gates via its own IsActive()
-        // and is a no-op when its toggle is off, so they run OUTSIDE the usePhysicsHandBodies
-        // branch — BodyBoneCollider / WeaponCollision / TwoHandedGrip are independent of the
-        // cup/finger setting, and gating them behind it meant enabling one alone silently
-        // never ticked (it claimed IsActive() but Update() was unreachable).
-        heisenberg::rock_hand_collider::Update();
-        heisenberg::rock_body_collider::Update();
-        heisenberg::rock_weapon_collision::Update();
-        heisenberg::rock_two_handed_grip::Update();
+        // NOTE: the ROCK integration per-frame entry points (rock_hand_collider /
+        // rock_body_collider / rock_weapon_collision / rock_two_handed_grip) were hoisted out
+        // of here into Hooks.cpp::UpdateHandCollisionBodies, ABOVE the bEnableHandCollision
+        // early-return, so each ticks whenever its own [RockIntegration] toggle is on,
+        // independent of the cup/finger hand-collision setting. (This Update() is itself
+        // unreachable when bEnableHandCollision=false.)
 
         // Wake sleeping objects near hands
         if (hknpW) {
@@ -2794,7 +1615,12 @@ namespace heisenberg
     void HandCollision::TriggerCollisionHaptics(bool isLeft, float intensity, float duration)
     {
         (void)duration;
-        int str = static_cast<int>(intensity * 500.0f);
+        // Honor the [HandCollision] INI/MCM toggle + scale (were loaded but never consumed;
+        // the scale was hardcoded at 500). Default scale is 500 so the shipped feel is unchanged.
+        if (!heisenberg::g_config.enableHandCollisionHaptics) {
+            return;
+        }
+        int str = static_cast<int>(intensity * heisenberg::g_config.handCollisionHapticScale);
         if (str < 500) str = 500;
         if (str > 50000) str = 50000;
         if (isLeft) _pendingLeftHaptic = str; else _pendingRightHaptic = str;

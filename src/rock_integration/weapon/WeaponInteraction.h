@@ -10,7 +10,7 @@
 #include "rock_integration/weapon/WeaponTypes.h"
 #include "rock_integration/weapon/WeaponSupport.h"
 
-namespace rock
+namespace heisenberg::rock_core
 {
     /*
      * Left-hand weapon behavior needs one authority. Generated layer 44 weapon

@@ -20,7 +20,7 @@ namespace RE
     class hknpWorld;
 }
 
-namespace rock::object_physics_body_set
+namespace heisenberg::rock_core::object_physics_body_set
 {
     inline constexpr std::uint32_t INVALID_BODY_ID = 0x7FFF'FFFF;
 
@@ -246,6 +246,7 @@ namespace rock::object_physics_body_set
         std::uint32_t unresolvedRefBodiesAccepted = 0;
         std::uint32_t unresolvedRefBodySkips = 0;
         std::uint32_t weaponExpansionSkips = 0;
+        std::uint32_t depthLimitSkips = 0;   // bodies skipped at the recursion depth limit (grab-core)
         std::array<std::uint32_t, 32> rejectCounts{};
     };
 

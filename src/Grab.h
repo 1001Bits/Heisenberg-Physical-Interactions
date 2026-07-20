@@ -55,9 +55,39 @@ namespace heisenberg
         Motor = 2,        // 6-DOF motor constraint (like Skyrim HIGGS) — ACTIVE
         VirtualSpring = 3, // Virtual spring velocity + HeldBody system
         MouseSpring = 4,  // Use native game mouse spring system
-        DynamicRock = 5   // Self-contained ROCK-style grab: place keyframed at offset,
+        DynamicRock = 5,  // Self-contained ROCK-style grab: place keyframed at offset,
                           // then switch the held body to DYNAMIC and drive it via velocity
                           // so it collides with walls/NPCs while held. No ROCK.dll needed.
+        // 6 = NativeGrab (native hknpBSMouseSpringAction; reserved, see NativeMouseSpringGrab).
+        RockForceGrab = 7 // PREPARED, NOT YET FUNCTIONAL. ROCK owns the *dynamic* hold AND the
+                          // placement (mesh/contact grab pocket) via its forceGrab API, while
+                          // Heisenberg stays the brain: selection, finger posing, sticky/
+                          // transfer/throw semantics — and creates NO keyframed body of its own.
+                          // We pass NO offset: ROCK seats the object at the real contact point,
+                          // which supersedes our keyframed dimension-table offset. The clean
+                          // successor to the bRockDynamicHandoff grip-injection hack.
+                          // Gated on RockBridge::SupportsDynamicHold(); until ROCK ships plain
+                          // v5 forceGrab, GetEffectiveGrabMode() degrades this to Keyframed.
+                          // WIRING CHECKLIST (when ROCK is ready):
+                          //   * StartGrab/handoff -> RockBridge::ForceGrab(refr)  (no offset)
+                          //   * set GrabState::rockForceGrabHold; do NOT make a keyframed body
+                          //   * per-frame -> drive fingers from RockBridge::GetHeldObject()
+                          //   * EndGrab -> RockBridge::ForceDrop()
+                          //   * loot/drop-to-hand -> ForceGrab instead of StartGrabOnRef
+                          //   * sticky/hand-to-hand -> ForceGrab/ForceDrop edges
+                          //   See TryStartRockForceGrabHold() in Grab.cpp for the entry stub.
+        ,
+        RockGrabCore = 8, // Self-contained 1:1 port of ROCK's grab core: a custom hknp atom-block
+                          // constraint (RockGrabConstraint) + ragdoll/linear motors driven by a
+                          // three-phase acquisition state machine, with object-prep + inertia
+                          // normalization. No ROCK.dll. Gated by [RockIntegration] bUseRockGrabCore
+                          // (default OFF); GetEffectiveGrabMode degrades to Keyframed if unavailable.
+        RockNativeGrab = 9 // The EMBEDDED ROCK ENGINE owns grab + selection 1:1 (upstream Jul-6 code:
+                          // its own input read, selection beam, force-grab, saved offsets, throw).
+                          // Heisenberg's grab/selection stand DOWN for grip input (OnGrabPressed/
+                          // OnGrabReleased become no-ops) and rock::HostSetGrabOwnership forces the
+                          // embed's bGrabEnabled/bSelectionEnabled ON across ini reloads. Requires
+                          // bUseRockEngineArchitecture=1 + HostLoad OK; else degrades to Keyframed.
     };
 
     /**
@@ -85,6 +115,10 @@ namespace heisenberg
         int  rockHandoffSettleFrames = 0;  // frames the object has been placed at offset before handoff
         bool rockDynamicActive = false;    // iGrabMode=5: held body flipped KEYFRAMED->DYNAMIC after settle
         int  rockDynamicSettleFrames = 0;  // frames placed at offset before the self-contained dynamic flip
+        bool handFollowActive = false;     // HIGGS hand-follows-object: FRIK hand slaved to the held object this frame (cleared on release)
+        RE::NiPoint3 handFollowSmoothedLag;// temporally-smoothed object-lag for the hand-follow (anti-snap)
+        bool rockForceGrabHold = false;
+        bool coHeldSecondary = false;  // two-handed grab: this hand is the secondary aim hand (no physics drive)    // iGrabMode=7 (PREPARED): object held by ROCK via forceGrab; Heisenberg drives only fingers/semantics, no keyframed body
         bool heldPlayerFilterApplied = false; // ROCK-style suppression bit applied (bit 14 of body filter info)
         int  heldPlayerFilterFrames = 0;      // frame counter for periodic re-application
         std::uint32_t heldOriginalFilterInfo = 0; // body's filter info before suppression bit set (for restore)
@@ -103,6 +137,13 @@ namespace heisenberg
         
         // Collision object is NOT ref-counted in Bethesda's system, but we validate before use
         RE::bhkNPCollisionObject* collisionObject = nullptr;
+
+        // Jul 19 (held-object-survives-a-cell-load fix): bhkWorld the collisionObject above was
+        // last synced against. A held object's NiNode keeps tracking correctly across a cell/
+        // worldspace transition (script-space, engine-driven), but its Havok collision presence
+        // does not self-heal the same way — PostPhysicsGrabUpdate compares this every frame
+        // against the refr's CURRENT bhkWorld and re-syncs on mismatch. See GetBhkWorldFromRefr.
+        RE::bhkWorld* lastSyncedBhkWorld = nullptr;
         
         // Original parent for restoring on release - smart pointer for safety
         RE::NiPointer<RE::NiNode> originalParent;
@@ -158,7 +199,8 @@ namespace heisenberg
             float linearDamping = 0.0f;
             float angularDamping = 0.0f;
             bool wasDeactivated = false;
-            std::uint32_t collisionLayer = 4;  // Default to kClutter, save original on grab
+            std::uint32_t collisionLayer = 4;      // Real pre-grab layer, captured when (and only when) the grab changes it
+            bool collisionLayerChanged = false;    // True only if the grab actually re-layered the body (kNonCollidable=15 paths); release skips SetLayer otherwise
             std::uint16_t collisionObjectFlags = 0;  // bhkNPCollisionObjectBase flags - restore on release (like HIGGS)
             RE::bhkWorld* savedBhkWorld = nullptr;  // Store the world we removed physics from (for interior cells)
         } savedState;
@@ -221,6 +263,11 @@ namespace heisenberg
 
         // HeldBody dynamic grab state (used by HeldBodyGrab system)
         bool usingHeldBodyGrab = false;         // True if using HeldBody spring/constraint grab
+        bool rockGrabCoreActive = false;        // True if this grab is owned by the ROCK grab core (iGrabMode=8)
+        bool rockGrabCoreConstraintCreated = false;  // P4: motor constraint live (object DYNAMIC, proxy driving)
+        int  rockGrabCoreSettleFrames = 0;           // P4: frames at the keyframed offset before the commit
+        RE::NiPoint3 lastDynamicTargetPos{};    // DynamicRock drive: last frame's target (velocity feed-forward)
+        bool hasLastDynamicTarget = false;
         std::uint32_t handBodyId = 0x7FFFFFFF;  // Physics body ID for hand body
         double heldBodyGrabTime = 0.0;          // Time when held body grab started
         bool heldBodyConstraintActive = false;  // True if the HeldBody backend is active
@@ -328,6 +375,10 @@ namespace heisenberg
             rockHandoffSettleFrames = 0;
             rockDynamicActive = false;
             rockDynamicSettleFrames = 0;
+            handFollowActive = false;
+            handFollowSmoothedLag = RE::NiPoint3();
+            rockForceGrabHold = false;
+            coHeldSecondary = false;
             heldPlayerFilterApplied = false;
             heldPlayerFilterFrames = 0;
             heldOriginalFilterInfo = 0;
@@ -382,6 +433,11 @@ namespace heisenberg
             deferredHeldBodyStart = false;
             // HeldBody grab state
             usingHeldBodyGrab = false;
+            rockGrabCoreActive = false;
+            rockGrabCoreConstraintCreated = false;
+            rockGrabCoreSettleFrames = 0;
+            lastDynamicTargetPos = RE::NiPoint3();
+            hasLastDynamicTarget = false;
             handBodyId = 0x7FFFFFFF;
             heldBodyGrabTime = 0.0;
             heldBodyConstraintActive = false;
@@ -457,7 +513,8 @@ namespace heisenberg
          * @param throwVelocity Optional velocity to apply when releasing
          * @param forStorage If true, skip node restoration (object is about to be deleted)
          */
-        void EndGrab(bool isLeft, const RE::NiPoint3* throwVelocity = nullptr, bool forStorage = false);
+        void EndGrab(bool isLeft, const RE::NiPoint3* throwVelocity = nullptr, bool forStorage = false,
+                     const RE::NiPoint3* throwAngularVelocity = nullptr);  // rad/s world frame (ROCK release composition, audit rank 3)
 
         /**
          * Check if a hand is currently grabbing
@@ -572,9 +629,6 @@ namespace heisenberg
                                const RE::NiMatrix3& targetRot, float deltaTime);
         RE::bhkNPCollisionObject* GetCollisionObject(RE::TESObjectREFR* refr);
         
-        // Virtual spring mode - applies forces to make object follow hand
-        void UpdateVirtualSpring(GrabState& state, const RE::NiPoint3& targetPos,
-                                 const RE::NiMatrix3& targetRot, float deltaTime);
 
         // State for each hand
         GrabState _leftGrab;
@@ -599,4 +653,9 @@ namespace heisenberg
         };
         PendingHolsterRequest _pendingHolster;
     };
+
+    // Two-handed support-hand finger pose driver (Jul 19): drives FRIK's base finger API
+    // from ROCK's grip pose (iTwoHandedFingerPoseMode=1) or the HIGGS geometry solver vs
+    // the weapon mesh (=2) while a support grip is engaged. Called from HookPostPhysics.
+    void UpdateTwoHandedSupportFingerPose();
 }

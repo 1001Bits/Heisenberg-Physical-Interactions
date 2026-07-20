@@ -38,6 +38,11 @@ namespace heisenberg
         State GetState() const { return _state; }
         const RE::NiPoint3& GetPosition() const { return _position; }
         const RE::NiPoint3& GetVelocity() const { return _velocity; }
+        RE::NiPoint3 GetAngularVelocity() const
+        {
+            return _angularVelocityHistory.empty() ?
+                RE::NiPoint3{} : _angularVelocityHistory.front();
+        }
         const RE::NiMatrix3& GetRotation() const { return _rotation; }
         const Selection& GetSelection() const { return _selection; }
 
@@ -112,6 +117,18 @@ namespace heisenberg
         RE::NiPoint3 _velocity;
         RE::NiMatrix3 _rotation;
         std::deque<RE::NiPoint3> _velocityHistory;
+
+        // ROCK-faithful release tracking (audit rank 3). ROCK composes release velocity from
+        // player-LOCAL hand velocity (hand minus player locomotion), hand ANGULAR velocity
+        // (for the swing/lever + spin terms), and the player velocity added back unscaled —
+        // each sampled as the MAX-MAGNITUDE entry of a short history ring, not the mean.
+        RE::NiMatrix3 _prevRotation;
+        RE::NiPoint3 _playerVelocity;                       // player locomotion velocity (game u/s)
+        RE::NiPoint3 _prevPlayerPos;
+        bool _hasPrevPlayerPos = false;
+        std::deque<RE::NiPoint3> _localVelocityHistory;     // hand velocity minus player velocity (game u/s)
+        std::deque<RE::NiPoint3> _angularVelocityHistory;   // hand angular velocity (rad/s, world frame)
+        std::size_t _relSampleCount = 0;                    // # real samples pushed into the ROCK release histories (0..5), for maxMagnitudeVelocity validCount
 
         // State machine
         State _state = State::Idle;

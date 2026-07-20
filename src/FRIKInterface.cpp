@@ -1,4 +1,5 @@
 #include "FRIKInterface.h"
+#include "HandAuthority.h"   // plugin-side hand placement when native FRIK lacks v5
 
 namespace heisenberg
 {
@@ -204,30 +205,38 @@ namespace heisenberg
 
     bool FRIKInterface::GetHandWorldTransform(bool isLeft, RE::NiTransform& outWorld) const
     {
-        if (!SupportsPushback()) return false;
-        auto* api = Api();
-        if (!api->getHandWorldTransform || !api->isSkeletonReady || !api->isSkeletonReady()) return false;
-        if (!GetHandWorldSEH(api, ToHand(isLeft), outWorld)) {
-            s_pushbackFaulted = true;
-            if (!s_loggedDisable) { spdlog::error("[FRIK] pushback call faulted (API layout mismatch?) — disabling pushback"); s_loggedDisable = true; }
+        // Native FRIK v5 path.
+        if (SupportsPushback()) {
+            auto* api = Api();
+            if (api->getHandWorldTransform && api->isSkeletonReady && api->isSkeletonReady()) {
+                if (GetHandWorldSEH(api, ToHand(isLeft), outWorld)) return true;
+                s_pushbackFaulted = true;
+                if (!s_loggedDisable) { spdlog::error("[FRIK] pushback call faulted (API layout mismatch?) — disabling pushback"); s_loggedDisable = true; }
+            }
             return false;
         }
-        return true;
+        // Older FRIK (no v5): our plugin-side hand authority owns the rendered hand.
+        return HandAuthority::GetRenderedHand(isLeft, outWorld);
     }
 
     bool FRIKInterface::ApplyExternalHandWorldTransform(bool isLeft, const RE::NiTransform& world, int priority) const
     {
-        if (!SupportsPushback()) return false;
-        auto* api = Api();
-        if (!api->applyExternalHandWorldTransform) return false;
-        return ApplyExtSEH(api, HEISENBERG_HAND_PUSHBACK_TAG, ToHand(isLeft), world, priority);
+        if (SupportsPushback()) {
+            auto* api = Api();
+            if (!api->applyExternalHandWorldTransform) return false;
+            return ApplyExtSEH(api, HEISENBERG_HAND_PUSHBACK_TAG, ToHand(isLeft), world, priority);
+        }
+        // Older FRIK (no v5): route to our plugin-side authority (applied at the post-physics hook).
+        return HandAuthority::Apply(HEISENBERG_HAND_PUSHBACK_TAG, isLeft, world, priority);
     }
 
     bool FRIKInterface::ClearExternalHandWorldTransform(bool isLeft) const
     {
-        if (!SupportsPushback()) return false;
-        auto* api = Api();
-        if (!api->clearExternalHandWorldTransform) return false;
-        return ClearExtSEH(api, HEISENBERG_HAND_PUSHBACK_TAG, ToHand(isLeft));
+        if (SupportsPushback()) {
+            auto* api = Api();
+            if (!api->clearExternalHandWorldTransform) return false;
+            return ClearExtSEH(api, HEISENBERG_HAND_PUSHBACK_TAG, ToHand(isLeft));
+        }
+        return HandAuthority::Clear(HEISENBERG_HAND_PUSHBACK_TAG, isLeft);
     }
 }

@@ -265,7 +265,7 @@ namespace rock::api
 }
 
 #if defined(ROCK_API_EXPORTS)
-namespace rock
+namespace heisenberg::rock_core
 {
     class PhysicsInteraction;
 }

@@ -53,6 +53,19 @@ namespace heisenberg::bethesda_physics_body
         // Detach from world + release ref-counted wrappers. Idempotent.
         void Destroy(void* bhkWorld);
 
+        // Drop all handles WITHOUT native calls. For when the creating world is already
+        // dead/different (cell transition): Destroy() against a dead world would UAF, so we
+        // deliberately abandon the (world-owned or already-freed) wrappers — a few hundred
+        // bytes leaked per abandoned body, traded for guaranteed crash-safety.
+        void Abandon()
+        {
+            _collisionObject = nullptr;
+            _physicsSystem = nullptr;
+            _systemData = nullptr;
+            _bodyId = 0x7FFFFFFF;
+            _created = false;
+        }
+
         // Drive functions — wrappers over Heisenberg's existing SetTransform / SetVelocity.
         bool SetTransform(const void* hkTransformf64);
         bool SetVelocity(const void* linVel4, const void* angVel4);

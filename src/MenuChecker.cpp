@@ -88,7 +88,20 @@ namespace heisenberg
 
     void MenuChecker::ClearState()
     {
-        _isLoading.store(false, std::memory_order_relaxed);
+        // Re-derive _isLoading from the live UI rather than force-clearing it.
+        // kNewGame/kPostLoadGame fire while LoadingMenu is still up (~17s before close),
+        // and the MenuOpenCloseEvent sink only re-sets the flag on the CLOSE event.
+        // Unconditionally storing false here defeated every IsLoading() hook guard for the
+        // load tail, letting per-frame work (incl. hand-collision body creation) run against
+        // a still-streaming world. kPreLoadGame fires before LoadingMenu opens, so this
+        // yields false there, preserving prior behavior on that path.
+        {
+            bool loadingNow = false;
+            if (auto* ui = RE::UI::GetSingleton()) {
+                loadingNow = ui->GetMenuOpen("LoadingMenu");
+            }
+            _isLoading.store(loadingNow, std::memory_order_relaxed);
+        }
         _isPaused.store(false, std::memory_order_relaxed);
         _isPipboyOpen.store(false, std::memory_order_relaxed);
         _isMainMenu.store(false, std::memory_order_relaxed);
@@ -104,9 +117,11 @@ namespace heisenberg
         _isScopeOpen.store(false, std::memory_order_relaxed);
         _isExamineOpen.store(false, std::memory_order_relaxed);
         _isExamineConfirmOpen.store(false, std::memory_order_relaxed);
-        _isGameStopped.store(false, std::memory_order_relaxed);
         _menuCloseCooldown.store(0.0f, std::memory_order_relaxed);
         _favoritesCloseTime.store(0.0, std::memory_order_relaxed);
+        // Recompute the combined stopped flag AFTER all individual flags are set, so it stays
+        // consistent with a still-true _isLoading during the load tail (instead of a flat false).
+        UpdateGameStopped();
         spdlog::debug("[MenuChecker] Cleared all menu state");
     }
 

@@ -4,7 +4,7 @@
 
 #include "rock_integration/CollisionLayerPolicy.h"
 
-namespace rock::grab_target
+namespace heisenberg::rock_core::grab_target
 {
     /*
      * Actor visuals, gore pieces, and loose objects can all arrive through the
@@ -19,8 +19,16 @@ namespace rock::grab_target
         LooseObject,
         ActorEquipment,
         DetachedGore,
+        DynamicMovableStatic,
+        DeadActorBody,
         LiveActorScissors,
         BlockedWholeActorBody,
+    };
+
+    enum class GrabAcquisitionMode : std::uint8_t
+    {
+        Default,
+        HandPocketOnly,
     };
 
     [[nodiscard]] inline constexpr const char* name(Kind kind) noexcept
@@ -32,6 +40,10 @@ namespace rock::grab_target
             return "actor-equipment";
         case Kind::DetachedGore:
             return "detached-gore";
+        case Kind::DynamicMovableStatic:
+            return "dynamic-movable-static";
+        case Kind::DeadActorBody:
+            return "dead-actor-body";
         case Kind::LiveActorScissors:
             return "live-actor-scissors";
         case Kind::BlockedWholeActorBody:
@@ -43,12 +55,34 @@ namespace rock::grab_target
 
     [[nodiscard]] inline constexpr bool isPhysicalRockObject(Kind kind) noexcept
     {
-        return kind == Kind::LooseObject || kind == Kind::DetachedGore;
+        return kind == Kind::LooseObject || kind == Kind::DetachedGore || kind == Kind::DynamicMovableStatic || kind == Kind::DeadActorBody;
+    }
+
+    [[nodiscard]] inline constexpr GrabAcquisitionMode acquisitionMode(Kind kind) noexcept
+    {
+        switch (kind) {
+        case Kind::DynamicMovableStatic:
+        case Kind::DetachedGore:
+        case Kind::DeadActorBody:
+            return GrabAcquisitionMode::HandPocketOnly;
+        default:
+            return GrabAcquisitionMode::Default;
+        }
+    }
+
+    [[nodiscard]] inline constexpr bool requiresHandPocketGrab(Kind kind) noexcept
+    {
+        return acquisitionMode(kind) == GrabAcquisitionMode::HandPocketOnly;
+    }
+
+    [[nodiscard]] inline constexpr bool canUseFarSelection(Kind kind) noexcept
+    {
+        return kind == Kind::ActorEquipment || (isPhysicalRockObject(kind) && !requiresHandPocketGrab(kind));
     }
 
     [[nodiscard]] inline constexpr bool canUseRockDynamicPull(Kind kind) noexcept
     {
-        return isPhysicalRockObject(kind);
+        return isPhysicalRockObject(kind) && !requiresHandPocketGrab(kind);
     }
 
     [[nodiscard]] inline constexpr bool canUseRockActiveGrab(Kind kind) noexcept

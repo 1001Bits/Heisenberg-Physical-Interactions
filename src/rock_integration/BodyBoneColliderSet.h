@@ -14,10 +14,29 @@
 //
 // Gated by Config::rockBodyBoneColliderSet.
 
+#include "rock_integration/SoftContactMath.h"
+
+#include <array>
+#include <cstdint>
+
 namespace heisenberg::rock_body_collider
 {
     void Init();
     void Shutdown();
     void Update();
     bool IsActive();
+
+    inline constexpr int kCapsuleCount = 23;
+
+    // Geometry-only build of the 23 body capsules from the live FRIK skeleton (no physics
+    // bodies needed), for the mode-3 soft-contact runtime. Capsule id = 300 + descriptor
+    // index; arm capsules are ids 305-309 (left arm) and 310-314 (right arm) so a hand can
+    // skip its own arm. Returns the count of valid capsules.
+    int BuildBodyCapsules(std::array<heisenberg::rock_core::soft_contact_math::Capsule, kCapsuleCount>& out);
+
+    // True if the capsule id is the arm on the given hand's side (skip same-side arm).
+    inline bool isSameSideArmCapsuleId(std::uint32_t id, bool isLeft)
+    {
+        return isLeft ? (id >= 305u && id <= 309u) : (id >= 310u && id <= 314u);
+    }
 }

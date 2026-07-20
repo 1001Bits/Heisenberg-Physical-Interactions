@@ -16,7 +16,7 @@
 #include <cstdint>
 #include <mutex>
 
-namespace rock::contact_evidence
+namespace heisenberg::rock_core::contact_evidence
 {
     inline constexpr std::uint32_t kInvalidBodyId = 0x7FFF'FFFFu;
     inline constexpr std::uint32_t kUnknownLayer = 0xFFFF'FFFFu;
@@ -67,6 +67,11 @@ namespace rock::contact_evidence
         RE::NiPoint3 contactNormalGame{};
         RE::NiPoint3 sourceVelocityGame{};
         float contactPointWeightSum = 0.0f;
+        // Heisenberg extension: the manifold's own penetration depth (game units, >=0) and
+        // whether an inline contact point was present this frame. For the "reused jacobian"
+        // case (inline count==-1) only the normal is valid → hasContactPoint=false.
+        float penetrationGame = 0.0f;
+        bool  hasContactPoint = false;
     };
 
     struct NativeContactEvidenceSnapshot

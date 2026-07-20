@@ -61,8 +61,17 @@ namespace heisenberg
         bool IsIntroSWFActive() const { return _introSWFActive; }
         bool IsProgramSWFActive() const { return _programSWFActive; }
         float GetFrikPipboyScale();
+        // True if FRIK's holo Pip-Boy is enabled ([Fallout4VRBody] HoloPipBoyEnabled in
+        // FRIK.ini). Holo mode requires a staged projected->wrist transition because FRIK
+        // replaces the Pip-Boy root on the following frame. Cached until cell/game load.
+        bool IsFrikHoloPipboyEnabled();
         void SetTapREFVisible(bool visible);
         void EjectCurrentHolotape();
+
+        // Inventory activation of the intro tape while it is physically loaded means
+        // "take it from the deck", not "play it again". Clears playback/deck state and
+        // queues the inventory copy into the right hand.
+        bool TakeLoadedIntroHolotapeToRightHand(std::uint32_t formID);
 
         // Tape deck animation — called from end-of-update hook (after all animation/skeleton updates)
         void UpdateTapeDeckAnimation();
@@ -106,6 +115,10 @@ namespace heisenberg
         void StartIntroPlayback();
         void UpdateIntroPlayback(float deltaTime);
         void StopIntroPlayback();
+        void BeginIntroProgramPlayback(std::uint32_t formID);
+        void QueueProgramHolotapePlayback(std::uint32_t formID);
+        void UpdateIntroWristTransition();
+        void ResetIntroWristTransition();
 
         // Mesh diffuse SRV helpers (used by terminal screen redirect)
         static uintptr_t GetMeshDiffuseSRV(RE::NiAVObject* mesh);
@@ -133,8 +146,7 @@ namespace heisenberg
         bool            _dumpedNodes          = false;
         float           _buttonOriginalZ      = 0.0f;    // Captured from node on first find
         bool            _buttonOriginalZSet   = false;
-        RE::NiPoint3    _prevEjectFingerPos   = {};      // Previous frame finger position for velocity calc
-        bool            _prevEjectFingerValid = false;   // True after first frame of tracking
+        bool            _ejectContactLatched  = false;   // Sticky contact; resets outside release radius
         bool            _tapeRefInitialHideDone = false;  // True once we've hidden the default tape on first update
         float           _holotapeGrabCooldown   = 0.0f;   // Cooldown to prevent instant re-grab after removal
         float           _closeAnimSpeed         = ANIM_SPEED; // Current close animation speed (variable for slam)
@@ -142,6 +154,7 @@ namespace heisenberg
         float           _pushStartDistance      = 0.0f;   // Hand distance when push started (for mapping)
         float           _pushProgress           = 1.0f;   // Hand-driven progress during Pushing state (1=open, 0=closed)
         float           _frikPipboyScale        = -1.0f;  // Cached FRIK PipboyScale (-1 = not yet read)
+        int             _frikHoloPipboy         = -1;     // Cached FRIK HoloPipBoyEnabled (-1=unread, 0=false, 1=true)
         bool            _tapREFForceHidden      = false;  // Set by removal, cleared by insertion — overrides per-frame visibility
         bool            _meshesInitialized      = false;  // True after first rotation init (reset on load)
         bool            _holsteredWeaponForHolotape = false; // True = we holstered weapon for holotape removal, re-draw when done
@@ -187,6 +200,15 @@ namespace heisenberg
         std::vector<std::pair<float, std::string>> _introSoundEvents;
         int             _introSoundEventIndex       = 0;     // Next event to play
         bool            _introAudioStarted          = false;  // True after intro WAV playback thread launched
+
+        // Staged HMD/projected + FRIK-Holo -> wrist transition. FRIK restores the
+        // original root on one frame and installs its replacement root on a later frame;
+        // activating the screen before that swap lights a node that is about to detach.
+        std::uint32_t   _introWristTransitionFormID = 0;
+        RE::NiNode*     _introWristPreFlipRoot       = nullptr;
+        RE::NiNode*     _introWristCandidateRoot     = nullptr;
+        int             _introWristStableFrames      = 0;
+        int             _introWristTimeoutFrames     = 0;
 
         // ── Terminal-on-Pipboy redirect state ──
         bool            _pendingTerminalRedirect    = false; // True = TerminalMenu pending redirect to Pipboy (holotape)
@@ -234,6 +256,7 @@ namespace heisenberg
         std::uint32_t           _introHolotapeFormID    = 0;
         bool                    _introDeliveryQueued    = false;
         float                   _introDeliveryDelay     = 0.0f;
+        bool                    _introPostLoadBaselinePending = false;  // Classify already-owned Pip-Boy after LoadingMenu closes
         bool                    _introInitDone          = false;
         bool                    _isNewGame              = false;  // True on kNewGame — waiting for vault exit
         bool                    _newGameExteriorReached = false;  // Player has reached exterior after new game
@@ -262,10 +285,8 @@ namespace heisenberg
         // Animation speed (progress per frame, matching FRIK)
         static constexpr float ANIM_SPEED             = 0.05f;
         // Eject button
-        static constexpr float EJECT_BUTTON_RANGE     =  2.0f;   // Animate button + fast-trigger radius (FRIK light: 2.0)
-        static constexpr float EJECT_BUTTON_RANGE_SLOW=  0.6f;   // Trigger radius when finger is moving slowly
-        static constexpr float EJECT_SPEED_THRESHOLD  =  0.5f;   // Finger speed (units/frame) above which full range is used
-        static constexpr float EJECT_TRIGGER_Z        = -0.14f;  // Z threshold to trigger press (FRIK light: -0.14)
+        static constexpr float EJECT_CONTACT_ENTER    =  5.0f;   // TapeDeck01 contact radius (matches FRIK physical zone)
+        static constexpr float EJECT_CONTACT_EXIT     =  7.0f;   // Sticky-contact release radius (hysteresis)
         static constexpr float EJECT_Z_MIN            = -0.2f;   // Max button depression (FRIK light: -0.2)
         static constexpr float EJECT_COOLDOWN_TIME    =  0.5f;   // Seconds between presses
         // Holotape slot

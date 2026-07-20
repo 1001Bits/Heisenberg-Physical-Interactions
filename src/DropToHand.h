@@ -13,6 +13,7 @@
 #include <atomic>
 #include <mutex>
 #include <set>
+#include <unordered_map>
 #include <vector>
 
 namespace heisenberg
@@ -186,6 +187,7 @@ namespace heisenberg
 
         std::vector<PendingDrop> _pendingDrops;
         std::set<std::uint32_t> _grabsInProgress;  // RefIDs currently being grabbed (before StartGrab completes)
+        std::unordered_map<std::uint32_t, int> _weaponSheatheWait;  // RefID -> frames waited for the weapon to holster before placing
         std::mutex _mutex;
         bool _initialized = false;
         

@@ -100,7 +100,8 @@ namespace heisenberg
         std::unordered_set<RE::TESFormID> _cookingKeywordIDs;
 
         // Base form IDs of furniture/activators that serve as cooking stations
-        std::unordered_set<RE::TESFormID> _cookingStationBaseIDs;
+        std::unordered_set<RE::TESFormID> _cookingStationBaseIDs;  // designed cooking stations (cooking keyword) — always usable
+        std::unordered_set<RE::TESFormID> _fireSourceBaseIDs;      // fire/heat-keyword sources — require an actively-burning flame
 
         // Cached cooking station detected via ViewCaster
         RE::ObjectRefHandle _activeCookingStation;

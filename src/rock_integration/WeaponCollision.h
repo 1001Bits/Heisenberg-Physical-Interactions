@@ -12,6 +12,8 @@
 //
 // Status: HEADER + STUB ONLY.
 
+#include "rock_integration/SoftContactMath.h"
+
 namespace heisenberg::rock_weapon_collision
 {
     void Init();
@@ -20,4 +22,10 @@ namespace heisenberg::rock_weapon_collision
     void OnWeaponUnequipped();
     void Update();
     bool IsActive();
+
+    // Geometry-only: build a single capsule approximating the equipped weapon (AABB profiled
+    // from the weapon NIF, capsule along its longest local axis), in WORLD space — for the
+    // mode-3 soft-contact runtime (hand-vs-weapon). Independent of the physics hull. Returns
+    // true if a weapon with geometry is equipped on that hand. Capsule id 500=right, 501=left.
+    bool BuildWeaponCapsule(bool isLeft, heisenberg::rock_core::soft_contact_math::Capsule& out);
 }

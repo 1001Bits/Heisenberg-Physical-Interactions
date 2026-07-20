@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace rock::contact_signal_subscription_policy
+namespace heisenberg::rock_core::contact_signal_subscription_policy
 {
     /*
      * FO4VR exposes contact notifications through an hkSignal slot on the hknp

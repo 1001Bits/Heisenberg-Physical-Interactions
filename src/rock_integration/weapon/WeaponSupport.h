@@ -17,9 +17,11 @@
  * the weapon-type enum level, while actual vanilla and modded pistol records
  * carry `AnimsGripPistol`. Long-gun grip keywords are checked before the
  * sidearm signal so rifle-like weapons keep the solver that owns weapon
- * transform authority. `BGSKeywordForm::HasKeyword(..., TBO_InstanceData*)`
- * preserves weapon-mod instance changes. Name fallback tokens only cover
- * vanilla sidearms whose records do not expose a stronger semantic signal.
+ * transform authority. Base WEAP keywords and instance keyword data are read
+ * through separate guarded paths: FO4VR can crash inside
+ * `BGSKeywordForm::HasKeyword` when a modded `TBO_InstanceData*` lacks the
+ * keyword component the engine expects. Name fallback tokens only cover vanilla
+ * sidearms whose records do not expose a stronger semantic signal.
  */
 
 #include "rock_integration/TransformMath.h"
@@ -28,7 +30,7 @@
 #include <cstdint>
 #include <string_view>
 
-namespace rock::weapon_support_authority_policy
+namespace heisenberg::rock_core::weapon_support_authority_policy
 {
     enum class WeaponSupportAuthorityMode
     {
@@ -190,7 +192,7 @@ namespace rock::weapon_support_authority_policy
 
 #include "rock_integration/weapon/WeaponTypes.h"
 
-namespace rock::weapon_support_grip_policy
+namespace heisenberg::rock_core::weapon_support_grip_policy
 {
     /*
      * ROCK gates two-handing by whether the equipped item can accept support
@@ -260,7 +262,7 @@ namespace rock::weapon_support_grip_policy
  * path and the provider can actually accept those transforms.
  */
 
-namespace rock::weapon_support_thumb_pose_policy
+namespace heisenberg::rock_core::weapon_support_thumb_pose_policy
 {
     [[nodiscard]] constexpr bool shouldPublishAlternateThumbLocalOverride(
         const bool solvedFingerPose,
@@ -306,7 +308,7 @@ namespace rock::weapon_support_thumb_pose_policy
 
 // ---- WeaponTwoHandedGripMath.h ----
 
-namespace rock
+namespace heisenberg::rock_core
 {
     template <class Vector>
     inline Vector weaponSolverSub(const Vector& lhs, const Vector& rhs);
@@ -315,7 +317,7 @@ namespace rock
     inline Vector weaponSolverAdd(const Vector& lhs, const Vector& rhs);
 }
 
-namespace rock::weapon_two_handed_grip_math
+namespace heisenberg::rock_core::weapon_two_handed_grip_math
 {
     /*
      * Equipped weapon two-hand support has two independent ownership rules:
@@ -361,7 +363,7 @@ namespace rock::weapon_two_handed_grip_math
 #include <algorithm>
 #include <cmath>
 
-namespace rock
+namespace heisenberg::rock_core
 {
     /*
      * FRIK's suppressed offhand grip works because it solves the weapon

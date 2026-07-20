@@ -102,12 +102,12 @@ namespace
     bool GetFRIKWeaponParentTransform(bool isLeft, RE::NiPoint3& outPos, RE::NiMatrix3& outRot)
     {
         auto* player = f4cf::f4vr::getPlayer();
-        if (!player || !player->firstPersonSkeleton) {
+        if (!player || !player->firstPerson3D.get()) {
             return false;
         }
 
         const char* handNodeName = isLeft ? "LArm_Hand" : "RArm_Hand";
-        RE::NiAVObject* handNodeObj = heisenberg::Utils::FindNode(player->firstPersonSkeleton, handNodeName, 15);
+        RE::NiAVObject* handNodeObj = heisenberg::Utils::FindNode(player->firstPerson3D.get(), handNodeName, 15);
         RE::NiNode* handNode = handNodeObj ? handNodeObj->IsNode() : nullptr;
         if (handNode) {
             outPos = handNode->world.translate;
@@ -115,7 +115,7 @@ namespace
             return true;
         }
 
-        RE::NiAVObject* weaponObj = heisenberg::Utils::FindNode(player->firstPersonSkeleton, "Weapon", 15);
+        RE::NiAVObject* weaponObj = heisenberg::Utils::FindNode(player->firstPerson3D.get(), "Weapon", 15);
         RE::NiNode* weaponNode = weaponObj ? weaponObj->IsNode() : nullptr;
         if (!weaponNode || !weaponNode->parent) {
             return false;
@@ -2176,14 +2176,26 @@ namespace heisenberg
         // UpdateConstraintMotors can soften tau during contact, HIGGS-style.
         ContactImpulseListener::GetSingleton().SubscribeForGrabbedBody(objectBodyId, isLeft);
 
-        // Disable collision between grabbed object and player capsule using pair filter.
-        std::uint32_t playerBodyId = Physics::GetPlayerBodyId();
-        if (playerBodyId != 0x7FFFFFFF && hknpWorld) {
-            Physics::DisableCollisionBetween(hknpWorld, objectBodyId, playerBodyId);
-            spdlog::info("[HELDBODY] Disabled player↔object collision via pair filter: player=0x{:08X}, object=0x{:08X}",
-                         playerBodyId, objectBodyId);
+        // Stop the held object from pushing the PLAYER while still letting it collide with the
+        // world/NPCs. The old Physics::DisableCollisionBetween pair-filter call is a neutralized
+        // no-op (the engine pair-filter faults), so the object could still shove the player.
+        // Instead apply ROCK's proven layer-43 + 0x000B group-bit filter (same mechanism as
+        // TryDisablePlayerHeldObjectCollision): layer 43 is excluded from the CharController in
+        // the collision matrix and the 0x000B group bits short-circuit the player pairing.
+        // objectOriginalFilter was snapshotted above (2132-2140) and EndGrab (2429-2431) writes
+        // it back, so this auto-reverts on release.
+        if (hknpWorld && objectBodyId != 0x7FFFFFFF && constraint.objectFilterSaved) {
+            constexpr std::uint32_t kLayerMask = 0x7Fu;
+            constexpr std::uint32_t kHandLayer = 43u;
+            constexpr std::uint32_t kHandGroupBits = 0x000Bu << 16;
+            const std::uint32_t cur = constraint.objectOriginalFilter;
+            const std::uint32_t merged = (cur & ~kLayerMask) | kHandLayer | kHandGroupBits;
+            if (merged != cur) {
+                heisenberg::Physics::TryWriteBodyFilterInfo(hknpWorld, objectBodyId, merged);
+            }
+            spdlog::info("[HELDBODY] StartGrab: applied layer43+0x000B player-no-push filter 0x{:08X}->0x{:08X}", cur, merged);
         } else {
-            spdlog::warn("[HELDBODY] Player body not found — capsule collision not suppressed. Grab.cpp will set kNonCollidable as fallback.");
+            spdlog::warn("[HELDBODY] Object filter not saved — player-no-push filter not applied; Grab.cpp kNonCollidable fallback may apply.");
         }
 
         const char* backendName = constraint.IsSpringMode() ? "spring" :
@@ -2491,6 +2503,45 @@ namespace heisenberg
         return isLeft ? _leftHandBody : _rightHandBody;
     }
 
+    // Ref-based teardown of ONE HeldBody constraint. Extracted so both DestroyGrabConstraint
+    // (state-resolved) and the CreateGrabConstraint overwrite-guard (isLeft-resolved) reuse the
+    // exact same release sequence: remove the body-map registration, destroy the live Havok
+    // constraint, free the motors + constraint data, then invalidate. Releasing a still-active
+    // constraint here is what prevents the leak when a new grab reuses a hand slot.
+    static void DestroyHeldBodyConstraintRef(HeldBodyGrabConstraint& constraint)
+    {
+        if (!constraint.IsValid()) {
+            return;
+        }
+        if (!constraint.UsesConstraint()) {
+            constraint.Invalidate();   // dynamic-spring backend: no native constraint to destroy
+            return;
+        }
+        // CRITICAL: RemoveConstraintBodyMap takes (world, 0, constraintId.m_value).
+        ConstraintFunctions::RemoveConstraintBodyMap(constraint.hknpWorld, 0, constraint.constraintId.m_value);
+        hknpConstraintId ids[1] = { constraint.constraintId };
+        ConstraintFunctions::DestroyConstraints(constraint.hknpWorld, ids, 1);
+        if (constraint.linearMotor) {
+            if (constraint.constraintData) {
+                DestroyGrabConstraintDataLocal(static_cast<GrabConstraintData*>(constraint.constraintData));
+                constraint.constraintData = nullptr;
+            }
+            delete constraint.angularMotor;
+            delete constraint.linearMotor;
+        } else {
+            if (constraint.angularMotor) {
+                ReleaseNativeRagdollMotorRefs(constraint.angularMotor);
+            }
+            if (constraint.constraintData) {
+                _aligned_free(constraint.constraintData);
+                constraint.constraintData = nullptr;
+            }
+        }
+        constraint.angularMotor = nullptr;
+        constraint.linearMotor = nullptr;
+        constraint.Invalidate();
+    }
+
     // =========================================================================
     // Constraint Management
     // =========================================================================
@@ -2501,7 +2552,18 @@ namespace heisenberg
     {
         HeldBodyHandPhysics& handBody = isLeft ? _leftHandBody : _rightHandBody;
         HeldBodyGrabConstraint& constraint = isLeft ? _leftConstraint : _rightConstraint;
-        
+
+        // Hardening (#6): never overwrite a still-active constraint. Leak paths elsewhere can
+        // clear GrabState without tearing the manager constraint down; reusing this hand slot
+        // would then orphan the live Havok constraint + motors + body-map registration. Tear
+        // down any pre-existing one (it has a different objectBodyId, so a state-resolved
+        // DestroyGrabConstraint would NOT find it — destroy the slot directly).
+        if (constraint.IsValid()) {
+            spdlog::warn("[HELDBODY] CreateGrabConstraint: {} hand constraint already active (ID 0x{:08X}) — destroying before recreate",
+                         isLeft ? "left" : "right", constraint.constraintId.m_value);
+            DestroyHeldBodyConstraintRef(constraint);
+        }
+
         if (!handBody.IsValid()) {
             spdlog::error("[HELDBODY] CreateGrabConstraint: Hand body not valid");
             return false;
@@ -2783,52 +2845,13 @@ namespace heisenberg
 
     void HeldBodyGrabManager::DestroyGrabConstraint(GrabState& state)
     {
-        // Find which hand's constraint to destroy
+        // Find which hand's constraint to destroy, then release it via the shared ref teardown.
         HeldBodyGrabConstraint* constraint = FindHeldBodyConstraintForState(state, _leftConstraint, _rightConstraint);
-        
-        if (!constraint || !constraint->IsValid()) {
-            return;
+        if (constraint && constraint->IsValid()) {
+            spdlog::info("[HELDBODY] DestroyGrabConstraint: Destroying HeldBody constraint ID 0x{:08X}",
+                         constraint->constraintId.m_value);
+            DestroyHeldBodyConstraintRef(*constraint);
         }
-
-        if (!constraint->UsesConstraint()) {
-            spdlog::info("[HELDBODY] DestroyGrabConstraint: Clearing dynamic spring backend for body 0x{:08X}",
-                         constraint->objectBodyId);
-            constraint->Invalidate();
-            return;
-        }
-        
-        spdlog::info("[HELDBODY] DestroyGrabConstraint: Destroying HeldBody constraint ID 0x{:08X}",
-                     constraint->constraintId.m_value);
-        
-        // Remove from Bethesda tracking
-        // CRITICAL: RemoveConstraintBodyMap takes (world, 0, constraintId.m_value), NOT (world, constraintId)!
-        ConstraintFunctions::RemoveConstraintBodyMap(constraint->hknpWorld, 0, constraint->constraintId.m_value);
-        
-        // Destroy the constraint
-        hknpConstraintId ids[1] = { constraint->constraintId };
-        ConstraintFunctions::DestroyConstraints(constraint->hknpWorld, ids, 1);
-        
-        if (constraint->linearMotor) {
-            if (constraint->constraintData) {
-                DestroyGrabConstraintDataLocal(static_cast<GrabConstraintData*>(constraint->constraintData));
-                constraint->constraintData = nullptr;
-            }
-            delete constraint->angularMotor;
-            delete constraint->linearMotor;
-        } else {
-            if (constraint->angularMotor) {
-                ReleaseNativeRagdollMotorRefs(constraint->angularMotor);
-            }
-            if (constraint->constraintData) {
-                _aligned_free(constraint->constraintData);
-                constraint->constraintData = nullptr;
-            }
-        }
-
-        constraint->angularMotor = nullptr;
-        constraint->linearMotor = nullptr;
-        
-        constraint->Invalidate();
     }
 
     void HeldBodyGrabManager::UpdateConstraintMotors(GrabState& state, float deltaTime)

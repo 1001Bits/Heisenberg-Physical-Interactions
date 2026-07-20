@@ -23,7 +23,7 @@ namespace RE
     class hknpWorld;
 }
 
-namespace rock::contact_target_identity
+namespace heisenberg::rock_core::contact_target_identity
 {
     inline constexpr std::uint32_t kUnknownLayer = 0xFFFF'FFFFu;
     inline constexpr std::uint32_t kUnknownFilterInfo = 0xFFFF'FFFFu;

@@ -264,6 +264,10 @@ namespace heisenberg::bethesda_physics_body
                 _systemData = nullptr;
                 return false;
             }
+            // Jul 6: keyframed quality REVERTED 2 -> 0xFF (mirrors the embed). On the
+            // hknpPhysicsSystemData->AddToWorld path 0xFF auto-assigns the game's keyframed
+            // quality (speculative contacts + no-deactivation); 2 starved hand-object contacts
+            // (tunneling + no clutter wake). Matches proven standalone ROCK.
             std::uint16_t qualityId = (motionType == MotionType::Static)    ? 0 :
                                       (motionType == MotionType::Dynamic)   ? 1 : 0xFF;
             *reinterpret_cast<void**>        (bcinfo + BC::kShape)         = hknpShape;

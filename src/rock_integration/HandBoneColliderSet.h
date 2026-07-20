@@ -19,6 +19,9 @@
 //   bUsePhysicsHandBodies=true + bUseBethesdaPhysicsBody=true + bEnableHandCollision=true.
 // When IsActive(), HandCollision should yield its 3-body cup path.
 
+#include "rock_integration/SoftContactMath.h"
+
+#include <array>
 #include <cstdint>
 
 namespace heisenberg::rock_hand_collider
@@ -34,4 +37,13 @@ namespace heisenberg::rock_hand_collider
     // True if this subsystem owns the hand-collision pipeline this frame.
     // HandCollision's existing cup path should check this and yield.
     bool IsActive();
+
+    // 16 capsule segments per hand (palm + 5 fingers × 3).
+    inline constexpr int kCapsulesPerHand = 16;
+
+    // GEOMETRY-ONLY: build the 16 finger-segment capsules for a hand directly from the
+    // FRIK skeleton (getCommonNode), independent of whether the physics bodies exist.
+    // Reuses the same bone table + radii as the physics colliders. Used by the mode-3
+    // soft-contact runtime (hand-vs-hand/body/weapon). Returns the count of valid capsules.
+    int BuildHandCapsules(bool isLeft, std::array<heisenberg::rock_core::soft_contact_math::Capsule, kCapsulesPerHand>& out);
 }

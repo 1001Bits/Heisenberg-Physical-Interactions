@@ -164,6 +164,13 @@ namespace heisenberg
         // Used for MSTT items where only stored offsets should be used
         std::optional<ItemOffset> GetExactOffset(RE::TESObjectREFR* refr, bool isLeft) const;
 
+        // Get the offset for a 100% EXACT dimensions match (no tolerance whatsoever).
+        // Returns a profiled offset whose L/W/H equal the item's bounds exactly — used so items
+        // that reuse another item's model (e.g. Addictol↔Jet, Buffout↔Bufftats) inherit its
+        // hand-tuned offset instead of floating via geometry placement. Same form type is
+        // preferred as a tiebreaker. NO fuzzy/similar/ratio matching — exact only.
+        std::optional<ItemOffset> GetExactDimensionsOffset(RE::TESObjectREFR* refr, bool isLeft) const;
+
         // Get default offset (used when no specific offset is saved)
         const ItemOffset& GetDefaultOffset() const { return _defaultOffset; }
 

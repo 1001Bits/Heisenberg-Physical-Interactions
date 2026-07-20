@@ -17,7 +17,7 @@ namespace RE
     class NiAVObject;
 }
 
-namespace rock
+namespace heisenberg::rock_core
 {
     /*
      * Weapon collision hulls are now gameplay entities, not anonymous debug
@@ -210,7 +210,7 @@ namespace rock
 #include <string>
 #include <vector>
 
-namespace rock
+namespace heisenberg::rock_core
 {
     /*
      * ROCK publishes equipped-weapon evidence for external systems without
@@ -262,7 +262,7 @@ namespace rock
 
 #include <cstddef>
 
-namespace rock
+namespace heisenberg::rock_core
 {
     /*
      * Weapon mesh collision is generated as several convex hull bodies so long

@@ -1652,6 +1652,67 @@ namespace heisenberg
         return false;
     }
 
+    std::optional<ItemOffset> ItemOffsetManager::GetExactDimensionsOffset(RE::TESObjectREFR* refr, bool isLeft) const
+    {
+        if (!refr) {
+            return std::nullopt;
+        }
+
+        // Item bounds (int16 OBND extents). Two items built from the same mesh share identical
+        // bounds, so a strict equality test reliably groups visual duplicates together.
+        float L = 0, W = 0, H = 0;
+        GetItemDimensions(const_cast<RE::TESObjectREFR*>(refr), L, W, H);
+        if (L <= 0 || W <= 0 || H <= 0) {
+            return std::nullopt;  // need valid dimensions to match
+        }
+
+        std::string itemName = GetItemName(refr);
+        std::string itemType = GetItemType(const_cast<RE::TESObjectREFR*>(refr));
+
+        const ItemOffset* best = nullptr;
+        std::string bestName;
+        int bestRank = -1;  // higher = better: same-type and non-variant base entries win
+
+        for (const auto& [candName, candOffset] : _offsets) {
+            if (candOffset.length <= 0 || candOffset.width <= 0 || candOffset.height <= 0) {
+                continue;
+            }
+            // 100% EXACT dimensions — no tolerance whatsoever
+            if (candOffset.length != L || candOffset.width != W || candOffset.height != H) {
+                continue;
+            }
+            // Rank candidates: prefer same form type (ALCH↔ALCH, avoids a chem inheriting a
+            // MISC item that happens to share bounds), and prefer the non-hand/PA/throwable base
+            // entry so the mirror logic in StartGrab behaves predictably.
+            int rank = 0;
+            if (!itemType.empty() && candOffset.itemType == itemType) rank += 2;
+            bool isVariant = candOffset.isLeftHanded || candOffset.isPowerArmor || candOffset.isThrowable;
+            if (!isVariant) rank += 1;
+            if (rank > bestRank) {
+                bestRank = rank;
+                best = &candOffset;
+                bestName = candName;
+            }
+        }
+
+        if (best) {
+            spdlog::info("[ItemOffsets] EXACT-DIMS offset for '{}' -> '{}' (L={:.1f} W={:.1f} H={:.1f}, type={}) pos=({:.2f},{:.2f},{:.2f})",
+                        itemName, bestName, L, W, H, itemType,
+                        best->position.x, best->position.y, best->position.z);
+            ItemOffset result = *best;
+            result.length = L;
+            result.width = W;
+            result.height = H;
+            result.matchQuality = OffsetMatchQuality::Dimensions;
+            result.matchedName = bestName;
+            return result;
+        }
+
+        spdlog::debug("[ItemOffsets] GetExactDimensionsOffset: no 100%% dims match for '{}' (L={:.1f} W={:.1f} H={:.1f})",
+                    itemName, L, W, H);
+        return std::nullopt;
+    }
+
     bool ItemOffsetManager::HasExactMatch(RE::TESObjectREFR* refr) const
     {
         if (!refr) {

@@ -35,6 +35,13 @@ namespace heisenberg
         // its built-in physics/grab: ROCK present AND config not forced off.
         bool IsActive() const;
 
+        // ROCK is present, enabled (iUseRockPhysics != 0), AND actively running its physics
+        // interaction — i.e. NOT disabled at runtime / torn down. Use this for AUTO ownership
+        // switching (hand collision, grab): when ROCK is turned off, IsRunning() goes false
+        // and Heisenberg reclaims those automatically, no INI change. IsActive() only checks
+        // presence + the toggle, so it stays true even while ROCK is runtime-disabled.
+        bool IsRunning() const;
+
         // forceGrab/canForceGrab available (live ROCK reports getVersion() >= 5).
         bool HasForceGrab() const { return _hasForceGrab; }
         std::uint32_t Version() const { return _version; }
@@ -65,6 +72,20 @@ namespace heisenberg
         // True only if ROCK committed the grab (requires HasForceGrab). Caller
         // must check the return and fall back when false.
         bool ForceGrab(bool isLeft, RE::TESObjectREFR* refr) const;
+
+        // ---- PREPARED for the future "ROCK owns the dynamic hold" model ----
+        // (GrabMode::RockForceGrab). Not wired into the live grab path yet.
+        //
+        // True when ROCK can hold a Heisenberg-chosen object via its dynamic grab API
+        // (needs forceGrab; ROCK < v5 returns false). The RockForceGrab grab mode is
+        // gated on this so it safely degrades to keyframed until ROCK ships forceGrab.
+        //
+        // The integration primitive is the existing ForceGrab(isLeft, refr): Heisenberg
+        // SELECTS, then hands the object to ROCK, and ROCK does the PLACEMENT (mesh/contact
+        // grab pockets) + dynamic hold. We deliberately do NOT pass a Heisenberg offset —
+        // ROCK seats the object at the real contact point, which supersedes our keyframed
+        // dimension-table offset. Plain v5 forceGrab(hand, refr) is therefore sufficient.
+        bool SupportsDynamicHold() const { return _hasForceGrab; }
 
         // F4SE message from ROCK (sender "ROCK"). Phase 0: log; Phase 2: dispatch
         // touch/grab/release into Heisenberg feature logic.

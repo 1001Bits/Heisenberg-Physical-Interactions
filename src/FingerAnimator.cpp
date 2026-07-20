@@ -12,9 +12,13 @@ namespace heisenberg
     void ExpandFingerToJointValues(float thumb, float index, float middle, float ring, float pinky, float out[15])
     {
         auto setFinger = [&out](int finger, float base) {
-            out[finger * 3 + 0] = base;                                    // proximal
-            out[finger * 3 + 1] = std::clamp(base * 0.95f, 0.0f, 1.0f);   // medial (slightly more bent)
-            out[finger * 3 + 2] = std::clamp(base * 0.85f, 0.0f, 1.0f);   // distal (fingertip wraps more)
+            // No per-joint shaping (Jul 19 finger audit): FRIK's 5-scalar API averages the
+            // three joints back to one value, so the old {1.0, 0.95, 0.85} shaping never
+            // rendered — it only shifted the average to 0.9333*base, applying every solved
+            // grip ~6.7% of full range deeper-closed than the geometry solver requested.
+            out[finger * 3 + 0] = base;
+            out[finger * 3 + 1] = base;
+            out[finger * 3 + 2] = base;
         };
         setFinger(0, thumb);
         setFinger(1, index);
@@ -31,6 +35,16 @@ namespace heisenberg
 
     void FingerAnimator::SetTargetPose(const float values[NUM_JOINTS], float speed)
     {
+        // PERF (Jul 5): dedupe — per-frame finger-curl callers re-send the SAME pose every
+        // frame during a hold, and each call used to reset _state to Closing, so Update()
+        // re-reached the target instantly and logged "Closing -> Holding" thousands of times
+        // per session (90% of the log) while churning the state machine. If the target is
+        // unchanged and we're already animating toward/holding it, keep the current state.
+        if ((_state == State::Holding || _state == State::Closing)
+            && std::memcmp(_target, values, sizeof(_target)) == 0) {
+            _speed = speed;
+            return;
+        }
         std::memcpy(_target, values, sizeof(_target));
         _speed = speed;
         _state = State::Closing;
@@ -92,14 +106,14 @@ namespace heisenberg
 
         // Log progress during Opening state (every ~10 frames)
         if (_state == State::Opening && (frameCounter[handIdx] % 10 == 0)) {
-            spdlog::info("[FingerAnim] {} hand: OPENING progress avg={:.2f} target=1.0 frikOk={}",
-                         isLeft ? "Left" : "Right", GetAverageCurl(), frikSuccess);
+            spdlog::debug("[FingerAnim] {} hand: OPENING progress avg={:.2f} target=1.0 frikOk={}",
+                          isLeft ? "Left" : "Right", GetAverageCurl(), frikSuccess);
         }
 
         if (allReached) {
             if (_state == State::Closing) {
                 _state = State::Holding;
-                spdlog::info("[FingerAnim] {} hand: Closing -> Holding", isLeft ? "Left" : "Right");
+                spdlog::debug("[FingerAnim] {} hand: Closing -> Holding", isLeft ? "Left" : "Right");
             } else if (_state == State::Opening) {
                 // Check config: should we release FRIK control?
                 if (g_config.fingerPoseMode == 0) {

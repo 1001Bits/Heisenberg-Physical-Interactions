@@ -7,7 +7,7 @@
 #include <limits>
 #include <mutex>
 
-namespace rock::contact_activity_tracker
+namespace heisenberg::rock_core::contact_activity_tracker
 {
     /*
      * ROCK's semantic hand contacts answer "which generated hand part touched

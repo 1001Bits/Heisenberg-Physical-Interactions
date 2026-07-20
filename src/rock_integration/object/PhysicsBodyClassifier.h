@@ -5,7 +5,7 @@
 #include "rock_integration/CollisionLayerPolicy.h"
 #include "rock_integration/object/GrabTargetKind.h"
 
-namespace rock::physics_body_classifier
+namespace heisenberg::rock_core::physics_body_classifier
 {
     enum class BodyMotionType : std::uint8_t
     {
@@ -176,7 +176,25 @@ namespace rock::physics_body_classifier
             mode == InteractionMode::ActiveGrab &&
             input.targetKind == grab_target::Kind::DetachedGore &&
             grab_target::isDetachedGoreLayer(input.layer);
-        if (mode != InteractionMode::PassivePush && collision_layer_policy::isActorOrBipedLayer(input.layer) && !activeDetachedGoreLayer) {
+        const bool activeDynamicMovableStatic =
+            mode == InteractionMode::ActiveGrab &&
+            input.targetKind == grab_target::Kind::DynamicMovableStatic;
+        /*
+         * Some pickup refs, including consumables, keep the native PROPS layer
+         * on their hknp body even after active-prep converts the body motion.
+         * The target-kind classifier has already proven this is a loose-form
+         * ref, so the layer gate allows it through and the motion checks below
+         * still fail closed unless prep produced a dynamic body.
+         */
+        const bool activeLoosePickupLayer =
+            mode == InteractionMode::ActiveGrab &&
+            input.targetKind == grab_target::Kind::LooseObject &&
+            input.layer == collision_layer_policy::FO4_LAYER_PROPS;
+        const bool activeDeadActorBody =
+            mode == InteractionMode::ActiveGrab &&
+            input.targetKind == grab_target::Kind::DeadActorBody &&
+            collision_layer_policy::isActorOrBipedLayer(input.layer);
+        if (mode != InteractionMode::PassivePush && collision_layer_policy::isActorOrBipedLayer(input.layer) && !activeDetachedGoreLayer && !activeDynamicMovableStatic && !activeDeadActorBody) {
             return reject(BodyRejectReason::ActorLayer);
         }
         if (input.layer == collision_layer_policy::FO4_LAYER_NONCOLLIDABLE) {
@@ -184,7 +202,7 @@ namespace rock::physics_body_classifier
         }
         const bool interactionLayer =
             mode == InteractionMode::PassivePush ? collision_layer_policy::isPassivePushInteractionLayer(input.layer) :
-                                                   (collision_layer_policy::isDynamicPropInteractionLayer(input.layer) || activeDetachedGoreLayer);
+                                                   (collision_layer_policy::isDynamicPropInteractionLayer(input.layer) || activeDetachedGoreLayer || activeDynamicMovableStatic || activeLoosePickupLayer || activeDeadActorBody);
         if (!interactionLayer) {
             return reject(BodyRejectReason::UnsupportedLayer);
         }

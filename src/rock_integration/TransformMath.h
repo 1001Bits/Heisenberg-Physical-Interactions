@@ -2,7 +2,7 @@
 
 #include <cmath>
 
-namespace rock::transform_math
+namespace heisenberg::rock_core::transform_math
 {
     /*
      * Shared transform convention:

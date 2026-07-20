@@ -2,6 +2,7 @@
 #include "HandCollision.h"
 #include "Config.h"
 #include "Physics.h"
+#include "rock_integration/contact/NativeContactEvidenceRuntime.h"
 
 #include <spdlog/spdlog.h>
 #include <REL/Relocation.h>
@@ -104,11 +105,9 @@ namespace heisenberg
 
         // Only tally STARTED events so the legacy counters still mean
         // "new contacts" rather than being doubled by FINISHED pairs.
-        if (started) {
-            listener._totalEvents++;
-        }
-
-        std::uint64_t count = listener._totalEvents.load();
+        // Capture the post-increment value atomically — a separate ++ then .load() can read a
+        // value already mutated by a concurrent worker-thread callback (torn count/log).
+        std::uint64_t count = started ? ++listener._totalEvents : listener._totalEvents.load();
         if (started && (count <= 10 || count % 50 == 1)) {
             spdlog::info("[CONTACT] OnContactCallback FIRED! totalEvents={}, worldPtr=0x{:X}, eventPtr=0x{:X}",
                         count, reinterpret_cast<std::uintptr_t>(worldPtr), reinterpret_cast<std::uintptr_t>(eventPtr));
@@ -151,6 +150,42 @@ namespace heisenberg
             }
         }
 
+        // Native contact evidence (mode-3 soft contact): extract the inline manifold from the
+        // hknpManifoldProcessedEvent (offsets from getManifold 0x1417ba540):
+        //   +0x30 = inline contact COUNT (NOT an id); -1 = "reused jacobian" (no inline points
+        //           this frame, but the separating normal @+0x40 is STILL valid).
+        //   +0x40 = unit separating normal (always valid).
+        //   +0x70 = first contact point (hkVector4: xyz position + w=signed separation), Havok scale.
+        // The mode-3 runtime turns the freshest world-static record into a native world candidate.
+        auto recordNativeEvidence = [&](std::uint32_t handId, std::uint32_t otherId, bool isLeft) {
+            if (!native_contact_evidence::IsRecordingEnabled()) {
+                return;  // published by HandWallPushback::Update (mode==3 && softContactWorld)
+            }
+            const auto* base = reinterpret_cast<const std::uint8_t*>(eventPtr);
+            auto read3 = [&](std::ptrdiff_t off) {
+                const float* f = reinterpret_cast<const float*>(base + off);
+                return RE::NiPoint3(f[0], f[1], f[2]);
+            };
+            const RE::NiPoint3 normal = read3(0x40);   // valid even in the reused-jacobian case
+            if (!std::isfinite(normal.x) || !std::isfinite(normal.y) || !std::isfinite(normal.z)) {
+                return;
+            }
+            const int contactCount = *reinterpret_cast<const int*>(base + 0x30);
+            if (contactCount > 0 && contactCount <= 4) {
+                const RE::NiPoint3 point = read3(0x70) * INV_HAVOK_SCALE;   // Havok -> game units
+                // The contact point's w (@+0x7C) is the signed separation (Havok); negative = penetrating.
+                const float wSep = *reinterpret_cast<const float*>(base + 0x7C);
+                const float penetration = (std::isfinite(wSep) && wSep < 0.0f) ? (-wSep * INV_HAVOK_SCALE) : 0.0f;
+                if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) {
+                    return;
+                }
+                native_contact_evidence::RecordHandContact(isLeft, handId, otherId, point, normal, penetration, true);
+            } else {
+                // Reused-jacobian: normal-only record (no inline point/depth this frame).
+                native_contact_evidence::RecordHandContact(isLeft, handId, otherId, RE::NiPoint3{}, normal, 0.0f, false);
+            }
+        };
+
         if (leftHit) {
             std::uint32_t otherId = (event.bodyIdA == leftId) ? event.bodyIdB : event.bodyIdA;
             bool stillOverlapping = true;
@@ -165,6 +200,7 @@ namespace heisenberg
                     event.bodyIdA, event.bodyIdB);
                 listener.ProcessHandCollision(event, true);
                 listener._handCollisions++;
+                recordNativeEvidence(leftId, otherId, true);
             } else if (!stillOverlapping) {
                 HandCollision::GetSingleton().ClearContactBodyId(true);
             }
@@ -184,6 +220,7 @@ namespace heisenberg
                     event.bodyIdA, event.bodyIdB);
                 listener.ProcessHandCollision(event, false);
                 listener._handCollisions++;
+                recordNativeEvidence(rightId, otherId, false);
             } else if (!stillOverlapping) {
                 HandCollision::GetSingleton().ClearContactBodyId(false);
             }

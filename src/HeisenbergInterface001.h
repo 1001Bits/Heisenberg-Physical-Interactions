@@ -18,6 +18,7 @@
  */
 
 #include "RE/Fallout.h"
+#include "DualWieldAPI.h"
 
 namespace HeisenbergPluginAPI {
 
@@ -550,6 +551,70 @@ namespace HeisenbergPluginAPI {
          * @param durationMs Window length in milliseconds (0 = default ~1500ms)
          */
         virtual void SuppressItemToHand(unsigned int durationMs) = 0;
+
+        // =====================================================================
+        // WEAPON COLLISION + TWO-HANDING CONTROL (Virtual Reloads API, Jul 19)
+        // ABI: appended at the END of the vtable — never reorder or insert above.
+        // AVAILABILITY: every function below this line exists only when
+        // GetBuildNumber() >= 2 — guard with that check before calling, or a vtable
+        // slot that does not exist on an older Heisenberg DLL will be invoked.
+        // =====================================================================
+
+        /**
+         * Enable/disable the equipped-weapon collision body (embedded ROCK engine).
+         * Latch semantics: disabled stays disabled until EnableWeaponCollision(true).
+         * Re-enable takes effect the same frame.
+         */
+        virtual void EnableWeaponCollision(bool enable) = 0;
+
+        /** True while weapon collision is disabled via this API (lease active). */
+        virtual bool IsWeaponCollisionDisabled() = 0;
+
+        /**
+         * Block/unblock off-hand weapon gripping (two-handed support grip).
+         * Blocking releases an engaged support grip and refuses new captures.
+         * Latch semantics: blocked until unblocked. tag is informational
+         * (logged), mirroring FRIK's blockOffHandWeaponGripping signature.
+         */
+        virtual void BlockOffHandWeaponGripping(const char* tag, bool block) = 0;
+
+        /** True while off-hand weapon gripping is blocked via this API. */
+        virtual bool IsOffHandWeaponGrippingBlocked() = 0;
+
+        /** True while either hand holds a two-handed support grip on the weapon. */
+        virtual bool IsOffHandGrippingWeapon() = 0;
+
+        /**
+         * Disable this hand's PHYSICS collision (embedded ROCK hand+arm colliders) —
+         * separate from DisableHand, which only affects grab/selection. Latch
+         * semantics: disabled until EnableHandCollision, which restores
+         * IMMEDIATELY (same frame — pair caches are rebuilt, no settle delay).
+         */
+        virtual void DisableHandCollision(bool isLeft) = 0;
+        virtual void EnableHandCollision(bool isLeft) = 0;
+
+        /** True while this hand's physics collision is disabled via this API. */
+        virtual bool IsHandCollisionDisabled(bool isLeft) = 0;
+
+        // =====================================================================
+        // DUAL WIELD BRIDGE
+        // ABI: build 3, appended after every build-2 slot above. Never reorder.
+        // All methods below require GetBuildNumber() >= 3.
+        // Registration owns one callback slot and never replaces another owner.
+        // Unregister waits for in-flight calls. A callback/provider must therefore
+        // never unregister itself from inside its own invocation.
+        // =====================================================================
+        virtual bool RegisterDualWieldStateProvider(DualWieldStateProvider provider) = 0;
+        virtual bool UnregisterDualWieldStateProvider(DualWieldStateProvider provider) = 0;
+
+        // Main-game-thread query. The caller initializes abiVersion, structSize,
+        // and physicalHand (MakeInputState does this).
+        virtual bool GetPhysicalHandInputState(
+            PhysicalHand hand,
+            PhysicalHandInputState* state) = 0;
+
+        virtual bool RegisterDualWieldWeaponContactCallback(DualWieldWeaponContactCallback callback) = 0;
+        virtual bool UnregisterDualWieldWeaponContactCallback(DualWieldWeaponContactCallback callback) = 0;
     };
 
     // =========================================================================
@@ -589,6 +654,11 @@ namespace HeisenbergPluginAPI {
 
     /** Check if a hand is disabled via the API (for internal use by Hand.cpp, Grab.cpp). */
     bool IsHandDisabledByAPI(bool isLeft);
+
+    /** Lease-evaluated external control state (for Hooks.cpp per-frame push into ROCK). */
+    bool IsWeaponCollisionDisabledByAPI();
+    bool IsOffHandGripBlockedByAPI();
+    bool IsHandCollisionDisabledByAPI(bool isLeft);
 
 } // namespace HeisenbergPluginAPI
 

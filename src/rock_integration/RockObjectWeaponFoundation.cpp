@@ -1,6 +1,6 @@
 // ROCK object-pipeline + weapon-interaction LOGIC foundation — Heisenberg port (#108/#109/#110).
 //
-// Self-contained policy/data headers ported verbatim (namespaces kept rock::*), validated here.
+// Self-contained policy/data headers ported verbatim (namespaces kept heisenberg::rock_core::*), validated here.
 // These are the decision/classification layer that the functional runtimes build on:
 //   - object/GrabTargetKind        : classify a grab target (clutter / actor / weapon / world …)
 //   - object/PhysicsBodyClassifier : classify an hknp body by layer/role → grab-target kind
@@ -24,7 +24,7 @@
 namespace heisenberg::rock_object_weapon
 {
     bool ObjectWeaponFoundationCompiled() {
-    rock::object_physics_body_set::PureBodySet set;  // anchor the multi-body selection logic
+    heisenberg::rock_core::object_physics_body_set::PureBodySet set;  // anchor the multi-body selection logic
     return set.acceptedBodyIds().empty();
 }
 }

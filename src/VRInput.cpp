@@ -93,6 +93,8 @@ namespace heisenberg
         // Save previous state
         _leftController.previous = _leftController.current;
         _rightController.previous = _rightController.current;
+        _leftController.previousTriggerValue = _leftController.triggerValue;
+        _rightController.previousTriggerValue = _rightController.triggerValue;
 
         // Get tracked device indices for controllers
         auto leftIndex = vrSystem->GetTrackedDeviceIndexForControllerRole(
@@ -121,6 +123,7 @@ namespace heisenberg
         // directly — in that case no vtable hook exists so it's already unfiltered.
 
         _leftController.valid = false;
+        _leftController.poseValid = false;
         if (leftIndex != vr::k_unTrackedDeviceIndexInvalid) {
             vr::VRControllerState_t state{};
             bool gotState = openvrHook.GetControllerStateUnfiltered(leftIndex, &state, sizeof(state));
@@ -137,7 +140,8 @@ namespace heisenberg
                 _leftController.valid = true;
                 if (state.rAxis[2].x > 0.1f) _leftController.hasAnalogGrip = true;
             }
-            if (poses[leftIndex].bPoseIsValid) {
+            _leftController.poseValid = poses[leftIndex].bPoseIsValid && poses[leftIndex].bDeviceIsConnected;
+            if (_leftController.poseValid) {
                 auto& av = poses[leftIndex].vAngularVelocity;
                 _leftController.angularVelMag = std::sqrt(av.v[0]*av.v[0] + av.v[1]*av.v[1] + av.v[2]*av.v[2]);
             }
@@ -145,6 +149,7 @@ namespace heisenberg
 
         // Get right controller state
         _rightController.valid = false;
+        _rightController.poseValid = false;
         bool rightGotState = false;
         vr::VRControllerState_t rightRawState{};
         if (rightIndex != vr::k_unTrackedDeviceIndexInvalid) {
@@ -161,44 +166,13 @@ namespace heisenberg
                 _rightController.valid = true;
                 if (rightRawState.rAxis[2].x > 0.1f) _rightController.hasAnalogGrip = true;
             }
-            if (poses[rightIndex].bPoseIsValid) {
+            _rightController.poseValid = poses[rightIndex].bPoseIsValid && poses[rightIndex].bDeviceIsConnected;
+            if (_rightController.poseValid) {
                 auto& av = poses[rightIndex].vAngularVelocity;
                 _rightController.angularVelMag = std::sqrt(av.v[0]*av.v[0] + av.v[1]*av.v[1] + av.v[2]*av.v[2]);
             }
         }
 
-        // DIAGNOSTIC: OpenComposite right-grip asymmetry probe.
-        // Dump full raw state returned by OpenComposite for the right controller so we
-        // can see whether grip is hiding in a different rAxis slot or is missing entirely.
-        {
-            static int s_probeFrames = 0;
-            static uint64_t s_lastPressed = ~0ULL;
-            static float s_lastAxes[5] = {-999,-999,-999,-999,-999};
-            s_probeFrames++;
-            bool initialBurst = (s_probeFrames <= 600);
-            bool changed = false;
-            if (rightGotState) {
-                if (rightRawState.ulButtonPressed != s_lastPressed) changed = true;
-                for (int i = 0; i < 5; ++i) {
-                    if (std::abs(rightRawState.rAxis[i].x - s_lastAxes[i]) > 0.05f) { changed = true; break; }
-                }
-            }
-            bool periodic = (s_probeFrames % 90 == 0);
-            if (initialBurst || changed || periodic) {
-                spdlog::info("[RIGHT-RAW] frame={} idx={} got={} pressed=0x{:016X} touched=0x{:016X} "
-                             "ax0=({:.2f},{:.2f}) ax1=({:.2f},{:.2f}) ax2=({:.2f},{:.2f}) "
-                             "ax3=({:.2f},{:.2f}) ax4=({:.2f},{:.2f})",
-                             s_probeFrames, rightIndex, rightGotState,
-                             rightRawState.ulButtonPressed, rightRawState.ulButtonTouched,
-                             rightRawState.rAxis[0].x, rightRawState.rAxis[0].y,
-                             rightRawState.rAxis[1].x, rightRawState.rAxis[1].y,
-                             rightRawState.rAxis[2].x, rightRawState.rAxis[2].y,
-                             rightRawState.rAxis[3].x, rightRawState.rAxis[3].y,
-                             rightRawState.rAxis[4].x, rightRawState.rAxis[4].y);
-                s_lastPressed = rightRawState.ulButtonPressed;
-                for (int i = 0; i < 5; ++i) s_lastAxes[i] = rightRawState.rAxis[i].x;
-            }
-        }
     }
 
     bool VRInput::IsPressed(bool isLeftHand, VRButton button) const
@@ -259,6 +233,9 @@ namespace heisenberg
     {
         const auto& state = GetControllerState(isLeftHand);
         if (!state.valid) return false;
+        if (button == VRButton::Trigger) {
+            return state.triggerValue > 0.5f && state.previousTriggerValue <= 0.5f;
+        }
         uint64_t mask = ButtonMask(button);
         return (state.current & mask) != 0 && (state.previous & mask) == 0;
     }
@@ -267,6 +244,9 @@ namespace heisenberg
     {
         const auto& state = GetControllerState(isLeftHand);
         if (!state.valid) return false;
+        if (button == VRButton::Trigger) {
+            return state.triggerValue <= 0.5f && state.previousTriggerValue > 0.5f;
+        }
         uint64_t mask = ButtonMask(button);
         return (state.current & mask) == 0 && (state.previous & mask) != 0;
     }

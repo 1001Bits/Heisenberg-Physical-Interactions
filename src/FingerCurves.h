@@ -277,7 +277,8 @@ namespace heisenberg
      * @param root Root node to extract from
      * @param outTriangles Output vector to append triangles to
      */
-    void GetTriangles(RE::NiAVObject* root, std::vector<TriangleData>& outTriangles);
+    void GetTriangles(RE::NiAVObject* root, std::vector<TriangleData>& outTriangles,
+                      std::size_t maxTriangles = SIZE_MAX);
 
     /**
      * Find the closest point on object geometry to a line (palm position + direction)

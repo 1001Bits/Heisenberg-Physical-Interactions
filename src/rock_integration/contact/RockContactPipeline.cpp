@@ -9,7 +9,7 @@
 //   - NativeContactEvidence         : raw contact evidence buffer from Havok callbacks (header-only)
 //   - ContactTargetIdentity (.h)    : data model for "what did we touch" (resolution .cpp pending)
 //
-// Ported verbatim where self-contained; namespaces kept as `rock::*` (header-only
+// Ported verbatim where self-contained; namespaces kept as `heisenberg::rock_core::*` (header-only
 // inline → no clash with an external ROCK.dll).
 
 #include "rock_integration/contact/ContactActivityTracker.h"
@@ -22,7 +22,7 @@ namespace heisenberg::rock_contact
     // Compile-anchor: forces the ported headers to instantiate. Runtime wiring follows.
     bool ContactPipelineHeadersCompiled()
     {
-        return rock::contact_evidence::kInvalidBodyId != 0u
-            || rock::contact_target_identity::kUnknownLayer != 0u;
+        return heisenberg::rock_core::contact_evidence::kInvalidBodyId != 0u
+            || heisenberg::rock_core::contact_target_identity::kUnknownLayer != 0u;
     }
 }

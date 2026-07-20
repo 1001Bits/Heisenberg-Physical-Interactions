@@ -7,8 +7,12 @@
 
 #include "HeisenbergInterface001.h"
 #include "Heisenberg.h"
+#include "../external/ROCK/src/ROCKMain.h"
 #include "Grab.h"
 #include "Hand.h"
+#include <Windows.h>   // GetModuleHandleExA / GetModuleFileNameA — identify DisableHand caller
+#include <intrin.h>    // _ReturnAddress
+#include <cstring>     // strrchr
 #include "Config.h"
 #include "DropToHand.h"
 #include "SmartGrabHandler.h"
@@ -21,7 +25,12 @@
 namespace HeisenbergPluginAPI {
 
     // Build number - increment when API changes
-    constexpr unsigned int HEISENBERG_BUILD_NUMBER = 1;
+    // 2 (Jul 19 2026): vtable extended — weapon-collision control, off-hand grip block,
+    //   IsOffHandGrippingWeapon, per-hand DisableHandCollision/EnableHandCollision.
+    //   External consumers must check GetBuildNumber() >= 2 before calling those slots.
+    // 3 (Jul 20 2026): append-only dual-wield state/input/contact bridge.
+    //   External consumers must check GetBuildNumber() >= 3 before calling those slots.
+    constexpr unsigned int HEISENBERG_BUILD_NUMBER = 3;
 
     // =========================================================================
     // Callback storage
@@ -37,9 +46,34 @@ namespace HeisenbergPluginAPI {
     static std::vector<IHeisenbergInterface001::PostPhysicsCallback> g_postPhysicsCallbacks;
     static std::vector<IHeisenbergInterface001::ViewCasterTargetChangedCallback> g_viewCasterCallbacks;
 
-    // Per-hand state
-    static bool g_leftHandDisabled = false;
-    static bool g_rightHandDisabled = false;
+    // Per-hand state.
+    // Jul 19 (user directive): external disables are plain LATCHES — a feature stays disabled
+    // until the caller explicitly re-enables it (no auto-expiry). The Jul-11 5s lease existed
+    // because an early VirtualReloads never called EnableHand; consumers now use the
+    // disable-at-start / enable-when-done pattern, and the timer caused features to pop back
+    // mid-window. A caller that dies without re-enabling leaves the feature off until relaunch
+    // — by design. Timestamps kept (0 = not disabled) for log attribution.
+    static unsigned long long g_leftHandDisabledAtMs = 0;   // 0 = not disabled
+    static unsigned long long g_rightHandDisabledAtMs = 0;
+
+    static bool IsExternalHandDisableActive(bool isLeft)
+    {
+        return (isLeft ? g_leftHandDisabledAtMs : g_rightHandDisabledAtMs) != 0;
+    }
+
+    // Jul 19 (Virtual Reloads API, latch semantics per user directive — see the hand-disable
+    // comment above): weapon-collision disable, off-hand grip block, and per-hand collision
+    // disable are plain latches. 0 = not active; non-zero = the GetTickCount64() timestamp of
+    // the disable (attribution only).
+    static unsigned long long g_weaponCollisionDisabledAtMs = 0;  // 0 = enabled
+    static unsigned long long g_offhandGripBlockedAtMs = 0;       // 0 = unblocked
+    static unsigned long long g_handCollisionDisabledAtMs[2] = { 0, 0 };  // [0]=Right [1]=Left; 0 = enabled
+
+    static bool IsExternalLeaseActive(unsigned long long& ts, bool&, const char*)
+    {
+        return ts != 0;
+    }
+    static bool g_unusedLeaseLogFlag = false;  // keeps legacy call sites' signature stable
 
     // =========================================================================
     // Callback invocation functions (called from Heisenberg internals)
@@ -141,7 +175,7 @@ namespace HeisenbergPluginAPI {
         bool CanGrabObject(bool isLeft) override
         {
             // Check if hand is disabled
-            if (isLeft ? g_leftHandDisabled : g_rightHandDisabled) {
+            if (IsExternalHandDisableActive(isLeft)) {
                 return false;
             }
             
@@ -250,26 +284,42 @@ namespace HeisenbergPluginAPI {
         void DisableHand(bool isLeft) override
         {
             if (isLeft) {
-                g_leftHandDisabled = true;
+                g_leftHandDisabledAtMs = GetTickCount64();
             } else {
-                g_rightHandDisabled = true;
+                g_rightHandDisabledAtMs = GetTickCount64();
             }
-            spdlog::debug("[HeisenbergAPI] {} hand disabled", isLeft ? "Left" : "Right");
+            // Jul 6: identify WHICH plugin disabled the hand — an external mod was disabling the LEFT
+            // hand and never re-enabling it, killing left-hand grab. Log the calling module so the
+            // culprit is named. (Same _ReturnAddress->module trick as the OpenVR input routing fix.)
+            const char* callerModule = "unknown";
+            char moduleName[MAX_PATH] = {};
+            HMODULE hmod = nullptr;
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    reinterpret_cast<LPCSTR>(_ReturnAddress()), &hmod)
+                && hmod && GetModuleFileNameA(hmod, moduleName, MAX_PATH) > 0) {
+                if (const char* slash = std::strrchr(moduleName, '\\')) {
+                    callerModule = slash + 1;
+                } else {
+                    callerModule = moduleName;
+                }
+            }
+            spdlog::info("[HeisenbergAPI] {} hand DISABLED by module '{}' (grab/collision on this hand now suppressed until it calls EnableHand)",
+                         isLeft ? "Left" : "Right", callerModule);
         }
 
         void EnableHand(bool isLeft) override
         {
             if (isLeft) {
-                g_leftHandDisabled = false;
+                g_leftHandDisabledAtMs = 0;
             } else {
-                g_rightHandDisabled = false;
+                g_rightHandDisabledAtMs = 0;
             }
             spdlog::debug("[HeisenbergAPI] {} hand enabled", isLeft ? "Left" : "Right");
         }
 
         bool IsHandDisabled(bool isLeft) override
         {
-            return isLeft ? g_leftHandDisabled : g_rightHandDisabled;
+            return IsExternalHandDisableActive(isLeft);
         }
 
         // =====================================================================
@@ -492,6 +542,109 @@ namespace HeisenbergPluginAPI {
             heisenberg::DropToHand::SuppressItemToHand(
                 durationMs ? durationMs : 1500);
         }
+
+        // =====================================================================
+        // WEAPON COLLISION + TWO-HANDING CONTROL (Virtual Reloads API, Jul 19)
+        // =====================================================================
+
+        void EnableWeaponCollision(bool enable) override
+        {
+            if (enable) {
+                if (g_weaponCollisionDisabledAtMs != 0) {
+                    spdlog::info("[HeisenbergAPI] weapon collision RE-ENABLED by external module");
+                }
+                g_weaponCollisionDisabledAtMs = 0;
+            } else {
+                if (g_weaponCollisionDisabledAtMs == 0) {
+                    spdlog::info("[HeisenbergAPI] weapon collision DISABLED by external module (latched until it calls EnableWeaponCollision(true))");
+                }
+                g_weaponCollisionDisabledAtMs = GetTickCount64();
+            }
+        }
+
+        bool IsWeaponCollisionDisabled() override
+        {
+            return IsWeaponCollisionDisabledByAPI();
+        }
+
+        void BlockOffHandWeaponGripping(const char* tag, bool block) override
+        {
+            if (block) {
+                if (g_offhandGripBlockedAtMs == 0) {
+                    spdlog::info("[HeisenbergAPI] off-hand weapon gripping BLOCKED by '{}' (latched until unblocked)",
+                                 tag ? tag : "(null)");
+                }
+                g_offhandGripBlockedAtMs = GetTickCount64();
+            } else {
+                if (g_offhandGripBlockedAtMs != 0) {
+                    spdlog::info("[HeisenbergAPI] off-hand weapon gripping UNBLOCKED by '{}'", tag ? tag : "(null)");
+                }
+                g_offhandGripBlockedAtMs = 0;
+            }
+        }
+
+        bool IsOffHandWeaponGrippingBlocked() override
+        {
+            return IsOffHandGripBlockedByAPI();
+        }
+
+        bool IsOffHandGrippingWeapon() override
+        {
+            // Embedded ROCK owns two-handing; FRIK's isOffHandGrippingWeapon cannot see it.
+            return heisenberg::IsRockEngineHosted() &&
+                   (rock::HostIsWeaponSupportEngaged(true) || rock::HostIsWeaponSupportEngaged(false));
+        }
+
+        void DisableHandCollision(bool isLeft) override
+        {
+            unsigned long long& ts = g_handCollisionDisabledAtMs[isLeft ? 1 : 0];
+            if (ts == 0) {
+                spdlog::info("[HeisenbergAPI] {} hand collision DISABLED by external module (latched until it calls EnableHandCollision)",
+                             isLeft ? "Left" : "Right");
+            }
+            ts = GetTickCount64();
+        }
+
+        void EnableHandCollision(bool isLeft) override
+        {
+            unsigned long long& ts = g_handCollisionDisabledAtMs[isLeft ? 1 : 0];
+            if (ts != 0) {
+                spdlog::info("[HeisenbergAPI] {} hand collision RE-ENABLED by external module", isLeft ? "Left" : "Right");
+            }
+            ts = 0;
+        }
+
+        bool IsHandCollisionDisabled(bool isLeft) override
+        {
+            return IsHandCollisionDisabledByAPI(isLeft);
+        }
+
+        bool RegisterDualWieldStateProvider(DualWieldStateProvider provider) override
+        {
+            return RegisterDualWieldStateProviderImpl(provider);
+        }
+
+        bool UnregisterDualWieldStateProvider(DualWieldStateProvider provider) override
+        {
+            return UnregisterDualWieldStateProviderImpl(provider);
+        }
+
+        bool GetPhysicalHandInputState(
+            PhysicalHand hand,
+            PhysicalHandInputState* state) override
+        {
+            return GetPhysicalHandInputStateImpl(hand, state);
+        }
+
+        bool RegisterDualWieldWeaponContactCallback(DualWieldWeaponContactCallback callback) override
+        {
+            return RegisterDualWieldWeaponContactCallbackImpl(callback);
+        }
+
+        bool UnregisterDualWieldWeaponContactCallback(DualWieldWeaponContactCallback callback) override
+        {
+            return UnregisterDualWieldWeaponContactCallbackImpl(callback);
+        }
     };
 
     // =========================================================================
@@ -591,7 +744,24 @@ namespace HeisenbergPluginAPI {
 
     bool IsHandDisabledByAPI(bool isLeft)
     {
-        return isLeft ? g_leftHandDisabled : g_rightHandDisabled;
+        return IsExternalHandDisableActive(isLeft);
+    }
+
+    bool IsWeaponCollisionDisabledByAPI()
+    {
+        return IsExternalLeaseActive(g_weaponCollisionDisabledAtMs, g_unusedLeaseLogFlag, "weapon-collision disable");
+    }
+
+    bool IsOffHandGripBlockedByAPI()
+    {
+        return IsExternalLeaseActive(g_offhandGripBlockedAtMs, g_unusedLeaseLogFlag, "off-hand grip block");
+    }
+
+    bool IsHandCollisionDisabledByAPI(bool isLeft)
+    {
+        const int idx = isLeft ? 1 : 0;
+        return IsExternalLeaseActive(g_handCollisionDisabledAtMs[idx], g_unusedLeaseLogFlag,
+                                     isLeft ? "left hand-collision disable" : "right hand-collision disable");
     }
 
 } // namespace HeisenbergPluginAPI

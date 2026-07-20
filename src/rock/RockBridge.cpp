@@ -1,6 +1,7 @@
 #include "rock/RockBridge.h"
 
 #include "Config.h"
+#include "ThrownObjectTracker.h"
 
 #include <spdlog/spdlog.h>
 
@@ -62,6 +63,15 @@ namespace heisenberg
         }
         // -1 auto (on), 0 force off, 1 force on. Forcing on still requires presence.
         return g_config.useRockPhysics != 0;
+    }
+
+    bool RockBridge::IsRunning() const
+    {
+        // Present + enabled (IsActive) AND ROCK's physics interaction is actually live.
+        // When ROCK is disabled in its INI or toggled off at runtime, it never creates
+        // (or tears down) its PhysicsInteraction, so isPhysicsInteractionReady() is false
+        // and Heisenberg auto-reclaims hand collision + grab.
+        return IsActive() && IsPhysicsReady();
     }
 
     bool RockBridge::IsPhysicsReady() const
@@ -143,12 +153,17 @@ namespace heisenberg
         return _api->forceGrab(HandOf(isLeft), refr);
     }
 
-    void RockBridge::OnRockMessage(std::uint32_t type, const void* /*data*/, std::uint32_t /*dataLen*/)
+    void RockBridge::OnRockMessage(std::uint32_t type, const void* data, std::uint32_t dataLen)
     {
-        // Phase 0: observe ROCK's physics lifecycle/contact messages. Phase 2 will
-        // dispatch kOnGrab/kOnRelease into Heisenberg's release-action + throwable
-        // logic. Keep this light; it runs on the F4SE messaging thread.
-        using PM = rock::api::ROCKApi::PhysicsMessage;
+        // Observe ROCK's physics lifecycle + grab events. When ROCK owns the grab
+        // (bDelegateWorldGrabToRock), its Released event is the ONLY signal that an
+        // object was thrown — our own EndGrab->OnThrown path never runs. Translate it
+        // so Heisenberg's thrown-object pipeline (impact damage / knockback / NPC aggro)
+        // still engages. Keep this light; it runs on the F4SE messaging thread, but
+        // ROCK dispatches grab events from its game-thread update (same context our own
+        // EndGrab->OnThrown runs in), so a direct call is symmetric and safe.
+        using API = rock::api::ROCKApi;
+        using PM = API::PhysicsMessage;
         switch (type) {
         case PM::kOnPhysicsInit:
             spdlog::info("[ROCK] kOnPhysicsInit");
@@ -156,8 +171,27 @@ namespace heisenberg
         case PM::kOnPhysicsShutdown:
             spdlog::info("[ROCK] kOnPhysicsShutdown");
             break;
+        case PM::kOnGrabEvent: {
+            if (!IsActive() || !data || dataLen < sizeof(API::GrabEventData)) {
+                break;
+            }
+            const auto* ev = static_cast<const API::GrabEventData*>(data);
+            // Only a genuine throw/release with a resolved body and a trustworthy
+            // release velocity feeds the thrown-object tracker. Gentle drops are
+            // filtered downstream by OnThrown's min-speed gate.
+            if (ev->type != API::GrabEventType::Released ||
+                !ev->refr || ev->primaryBodyId == 0x7FFF'FFFFu ||
+                !(ev->flags & API::kGrabEventFlagVelocityValid)) {
+                break;
+            }
+            const RE::NiPoint3 vel(ev->velocityGame[0], ev->velocityGame[1], ev->velocityGame[2]);
+            spdlog::debug("[ROCK] Released {:08X} body=0x{:08X} vel=({:.0f},{:.0f},{:.0f}) — feeding ThrownObjectTracker",
+                          ev->formID, ev->primaryBodyId, vel.x, vel.y, vel.z);
+            ThrownObjectTracker::GetSingleton().OnThrown(ev->refr, ev->primaryBodyId, vel);
+            break;
+        }
         default:
-            // kOnTouch/kOnTouchEnd/kOnGrab/kOnRelease/kOnGrabEvent — handled in Phase 2.
+            // kOnTouch/kOnTouchEnd/kOnGrab/kOnRelease — not consumed yet.
             break;
         }
     }

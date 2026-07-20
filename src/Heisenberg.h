@@ -12,6 +12,16 @@ namespace heisenberg
     class PhysicsManager;
     class SelectionManager;
 
+    // True once the embedded ROCK engine is hosted this session (bUseRockEngineArchitecture=1
+    // + rock::HostLoad OK). Ownership gates must treat this like a running external ROCK.dll —
+    // RockBridge::IsRunning() is structurally always false in the embed. Defined in Heisenberg.cpp.
+    bool IsRockEngineHosted();
+
+    // BetterScopesVR bridge (Jul 19): track its looking-through-scope broadcast (msg 15) and
+    // exit scope mode (toggle msg 16) when the two-handed support grip releases while zoomed.
+    void SetLookingThroughScope(bool a_looking);
+    void ExitScopeModeOnGripRelease();
+
     /**
      * Main Heisenberg mod class for Fallout 4 VR.
      * Handles physics-based object grabbing, throwing, and hand collision.
@@ -229,6 +239,7 @@ namespace heisenberg
         // Post-grab kFighting suppression - prevents Unarmed from auto-equipping on grip release
         float _postGrabSuppressTimer = 0.0f;       // Time remaining for post-grab suppression
         bool _postGrabFightingSuppressed = false;  // Currently suppressing due to post-grab
+        bool _holdFightingSuppressed = false;      // Suppressing kFighting because an object is held (blocks trigger weapon-draw)
         static constexpr float POST_GRAB_SUPPRESS_DURATION = 0.5f;  // How long to suppress after grab
 
         // Force-sheathed tracking - when we sheathe a weapon for grabbing, keep it sheathed until trigger
@@ -262,7 +273,7 @@ namespace heisenberg
         // THREAD SAFETY: Cached weapon state for OpenVR callback
         // These are updated on main thread in OnInputUpdate() and read from OpenVR thread
         // This avoids accessing game data structures from OpenVR callback thread
-        std::atomic<bool> _cachedWeaponDrawn{false};       // player->actorState.IsWeaponDrawn()
+        std::atomic<bool> _cachedWeaponDrawn{false};       // player->GetWeaponMagicDrawn()
         std::atomic<bool> _cachedHasRealWeapon{false};     // HasRealWeaponEquipped() result
 
         // =====================================================================

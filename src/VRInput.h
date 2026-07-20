@@ -134,6 +134,13 @@ namespace heisenberg
          */
         bool IsAvailable() const { return _initialized; }
 
+        /** True when both input and pose tracking are valid for this controller. */
+        bool IsControllerTracked(bool isLeftHand) const
+        {
+            const auto& state = GetControllerState(isLeftHand);
+            return state.valid && state.poseValid;
+        }
+
         /**
          * Check if left-handed mode is active
          * @return true if the game is in left-handed VR mode
@@ -181,12 +188,14 @@ namespace heisenberg
             uint64_t current = 0;
             uint64_t previous = 0;
             float triggerValue = 0.0f;
+            float previousTriggerValue = 0.0f;
             float gripValue = 0.0f;
             float thumbstickX = 0.0f;
             float thumbstickY = 0.0f;
             float angularVelMag = 0.0f;  // Angular velocity magnitude (rad/s)
             uint32_t deviceIndex = 0xFFFFFFFF;
             bool valid = false;
+            bool poseValid = false;
             bool hasAnalogGrip = false;  // True once we've seen gripValue > threshold
         };
         

@@ -31,7 +31,11 @@ namespace heisenberg
             float hitFraction = 1.0f;
             RE::TESObjectREFR* hitRefr = nullptr;
             RE::NiAVObject* hitNode = nullptr;
-            RE::hknpBodyId bodyId;
+            // Initialized INVALID (review C1): Phase-1 refr-sphere hits never write bodyId, so
+            // an uninitialized value here was stack garbage — HandWallPushback's fail-closed
+            // filter then read a RANDOM body's filter and could accept the fabricated hit.
+            // Invalid id -> TryReadBodyFilterInfo fails -> Phase-1 hits reliably rejected.
+            RE::hknpBodyId bodyId{ 0x7FFFFFFF };
         };
 
         RaycastResult CastRay(
@@ -71,6 +75,11 @@ namespace heisenberg
 
         // Cleanup cached physics shapes (call on shutdown)
         void CleanupCachedShapes();
+
+        // Shared unit-radius cached sphere shape (created on first use; freed by
+        // CleanupCachedShapes). Used by the RockGrabCore proxy body (geometry is
+        // irrelevant there — the proxy is no-contact).
+        RE::hknpShape* GetSharedSphereShape();
 
         // Apply impulse to an object
         void ApplyImpulse(RE::TESObjectREFR* refr, const RE::NiPoint3& impulse, const RE::NiPoint3& point);
@@ -203,6 +212,15 @@ namespace heisenberg
         void ClearPlayerProxySupportBody();
 
         /**
+         * Resolve the player's bhkCharacterController (via currentProcess->middleHigh),
+         * or nullptr if unavailable. Used by the HandleBumpedCharacter guard to recognise
+         * when the player proxy is the one being bumped (so we can suppress hand-body
+         * pushes that would otherwise fault the char-proxy). SEH-guarded; safe to call
+         * from the physics thread.
+         */
+        RE::bhkCharacterController* GetPlayerCharacterController();
+
+        /**
          * Held-object mass / inertia (1:1 with ROCK GrabConstraint). Mass comes from the
          * hknpMotion packed inverse-mass (bfloat16). NormalizeHeldObjectInertia clamps the
          * inverse-inertia ratio to maxRatio (ROCK default 10) so elongated objects don't
@@ -232,6 +250,12 @@ namespace heisenberg
 
         /** Direct write of the body's collisionFilterInfo (SEH-wrapped). */
         bool TryWriteBodyFilterInfo(void* hknpWorld, std::uint32_t bodyId, std::uint32_t filterInfo);
+
+        // Jul 18 (catch/anti-tunneling): per-body CCD look-ahead. Positive distance (Havok
+        // meters) makes the engine sweep this body's motion so it can't step through thin
+        // colliders (hand capsules/palm) in one frame. hknpWorld::setBodyCollisionLookAhead-
+        // Distance @VA 0x14153B120 (F4VR 1.2.72); the vector arg is only read when dist<=0.
+        bool TrySetBodyCollisionLookAhead(void* hknpWorld, std::uint32_t bodyId, float distanceHavok);
 
         /** Direct read of the body's collisionFilterInfo (SEH-wrapped). */
         bool TryReadBodyFilterInfo(void* hknpWorld, std::uint32_t bodyId, std::uint32_t& outFilterInfo);

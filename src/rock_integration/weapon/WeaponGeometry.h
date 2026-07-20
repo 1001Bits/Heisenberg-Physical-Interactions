@@ -21,7 +21,7 @@
 #undef max
 #undef min
 
-namespace rock::weapon_collision_geometry_math
+namespace heisenberg::rock_core::weapon_collision_geometry_math
 {
     /*
      * Weapon mesh collision is generated in weapon-root local space so every
@@ -975,7 +975,7 @@ namespace rock::weapon_collision_geometry_math
 #include <algorithm>
 #include <cmath>
 
-namespace rock::weapon_interaction_probe_math
+namespace heisenberg::rock_core::weapon_interaction_probe_math
 {
     /*
      * ROCK drives two-handed weapon selection from an active near-hand search

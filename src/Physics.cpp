@@ -305,6 +305,13 @@ namespace heisenberg::Physics
         return g_sphereShape;
     }
 
+    // Public wrapper (RockGrabCore proxy body needs a shape; reuses the cached one + its
+    // CleanupCachedShapes lifecycle instead of creating a private sphere).
+    RE::hknpShape* GetSharedSphereShape()
+    {
+        return GetCachedSphereShape();
+    }
+
     void CleanupCachedShapes()
     {
         // Note: Havok shapes are reference-counted internally.
@@ -1761,6 +1768,19 @@ namespace heisenberg::Physics
         }
     }
 
+    RE::bhkCharacterController* GetPlayerCharacterController()
+    {
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player) return nullptr;
+        auto* actor = static_cast<RE::Actor*>(player);
+        auto* process = actor ? actor->currentProcess : nullptr;
+        auto* middleHigh = process ? process->middleHigh : nullptr;
+        if (!middleHigh) return nullptr;
+        RE::bhkCharacterController* charController = nullptr;
+        TryReadMiddleHighCharControllerImpl(middleHigh, charController);
+        return charController;
+    }
+
     // =====================================================================
     // HELD-OBJECT MASS / INERTIA (1:1 with ROCK GrabConstraint.cpp)
     // =====================================================================
@@ -2055,6 +2075,38 @@ namespace heisenberg::Physics
     //
     // NOTE: this writes the filter info field directly. Some engine paths re-derive collision
     // pairs lazily, so the filter takes effect on the next broadphase iteration.
+    // Jul 18: per-body CCD look-ahead (anti-tunneling for released objects vs thin hand
+    // colliders). See Physics.h. SEH rule: Relocation outside __try.
+    static void SetBodyCollisionLookAheadNative(void* hknpWorld, std::uint32_t bodyId, float dist, const float* vec4)
+    {
+        using Fn = void (*)(void*, std::uint32_t, float, const float*);
+        static REL::Relocation<Fn> s_fn{ REL::Offset(0x153B120) };
+        s_fn(hknpWorld, bodyId, dist, vec4);
+    }
+
+    bool TrySetBodyCollisionLookAhead(void* hknpWorld, std::uint32_t bodyId, float distanceHavok)
+    {
+        if (!hknpWorld || IsInvalidBodyId(bodyId)) {
+            return false;
+        }
+        static const float kZeroVec[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        __try {
+            SetBodyCollisionLookAheadNative(hknpWorld, bodyId, distanceHavok, kZeroVec);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
+
+    // SEH rule: REL::Relocation has a constructor, so it cannot live inside the __try below.
+    static void SetBodyCollisionFilterInfoNative(void* hknpWorld, std::uint32_t bodyId, std::uint32_t filterInfo)
+    {
+        using SetFilter_t = void (*)(void*, std::uint32_t, std::uint32_t);
+        static REL::Relocation<SetFilter_t> s_setFilter{ REL::Offset(0x1DF5B80) };  // hknpBSWorld::setBodyCollisionFilterInfo
+        s_setFilter(hknpWorld, bodyId, filterInfo);
+    }
+
     bool TryWriteBodyFilterInfo(void* hknpWorld, std::uint32_t bodyId, std::uint32_t filterInfo)
     {
         if (!hknpWorld || IsInvalidBodyId(bodyId)) {
@@ -2070,12 +2122,14 @@ namespace heisenberg::Physics
             if (!bodyBuffer) {
                 return false;
             }
-            void* bodyPtr = reinterpret_cast<void*>(
-                reinterpret_cast<uintptr_t>(bodyBuffer) + static_cast<uintptr_t>(bodyIndex) * hknpBody_Offsets::stride
-            );
-            *reinterpret_cast<std::uint32_t*>(
-                reinterpret_cast<uintptr_t>(bodyPtr) + hknpBody_Offsets::collisionFilterInfo
-            ) = filterInfo;
+            // Jul 18 (post-release dead hand-object collision): write through the ENGINE's
+            // setter, hknpBSWorld::setBodyCollisionFilterInfo @0x1DF5B80 (same native the
+            // embedded ROCK uses — HavokRuntime.h setFilterInfo). The old raw field write
+            // changed the filter word but never refreshed broadphase PAIRING, so a pair
+            // created as filtered-out during a hold (hand vs held object) kept its cached
+            // no-collide verdict after release — the hand permanently stopped colliding
+            // with any object it had grabbed until cell reload.
+            SetBodyCollisionFilterInfoNative(hknpWorld, bodyId, filterInfo);
             return true;
         }
         __except(EXCEPTION_EXECUTE_HANDLER) {

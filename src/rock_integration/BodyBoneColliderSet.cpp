@@ -330,4 +330,34 @@ namespace heisenberg::rock_body_collider
             inst.body->SetTransform(s_hk);
         }
     }
+
+    // Geometry-only build of the 23 body capsules from the live FRIK skeleton (getCommonNode),
+    // independent of the physics bodies. Same descriptors + radii. For the mode-3 soft-contact
+    // runtime (hand-vs-body). PA state derived from the player so it works standalone.
+    int BuildBodyCapsules(std::array<heisenberg::rock_core::soft_contact_math::Capsule, kCapsuleCount>& out)
+    {
+        for (auto& c : out) {
+            c = {};
+        }
+        auto* root = f4cf::f4vr::getCommonNode();
+        if (!root) {
+            return 0;
+        }
+        const Descriptor* desc = Utils::IsPlayerInPowerArmor() ? kPowerArmor : kStandard;
+        int n = 0;
+        for (int i = 0; i < kBodyCount; ++i) {
+            auto* s = f4vr::findAVObject(root, desc[i].startBone);
+            auto* e = f4vr::findAVObject(root, desc[i].endBone);
+            if (!s || !e) {
+                continue;
+            }
+            out[i].start = s->world.translate;
+            out[i].end = e->world.translate;
+            out[i].radius = desc[i].radius;
+            out[i].id = static_cast<std::uint32_t>(300 + i);
+            out[i].valid = true;
+            ++n;
+        }
+        return n;
+    }
 }

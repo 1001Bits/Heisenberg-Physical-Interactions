@@ -669,7 +669,16 @@ namespace heisenberg
         // Clamp to valid range
         if (lo >= kNumFingerVals) lo = kNumFingerVals - 1;
         if (lo < 0) lo = 0;
-        
+
+        // HIGGS floor semantics (finger_curves.cpp:487-499, Jul 19 finger audit): the
+        // binary search lands on the first sample >= desiredAngle (ceil). HIGGS returns
+        // the sample BELOW so the curve-walk seed covers the segment containing the
+        // query angle — ceil skipped that segment, missing graze-contact crossings
+        // (over-curl, or full miss -> 0.2 near-fist stab through the mesh).
+        if (lo > 0 && fingerVals[lo].angle > desiredAngle) {
+            lo -= 1;
+        }
+
         if (outData) {
             *outData = fingerVals[lo];
         }
@@ -865,9 +874,16 @@ namespace heisenberg
                      numTris, geom->name.c_str() ? geom->name.c_str() : "unnamed");
     }
 
-    void GetTriangles(RE::NiAVObject* root, std::vector<TriangleData>& outTriangles)
+    void GetTriangles(RE::NiAVObject* root, std::vector<TriangleData>& outTriangles, std::size_t maxTriangles)
     {
         if (!root) return;
+
+        // PERF CAP: stop once we've collected enough triangles. A high-poly object (e.g. an ornate
+        // vase, tens of thousands of tris) extracted in full every frame — and then distance-tested
+        // against the whole hand point cloud — collapses the frame rate to a freeze. Callers that
+        // need the FULL mesh (finger solver) pass the default (unlimited); the per-frame hand push
+        // passes a budget so it stays cheap on any object.
+        if (outTriangles.size() >= maxTriangles) return;
 
         // Skip culled nodes (APP_CULLED = 0x01)
         if (root->flags.flags & 0x01) return;
@@ -941,7 +957,8 @@ namespace heisenberg
             }
             for (auto& child : node->children) {
                 if (child) {
-                    GetTriangles(child.get(), outTriangles);
+                    if (outTriangles.size() >= maxTriangles) break;
+                    GetTriangles(child.get(), outTriangles, maxTriangles);
                 }
             }
         }
@@ -1026,24 +1043,72 @@ namespace heisenberg
         {
             float smallestAngle = std::min(startAngle, endAngle);
             float minAllowedAngle = fingerVals[0].angle + g_minAllowedFingerAngle;
-            
-            // Both ends behind finger - check circle intersection
-            if (std::max(startAngle, endAngle) < minAllowedAngle) {
+
+            // HIGGS CircleIntersection (math_utils.cpp:1338-1407, faithful port Jul 19
+            // finger audit): the old port inspected ONE arbitrary hit with no face gate,
+            // dropping HIGGS's dual-hit ordering + front-face gates and the -largerAngle
+            // guaranteed-open fallback — on large faces pressed against the palm that
+            // lost the open signal and let the finger close through the object.
+            auto CircleIntersection = [&]() -> bool {
                 RE::NiPoint3 circleInt1, circleInt2;
-                int numCircleHits = CircleIntersectsTriangle(fingerCenter, fingerNormal, 
+                int numCircleHits = CircleIntersectsTriangle(fingerCenter, fingerNormal,
                     fingerVals[0].fingerLength * scale, triangle, circleInt1, circleInt2);
-                if (numCircleHits > 0) {
-                    RE::NiPoint3 centerToIntersect = circleInt1 - fingerCenter;
-                    float angle = std::acos(std::clamp(DotProduct(VectorNormalized(centerToIntersect), zeroAngleVector), -1.0f, 1.0f));
-                    if (DotProduct(fingerNormal, CrossProduct(zeroAngleVector, centerToIntersect)) < 0) {
-                        angle *= -1;
-                    }
-                    if (angle <= 0) {
+                if (numCircleHits <= 0) {
+                    return false;
+                }
+                const RE::NiPoint3 triNormal = VectorNormalized(CrossProduct(
+                    triangle.v1 - triangle.v0, triangle.v2 - triangle.v1));
+                if (numCircleHits > 1) {
+                    const RE::NiPoint3 cti1 = circleInt1 - fingerCenter;
+                    const RE::NiPoint3 cti2 = circleInt2 - fingerCenter;
+                    const float angle1 = std::acos(std::clamp(DotProduct(VectorNormalized(cti1), zeroAngleVector), -1.0f, 1.0f));
+                    const float angle2 = std::acos(std::clamp(DotProduct(VectorNormalized(cti2), zeroAngleVector), -1.0f, 1.0f));
+                    const RE::NiPoint3 tangent1 = CrossProduct(fingerNormal, cti1);
+                    const RE::NiPoint3 tangent2 = CrossProduct(fingerNormal, cti2);
+                    const bool angle1Smaller = angle1 <= angle2;
+                    const float smallerAngle = angle1Smaller ? angle1 : angle2;
+                    const float largerAngle = angle1Smaller ? angle2 : angle1;
+                    const RE::NiPoint3& smallerTangent = angle1Smaller ? tangent1 : tangent2;
+                    const RE::NiPoint3& largerTangent = angle1Smaller ? tangent2 : tangent1;
+                    const RE::NiPoint3& smallerCTI = angle1Smaller ? cti1 : cti2;
+                    if (DotProduct(triNormal, smallerTangent) <= 0) {
+                        float angle = smallerAngle;
+                        if (DotProduct(fingerNormal, CrossProduct(zeroAngleVector, smallerCTI)) < 0) {
+                            angle *= -1;
+                        }
+                        if (angle > 0) {
+                            // hit at a positive angle while the finger curve missed — the
+                            // circle pass only exists to catch behind-finger points (HIGGS)
+                            return false;
+                        }
                         outAngle = angle;
                         return true;
                     }
+                    if (DotProduct(triNormal, largerTangent) <= 0) {
+                        outAngle = -largerAngle;  // guaranteed-open signal
+                        return true;
+                    }
+                    return false;
+                }
+                const RE::NiPoint3 cti = circleInt1 - fingerCenter;
+                const RE::NiPoint3 tangent = CrossProduct(fingerNormal, cti);
+                if (DotProduct(triNormal, tangent) <= 0) {
+                    float angle = std::acos(std::clamp(DotProduct(VectorNormalized(cti), zeroAngleVector), -1.0f, 1.0f));
+                    if (DotProduct(fingerNormal, CrossProduct(zeroAngleVector, cti)) < 0) {
+                        angle *= -1;
+                    }
+                    if (angle > 0) {
+                        return false;
+                    }
+                    outAngle = angle;
+                    return true;
                 }
                 return false;
+            };
+
+            // Both ends behind finger - check circle intersection (derotate)
+            if (std::max(startAngle, endAngle) < minAllowedAngle) {
+                return CircleIntersection();
             }
             
             bool crossesBehind = smallestAngle < minAllowedAngle;
@@ -1100,22 +1165,9 @@ namespace heisenberg
             
             // Check circle intersection if edge crosses behind finger
             if (crossesBehind) {
-                RE::NiPoint3 circleInt1, circleInt2;
-                int numCircleHits = CircleIntersectsTriangle(fingerCenter, fingerNormal, 
-                    fingerVals[0].fingerLength * scale, triangle, circleInt1, circleInt2);
-                if (numCircleHits > 0) {
-                    RE::NiPoint3 centerToIntersect = circleInt1 - fingerCenter;
-                    float angle = std::acos(std::clamp(DotProduct(VectorNormalized(centerToIntersect), zeroAngleVector), -1.0f, 1.0f));
-                    if (DotProduct(fingerNormal, CrossProduct(zeroAngleVector, centerToIntersect)) < 0) {
-                        angle *= -1;
-                    }
-                    if (angle <= 0) {
-                        outAngle = angle;
-                        return true;
-                    }
-                }
+                return CircleIntersection();
             }
-            
+
             return false;
         };
         
@@ -1308,14 +1360,16 @@ namespace heisenberg
         GetTriangles(objectNode, triangles);
 
         if (triangles.empty()) {
-            spdlog::warn("[FINGER] No triangles extracted from object '{}', using fallback 0.6",
+            spdlog::warn("[FINGER] No triangles extracted from object '{}', using fallback 0.9",
                         objectNode->name.c_str());
-            // Fallback: Use default curl values for objects without accessible geometry
-            result.thumb = 0.6f;
-            result.index = 0.6f;
-            result.middle = 0.6f;
-            result.ring = 0.6f;
-            result.pinky = 0.6f;
+            // Fallback for objects without accessible geometry: 0.9 (HIGGS parity, Jul 19
+            // finger audit) — 0.6 buried the fingertips inside fat objects; near-open only
+            // ever hovers, which reads far better than penetration.
+            result.thumb = 0.9f;
+            result.index = 0.9f;
+            result.middle = 0.9f;
+            result.ring = 0.9f;
+            result.pinky = 0.9f;
             result.success = true;
             return result;
         }
@@ -1617,7 +1671,9 @@ namespace heisenberg
             }
 
             // Ray fallback toward the seated mesh point when the disk missed.
-            if (!solved.hit) {
+            // Use ROCK's exact gate: skip the fallback for a thumb that intentionally used the
+            // alternate curve and missed (that miss is the closed-thumb result, not an error).
+            if (rfm::shouldRunFallbackRayAfterCurveSolve(static_cast<std::size_t>(i), solved.hit, useAltThumb)) {
                 RE::NiPoint3 toContact = closestMeshPoint - centerWorld;
                 RE::NiPoint3 probeDir = VectorNormalized(toContact);
                 if (VectorLengthSquared(probeDir) > 0.5f) {

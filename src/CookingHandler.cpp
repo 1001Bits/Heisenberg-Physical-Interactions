@@ -29,6 +29,67 @@ namespace heisenberg
             || ContainsCI(editorID, "heat");
     }
 
+    // Detect the GRAPHIC SIGNATURE of an active flame on a single node, independent of its name:
+    //  (1) a BSGeometry whose shader property is a BSEffectShaderProperty — the additive,
+    //      emissive, animated-UV glow shader FO4 renders flames/embers/smoke with; OR
+    //  (2) a particle-system node (NiParticleSystem / BSStripParticleSystem etc.) — the actual
+    //      flame/ember/spark particles.
+    // An unlit fire culls (or omits) these, so their PRESENCE on a visible node == "burning".
+    static bool NodeHasFlameGraphicSignature(RE::NiAVObject* node)
+    {
+        if (auto* geom = node->IsGeometry()) {
+            for (int i = 0; i < 2; ++i) {
+                if (auto* prop = geom->properties[i].get()) {
+                    if (auto* rtti = prop->GetRTTI(); rtti && rtti->GetName()
+                        && std::strstr(rtti->GetName(), "EffectShaderProperty")) {
+                        return true;  // additive emissive glow shader = rendered flame/glow
+                    }
+                }
+            }
+        }
+        if (auto* rtti = node->GetRTTI(); rtti && rtti->GetName()
+            && std::strstr(rtti->GetName(), "ParticleSystem")) {
+            return true;  // active particle emitter (flame/embers/sparks/smoke)
+        }
+        return false;
+    }
+
+    // Walk a heat source's loaded 3D for a VISIBLE active flame — the "actively burning" signal.
+    // Primary test is the graphic signature (effect-shader / particle system); a flame-named node
+    // is kept as a belt-and-suspenders fallback. Recursion stops at AppCulled subtrees (bit 0x1)
+    // and zero-scale nodes — how the game hides an unlit fire's flame — so an unlit fireplace
+    // returns false. Depth-capped.
+    static bool HasVisibleFlameNode(RE::NiAVObject* node, int depth)
+    {
+        if (!node || depth > 8) return false;
+        if ((node->flags.flags & static_cast<std::uint64_t>(0x1)) != 0) return false;  // AppCulled subtree = hidden
+        if (node->local.scale > 0.001f) {
+            if (NodeHasFlameGraphicSignature(node)) {
+                return true;
+            }
+            const char* nm = node->name.c_str();
+            if (nm && (ContainsCI(nm, "fire") || ContainsCI(nm, "flame") || ContainsCI(nm, "ember")
+                    || ContainsCI(nm, "burn") || ContainsCI(nm, "candle") || ContainsCI(nm, "torch")
+                    || ContainsCI(nm, "lava") || ContainsCI(nm, "smoke") || ContainsCI(nm, "glow"))) {
+                return true;
+            }
+        }
+        if (auto* asNode = node->IsNode()) {
+            for (auto& child : asNode->children) {
+                if (child && HasVisibleFlameNode(child.get(), depth + 1)) return true;
+            }
+        }
+        return false;
+    }
+
+    // Always-hot appliances / molten sources have no on/off flame state — accept by name.
+    static bool IsAlwaysHotName(const char* name)
+    {
+        if (!name) return false;
+        return ContainsCI(name, "lava") || ContainsCI(name, "forge") || ContainsCI(name, "stove")
+            || ContainsCI(name, "oven") || ContainsCI(name, "grill") || ContainsCI(name, "cooking");
+    }
+
     static std::string GetFormDisplayName(RE::TESFormID formID)
     {
         auto* form = RE::TESForm::GetFormByID(formID);
@@ -141,8 +202,13 @@ namespace heisenberg
             if (kwForm && kwForm->keywords && kwForm->numKeywords > 0) {
                 for (std::uint32_t i = 0; i < kwForm->numKeywords; ++i) {
                     RE::BGSKeyword* kw = kwForm->keywords[i];
-                    if (kw && (_cookingKeywordIDs.count(kw->GetFormID()) || IsFireHeatKeyword(kw->GetFormEditorID()))) {
+                    if (!kw) continue;
+                    if (_cookingKeywordIDs.count(kw->GetFormID())) {        // designed cooking station — always usable
                         _cookingStationBaseIDs.insert(furn->GetFormID());
+                        break;
+                    }
+                    if (IsFireHeatKeyword(kw->GetFormEditorID())) {         // fire source — require active flame
+                        _fireSourceBaseIDs.insert(furn->GetFormID());
                         break;
                     }
                 }
@@ -159,46 +225,58 @@ namespace heisenberg
             if (kwForm && kwForm->keywords && kwForm->numKeywords > 0) {
                 for (std::uint32_t i = 0; i < kwForm->numKeywords; ++i) {
                     RE::BGSKeyword* kw = kwForm->keywords[i];
-                    if (kw && (_cookingKeywordIDs.count(kw->GetFormID()) || IsFireHeatKeyword(kw->GetFormEditorID()))) {
+                    if (!kw) continue;
+                    if (_cookingKeywordIDs.count(kw->GetFormID())) {        // designed cooking station — always usable
                         _cookingStationBaseIDs.insert(acti->GetFormID());
+                        break;
+                    }
+                    if (IsFireHeatKeyword(kw->GetFormEditorID())) {         // fire source — require active flame
+                        _fireSourceBaseIDs.insert(acti->GetFormID());
                         break;
                     }
                 }
             }
         }
 
-        spdlog::info("[COOKING] Found {} cooking/fire station base forms", _cookingStationBaseIDs.size());
+        spdlog::info("[COOKING] Found {} cooking stations + {} fire sources", _cookingStationBaseIDs.size(), _fireSourceBaseIDs.size());
     }
 
     bool CookingHandler::IsCookingStation(RE::TESObjectREFR* refr) const
     {
         if (!refr) return false;
 
+        // Must be present and loaded.
+        if (refr->IsDisabled() || refr->IsDeleted() || !refr->Get3D()) return false;
+
         const auto baseObj = refr->GetObjectReference();
         if (!baseObj) return false;
 
+        // Designed cooking stations (cooking-keyword workbenches) are always usable.
         if (_cookingStationBaseIDs.count(baseObj->GetFormID()) > 0) {
             return true;
         }
 
+        // Decide whether this is a heat/fire source at all (by fire keyword or by name).
+        const bool fireKeyworded = _fireSourceBaseIDs.count(baseObj->GetFormID()) > 0;
         auto nameView = RE::TESFullName::GetFullName(*baseObj, false);
-        if (!nameView.empty()) {
-            const char* name = nameView.data();
-            if (ContainsCI(name, "cooking")
-                || ContainsCI(name, "fire")
-                || ContainsCI(name, "lava")
-                || ContainsCI(name, "forge")
-                || ContainsCI(name, "stove")
-                || ContainsCI(name, "oven")
-                || ContainsCI(name, "grill")
-                || ContainsCI(name, "brazier")
-                || ContainsCI(name, "flame"))
-            {
-                return true;
-            }
+        const char* name = nameView.empty() ? nullptr : nameView.data();
+        const bool fireNamed = name && (ContainsCI(name, "fire") || ContainsCI(name, "flame")
+            || ContainsCI(name, "brazier") || ContainsCI(name, "campfire") || ContainsCI(name, "firepit")
+            || IsAlwaysHotName(name));
+        if (!fireKeyworded && !fireNamed) {
+            return false;  // not a heat source
         }
 
-        return false;
+        // Always-hot appliances / molten sources (lava, forge, stove, oven, grill, cooking) have
+        // no on/off flame — accept them outright.
+        if (IsAlwaysHotName(name)) {
+            return true;
+        }
+
+        // Otherwise it's a fire pit / campfire / brazier that can be lit or unlit: require an
+        // ACTIVELY-burning flame in its 3D. This is what makes "only burning open fires" work —
+        // an unlit fireplace has no visible flame node and is rejected.
+        return HasVisibleFlameNode(refr->Get3D(), 0);
     }
 
     bool CookingHandler::HasIngredients(const CookingRecipe& recipe, RE::TESFormID heldFormID) const
@@ -392,10 +470,13 @@ namespace heisenberg
                 return;
             }
         } else {
-            // Default mode: cook if viewcaster active OR station cached within proximity
-            if (!_activeCookingStation && !_viewCasterPointingAtStation) {
+            // Default mode: require live viewcaster aim too (no proximity-cache fallback).
+            // Heat/cook must only trigger while a center/wand viewcaster is actually aimed at the
+            // station — previously a cached station kept triggering by mere proximity while the
+            // player faced away.
+            if (!_viewCasterPointingAtStation) {
                 if (state.isCooking) state.Reset();
-                if (logThisFrame) spdlog::debug("[COOKING] {} UpdateHand: no active station", isLeft ? "L" : "R");
+                if (logThisFrame) spdlog::debug("[COOKING] {} UpdateHand: viewcaster not on station", isLeft ? "L" : "R");
                 return;
             }
         }
@@ -432,36 +513,15 @@ namespace heisenberg
             return;
         }
 
-        // Get held item position
-        RE::NiPoint3 itemPos;
-        if (grabState.node) {
-            itemPos = grabState.node->world.translate;
-        } else {
+        // Require a held item (node present). No proximity fallback: heat/cook only triggers
+        // while a center/wand viewcaster is actually aimed at the (lit) station, so simply
+        // standing near a fire with the item — or facing away — no longer triggers it.
+        if (!grabState.node) {
             if (state.isCooking) state.Reset();
             return;
         }
 
-        // Check proximity to the cached cooking station
-        bool inRange = _viewCasterPointingAtStation;  // Always in range if actively pointing
-
-        if (!inRange) {
-            // Fall back to proximity check (only in default mode, since station-only already returned)
-            float dx = itemPos.x - _activeStationPos.x;
-            float dy = itemPos.y - _activeStationPos.y;
-            float dz = itemPos.z - _activeStationPos.z;
-            float distSq = dx * dx + dy * dy + dz * dz;
-            float radiusSq = g_config.cookDetectionRadius * g_config.cookDetectionRadius;
-
-            if (logThisFrame) {
-                float dist = std::sqrt(distSq);
-                spdlog::debug("[COOKING] {} hand: ingredient {:08X} dist={:.0f} (radius={:.0f}) item=({:.0f},{:.0f},{:.0f}) station=({:.0f},{:.0f},{:.0f})",
-                    isLeft ? "L" : "R", heldFormID, dist, g_config.cookDetectionRadius,
-                    itemPos.x, itemPos.y, itemPos.z,
-                    _activeStationPos.x, _activeStationPos.y, _activeStationPos.z);
-            }
-
-            inRange = (distSq < radiusSq);
-        }
+        const bool inRange = _viewCasterPointingAtStation;
 
         if (inRange) {
             if (!state.notifiedStart) {

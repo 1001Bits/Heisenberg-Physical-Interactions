@@ -1,6 +1,7 @@
 #include "HandBoneColliderSet.h"
 #include "../BethesdaPhysicsBody.h"
 #include "../Config.h"
+#include "../ContactImpulseListener.h"
 #include "../GrabConstraint.h"
 #include "../Physics.h"
 #include "../Utils.h"
@@ -115,7 +116,7 @@ namespace heisenberg::rock_hand_collider
     {
         if (!heisenberg::g_config.rockHandBoneColliderSet) {
             if (!s_loggedDisabled) {
-                spdlog::info("[ROCK::HandBoneCollider] Disabled by config (bRockHandBoneColliderSet=false)");
+                spdlog::info("[ROCK::HandBoneCollider] Disabled by config ([RockIntegration] bHandBoneColliderSet=false)");
                 s_loggedDisabled = true;
             }
             return;
@@ -234,6 +235,22 @@ namespace heisenberg::rock_hand_collider
                 spdlog::info("[ROCK::HandBoneCollider] {} hand built {}/{} bodies (PA={}{})",
                              isLeft ? "LEFT" : "RIGHT", createdCount, kRolesPerHand, pa ? "yes" : "no",
                              createdCount < kRolesPerHand ? ", PARTIAL after retry cap" : "");
+
+                // Feed the native-contact evidence pipeline. In this 16-body config the cup
+                // path (the only other SubscribeForBody caller) is torn down, so without this
+                // the ContactImpulseListener never sees a hand body: mode-3 NativeWorld
+                // pushback records and hand-contact haptics both go dead. Subscribe the PALM
+                // body only (the listener tracks one bodyId per hand). Do this ONLY here after
+                // the latch — never in the retry loop above, where DestroyHand churns bodies
+                // and UnsubscribeBody has no real Havok unsubscribe (would leak signal hooks).
+                auto& cl = heisenberg::ContactImpulseListener::GetSingleton();
+                cl.SetWorld(bhkWorld);
+                for (int i = 0; i < kRolesPerHand; ++i) {
+                    if (kRoles[i].seg == Segment::Palm && hs.bodies[i]) {
+                        cl.SubscribeForBody(hs.bodies[i]->GetBodyId(), isLeft);
+                        break;
+                    }
+                }
             }
             s_attempts[side01] = 0;
             return hs.built;
@@ -253,6 +270,10 @@ namespace heisenberg::rock_hand_collider
 
     static void DestroyHand(HandSet& hs)
     {
+        // Clear the ContactImpulseListener's subscribed bodyId for this hand BEFORE freeing
+        // the bodies, so a stale subscribed id can never match a freed/reused body slot.
+        // Safe to call even when nothing was subscribed (no-op clears the per-hand id).
+        heisenberg::ContactImpulseListener::GetSingleton().UnsubscribeBody(&hs == &g_left);
         // Drop any proxy-cached support pointer to these bodies before freeing them
         // (refcounted dangling pointer = char-proxy crash). See Physics helper.
         heisenberg::Physics::ClearPlayerProxySupportBody();
@@ -430,5 +451,61 @@ namespace heisenberg::rock_hand_collider
 
         DriveHand(g_left);
         DriveHand(g_right);
+    }
+
+    // Geometry-only build of the 16 finger-segment capsules from the live FRIK skeleton
+    // (getCommonNode), independent of the physics bodies. Same bone table + radii as the
+    // colliders; tips degenerate to a sphere at the distal bone. For the mode-3 soft-contact
+    // runtime (hand-vs-hand/body/weapon via SoftContactMath).
+    int BuildHandCapsules(bool isLeft, std::array<heisenberg::rock_core::soft_contact_math::Capsule, kCapsulesPerHand>& out)
+    {
+        for (auto& c : out) {
+            c = {};
+        }
+        auto* root = f4cf::f4vr::getCommonNode();
+        if (!root) {
+            return 0;
+        }
+        const bool pa = Utils::IsPlayerInPowerArmor();
+        const char* side = isLeft ? "L" : "R";
+        char ba[64], bb[64];
+        int n = 0;
+        for (int i = 0; i < kRolesPerHand; ++i) {
+            std::snprintf(ba, sizeof(ba), kRoles[i].boneA, side);
+            auto* nodeA = f4vr::findAVObject(root, ba);
+            if (!nodeA) {
+                continue;
+            }
+            const RE::NiPoint3 start = nodeA->world.translate;
+            RE::NiPoint3 end = start;  // default: sphere at the distal bone
+            if (kRoles[i].boneB && kRoles[i].boneB[0]) {
+                std::snprintf(bb, sizeof(bb), kRoles[i].boneB, side);
+                auto* nodeB = f4vr::findAVObject(root, bb);
+                if (!nodeB) {
+                    continue;
+                }
+                end = nodeB->world.translate;
+            } else if (nodeA->parent) {
+                // Tip bone (no child): project the capsule out along the finger's OWN direction
+                // (parent→tip), by a fingertip length, so the geometry actually covers the
+                // fingertip instead of collapsing to a sphere at the distal joint. Geometry-
+                // derived direction — no bone-axis/roll assumption — and scales with hand size.
+                const RE::NiPoint3 parentPos = nodeA->parent->world.translate;
+                const RE::NiPoint3 dir = start - parentPos;
+                const float len = std::sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+                if (len > 1.0e-4f) {
+                    constexpr float kTipLength = 1.5f;  // distal-phalanx fingertip reach (game units)
+                    const float s = kTipLength / len;
+                    end = RE::NiPoint3(start.x + dir.x * s, start.y + dir.y * s, start.z + dir.z * s);
+                }
+            }
+            out[i].start = start;
+            out[i].end = end;
+            out[i].radius = roleRadius(kRoles[i].seg, pa);
+            out[i].id = static_cast<std::uint32_t>((isLeft ? 100 : 200) + i);
+            out[i].valid = true;
+            ++n;
+        }
+        return n;
     }
 }

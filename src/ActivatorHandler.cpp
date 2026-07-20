@@ -38,6 +38,8 @@ namespace heisenberg
 [Whitelist]
 ; Known working activators from Interactive Activators VR
 Water Fountain=0x0020DE62
+Vault Water Fountain=0x000B1CFE
+Vault Sink=0x000C3676
 Elevator Call Button=0x000F7C7C
 Elevator Floor Button=0x000F7C7B
 Big Red Button=0x0005815F
@@ -59,6 +61,20 @@ Port-A-Diner=0x0019F4C6
 ; Water fountain - target the button bone instead of root
 ; fBoneButton is where the actual push button is located
 sTargetNode=fBoneButton
+fActivationRadius=10.0
+fPointingRadius=30.0
+fZOffset=0.0
+
+[Vault Water Fountain:000B1CFE]
+; Clean Vault 111 fountain uses the same visible push-button bone as the rads variant.
+sTargetNode=fBoneButton
+fActivationRadius=10.0
+fPointingRadius=30.0
+fZOffset=0.0
+
+[Vault Sink:000C3676]
+; Vault 111 sink activation is located on the tap, well away from the model root.
+sTargetNode=fBoneTap
 fActivationRadius=10.0
 fPointingRadius=30.0
 fZOffset=0.0

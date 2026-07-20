@@ -249,6 +249,16 @@ namespace heisenberg
                 // (oldContainer=player, newContainer=0, refID=0), causing a bullet to spawn in hand.
                 auto* baseForm = RE::TESForm::GetFormByID(a_event.baseObjectFormID);
                 if (baseForm) {
+                    // A consumable that was just USED (not dropped) is marked by the EquipObject hook
+                    // right before the game consumes it. Using a chem/food/drink fires the same
+                    // old=player->new=0 event as a drop, so without this an activated item (e.g. Jet)
+                    // gets yanked to the hand even with consume-to-hand OFF. A real DROP never goes
+                    // through EquipObject, so it's not marked and still grabs.
+                    if (WasRecentlyStored(a_event.baseObjectFormID)) {
+                        spdlog::debug("[DropToHand] Skipping {:08X} — consumed/handled via equip, not a drop",
+                            a_event.baseObjectFormID);
+                        return RE::BSEventNotifyControl::kContinue;
+                    }
                     if (baseForm->GetFormType() == RE::ENUM_FORM_ID::kAMMO) {
                         spdlog::debug("[DropToHand] Skipping ammo {:08X} - consumed by weapon fire, not a drop",
                             a_event.baseObjectFormID);
@@ -299,6 +309,20 @@ namespace heisenberg
                             spdlog::info("[DropToHand] Skipping engine item {:08X} '{}' edID='{}' (HC_/omod prefix)",
                                 a_event.baseObjectFormID,
                                 RE::TESFullName::GetFullName(*baseForm, false), editorID);
+                            return RE::BSEventNotifyControl::kContinue;
+                        }
+                    }
+                    // Survival HC status tokens (Parched/Thirsty/Dehydrated/...) are PLAYABLE ALCH
+                    // with an empty editor ID, slipping past both guards above. They're invisible
+                    // (no model) → a drop-to-hand waits forever for a 3D, times out, re-adds the
+                    // token (re-applying its effect) and re-queues = the "status effects loop" bug.
+                    // Real chems have a model and stay grabbable. Skip only model-less ALCH.
+                    if (baseForm->GetFormType() == RE::ENUM_FORM_ID::kALCH) {
+                        const char* modelPath = nullptr;
+                        if (auto* asModel = baseForm->As<RE::TESModel>()) modelPath = asModel->GetModel();
+                        if (!modelPath || modelPath[0] == '\0') {
+                            spdlog::info("[DropToHand] Skipping model-less ALCH {:08X} (invisible survival/status token)",
+                                a_event.baseObjectFormID);
                             return RE::BSEventNotifyControl::kContinue;
                         }
                     }
@@ -849,9 +873,33 @@ namespace heisenberg
         // If target hand is already holding something, skip this drop
         // Don't interrupt existing grabs
         if (grabMgr.IsGrabbing(isLeft)) {
-            spdlog::debug("[DropToHand] Target {} hand occupied, skipping drop {:08X}", 
+            spdlog::debug("[DropToHand] Target {} hand occupied, skipping drop {:08X}",
                 isLeft ? "left" : "right", drop.referenceFormID);
             return true;  // Remove from queue, let item fall naturally
+        }
+
+        // HOLSTER-FIRST: when this drop targets the WEAPON hand and a weapon is drawn, sheathe
+        // it and WAIT (re-queue) until it's holstered before placing the item — otherwise the
+        // item appears in hand while the weapon is still drawn (the holotape, always the
+        // right/weapon hand, is the visible case). Must run BEFORE _grabsInProgress.insert below,
+        // or the re-queued drop would be dropped by the "grab already in progress" guard above.
+        // Frame cap is a failsafe so the queue can never stick.
+        {
+            auto* pc = f4vr::getPlayer();  // F4SEVR::PlayerCharacter — has actorState
+            const bool targetIsWeaponHand = (isLeft == VRInput::GetSingleton().IsLeftHandedMode());
+            if (pc && targetIsWeaponHand && pc->GetWeaponMagicDrawn()) {
+                int& waited = _weaponSheatheWait[drop.referenceFormID];
+                if (waited == 0) {
+                    if (auto* rePc = RE::PlayerCharacter::GetSingleton())
+                        rePc->DrawWeaponMagicHands(false);  // sheathe the drawn weapon (or fists)
+                    spdlog::debug("[DropToHand] Weapon drawn on target hand — sheathing before placing {:08X}", drop.referenceFormID);
+                }
+                if (++waited < 90) {  // ~1.5s failsafe at 60fps
+                    return false;     // keep in queue; retry next frame until holstered
+                }
+                spdlog::warn("[DropToHand] Sheathe wait timed out for {:08X} — placing anyway", drop.referenceFormID);
+            }
+            _weaponSheatheWait.erase(drop.referenceFormID);
         }
         
         // Log match quality for debugging (no filtering - all items go to hand)

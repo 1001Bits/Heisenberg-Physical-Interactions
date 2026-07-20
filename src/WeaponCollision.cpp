@@ -420,20 +420,20 @@ namespace heisenberg
         auto* player = f4vr::getPlayer();
         if (!player) return false;
 
-        if (!player->actorState.IsWeaponDrawn()) return false;
+        if (!player->GetWeaponMagicDrawn()) return false;
 
         // Check if equipped weapon exists and is melee
-        // Access via middleProcess chain (same as Grab.cpp HasRealWeaponEquipped)
-        if (!player->middleProcess) return false;
-        auto* unk08 = player->middleProcess->unk08;
-        if (!unk08) return false;
-        auto* equipData = unk08->equipData;
-        if (!equipData) return false;
-        auto* item = equipData->item;
+        // Access via currentProcess->middleHigh->equippedItems (RE framework; same as Grab.cpp).
+        if (!player->currentProcess) return false;
+        auto* middleHigh = player->currentProcess->middleHigh;
+        if (!middleHigh || middleHigh->equippedItems.empty()) return false;
+        auto* item = middleHigh->equippedItems.front().item.object;
         if (!item) return false;
 
-        // Check if it has a name (real weapon, not Unarmed)
-        const char* name = item->GetFullName();
+        // Check if it has a name (real weapon, not Unarmed). item is TESBoundObject* (no
+        // GetFullName mixin) — use the TESFullName helper (RE framework).
+        const auto nameView = RE::TESFullName::GetFullName(*item);
+        const char* name = nameView.empty() ? nullptr : nameView.data();
         if (!name || name[0] == '\0') return false;
 
         // IsWeaponDrawn() guarantees this is a weapon, name check filters Unarmed.

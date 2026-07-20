@@ -53,7 +53,7 @@ namespace heisenberg::rock_two_handed_grip
             return;
         }
         if (!heisenberg::g_config.rockWeaponCollision) {
-            spdlog::warn("[ROCK::TwoHandedGrip] Requires bRockWeaponCollision=true — DISABLED");
+            spdlog::warn("[ROCK::TwoHandedGrip] Requires [RockIntegration] bWeaponCollision=true — DISABLED");
             return;
         }
         spdlog::info("[ROCK::TwoHandedGrip] Init — will poll FRIK + ramp stabilization factor 0->1 over {:.1f}s",

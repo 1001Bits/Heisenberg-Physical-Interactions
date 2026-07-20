@@ -6,6 +6,7 @@
 #include "FRIKInterface.h"
 #include "Grab.h"
 #include "Heisenberg.h"
+#include "../external/ROCK/src/ROCKMain.h"
 #include "HeisenbergInterface001.h"
 #include "Highlight.h"
 #include "Hooks.h"
@@ -13,6 +14,8 @@
 #include "ContactImpulseListener.h"
 #include "Physics.h"
 #include "PickpocketHandler.h"
+#include "RockReleaseVelocity.h"
+#include "rock/RockBridge.h"
 #include "SmartGrabHandler.h"
 #include "Utils.h"
 #include "VRInput.h"
@@ -72,7 +75,9 @@ namespace heisenberg
     Hand::Hand(bool isLeft) :
         _isLeft(isLeft),
         _handNodeName(isLeft ? "LArm_Hand" : "RArm_Hand"),
-        _velocityHistory(5, RE::NiPoint3())
+        _velocityHistory(5, RE::NiPoint3()),
+        _localVelocityHistory(5, RE::NiPoint3()),
+        _angularVelocityHistory(5, RE::NiPoint3())
     {
         spdlog::debug("Created {} hand", isLeft ? "left" : "right");
     }
@@ -217,8 +222,11 @@ namespace heisenberg
             float analogGrip = gripValue;
             bool hasAnalog = (gripValue > 0.0f);
             const char* tag = logTransition ? (gripPressed ? "PRESS" : "RELEASE") : "SAMPLE";
+            // PERF: periodic SAMPLEs at debug (they were per-second per-hand info spam);
+            // PRESS/RELEASE transitions stay at info — those are the diagnostic edges.
+            const auto lvl = logTransition ? spdlog::level::info : spdlog::level::debug;
             if (grabButton != VRButton::Grip) {
-                spdlog::info("[GRAB-BTN:{}] {} hand: button={} raw=0x{:016X} bit7={} bit2={} analog={:.2f} hasAnalog={} pressed={} config=L{}/R{}",
+                spdlog::log(lvl, "[GRAB-BTN:{}] {} hand: button={} raw=0x{:016X} bit7={} bit2={} analog={:.2f} hasAnalog={} pressed={} config=L{}/R{}",
                     tag,
                     _isLeft ? "Left" : "Right",
                     static_cast<int>(grabButton),
@@ -229,7 +237,7 @@ namespace heisenberg
                     gripPressed,
                     g_config.useXForLeftGrab, g_config.useAForRightGrab);
             } else {
-                spdlog::info("[GRAB-BTN:{}] {} hand: analog={:.2f} hasAnalog={} bit2={} bit7={} gripVal={:.2f} pressed={} _prev={} state={} config=L{}/R{}",
+                spdlog::log(lvl, "[GRAB-BTN:{}] {} hand: analog={:.2f} hasAnalog={} bit2={} bit7={} gripVal={:.2f} pressed={} _prev={} state={} config=L{}/R{}",
                             tag,
                             _isLeft ? "Left" : "Right",
                             analogGrip, hasAnalog,
@@ -241,31 +249,16 @@ namespace heisenberg
         }
 
         // =========================================================================
-        // FRIK TWO-HANDED MODE DETECTION
+        // OFF-HAND GRIP OWNERSHIP
         // =========================================================================
-        // When FRIK is in two-handed weapon mode, the offhand grip is used to grip
-        // the weapon. We should NOT intercept this grip for Heisenberg object grabbing.
-        // Only skip for the OFF-hand - primary hand grip should still work for dropping objects.
-        // Off-hand = left normally, right in left-handed mode
-        auto& frik = FRIKInterface::GetSingleton();
-        bool frikTwoHandedActive = frik.IsOffHandGrippingWeapon();
-        
-        // If this is the offhand and FRIK is in two-handed mode, don't process Heisenberg grab
-        if (IsOffHand() && frikTwoHandedActive)
-        {
-            // If we're holding something and FRIK just took over, release it
-            if (_state == State::Held || _state == State::Pulling)
-            {
-                spdlog::debug("[FRIK] Offhand entering two-handed mode - releasing grab");
-                auto& grabMgr = GrabManager::GetSingleton();
-                grabMgr.EndGrab(_isLeft, nullptr);  // Drop without throw
-                TransitionToIdle();
-            }
-            
-            // Don't process grip input for Heisenberg while in two-handed mode
-            _grabPressed = gripPressed;  // Track state but don't act on it
-            return;
-        }
+        // REMOVED (Jul 6, user directive "remove the offhand can't grab while armed rule"):
+        // Heisenberg used to early-return here when FRIK reported the off-hand was in two-handed
+        // weapon mode (IsOffHandGrippingWeapon), which blocked ALL off-hand object grabbing while a
+        // weapon was drawn. The embedded ROCK engine now owns two-handed support grip via its own
+        // proximity detection (grip near the weapon foregrip), so Heisenberg does not need to cede
+        // the off-hand grip. The off-hand now processes grip for object grabbing exactly like the
+        // primary hand; ROCK still two-hands the weapon when the off-hand is actually on the foregrip
+        // (that path is independent of this grab interception, and two-handing was confirmed working).
 
         // Check if hand is disabled via the API (another plugin called DisableHand)
         if (HeisenbergPluginAPI::IsHandDisabledByAPI(_isLeft)) {
@@ -305,9 +298,14 @@ namespace heisenberg
                                  _isLeft ? "Left" : "Right");
                     OnGrabPressed();
                 } else {
-                    // Not holding — start hold timer, don't grab yet
+                    // Not holding — start hold timer, don't grab yet.
+                    // Latch _grabPressed so this press-edge branch doesn't re-fire (and reset
+                    // the timer) every frame; without it the hold-confirmation branch below —
+                    // which requires _grabPressed==true — was unreachable, so A/X hold-to-grab
+                    // could never confirm.
                     _axGrabPressTime = Utils::GetTime();
                     _axGrabHoldConfirmed = false;
+                    _grabPressed = true;
                     spdlog::debug("[INPUT] {} A/X PRESSED — waiting for hold confirmation",
                                  _isLeft ? "Left" : "Right");
                 }
@@ -344,6 +342,10 @@ namespace heisenberg
                                  _isLeft ? "Left" : "Right");
                 }
                 _axGrabHoldConfirmed = false;
+                // Clear the press latch on every release sub-case. The confirmed-hold path
+                // already cleared it via OnGrabReleased, but the tap and anti-bounce paths did
+                // not — leaving _grabPressed stuck true would swallow the next A/X press edge.
+                _grabPressed = false;
             }
         }
         // Grip: immediate grab (no hold delay)
@@ -392,24 +394,79 @@ namespace heisenberg
         
         // Get BOTH position and rotation from wand node
         _prevPosition = _position;
+        RE::NiMatrix3 prevRotation = _rotation;
         _position = wandNode->world.translate;
         _rotation = wandNode->world.rotate;
-        
+
         // Calculate velocity
         float dt = 1.0f / 90.0f; // Assume 90Hz for now - TODO: get actual frame time
         _lastDeltaTime = dt;
         if (dt > 0.0f) {
             RE::NiPoint3 newVelocity = (_position - _prevPosition) / dt;
-            
+
             // Add to history and compute average
             _velocityHistory.pop_back();
             _velocityHistory.push_front(newVelocity);
-            
+
             _velocity = RE::NiPoint3();
             for (const auto& v : _velocityHistory) {
                 _velocity += v;
             }
             _velocity /= static_cast<float>(_velocityHistory.size());
+
+            // ── ROCK-faithful release tracking (audit rank 3) ─────────────────────────
+            // WARP GATE (rank 3a): ROCK samples held-hand motion only on non-warp frames and
+            // zeroes player velocity on a room-space warp (snap turn / teleport). Those events
+            // jump the wand's WORLD position ~0.2-0.3 m in one frame (a ~15-20 m/s phantom
+            // spike) without moving player->data.location, so the spike would survive into the
+            // release. We detect it by implausible raw hand speed (no human hand moves this
+            // fast) and SKIP the release-history push that frame, preserving the last good
+            // samples. kWarpSpeed = 1500 game u/s ≈ 21 m/s (well above ~10 m/s peak hand speed).
+            constexpr float kWarpSpeed = 1500.0f;
+            const float rawSpeed = std::sqrt(newVelocity.x * newVelocity.x + newVelocity.y * newVelocity.y + newVelocity.z * newVelocity.z);
+            const bool warpFrame = rawSpeed > kWarpSpeed;
+
+            // Player locomotion velocity: ROCK composes throws from the player-LOCAL hand
+            // velocity and adds the player velocity back UNSCALED after the throw multiplier.
+            // Using the raw world hand velocity would over-boost the locomotion component by
+            // the multiplier. Zeroed on warp frames (ROCK does the same).
+            if (!warpFrame) {
+                if (auto* player = RE::PlayerCharacter::GetSingleton()) {
+                    const RE::NiPoint3 playerPos = player->data.location;
+                    if (_hasPrevPlayerPos) {
+                        _playerVelocity = (playerPos - _prevPlayerPos) / dt;
+                    } else {
+                        _playerVelocity = RE::NiPoint3();
+                    }
+                    _prevPlayerPos = playerPos;
+                    _hasPrevPlayerPos = true;
+                } else {
+                    _playerVelocity = RE::NiPoint3();
+                    _hasPrevPlayerPos = false;
+                }
+                _localVelocityHistory.pop_back();
+                _localVelocityHistory.push_front(newVelocity - _playerVelocity);
+
+                // Hand angular velocity (world frame, rad/s) from the frame's rotation delta.
+                // F4VR row-vector convention: world axes are the ROWS of the rotation matrix.
+                // omega ≈ 0.5 * Σ(prevAxis × curAxis) / dt — the small-angle axis*theta/dt form,
+                // same construction as the dynamic-drive alignment in Grab.cpp.
+                RE::NiPoint3 w{ 0.0f, 0.0f, 0.0f };
+                for (int r = 0; r < 3; ++r) {
+                    const float px = prevRotation.entry[r][0], py = prevRotation.entry[r][1], pz = prevRotation.entry[r][2];
+                    const float cx = _rotation.entry[r][0], cy = _rotation.entry[r][1], cz = _rotation.entry[r][2];
+                    w.x += py * cz - pz * cy;
+                    w.y += pz * cx - px * cz;
+                    w.z += px * cy - py * cx;
+                }
+                const float g = 0.5f / dt;
+                _angularVelocityHistory.pop_back();
+                _angularVelocityHistory.push_front(RE::NiPoint3{ w.x * g, w.y * g, w.z * g });
+
+                if (_relSampleCount < _localVelocityHistory.size()) {
+                    ++_relSampleCount;
+                }
+            }
         }
         
         // PERF: Removed periodic tracking log - was causing unnecessary log IO
@@ -738,6 +795,23 @@ namespace heisenberg
     {
         _grabPressed = true;
 
+        // OFFHAND-VS-GRAB GATE (Jul 18, user request): while this hand is engaging the equipped
+        // weapon (ROCK two-handed support touch/grip), a grip press means "grab the weapon" —
+        // NOT "grab a world object". Starting a Heisenberg grab here made two systems pose the
+        // same hand (ROCK support grip + our grab/pull) = the chewing-gum stretch.
+        if (heisenberg::IsRockEngineHosted() && rock::HostIsWeaponSupportEngaged(_isLeft)) {
+            spdlog::debug("[GRAB] {} hand: grip press ceded to ROCK two-handed support grip (no object grab)",
+                          _isLeft ? "Left" : "Right");
+            return;
+        }
+
+        // iGrabMode=9 (RockNativeGrab): the embedded ROCK engine reads grip input itself and owns
+        // grab+selection end-to-end. Heisenberg must not contend for the grip or start its own
+        // grabs (double-grab / input-flap — see the two-handed offhand grip conflict).
+        if (g_config.grabMode == static_cast<int>(GrabMode::RockNativeGrab) && heisenberg::IsRockEngineHosted()) {
+            return;
+        }
+
         // Check if we have an active grab — both sticky and non-sticky desync cases.
         // Must be checked BEFORE menu cooldown: player should be able to release
         // a grab immediately after closing Pipboy (not blocked by 1s cooldown).
@@ -828,10 +902,11 @@ namespace heisenberg
                 // which would cause repeated unequip triggers on subsequent grip presses.
                 if (g_config.enableStorageZoneWeaponEquip && IsPrimaryHand() && storageCheck.isInZone) {
                     auto* player = f4vr::getPlayer();
-                    if (player && player->actorState.IsWeaponDrawn() &&
-                        player->middleProcess && player->middleProcess->unk08 &&
-                        player->middleProcess->unk08->equipData && player->middleProcess->unk08->equipData->item) {
-                        auto* item = player->middleProcess->unk08->equipData->item;
+                    if (player && player->GetWeaponMagicDrawn() &&
+                        player->currentProcess && player->currentProcess->middleHigh &&
+                        !player->currentProcess->middleHigh->equippedItems.empty() &&
+                        player->currentProcess->middleHigh->equippedItems.front().item.object) {
+                        auto* item = player->currentProcess->middleHigh->equippedItems.front().item.object;
                         auto* reForm = reinterpret_cast<RE::TESForm*>(item);
                         // Only unequip real weapons (guns, melee) - skip throwables and non-weapons
                         bool isRealWeapon = false;
@@ -855,7 +930,7 @@ namespace heisenberg
                     }
                     // RE-EQUIP: Weapon not drawn, but we have a previously unequipped weapon
                     // Grip in storage zone with weapon hand → re-equip the last unequipped weapon
-                    else if (player && !player->actorState.IsWeaponDrawn()) {
+                    else if (player && !player->GetWeaponMagicDrawn()) {
                         auto* lastWeapon = g_heisenberg.GetLastUnequippedWeapon();
                         if (lastWeapon) {
                             auto weaponName = g_heisenberg.GetLastUnequippedWeaponName();
@@ -888,6 +963,11 @@ namespace heisenberg
     void Hand::OnGrabReleased()
     {
         _grabPressed = false;
+
+        // iGrabMode=9 (RockNativeGrab): release is ROCK's to handle too.
+        if (g_config.grabMode == static_cast<int>(GrabMode::RockNativeGrab) && heisenberg::IsRockEngineHosted()) {
+            return;
+        }
         
         // Get the grab state from GrabManager - this is the authoritative source
         // because grabs can be started by DropToHand without going through Hand state machine
@@ -939,6 +1019,21 @@ namespace heisenberg
     {
         // Block grabbing if hand is disabled via API
         if (HeisenbergPluginAPI::IsHandDisabledByAPI(_isLeft)) {
+            return false;
+        }
+
+        // ROCK owns the world-object grab (fully dynamic held object). When delegating,
+        // Heisenberg never initiates a world grab from selection/pull/transfer — ROCK does.
+        // Gated on ROCK actually being active so the toggle is a no-op without ROCK, and so
+        // it never silently disables grab when ROCK is absent. Programmatic in-hand placement
+        // (loot/drop/holotape) bypasses this via GrabManager::StartGrabOnRef and is unaffected.
+        if (g_config.delegateWorldGrabToRock && RockBridge::GetSingleton().IsRunning()) {
+            static bool loggedDelegate = false;
+            if (!loggedDelegate) {
+                spdlog::info("[GRAB] World-object grab delegated to ROCK (bDelegateWorldGrabToRock) — "
+                             "Heisenberg will not initiate world grabs.");
+                loggedDelegate = true;
+            }
             return false;
         }
 
@@ -1030,20 +1125,75 @@ namespace heisenberg
         auto& grabMgr = GrabManager::GetSingleton();
         
         if (throw_object) {
-            // Calculate throw velocity from hand velocity, clamped to max
-            RE::NiPoint3 throwVel = _velocity * Config::GetSingleton().throwVelocityBoostFactor;
-            // Clamp each axis to max velocity
-            throwVel.x = std::clamp(throwVel.x, -kMaxThrowVelocity, kMaxThrowVelocity);
-            throwVel.y = std::clamp(throwVel.y, -kMaxThrowVelocity, kMaxThrowVelocity);
-            throwVel.z = std::clamp(throwVel.z, -kMaxThrowVelocity, kMaxThrowVelocity);
-            
-            // Check if velocity is above threshold - if not, just drop without velocity
-            float speed = std::sqrt(throwVel.x * throwVel.x + throwVel.y * throwVel.y + throwVel.z * throwVel.z);
+            // FAITHFULNESS (2026-07-05 audit rank 3): ROCK's release/throw composition —
+            // replaces mean-velocity * boost + per-axis ±500 clamp + dead-drop deadband.
+            //   local = handLocal + tangential(swing lever) + 0.35*objectLocal
+            //   final = clampMag(player + multiplier * clampMag(local, 12), 12)   [Havok m/s]
+            //   angular = clampMag(handAngular, 18 rad/s)
+            // Sampling is MAX-MAGNITUDE over the history ring, not the mean; hand velocity is
+            // player-LOCAL with the player's locomotion added back UNSCALED. ROCK has NO
+            // minimum-speed deadband — slow releases carry their (small) velocity, which is
+            // what makes gentle drops separate cleanly instead of dead-dropping.
+            // See RockReleaseVelocity.h (mirrored from GrabHeldObject.h grab_held_response).
+            namespace rrv = heisenberg::rock_release_velocity;
+            constexpr float kHavokWorldScale = 0.0142875f;
+
+            const RE::NiPoint3 handLocalGame = rrv::maxMagnitudeVelocity(_localVelocityHistory, _relSampleCount);
+            const RE::NiPoint3 handAngular = rrv::maxMagnitudeVelocity(_angularVelocityHistory, _relSampleCount);
+            const RE::NiPoint3 handLocalHavok = handLocalGame * kHavokWorldScale;
+            const RE::NiPoint3 playerHavok = _playerVelocity * kHavokWorldScale;
+
+            // Tangential swing/lever term about the held object's center (node origin ≈ COM
+            // for clutter; ROCK reads the true body COM via its native layer).
+            RE::NiPoint3 tangentialHavok{};
+            bool hasTangential = false;
+            {
+                auto& state = grabMgr.GetGrabState(_isLeft);
+                if (state.active && state.node) {
+                    tangentialHavok = rrv::computeTangentialVelocityFromAngularSwing(
+                        handAngular,
+                        _position * kHavokWorldScale,
+                        state.node->world.translate * kHavokWorldScale);
+                    hasTangential = rrv::lengthSquaredOf(tangentialHavok) > 0.000001f;
+                }
+            }
+
+            // Object-velocity blend: ROCK blends 0.35 of the dynamic held object's own local
+            // velocity history. Our keyframed/velocity-driven held object tracks the hand
+            // target exactly, so its local velocity ≡ the hand's local velocity.
+            const RE::NiPoint3 releaseHavok = rrv::composeControllerReleaseVelocity({
+                .controllerDerivedEnabled = true,
+                .hasHandLocalVelocity = true,
+                .hasObjectLocalVelocity = true,
+                .hasTangentialVelocity = hasTangential,
+                .handLocalVelocityHavok = handLocalHavok,
+                .objectLocalVelocityHavok = handLocalHavok,
+                .playerVelocityHavok = playerHavok,
+                .tangentialVelocityHavok = tangentialHavok,
+                .objectVelocityBlend = 0.35f,                                        // ROCK fGrabThrowObjectVelocityBlend
+                .tangentialVelocityScale = 1.0f,                                     // ROCK fGrabThrowTangentialVelocityScale
+                .throwMultiplier = Config::GetSingleton().throwVelocityBoostFactor,  // == ROCK fThrowVelocityMultiplier (1.5)
+                .maxVelocityHavok = 12.0f,                                           // ROCK fGrabThrowMaxVelocityHavok
+            });
+            RE::NiPoint3 releaseAngular = rrv::composeControllerReleaseAngularVelocity({
+                .controllerDerivedEnabled = true,
+                .hasHandAngularVelocity = true,
+                .handAngularVelocityRadiansPerSecond = handAngular,
+                .angularVelocityScale = 1.0f,                                        // ROCK fGrabThrowAngularVelocityScale
+                .maxAngularVelocityRadiansPerSecond = 18.0f,                         // ROCK fGrabThrowMaxAngularVelocityRadiansPerSecond
+            });
+
+            RE::NiPoint3 throwVel = releaseHavok * (1.0f / kHavokWorldScale);  // back to game u/s for EndGrab
+            const float speed = rrv::lengthOf(throwVel);
+            // Legacy deadband knob (fThrowVelocityThreshold): ROCK has none — ship 0 in the
+            // INI so every release carries its velocity; the knob remains for users who want
+            // the old dead-drop behavior back.
             if (speed >= Config::GetSingleton().throwVelocityThreshold) {
-                grabMgr.EndGrab(_isLeft, &throwVel);
-                spdlog::debug("{} hand threw object with velocity ({:.2f}, {:.2f}, {:.2f}) speed={:.2f}",
+                grabMgr.EndGrab(_isLeft, &throwVel, false, &releaseAngular);
+                spdlog::debug("{} hand released object with velocity ({:.2f}, {:.2f}, {:.2f}) speed={:.2f} angular=({:.2f},{:.2f},{:.2f})",
                               _isLeft ? "Left" : "Right",
-                              throwVel.x, throwVel.y, throwVel.z, speed);
+                              throwVel.x, throwVel.y, throwVel.z, speed,
+                              releaseAngular.x, releaseAngular.y, releaseAngular.z);
             } else {
                 grabMgr.EndGrab(_isLeft, nullptr);
                 spdlog::debug("{} hand dropped object (speed {:.2f} below threshold {:.2f})",

@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.23)
 # >>> Project
 set(NAME "Heisenberg_F4VR")
 set(FRIENDLY_NAME "Heisenberg F4VR")
-set(VERSION 0.7.0)
+set(VERSION 0.8.1)
 
 message(">>> Start build for '${NAME}' v${VERSION}")
 
@@ -66,6 +66,44 @@ set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_DEBUG OFF)
 add_subdirectory(${F4VR_COMMON_FRAMEWORK_PATH} "F4VRCommonFramework" EXCLUDE_FROM_ALL)
 
 
+# >>> Vendored ROCK engine (Route A: pristine source compiled as a static lib).
+# Source lives in external/ROCK/src (pinned — see external/ROCK/VENDORED_FROM.txt).
+# ROCKMain.cpp's F4SEPlugin_Query/Load exports have been stripped and replaced by
+# rock::HostLoad() (embedded-host entry) — Heisenberg owns the F4SE entry point and calls
+# HostLoad after its own init, gated on bUseRockEngineArchitecture. So ROCKMain.cpp is now
+# COMPILED INTO rock_engine (no longer filtered out).
+set(ROCK_DIR "${ROOT_DIR}/external/ROCK")
+if(EXISTS "${ROCK_DIR}/src/PCH.h")
+  file(GLOB_RECURSE rock_sources CONFIGURE_DEPENDS "${ROCK_DIR}/src/*.cpp")
+  file(GLOB_RECURSE rock_headers CONFIGURE_DEPENDS "${ROCK_DIR}/src/*.h")
+  file(GLOB_RECURSE rock_inls    CONFIGURE_DEPENDS "${ROCK_DIR}/src/*.inl")
+
+  add_library(rock_engine STATIC EXCLUDE_FROM_ALL ${rock_sources} ${rock_headers} ${rock_inls})
+  target_compile_features(rock_engine PRIVATE cxx_std_23)
+  target_compile_definitions(rock_engine PRIVATE _UNICODE)
+  target_include_directories(rock_engine PRIVATE "${ROCK_DIR}/generated" "${ROCK_DIR}/src")
+  find_package(cpptrace CONFIG REQUIRED)
+  target_link_libraries(rock_engine PRIVATE F4VRCommon::framework cpptrace::cpptrace d3d11.lib dxgi.lib d3dcompiler.lib)
+  target_precompile_headers(rock_engine PRIVATE "${ROCK_DIR}/src/PCH.h")
+  # Vendored code: relax warnings (no /WX), mirror ROCK's essential flags.
+  target_compile_options(rock_engine PRIVATE /utf-8 /permissive- /Zc:preprocessor /EHsc /bigobj /W1)
+  # Disable LTO/LTCG for rock_engine so its codegen matches the known-good STANDALONE ROCK build
+  # (which builds this identical source with IPO OFF). The directory-scope
+  # CMAKE_INTERPROCEDURAL_OPTIMIZATION=ON (line 61) is otherwise inherited by this target.
+  # NOTE: LTCG was investigated as, but PROVEN NOT to be, the cause of the g_rockConfig config-load
+  # CTD (a minimal MSVC repro showed heap-std::string NSDMIs compile to a valid non-null buffer
+  # under /GL+/LTCG too). The real cause of that "unkillable" crash was a STALE BUILD (a 3-week-old
+  # main-target PCH surviving incremental builds) plus a STALE RESIDENT DLL image (F4SE loads DLLs
+  # only at launch, so a save-reload kept the old pre-fix binary running). The source fixes that
+  # actually matter live in RockConfig.{h,cpp}: `extern` single-definition of g_rockConfig + empty
+  # NSDMIs on the 3 heap strings (set at runtime in resetToDefaults). This IPO-OFF line is kept as
+  # harmless parity-with-standalone insurance, not as the fix. See memory
+  # project_rock_embed_build_milestone_jun13.md ("FOURTH-CRASH REAL ROOT CAUSE").
+  set_target_properties(rock_engine PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF)
+  message(">>> rock_engine target defined (vendored ROCK source, compile-proof; LTO OFF = standalone parity)")
+endif()
+
+
 # >>> Version & resource files
 configure_file(${ROOT_DIR}/cmake/version.rc.in  ${BUILD_DIR}/version.rc  @ONLY)
 configure_file(${ROOT_DIR}/cmake/Version.h.in   ${BUILD_DIR}/include/Version.h @ONLY)
@@ -76,6 +114,18 @@ source_group(TREE ${BUILD_DIR} FILES ${BUILD_DIR}/include/Version.h ${BUILD_DIR}
 file(GLOB_RECURSE headers CONFIGURE_DEPENDS "${SOURCE_DIR}/*.h")
 file(GLOB_RECURSE sources CONFIGURE_DEPENDS "${SOURCE_DIR}/*.cpp")
 list(FILTER sources EXCLUDE REGEX "HIGGS\\.cpp$")
+
+# >>> ODR isolation vs the embedded rock_engine (second architecture).
+# The in-house rock_integration ports formerly reused the engine's bare `rock::` namespace,
+# which silently merged their weak/COMDAT symbols with the vendored engine's DIVERGENT copies
+# (~54 sub-namespaces + direct types collided — the generalization of the old g_rockConfig ODR
+# crash; integration audit H3). All in-house ports are now namespace-isolated under
+# `heisenberg::rock_core::` (references to genuine engine symbols — rock::api, rock::HostLoad,
+# rock::g_rockConfig/RockConfig, rock::push_assist, rock::grab_finger_pose_math,
+# rock::selection_query_policy — deliberately stay `rock::`). Distinct namespaces = no COMDAT
+# merge, so the three strong-symbol ports below no longer collide and are compiled normally;
+# their consumers (RockGrabCoreManager etc.) now resolve against the in-house copy they were
+# written against, not an arbitrary COMDAT winner.
 source_group(TREE ${ROOT_DIR} FILES ${headers} ${sources})
 
 
@@ -105,11 +155,12 @@ target_include_directories(${PROJECT_NAME}
 target_link_libraries(${PROJECT_NAME}
   PRIVATE
     F4VRCommon::framework
+    rock_engine   # embedded ROCK grab/physics engine (second architecture; gated at runtime)
 )
 
 
 # >>> PCH
-target_precompile_headers(${PROJECT_NAME} PRIVATE src/PCH.h)
+target_precompile_headers(${PROJECT_NAME} PRIVATE backups/0.7.2/PCH.h)
 
 
 # >>> Compile / Link options
@@ -136,7 +187,13 @@ target_compile_options(${PROJECT_NAME}
     /Zc:sizedDealloc
     /Zc:strictStrings
     /Zc:ternary
-    /Zc:threadSafeInit
+    # threadSafeInit- : use a simple init-flag for function-local statics instead of the
+    # locking guard. The locking guard (_Init_thread_wait_v2) DEADLOCKS when a static's
+    # initialization is unwound by an SEH __except (e.g. HookEndUpdate's "tape deck skipped"
+    # guard interrupting a lazy static init in the holotape path) — the guard is left locked
+    # and the NEXT access waits forever (the second-holotape-insert freeze). With '-', an
+    # interrupted init simply retries on next access instead of hanging.
+    /Zc:threadSafeInit-
     /Zc:tlsGuards
     /Zc:trigraphs
     /Zc:wchar_t

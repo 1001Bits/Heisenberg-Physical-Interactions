@@ -448,6 +448,11 @@ namespace heisenberg
                 if (refrPtr) {
                     ClearTelekinesisObjectSeh(refrPtr.get());
                 }
+                // CATCH FIX (Jul 18): flight is over — drop the CCD look-ahead that the
+                // release path enabled (tiny epsilon: the <=0 path doesn't write the field).
+                if (_hknpWorld) {
+                    heisenberg::Physics::TrySetBodyCollisionLookAhead(_hknpWorld, it->first, 0.001f);
+                }
                 it = _byBodyId.erase(it);
             } else {
                 ++it;

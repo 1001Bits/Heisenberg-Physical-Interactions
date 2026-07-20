@@ -267,12 +267,14 @@ namespace heisenberg
 
         // Periodic debug logging (every ~5 seconds at 90fps)
         static int s_debugCounter = 0;
-        if (++s_debugCounter >= 450) {
+        // PERF: debug-only (was info), and skip the two GetWaterHeightAt() probes entirely
+        // when debug logging is off — they were paid every 5s just to format a log line.
+        if (++s_debugCounter >= 450 && spdlog::should_log(spdlog::level::debug)) {
             s_debugCounter = 0;
             float lWH = -10000.0f, rWH = -10000.0f;
             if (leftWand) lWH = GetWaterHeightAt(leftWand->world.translate);
             if (rightWand) rWH = GetWaterHeightAt(rightWand->world.translate);
-            spdlog::info("[Water] Update running — L={} R={} LwH={:.1f} RwH={:.1f} Lsub={} Rsub={} spd={:.1f} depth={:.1f}",
+            spdlog::debug("[Water] Update running — L={} R={} LwH={:.1f} RwH={:.1f} Lsub={} Rsub={} spd={:.1f} depth={:.1f}",
                          leftWand ? "yes" : "no", rightWand ? "yes" : "no",
                          lWH, rWH,
                          _leftHand.isSubmerged, _rightHand.isSubmerged,

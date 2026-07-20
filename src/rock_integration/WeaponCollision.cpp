@@ -4,6 +4,8 @@
 #include "../GrabConstraint.h"
 #include "../Physics.h"
 #include "../Utils.h"
+#include "../DualWieldAPI.h"
+#include "../DualWieldWeaponContact.h"
 #include "../FingerCurves.h"         // GetTriangles — tight per-vertex weapon bounds
 #include "weapon/WeaponGeometry.h"   // ported ROCK weapon-collision geometry math
 
@@ -49,18 +51,24 @@ namespace heisenberg::rock_weapon_collision
     static bool s_initialized = false;
     static bool s_loggedDisabled = false;
 
-    bool IsActive() { return s_initialized && heisenberg::g_config.rockWeaponCollision; }
+    static bool WantsWeaponCollision()
+    {
+        return heisenberg::g_config.rockWeaponCollision ||
+               HeisenbergPluginAPI::HasDualWieldStateProvider();
+    }
+
+    bool IsActive() { return s_initialized && WantsWeaponCollision(); }
 
     void Init()
     {
-        if (!heisenberg::g_config.rockWeaponCollision) {
+        if (!WantsWeaponCollision()) {
             if (!s_loggedDisabled) {
                 spdlog::info("[ROCK::WeaponCollision] Disabled by config");
                 s_loggedDisabled = true;
             }
             return;
         }
-        spdlog::info("[ROCK::WeaponCollision] Init — will track Weapon/WeaponLeft attachments per frame");
+        spdlog::info("[ROCK::WeaponCollision] Init — tracking Weapon/WeaponLeft attachments (dual-wield provider can force-enable)");
         s_initialized = true;
     }
 
@@ -215,7 +223,7 @@ namespace heisenberg::rock_weapon_collision
     static void* BuildConvexHull(const std::vector<RE::NiPoint3>& localPoints)
     {
         namespace cf = heisenberg::ConstraintFunctions;
-        namespace wg = rock::weapon_collision_geometry_math;
+        namespace wg = heisenberg::rock_core::weapon_collision_geometry_math;
         if (localPoints.size() < 4) return nullptr;
         constexpr std::size_t kMaxHullPoints = 200;
         std::vector<RE::NiPoint3> pts = wg::limitPointCloud(localPoints, kMaxHullPoints);
@@ -255,10 +263,11 @@ namespace heisenberg::rock_weapon_collision
         return false;
     }
 
-    static void EnsureBody(WeaponHand& hand, void* hknpWorld, void* bhkWorld, const char* label)
+    static void EnsureBody(
+        WeaponHand& hand, void* hknpWorld, void* bhkWorld, const char* label, bool isLeft)
     {
         if (hand.body || !hand.weaponNode) return;
-        namespace wg = rock::weapon_collision_geometry_math;
+        namespace wg = heisenberg::rock_core::weapon_collision_geometry_math;
 
         // Swap-detection baseline MUST stay in the worldBound metric — the per-frame swap check
         // (below, in Update) re-profiles via ProfileWeapon/worldBound and compares to halfX/Y/Z.
@@ -318,12 +327,17 @@ namespace heisenberg::rock_weapon_collision
         hand.halfX = wbHx;  // swap-detection baseline (worldBound metric)
         hand.halfY = wbHy;
         hand.halfZ = wbHz;
+        if (!heisenberg::dual_wield_contact::Subscribe(
+                hknpWorld, bb->GetBodyId(), isLeft)) {
+            spdlog::warn("[ROCK::WeaponCollision] {} contact bridge subscription failed", label);
+        }
         spdlog::info("[ROCK::WeaponCollision] {} body created ({}, {} verts, swapHalf=({:.1f},{:.1f},{:.1f}))",
                      label, shapeKind, nPts, wbHx, wbHy, wbHz);
     }
 
-    static void DestroyBody(WeaponHand& hand, const char* label)
+    static void DestroyBody(WeaponHand& hand, const char* label, bool isLeft)
     {
+        heisenberg::dual_wield_contact::Unsubscribe(isLeft);
         if (!hand.body) return;
         // Drop any proxy-cached support pointer to this body before freeing it
         // (refcounted dangling pointer = char-proxy crash). See Physics helper.
@@ -338,8 +352,8 @@ namespace heisenberg::rock_weapon_collision
     void Shutdown()
     {
         if (!s_initialized) return;
-        DestroyBody(g_right, "RIGHT");
-        DestroyBody(g_left,  "LEFT");
+        DestroyBody(g_right, "RIGHT", false);
+        DestroyBody(g_left,  "LEFT", true);
         g_right.weaponNode.reset();
         g_left.weaponNode.reset();
         g_right.wasEquipped = false;
@@ -373,7 +387,14 @@ namespace heisenberg::rock_weapon_collision
         hand.body->SetTransform(s_hk);
     }
 
-    static void HandleHand(WeaponHand& hand, RE::NiAVObject* skeletonRoot, const char* nodeName, const char* label)
+    static void HandleHand(
+        WeaponHand& hand,
+        RE::NiAVObject* skeletonRoot,
+        const char* nodeName,
+        const char* label,
+        bool isLeft,
+        RE::NiAVObject* providerNode = nullptr,
+        bool providerAuthoritative = false)
     {
         // Throttled collision-check log (~every 120 frames) so the weapon hull state is
         // visible without spamming. Covers all three cases: node missing, equipped/empty,
@@ -381,7 +402,11 @@ namespace heisenberg::rock_weapon_collision
         static int s_throttle = 0;
         const bool logNow = ((s_throttle++ % 120) == 0);
 
-        if (!hand.weaponNode) {
+        if (providerAuthoritative && hand.weaponNode.get() != providerNode) {
+            DestroyBody(hand, label, isLeft);
+            hand.weaponNode.reset(providerNode);
+            hand.wasEquipped = false;
+        } else if (!providerAuthoritative && !hand.weaponNode) {
             auto* wn = Utils::FindNode(skeletonRoot, nodeName);
             if (!wn) {
                 if (logNow) spdlog::info("[ROCK::WeaponCollision] {} check: node '{}' not found under firstPersonSkeleton (no weapon attach point)", label, nodeName);
@@ -390,7 +415,9 @@ namespace heisenberg::rock_weapon_collision
             hand.weaponNode.reset(wn);
             spdlog::info("[ROCK::WeaponCollision] {} found weapon attach node '{}'", label, nodeName);
         }
-        const bool equipped = WeaponNodeHasContent(hand.weaponNode.get());
+        const bool equipped = providerAuthoritative ?
+            providerNode != nullptr :
+            WeaponNodeHasContent(hand.weaponNode.get());
         if (logNow) {
             spdlog::info("[ROCK::WeaponCollision] {} check: equipped={} hull={} (half {:.2f},{:.2f},{:.2f})",
                          label, equipped ? "yes" : "no", hand.body ? "built" : "none",
@@ -410,14 +437,14 @@ namespace heisenberg::rock_weapon_collision
             if (divX > 0.25f || divY > 0.25f || divZ > 0.25f) {
                 spdlog::info("[ROCK::WeaponCollision] {} weapon size changed ({:.1f},{:.1f},{:.1f})->({:.1f},{:.1f},{:.1f}) — rebuild",
                              label, hand.halfX, hand.halfY, hand.halfZ, nhx, nhy, nhz);
-                DestroyBody(hand, label);
+                DestroyBody(hand, label, isLeft);
             }
         }
 
         if (equipped && !hand.body) {
-            EnsureBody(hand, g_hknpWorld, g_bhkWorld, label);
+            EnsureBody(hand, g_hknpWorld, g_bhkWorld, label, isLeft);
         } else if (!equipped && hand.wasEquipped) {
-            DestroyBody(hand, label);
+            DestroyBody(hand, label, isLeft);
         }
         hand.wasEquipped = equipped;
 
@@ -437,7 +464,21 @@ namespace heisenberg::rock_weapon_collision
 
     void Update()
     {
-        if (!IsActive()) return;
+        // Also handles a late dependency handshake without requiring a reload.
+        if (!s_initialized && HeisenbergPluginAPI::HasDualWieldStateProvider()) {
+            Init();
+        }
+        if (!IsActive()) {
+            // A provider can force-enable this module over a disabled legacy
+            // setting. Tear its bodies down on provider loss instead of leaving
+            // ghost keyframed hulls behind until the next world shutdown.
+            if (s_initialized &&
+                (g_right.body || g_left.body || g_right.weaponNode.get() ||
+                 g_left.weaponNode.get())) {
+                Shutdown();
+            }
+            return;
+        }
 
         auto* player = RE::PlayerCharacter::GetSingleton();
         if (!player || !player->parentCell) return;
@@ -451,8 +492,8 @@ namespace heisenberg::rock_weapon_collision
         // weapon-node pointers and re-cache, so we never drive bodies in freed memory.
         if (g_hknpWorld && g_hknpWorld != hknp) {
             spdlog::info("[ROCK::WeaponCollision] World changed → drop weapon bodies");
-            DestroyBody(g_right, "RIGHT");
-            DestroyBody(g_left, "LEFT");
+            DestroyBody(g_right, "RIGHT", false);
+            DestroyBody(g_left, "LEFT", true);
             g_right.weaponNode.reset();
             g_left.weaponNode.reset();
             g_right.wasEquipped = false;
@@ -467,7 +508,96 @@ namespace heisenberg::rock_weapon_collision
         auto* root = f4cf::f4vr::getFirstPersonSkeleton();
         if (!root) return;
 
-        HandleHand(g_right, root, "Weapon",     "RIGHT");
-        HandleHand(g_left,  root, "WeaponLeft", "LEFT");
+        if (HeisenbergPluginAPI::HasDualWieldStateProvider()) {
+            auto rightState = HeisenbergPluginAPI::MakeHandState(
+                HeisenbergPluginAPI::PhysicalHand::kRight);
+            auto leftState = HeisenbergPluginAPI::MakeHandState(
+                HeisenbergPluginAPI::PhysicalHand::kLeft);
+            const bool hasRight = HeisenbergPluginAPI::QueryDualWieldHandState(
+                HeisenbergPluginAPI::PhysicalHand::kRight, rightState);
+            const bool hasLeft = HeisenbergPluginAPI::QueryDualWieldHandState(
+                HeisenbergPluginAPI::PhysicalHand::kLeft, leftState);
+
+            auto getRoot = [](bool available, const HeisenbergPluginAPI::DualWieldHandState& state) {
+                const bool occupied = (state.flags & HeisenbergPluginAPI::kHandStateOccupied) != 0;
+                const bool rootValid = (state.flags & HeisenbergPluginAPI::kHandStateWeaponRootValid) != 0;
+                const bool categoryValid = state.itemCategory != HeisenbergPluginAPI::ItemCategory::kNone;
+                return available && occupied && rootValid && categoryValid ? state.weaponRoot : nullptr;
+            };
+
+            HandleHand(
+                g_right, root, "Weapon", "RIGHT", false,
+                getRoot(hasRight, rightState), true);
+            HandleHand(
+                g_left, root, "WeaponLeft", "LEFT", true,
+                getRoot(hasLeft, leftState), true);
+        } else {
+            // Build-2 behavior remains the fallback when no provider owns the slot.
+            HandleHand(g_right, root, "Weapon", "RIGHT", false);
+            HandleHand(g_left, root, "WeaponLeft", "LEFT", true);
+        }
+    }
+
+    // Geometry-only weapon capsule for the mode-3 soft-contact runtime. Finds the equipped
+    // weapon node under firstPersonSkeleton, profiles its AABB (reusing ProfileWeapon), and
+    // returns a world-space capsule along the weapon's longest local axis. Independent of the
+    // physics hull / bWeaponCollision.
+    bool BuildWeaponCapsule(bool isLeft, heisenberg::rock_core::soft_contact_math::Capsule& out)
+    {
+        out = {};
+        auto* root = f4cf::f4vr::getFirstPersonSkeleton();
+        if (!root) {
+            return false;
+        }
+        const char* nodeName = isLeft ? "WeaponLeft" : "Weapon";
+        auto* wn = Utils::FindNode(root, nodeName);
+        if (!wn || !WeaponNodeHasContent(wn)) {
+            return false;
+        }
+
+        float hx = 0.0f, hy = 0.0f, hz = 0.0f;
+        RE::NiPoint3 cLocal{};
+        ProfileWeapon(wn, hx, hy, hz, cLocal);
+
+        // Capsule along the weapon's LONGEST local axis; radius = larger of the other two.
+        int axis = 0;
+        float halfLen = hx;
+        float radius = (std::max)(hy, hz);
+        if (hy >= hx && hy >= hz) {
+            axis = 1;
+            halfLen = hy;
+            radius = (std::max)(hx, hz);
+        } else if (hz >= hx && hz >= hy) {
+            axis = 2;
+            halfLen = hz;
+            radius = (std::max)(hx, hy);
+        }
+
+        RE::NiPoint3 axisLocal{ 0.0f, 0.0f, 0.0f };
+        if (axis == 0) {
+            axisLocal.x = halfLen;
+        } else if (axis == 1) {
+            axisLocal.y = halfLen;
+        } else {
+            axisLocal.z = halfLen;
+        }
+        const RE::NiPoint3 startL{ cLocal.x - axisLocal.x, cLocal.y - axisLocal.y, cLocal.z - axisLocal.z };
+        const RE::NiPoint3 endL{ cLocal.x + axisLocal.x, cLocal.y + axisLocal.y, cLocal.z + axisLocal.z };
+
+        // world = pos + R * local (matches GatherBounds' local = R^T*(world - pos)).
+        const auto& W = wn->world;
+        const auto& R = W.rotate;
+        auto toWorld = [&](const RE::NiPoint3& l) -> RE::NiPoint3 {
+            return RE::NiPoint3(
+                W.translate.x + R.entry[0][0] * l.x + R.entry[0][1] * l.y + R.entry[0][2] * l.z,
+                W.translate.y + R.entry[1][0] * l.x + R.entry[1][1] * l.y + R.entry[1][2] * l.z,
+                W.translate.z + R.entry[2][0] * l.x + R.entry[2][1] * l.y + R.entry[2][2] * l.z);
+        };
+        out.start = toWorld(startL);
+        out.end = toWorld(endL);
+        out.radius = (std::max)(0.5f, radius);
+        out.id = isLeft ? 501u : 500u;
+        out.valid = true;
+        return true;
     }
 }

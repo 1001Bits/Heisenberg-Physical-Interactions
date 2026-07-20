@@ -1,4 +1,6 @@
 #include "Heisenberg.h"
+#include "HandAuthority.h"
+#include "FrikArmGoalHook.h"
 
 #include <chrono>
 #include <cstring>
@@ -20,6 +22,9 @@
 #include "FingerCurves.h"
 #include "WandNodeHelper.h"
 #include "HeldBodyGrab.h"
+#include "HandBumpHook.h"
+#include "HavokTimingFix.h"
+#include "rock_integration/grab/RockGrabCoreManager.h"
 // ROCK integration subsystems (toggled in [RockIntegration] INI section)
 #include "rock_integration/HandBoneColliderSet.h"
 #include "rock_integration/BodyBoneColliderSet.h"
@@ -30,6 +35,7 @@
 #include "ItemInsertHandler.h"
 #include "ItemOffsets.h"
 #include "ItemPositionConfigMode.h"
+#include "IntroCeremonyState.h"
 #include "MenuChecker.h"
 #include "NodeCaptureMode.h"
 #include "OpenVRHook.h"
@@ -38,7 +44,9 @@
 #include "WaterInteraction.h"
 #include "PlayerCharacterProxyListener.h"
 #include "rock/RockBridge.h"
+#include "../external/ROCK/src/ROCKMain.h"  // rock::HostLoad — embedded-engine host entry (lightweight fwd-decl header only)
 #include "SmartGrabHandler.h"
+#include "ThrownObjectTracker.h"
 #include "Utils.h"
 #include "VRInput.h"
 #include "WandNodeHelper.h"
@@ -48,6 +56,52 @@
 
 namespace heisenberg
 {
+    // True once the embedded ROCK engine has been hosted (bUseRockEngineArchitecture=1 + HostLoad OK).
+    // Gates whether OnF4SEMessage forwards F4SE messages into ROCK: ROCK cannot register its own
+    // F4SE-core listener in this single DLL (F4SE keeps Heisenberg's first-registered one), so ROCK
+    // only receives kGameLoaded/kPostLoadGame/kNewGame via that forward. Must stay false when the
+    // toggle is off, or forwarding would run ROCK's FRIK/physics init despite the engine being dormant.
+    static bool s_rockEngineHosted = false;
+
+    // Public accessor (audit rank 10): ownership gates elsewhere (e.g. Hooks.cpp
+    // UpdateHandCollisionBodies) must treat the EMBEDDED engine like a running ROCK.dll.
+    // RockBridge::IsRunning() binds via GetModuleHandleA("ROCK.dll") and is structurally
+    // always false in the embed, so gates keyed only on it never yield to the hosted engine.
+    bool IsRockEngineHosted() { return s_rockEngineHosted; }
+
+    // ---- Scope-mode exit on support-grip release (Jul 19, user request) ----
+    // Covers BOTH scope systems:
+    //  - BetterScopesVR zoom: state tracked from its msg-15 broadcast; exit = msg-16 toggle
+    //    (only sent while its own state says zoomed, so it can never toggle zoom ON).
+    //  - Vanilla ScopeMenu: tracked by MenuChecker; exit = UIMessageQueue kHide.
+    static bool s_lookingThroughScope = false;
+
+    void SetLookingThroughScope(bool a_looking)
+    {
+        if (s_lookingThroughScope != a_looking) {
+            spdlog::debug("[SCOPE] BetterScopesVR looking-through-scope = {}", a_looking);
+        }
+        s_lookingThroughScope = a_looking;
+    }
+
+    void ExitScopeModeOnGripRelease()
+    {
+        if (s_lookingThroughScope) {
+            s_lookingThroughScope = false;  // optimistic; its next msg 15 re-syncs
+            if (const auto* messaging = F4SE::GetMessagingInterface()) {
+                messaging->Dispatch(16, nullptr, 0, "FO4VRBETTERSCOPES");
+                spdlog::info("[SCOPE] support grip released while zoomed — sent scope-mode exit toggle to BetterScopesVR");
+            }
+        }
+        if (MenuChecker::GetSingleton().IsScopeOpen()) {
+            if (auto* msgQueue = RE::UIMessageQueue::GetSingleton()) {
+                static RE::BSFixedString scopeMenuName("ScopeMenu");
+                msgQueue->AddMessage(scopeMenuName, RE::UI_MESSAGE_TYPE::kHide);
+                spdlog::info("[SCOPE] support grip released while vanilla ScopeMenu open — sent kHide");
+            }
+        }
+    }
+
     // Destructor - defined here where Hand is complete
     Heisenberg::~Heisenberg() = default;
 
@@ -85,6 +139,36 @@ namespace heisenberg
     static void OnExternalPluginMessage(F4SE::MessagingInterface::Message* a_msg)
     {
         if (!a_msg) {
+            return;
+        }
+
+        // FRIK ("F4VRBody") lifecycle events (kSkeletonReady / kSkeletonDestroying / ...) must reach the
+        // embedded ROCK engine so it builds+destroys its hand/weapon colliders. ROCK cannot own a
+        // {plugin,"F4VRBody"} listener slot in this shared DLL (F4SE keeps our null-sender listener,
+        // registered first), so — exactly like the F4SE-core forward in OnF4SEMessage — we forward every
+        // FRIK message here. Without this the engine stays parked at "waiting for skeleton" and no ROCK
+        // hand/weapon collision ever occurs. Gated on s_rockEngineHosted so a dormant engine is untouched.
+        // "F4VRBody" is FRIK's F4SE plugin name (frik::api::FRIKApi::FRIK_F4SE_MOD_NAME).
+        // BetterScopesVR ("FO4VRBETTERSCOPES") broadcasts msg 15 with looking-through-scope
+        // state (data pointer used as the bool, mirroring FRIK's reading of the protocol).
+        // Tracked so releasing the two-handed support grip can exit scope mode (msg 16 toggle).
+        if (a_msg->sender && std::strcmp(a_msg->sender, "FO4VRBETTERSCOPES") == 0) {
+            if (a_msg->type == 15) {
+                heisenberg::SetLookingThroughScope(static_cast<bool>(a_msg->data));
+            }
+            return;
+        }
+
+        if (s_rockEngineHosted && a_msg->sender && std::strcmp(a_msg->sender, "F4VRBody") == 0) {
+            // Host-adapter isolation (integration audit §3.1 / C1): a fault inside the embedded
+            // engine must never std::terminate Heisenberg's own message handling.
+            try {
+                rock::HostOnFRIKMessage(a_msg);
+            } catch (const std::exception& e) {
+                spdlog::error("[Heisenberg] embedded ROCK threw in HostOnFRIKMessage (type={}): {}", a_msg->type, e.what());
+            } catch (...) {
+                spdlog::error("[Heisenberg] embedded ROCK threw (non-std) in HostOnFRIKMessage (type={})", a_msg->type);
+            }
             return;
         }
 
@@ -139,6 +223,23 @@ namespace heisenberg
             return;
         }
 
+        // Forward every F4SE-core message into the embedded ROCK engine. ROCK can't register its own
+        // {plugin,"F4SE"} listener (this DLL already has ours), so this is the ONLY way it receives
+        // kGameLoaded -> FRIKApi::initialize -> PhysicsInteraction. Gated on s_rockEngineHosted so a
+        // dormant engine (toggle off / HostLoad failed) is never driven.
+        if (s_rockEngineHosted) {
+            // Host-adapter isolation (integration audit §3.1 / C1): swallow+log any engine fault
+            // (e.g. RockConfig::load throwing when its embedded ROCK.ini resource is missing on a
+            // clean install) so it can't std::terminate the whole DLL.
+            try {
+                rock::HostOnF4SEMessage(a_msg);
+            } catch (const std::exception& e) {
+                spdlog::error("[Heisenberg] embedded ROCK threw in HostOnF4SEMessage (type={}): {}", a_msg->type, e.what());
+            } catch (...) {
+                spdlog::error("[Heisenberg] embedded ROCK threw (non-std) in HostOnF4SEMessage (type={})", a_msg->type);
+            }
+        }
+
         switch (a_msg->type) {
         case F4SE::MessagingInterface::kPostLoad:
             // All F4SE plugins (incl. ROCK) have loaded — safe to bind ROCK's API.
@@ -149,6 +250,13 @@ namespace heisenberg
             ForceWaterDisplacementEnabled();
             spdlog::info("[Water] Forced displacement settings at kGameLoaded");
             g_heisenberg.OnGameLoad();
+            // FRIK-GOAL seam (v5-equivalent hand authority): install AFTER FRIK is loaded
+            // and initialized. Stands down automatically if the loaded FRIK has API v5+.
+            if (heisenberg::FRIKInterface::GetSingleton().GetApiVersion() >= 5) {
+                spdlog::info("[FRIK-GOAL] loaded FRIK reports API v5+ — native authority path, seam not needed");
+            } else {
+                heisenberg::FrikArmGoalHook::Install();
+            }
             break;
         case F4SE::MessagingInterface::kPreSaveGame:
             spdlog::info("[SAVE] kPreSaveGame - force-releasing all grabbed objects");
@@ -161,6 +269,10 @@ namespace heisenberg
         case F4SE::MessagingInterface::kPreLoadGame:
             ForceWaterDisplacementEnabled();
             spdlog::info("[Water] Forced displacement settings at kPreLoadGame");
+            // Clear the previous save's ceremony bit before F4SE attempts to load the next
+            // co-save. Legacy saves may have no .f4se file at all, in which case F4SE never
+            // calls our load callback and this explicit reset is the only safe boundary.
+            heisenberg::IntroCeremonyState::PrepareForLoad();
             // Disable all "to hand" interception immediately — engine transfers during
             // load must not be intercepted (survival effects, perk items, etc.)
             heisenberg::DropToHand::SetSessionNotReady();
@@ -187,8 +299,14 @@ namespace heisenberg
             heisenberg::rock_hand_collider::Shutdown();
             heisenberg::rock_body_collider::Shutdown();
             heisenberg::rock_weapon_collision::Shutdown();
+            heisenberg::rock_grab_core::RockGrabCoreManager::GetSingleton().Shutdown();
             // Release any active FRIK hand-pushback overrides + reset tracking.
             heisenberg::hand_wall_pushback::Reset();
+            heisenberg::HandAuthority::Reset();
+            // Clear thrown-object tracking - tracked bodies, pending impacts, and the cached
+            // hknpWorld pointer all become stale across a load (UAF on first post-load throw).
+            heisenberg::ThrownObjectTracker::GetSingleton().Reset();
+            heisenberg::ThrownObjectTracker::GetSingleton().SetWorld(nullptr);
             // Clear pending drops/loots - form IDs become invalid
             heisenberg::DropToHand::GetSingleton().ClearState();
             // Clear cooking handler state - refs become invalid
@@ -199,6 +317,8 @@ namespace heisenberg
             heisenberg::PipboyInteraction::GetSingleton().ClearState();
             // Clear pickpocket state - NPC handles become invalid
             heisenberg::PickpocketHandler::GetSingleton().ClearState();
+            // Clear water hand-submersion / player-position tracking - stale across loads
+            heisenberg::WaterInteraction::GetSingleton().ClearState();
             // Unregister proxy listener before player is unloaded
             heisenberg::PlayerCharacterProxyListener::GetSingleton().UnregisterFromPlayer();
             // Clear last-unequipped weapon tracking - form becomes invalid
@@ -231,8 +351,14 @@ namespace heisenberg
             heisenberg::rock_hand_collider::Shutdown();
             heisenberg::rock_body_collider::Shutdown();
             heisenberg::rock_weapon_collision::Shutdown();
+            heisenberg::rock_grab_core::RockGrabCoreManager::GetSingleton().Shutdown();
             // Release any active FRIK hand-pushback overrides + reset tracking.
             heisenberg::hand_wall_pushback::Reset();
+            heisenberg::HandAuthority::Reset();
+            // Clear thrown-object tracking - tracked bodies, pending impacts, and the cached
+            // hknpWorld pointer all become stale across a load (UAF on first post-load throw).
+            heisenberg::ThrownObjectTracker::GetSingleton().Reset();
+            heisenberg::ThrownObjectTracker::GetSingleton().SetWorld(nullptr);
             // Clear pending drops/loots - form IDs become invalid
             heisenberg::DropToHand::GetSingleton().ClearState();
             // Clear cooking handler state - refs become invalid
@@ -243,6 +369,8 @@ namespace heisenberg
             heisenberg::PipboyInteraction::GetSingleton().ClearState();
             // Clear pickpocket state - NPC handles become invalid
             heisenberg::PickpocketHandler::GetSingleton().ClearState();
+            // Clear water hand-submersion / player-position tracking - stale across loads
+            heisenberg::WaterInteraction::GetSingleton().ClearState();
             // Intro holotape: on new game, wait for vault exit; on load, deliver after 3s
             if (a_msg->type == F4SE::MessagingInterface::kNewGame) {
                 heisenberg::PipboyInteraction::GetSingleton().SetNewGame();
@@ -303,7 +431,11 @@ namespace heisenberg
         // Default to INFO so startup/config messages are visible until
         // Config::Load() applies the user's iLogLevel setting.
         spdlog::set_level(spdlog::level::info);
-        spdlog::flush_on(spdlog::level::info);
+        // PERF (Jul 5): flush per WARN, not per INFO — flushing on every info line is an
+        // fflush write syscall per log call on the frame thread (~1000/s under load = real
+        // FPS cost). WER minidumps + dmp.py/sym.py cover crash forensics; bump to info/trace
+        // temporarily when chasing a CTD whose last line matters.
+        spdlog::flush_on(spdlog::level::warn);
 
         spdlog::info("Heisenberg F4VR loading...");
 
@@ -319,6 +451,11 @@ namespace heisenberg
             spdlog::critical("Failed to register message listener");
             return false;
         }
+
+        // The opening ceremony is save-local state, not a global INI preference.
+        // Register before any game/new-game messages can arrive. Failure is non-fatal:
+        // legacy holotape-presence inference still prevents ordinary re-delivery.
+        heisenberg::IntroCeremonyState::Initialize();
 
         // Register for messages from ALL other plugins (null sender). This is the
         // path that delivers the public Heisenberg plugin API: kMessage_GetInterface
@@ -340,6 +477,46 @@ namespace heisenberg
             spdlog::warn("OpenVR hook failed to initialize - input blocking disabled");
         }
 
+        // ─── SECOND ARCHITECTURE (embedded ROCK engine) ─────────────────────────────
+        // Read ONLY the master toggle directly from the INI here. The full Config::Load()
+        // runs later (kGameLoaded), but ROCK's host must register its own F4SE lifecycle
+        // listener NOW — before kGameLoaded fires — so it sees the same kGameLoaded that
+        // drives its FRIK init / config load / skeleton wait. When the toggle is off the
+        // linked engine stays completely dormant (no hook, no listener) = identical to today.
+        {
+            CSimpleIniA bootIni;
+            bootIni.SetUnicode();
+            bootIni.LoadFile("Data/F4SE/Plugins/Heisenberg_F4VR.ini");
+            const bool useRockEngine = bootIni.GetBoolValue("RockEngine", "bUseRockEngineArchitecture", false);
+            if (useRockEngine) {
+                spdlog::info("[RockEngine] bUseRockEngineArchitecture=1 — hosting embedded ROCK engine via rock::HostLoad()");
+                if (rock::HostLoad(a_f4se)) {
+                    s_rockEngineHosted = true;  // enable F4SE-message forwarding into ROCK (see OnF4SEMessage)
+                    // Register the plugin-side hand-authority table so ROCK's two-handing / wall-stop
+                    // route into our own hand placement when the loaded FRIK lacks the v5 API.
+                    rock::HostSetHandAuthority(reinterpret_cast<const rock::HostHandAuthority*>(&heisenberg::HandAuthority::HostTable()));
+                    // Jul 19 (frame-order audit): apply hand authority at the tail of ROCK's
+                    // frame — after its weapon write, before the bone-tree flatten — so the
+                    // rendered hand tracks the rendered weapon with zero lag.
+                    rock::HostSetPostUpdateCallback(&heisenberg::HandAuthority::ApplyWinners);
+                    // iGrabMode=9 (RockNativeGrab): cede grab+selection ownership to the embedded
+                    // engine for the whole session (read from the boot ini — g_config loads later).
+                    // The seam forces the embed's bGrabEnabled/bSelectionEnabled ON across every
+                    // ROCK.ini (re)load; Heisenberg's grip handlers stand down via GetEffectiveGrabMode.
+                    const long bootGrabMode = bootIni.GetLongValue("ObjectPickup", "iGrabMode", 0);
+                    if (bootGrabMode == 9) {
+                        rock::HostSetGrabOwnership(true);
+                        spdlog::info("[RockEngine] iGrabMode=9 — embedded ROCK owns grab+selection this session");
+                    }
+                    spdlog::info("[RockEngine] Embedded ROCK engine load OK — driven by ROCK.ini");
+                } else {
+                    spdlog::error("[RockEngine] rock::HostLoad() FAILED — embedded ROCK engine disabled this session");
+                }
+            } else {
+                spdlog::info("[RockEngine] bUseRockEngineArchitecture=0 — embedded ROCK engine dormant (default)");
+            }
+        }
+
         spdlog::info("Heisenberg F4VR loaded successfully");
         return true;
     }
@@ -357,6 +534,24 @@ namespace heisenberg
 
         // Apply grip weapon draw patch based on config (like STUF VR)
         Hooks::SetGripWeaponDrawDisabled(g_config.disableGripWeaponDraw);
+
+        // Arm the player char-proxy bump guard whenever physics hand bodies are active
+        // (they generate the player-proxy bumps that fault without it), or when forced on.
+        // Integration audit C4: the embedded ROCK engine spawns its OWN hand bodies (HBCS)
+        // independent of Heisenberg's hand-body flags, and ROCK's own installBumpHook is a
+        // dead patch (we hooked 0x1E24980 first, so its validation memcmp fails). Force our
+        // guard on whenever the engine is hosted, else the char-proxy bump hits the known CTD.
+        HandBumpHook::SetEnabled(g_config.rockHandBumpGuard
+                                 || g_config.usePhysicsHandBodies
+                                 || g_config.rockHandBoneColliderSet
+                                 || s_rockEngineHosted);
+
+        // Enable the ROCK Havok timing-fix substep override per config.
+        HavokTimingFix::SetEnabled(g_config.havokTimingFix);
+
+        // Initialize the ROCK grab-core host (idempotent). Selectable as iGrabMode=8 once
+        // bUseRockGrabCore is on; harmless otherwise.
+        rock_grab_core::RockGrabCoreManager::GetSingleton().Initialize();
 
         // Apply terminal-on-Pipboy patches based on config (after MCM settings loaded)
         Hooks::ApplyTerminalPatches(g_config.forceTerminalOnWrist);
@@ -1250,14 +1445,6 @@ namespace heisenberg
             // NOTE: Proxy listener registration disabled - charController is always null in VR
             // The hand pushback issue is NOT from physics collision - it's from VR hand reach limits
             // TODO: Find and hook the VR roomscale/hand reach constraint system
-#if 0
-            // Try to register proxy listener with player if not yet done
-            // (player may not be ready at OnGameLoad)
-            auto& proxyListener = PlayerCharacterProxyListener::GetSingleton();
-            if (!proxyListener.GetPlayerProxy()) {
-                proxyListener.RegisterWithPlayer();
-            }
-#endif
         }
 
         // ==== Node Capture Mode ====
@@ -1430,7 +1617,7 @@ namespace heisenberg
         if (g_config.enableWaterInteraction) {
             auto& wCfg = waterInteraction.GetConfig();
             wCfg.enabled = g_config.enableWaterInteraction;
-            wCfg.splashScale = 0.1f;
+            wCfg.splashScale = g_config.waterSplashScale;  // was hardcoded 0.1f — now forwards the fSplashScale INI/MCM slider (default 0.1, unchanged)
             wCfg.wakeEnabled = g_config.enableWakeRipples;
             wCfg.wakeAmt = g_config.wakeRippleAmount;
             wCfg.wakeIntervalMs = g_config.wakeRippleIntervalMs;
@@ -1469,8 +1656,11 @@ namespace heisenberg
             }
         }
 
-        // DISABLED FOR TESTING: Update item insert handler (Port-A-Diner, interactive discovery mode, etc.)
-        // ItemInsertHandler::GetSingleton().Update();
+        // Update item insert handler (Port-A-Diner, interactive discovery mode, etc.)
+        // Gated by the same master toggle as the sibling ActivatorHandler.
+        if (g_config.enableInteractiveActivators) {
+            ItemInsertHandler::GetSingleton().Update();
+        }
     }
 
     bool Heisenberg::IsHoldingAnything() const
@@ -1532,6 +1722,31 @@ namespace heisenberg
                     spdlog::debug("Heisenberg: Restored kFighting (unarmed sheathed)");
                 }
                 _postGrabFightingSuppressed = false;
+            }
+        }
+
+        // === PART 2.2: Block native weapon-draw (trigger auto-ready) while holding an object ===
+        // Fallout VR auto-readies/draws the equipped weapon when the trigger is pressed while
+        // holstered. With an object in hand (e.g. a holotape — always held in the right/weapon
+        // hand), that trigger unsheathes the weapon THROUGH the held item. The grip path is
+        // already blocked (ReadyWeaponHandler hook); the trigger path is only gated by kFighting,
+        // so suppress kFighting for the whole hold. Forced every frame while holding (overrides
+        // any stray re-enable) and self-correcting: once nothing is held we restore it (unless the
+        // post-grab unarmed path still owns it, in which case that path restores it).
+        {
+            auto& grabMgr = heisenberg::GrabManager::GetSingleton();
+            const bool holdingObject = grabMgr.IsGrabbing(true) || grabMgr.IsGrabbing(false);
+            if (holdingObject) {
+                if (inputManager) {
+                    inputManager->ForceUserEventEnabled(RE::UEFlag::kFighting, false);
+                }
+                _holdFightingSuppressed = true;
+            } else if (_holdFightingSuppressed) {
+                if (inputManager && !_postGrabFightingSuppressed) {
+                    inputManager->ForceUserEventEnabled(RE::UEFlag::kFighting, true);
+                    spdlog::debug("Heisenberg: Restored kFighting (object released — weapon draw re-enabled)");
+                }
+                _holdFightingSuppressed = false;
             }
         }
 
@@ -1979,7 +2194,7 @@ namespace heisenberg
         }
 
         // Cache weaponDrawn
-        bool weaponDrawn = f4vrPlayer->actorState.IsWeaponDrawn();
+        bool weaponDrawn = f4vrPlayer->GetWeaponMagicDrawn();
         const bool wasWeaponDrawn = _cachedWeaponDrawn.load(std::memory_order_relaxed);
         _cachedWeaponDrawn.store(weaponDrawn, std::memory_order_relaxed);
 
