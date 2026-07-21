@@ -522,9 +522,14 @@ namespace HeisenbergPluginAPI {
             if (!IsHandCollisionEnabled()) return nullptr;
             const auto& body = heisenberg::HandCollision::GetSingleton().GetHandBody(isLeft);
             if (!body.IsValid()) return nullptr;
-            // Return the hknpWorld pointer - caller can use bodyId from GetHandBody() for full access
-            // This is somewhat limited but avoids exposing internal structures
-            return body.hknpWorld;
+            // The published contract (HeisenbergInterface001.h) documents this as
+            // "Pointer to bhkNPCollisionObject" - this used to return body.hknpWorld
+            // instead (an unrelated type with a completely different layout). An external
+            // plugin following the documented contract and casting the result to
+            // RE::bhkNPCollisionObject* would read a garbage pointer from inside the
+            // hknpWorld and crash or corrupt on first use. Return what's actually
+            // documented: PhysicsHandBody::collisionObject IS the bhkNPCollisionObject*.
+            return body.collisionObject;
         }
 
         bool IsHandInContact(bool isLeft) override
@@ -591,8 +596,14 @@ namespace HeisenbergPluginAPI {
         bool IsOffHandGrippingWeapon() override
         {
             // Embedded ROCK owns two-handing; FRIK's isOffHandGrippingWeapon cannot see it.
+            // Uses HostIsWeaponSupportGripped (gripping only), NOT HostIsWeaponSupportEngaged
+            // (which also counts the Touching state - resting/brushing the off hand against
+            // the weapon's foregrip with no grip input, which this build-2 API's documented
+            // contract does not include). A consumer like VirtualReloads polling this to
+            // decide whether the support hand is actually gripping would otherwise get true
+            // on a bare hover and misclassify it as an engaged two-handed grip.
             return heisenberg::IsRockEngineHosted() &&
-                   (rock::HostIsWeaponSupportEngaged(true) || rock::HostIsWeaponSupportEngaged(false));
+                   (rock::HostIsWeaponSupportGripped(true) || rock::HostIsWeaponSupportGripped(false));
         }
 
         void DisableHandCollision(bool isLeft) override

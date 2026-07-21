@@ -213,6 +213,18 @@ namespace heisenberg
                          isLeft ? "L" : "R", handNode->name.c_str(), childNames);
         }
 
+        // Stage results locally and commit to g_handFinger* only on full 5/5 success
+        // (below). Writing straight into the live arrays inside the loop meant a
+        // partial-success frame (one finger bone missing/renamed) left SOME fingers
+        // holding fresh FRIK-frame data and others holding stale VRIK defaults - and
+        // since CalculateFingerCurlFromGeometry reads these arrays unconditionally
+        // (no g_fingerCalibrated gate), that mixed-frame state was used for every grab
+        // until a later frame happened to resolve all 5 (which, since nothing here
+        // resets a finger's flags/retry state between attempts, could be never).
+        RE::NiPoint3 stagedStartPositions[5]{};
+        RE::NiPoint3 stagedZeroAngleVecs[5]{};
+        RE::NiPoint3 stagedNormals[5]{};
+
         int foundCount = 0;
         for (int fi = 0; fi < 5; ++fi) {
             const int fingerDigit = fi + 1;  // 1=thumb..5=pinky in FRIK naming
@@ -251,6 +263,23 @@ namespace heisenberg
             const RE::NiPoint3 zeroAngle = v12 * (1.0f / proxLen);
             const float fingerLen = VectorLength(p3 - p1);
 
+            // STRAIGHTNESS GATE: FRIK's idle rest pose pre-curls the medial/distal joint
+            // ~40-50° (dot(d12,d23)~0.65-0.75, per the comment above). A hand actively
+            // gripping something at calibration time (trigger/grip held continuously since
+            // the first frame - TryCalibrateFingerDataIfIdle only checks button state, a
+            // weak proxy) shows much deeper curl. Reject this finger's sample when it's
+            // curled well past the documented idle range so a grip-since-load session
+            // can't commit a curled-frame calibration; retry next call instead.
+            const float v23Len = VectorLength(v23);
+            if (v23Len > 0.1f) {
+                const float straightnessDot = DotProduct(v12 * (1.0f / proxLen), v23 * (1.0f / v23Len));
+                if (straightnessDot < 0.4f) {
+                    spdlog::debug("[FINGER-CAL] {} hand: finger {} too curled to calibrate (dot={:.2f}) - skipping this attempt",
+                                 isLeft ? "LEFT" : "RIGHT", fi, straightnessDot);
+                    continue;
+                }
+            }
+
             // Curl plane normal from the bone triplet. Valid for any pose
             // where p1/p2/p3 aren't colinear — FRIK's pre-curled rest pose
             // guarantees a real bend, so this is always well-defined.
@@ -267,9 +296,9 @@ namespace heisenberg
             }
             normal = normal * (1.0f / nLen);
 
-            g_handFingerStartPositions[handIdx][fi] = p1;
-            g_handFingerZeroAngleVecs[handIdx][fi] = zeroAngle;
-            g_handFingerNormals[handIdx][fi] = normal;
+            stagedStartPositions[fi] = p1;
+            stagedZeroAngleVecs[fi] = zeroAngle;
+            stagedNormals[fi] = normal;
             foundCount++;
 
             spdlog::info("[FINGER-CAL] {} f{}: start=({:.2f},{:.2f},{:.2f}) zero=({:.3f},{:.3f},{:.3f}) normal=({:.3f},{:.3f},{:.3f}) len={:.2f}",
@@ -281,6 +310,14 @@ namespace heisenberg
         }
 
         if (foundCount == 5) {
+            // Commit the staged per-finger results now that all 5 resolved - never a
+            // mixed-frame partial commit (see the staging comment above the loop).
+            for (int i = 0; i < 5; ++i) {
+                g_handFingerStartPositions[handIdx][i] = stagedStartPositions[i];
+                g_handFingerZeroAngleVecs[handIdx][i] = stagedZeroAngleVecs[i];
+                g_handFingerNormals[handIdx][i] = stagedNormals[i];
+            }
+
             // Alt-thumb shares the thumb vectors — its alternate curl curve
             // is what matters, not the geometry. HIGGS uses slightly different
             // constants here but FRIK bone data doesn't expose that; thumb
@@ -652,31 +689,26 @@ namespace heisenberg
 
     int LookupFingerByAngle(const SavedFingerData fingerVals[], float desiredAngle, SavedFingerData* outData)
     {
-        // Binary search for the angle in the sorted finger curve data
-        // Finger data is sorted by increasing angle (from g_fingerTipVals[finger][0].angle to [200].angle)
-        int lo = 0;
-        int hi = kNumFingerVals - 1;
-        
-        while (lo < hi) {
-            int mid = (lo + hi) / 2;
-            if (fingerVals[mid].angle < desiredAngle) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
+        // Linear forward scan, NOT binary search: binary search requires the table to be
+        // sorted by angle, but the generated curve tables are NOT monotonic - several
+        // tables (finger 1/3/4 tip, finger 5 outer) have a handful of decreasing-angle
+        // samples in their deep-curl tail (verified numerically against
+        // FingerCurveData.cpp). Binary search silently returns the wrong sample/segment
+        // in those bands - wrong curl values, and skipped intersection walks when both
+        // endpoints of a query land in a non-monotonic run. Upstream HIGGS deliberately
+        // uses this same linear scan for the identical reason (its own comment: "Ensure
+        // monotonic increase... then we can go back to binary search"). 201 entries makes
+        // the O(n) cost a non-issue.
+        //
+        // Finds the first bracket [i, i+1] containing desiredAngle (equivalently: the
+        // largest index whose angle is <= desiredAngle, i.e. the "floor" sample) so the
+        // curve-walk seed covers the segment containing the query angle.
+        int lo = kNumFingerVals - 1;
+        for (int i = 0; i < kNumFingerVals - 1; ++i) {
+            if (fingerVals[i + 1].angle >= desiredAngle) {
+                lo = i;
+                break;
             }
-        }
-        
-        // Clamp to valid range
-        if (lo >= kNumFingerVals) lo = kNumFingerVals - 1;
-        if (lo < 0) lo = 0;
-
-        // HIGGS floor semantics (finger_curves.cpp:487-499, Jul 19 finger audit): the
-        // binary search lands on the first sample >= desiredAngle (ceil). HIGGS returns
-        // the sample BELOW so the curve-walk seed covers the segment containing the
-        // query angle — ceil skipped that segment, missing graze-contact crossings
-        // (over-curl, or full miss -> 0.2 near-fist stab through the mesh).
-        if (lo > 0 && fingerVals[lo].angle > desiredAngle) {
-            lo -= 1;
         }
 
         if (outData) {
@@ -1202,25 +1234,34 @@ namespace heisenberg
     {
         std::vector<Intersection> tipIntersections, outerIntersections, innerIntersections;
 
-        // TEMP diagnostic: count how many triangles pass each stage so we can
-        // see whether the plane intersects any geometry at all, and if so how
-        // many triangles survive the curve-check.
+        // TEMP diagnostic (downgraded to trace + gated, Jul 20): this used to run an
+        // extra O(triangles) signed-plane-distance pass EVERY finger cast of EVERY
+        // geometry solve and log it at spdlog::warn - a level that passes every log-level
+        // configuration, so it couldn't be silenced. With
+        // bEnableAutomaticFingerCurlsPerFrame=1 that repeated every recalc interval for
+        // the whole duration of every hold. Only pay for the extra pass when trace
+        // logging is actually enabled; the real per-triangle intersection test below
+        // (tipIntersections/outerIntersections/innerIntersections) is unconditional -
+        // only the diagnostic-only plane-distance bookkeeping is skipped otherwise.
+        const bool diagTraceEnabled = spdlog::default_logger_raw() && spdlog::default_logger_raw()->should_log(spdlog::level::trace);
         int planeHits = 0;
         float minDistToPlane = 1e30f;
         float maxDistToPlane = -1e30f;
         for (size_t i = 0; i < triangles.size(); ++i) {
             const auto& t = triangles[i];
-            auto sdist = [&](const RE::NiPoint3& v) {
-                return (v.x - fingerCenter.x) * fingerNormal.x
-                     + (v.y - fingerCenter.y) * fingerNormal.y
-                     + (v.z - fingerCenter.z) * fingerNormal.z;
-            };
-            float d0 = sdist(t.v0), d1 = sdist(t.v1), d2 = sdist(t.v2);
-            float mn = std::min({d0, d1, d2});
-            float mx = std::max({d0, d1, d2});
-            if (mn < minDistToPlane) minDistToPlane = mn;
-            if (mx > maxDistToPlane) maxDistToPlane = mx;
-            if (mn <= 0 && mx >= 0) ++planeHits;
+            if (diagTraceEnabled) {
+                auto sdist = [&](const RE::NiPoint3& v) {
+                    return (v.x - fingerCenter.x) * fingerNormal.x
+                         + (v.y - fingerCenter.y) * fingerNormal.y
+                         + (v.z - fingerCenter.z) * fingerNormal.z;
+                };
+                float d0 = sdist(t.v0), d1 = sdist(t.v1), d2 = sdist(t.v2);
+                float mn = std::min({d0, d1, d2});
+                float mx = std::max({d0, d1, d2});
+                if (mn < minDistToPlane) minDistToPlane = mn;
+                if (mx > maxDistToPlane) maxDistToPlane = mx;
+                if (mn <= 0 && mx >= 0) ++planeHits;
+            }
 
             float tipAngle, outerAngle, innerAngle;
             auto [tipHit, outerHit, innerHit] = FingerIntersectsTriangle(
@@ -1231,11 +1272,13 @@ namespace heisenberg
             if (outerHit) outerIntersections.push_back({ outerAngle, static_cast<std::int32_t>(i) });
             if (innerHit) innerIntersections.push_back({ innerAngle, static_cast<std::int32_t>(i) });
         }
-        spdlog::warn("[FINGER-DIAG] f{} center=({:.1f},{:.1f},{:.1f}) normal=({:.3f},{:.3f},{:.3f}) | plane-hit tris={}/{} signedDist=[{:.1f},{:.1f}] | curves tip={} outer={} inner={}",
-                     fingerIndex, fingerCenter.x, fingerCenter.y, fingerCenter.z,
-                     fingerNormal.x, fingerNormal.y, fingerNormal.z,
-                     planeHits, (int)triangles.size(), minDistToPlane, maxDistToPlane,
-                     (int)tipIntersections.size(), (int)outerIntersections.size(), (int)innerIntersections.size());
+        if (diagTraceEnabled) {
+            spdlog::trace("[FINGER-DIAG] f{} center=({:.1f},{:.1f},{:.1f}) normal=({:.3f},{:.3f},{:.3f}) | plane-hit tris={}/{} signedDist=[{:.1f},{:.1f}] | curves tip={} outer={} inner={}",
+                         fingerIndex, fingerCenter.x, fingerCenter.y, fingerCenter.z,
+                         fingerNormal.x, fingerNormal.y, fingerNormal.z,
+                         planeHits, (int)triangles.size(), minDistToPlane, maxDistToPlane,
+                         (int)tipIntersections.size(), (int)outerIntersections.size(), (int)innerIntersections.size());
+        }
 
         constexpr float HUGE_ANGLE = 1.0e30f;
 
@@ -1567,8 +1610,13 @@ namespace heisenberg
         GetTriangles(objectNode, triangles);
 
         if (triangles.empty()) {
-            spdlog::warn("[FINGER-ROCK] No triangles from '{}', fallback 0.6", objectNode->name.c_str());
-            result.thumb = result.index = result.middle = result.ring = result.pinky = 0.6f;
+            // 0.9 (HIGGS parity, Jul 19 finger audit - same fallback the table-solver path
+            // above already uses at line ~1400): 0.6 buried the fingertips inside fat
+            // objects on empty-triangle meshes (skinned-only geometry, culled subtrees);
+            // near-open only ever hovers, which reads far better than penetration. This
+            // ROCK-solver path (bUseRockFingerPose=1) had drifted back to the old 0.6.
+            spdlog::warn("[FINGER-ROCK] No triangles from '{}', fallback 0.9", objectNode->name.c_str());
+            result.thumb = result.index = result.middle = result.ring = result.pinky = 0.9f;
             result.success = true;
             return result;
         }

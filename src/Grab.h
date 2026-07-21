@@ -422,6 +422,22 @@ namespace heisenberg
             vhHandModeSwitched = false;
             consumeAttemptedThisVisit = false;
             wasInMouthZoneLocal = false;
+            // Every other per-grab zone/pose flag in this function is reset except these:
+            // isInMouthZone/mouthZoneTimer are only ever re-written by CheckMouthConsume,
+            // which the update loop gates to consumables only - a Nuka-Cola grabbed at the
+            // mouth then released without a fast-enough consume left isInMouthZone=true
+            // leaking through the public IsInMouthZone()/GetCurrentZoneName() plugin API
+            // for the rest of the session (and every later non-consumable grab, which
+            // never runs CheckMouthConsume to clear it). isInHandInjectionZone/
+            // wasInHandInjectionZoneLocal have the same latch problem for the injection-
+            // zone entry haptic. usedSnapMode/fingerCurlRecalcFrameCounter are simple
+            // per-grab counters that should start fresh too.
+            isInMouthZone = false;
+            mouthZoneTimer = 0.0f;
+            isInHandInjectionZone = false;
+            wasInHandInjectionZoneLocal = false;
+            usedSnapMode = false;
+            fingerCurlRecalcFrameCounter = 0;
             currentZoneName = "";
             grabStartTime = 0.0f;
             isFromLootDrop = false;

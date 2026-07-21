@@ -2295,6 +2295,26 @@ namespace heisenberg
         }
     }
 
+    // Pointer-only liveness check for the persistent eject-button / tape-deck sub-node
+    // caches below: never dereferences target, only walks root's CURRENT children -
+    // safe even if target is a freed/dangling pointer. The OnFrameUpdate generation
+    // check only fires when the 3rd-person SKELETON root pointer changes, but the
+    // engine/FRIK can rebuild the Pip-Boy subtree IN PLACE (post-equip finalize, FRIK
+    // config/holo rebuild) while that root stays the same pointer - this check catches
+    // that case by re-validating against the live arm node every frame instead.
+    static bool NodeStillInSubtree(RE::NiAVObject* root, const RE::NiAVObject* target, int maxDepth = 24)
+    {
+        if (!root || !target) return false;
+        if (root == target) return true;
+        if (maxDepth <= 0) return false;
+        if (auto* node = root->IsNode()) {
+            for (const auto& child : node->children) {
+                if (child && NodeStillInSubtree(child.get(), target, maxDepth - 1)) return true;
+            }
+        }
+        return false;
+    }
+
     RE::NiAVObject* PipboyInteraction::GetPipboyArmNode()
     {
         if (_frameCacheValid && _cachedArmNode) return _cachedArmNode;
@@ -2432,6 +2452,15 @@ namespace heisenberg
 
         RE::NiAVObject* arm = GetPipboyArmNode();
         if (!arm) return;
+
+        // Re-validate against the LIVE arm subtree before trusting the persistent cache -
+        // catches an in-place Pip-Boy rebuild the coarse skeleton-root check in
+        // OnFrameUpdate misses (see NodeStillInSubtree comment).
+        if (_nodesCached && !NodeStillInSubtree(arm, _cachedEjectButton)) {
+            _cachedEjectButton     = nullptr;
+            _cachedEjectButtonMesh = nullptr;
+            _nodesCached           = false;
+        }
 
         // Use cached nodes to avoid per-frame tree searches
         if (!_nodesCached) {
@@ -2681,6 +2710,14 @@ namespace heisenberg
 
         // Use cached nodes to avoid per-frame tree searches
         RE::NiAVObject* tapeDeckNode = GetCachedTapeDeckNode();
+        // Re-validate against the LIVE arm subtree - see NodeStillInSubtree comment /
+        // the matching eject-button check in OperateEjectButton.
+        if (_cachedTapeDeckLid && !NodeStillInSubtree(arm, _cachedTapeDeckLid)) {
+            _cachedTapeDeckLid      = nullptr;
+            _cachedTapeRef          = nullptr;
+            _cachedTapeDeckMesh1    = nullptr;
+            _cachedTapeDeckLidMesh1 = nullptr;
+        }
         if (!_cachedTapeDeckLid && tapeDeckNode) {
             _cachedTapeDeckLid     = f4vr::findAVObject(arm, "TapeDeckLid_mesh");
             _cachedTapeRef         = f4vr::findAVObject(arm, "TapREF");

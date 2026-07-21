@@ -815,6 +815,18 @@ namespace heisenberg
                             if (axPressed && !heldLong.load(std::memory_order_relaxed) && hasTarget) {
                                 allowMask &= ~axMask;
                             }
+                        } else {
+                            // shouldIntercept went false mid-press (selection cleared before
+                            // the 0.20s hold threshold, or between releasing A and the next
+                            // aim) - wasPressed/heldLong/pressTime would otherwise freeze at
+                            // their stale values, since the whole update block above is
+                            // skipped whenever we're not intercepting. A LATER press on a new
+                            // target then reads prevPressed=true/prevHeldLong=stale and
+                            // misclassifies the tap-vs-hold edge (heldLong flips true
+                            // instantly, or a real tap never injects). Reset so a press that
+                            // escapes interception can never leave a stale edge behind.
+                            wasPressed.store(false, std::memory_order_relaxed);
+                            heldLong.store(false, std::memory_order_relaxed);
                         }
 
                         // Tap injection: set the A bit for 2 frames after a quick
@@ -903,7 +915,14 @@ namespace heisenberg
                 // Forced arm from a VH unholster (kMessage_ArmThrowable): inject grip
                 // for a few frames so the just-equipped throwable arms instantly,
                 // skipping the hold-to-arm delay.
-                {
+                // isPrimaryHand-gated: this callback is invoked once per hand per poll
+                // (both controllers polled every frame), but the throwable-arm feature
+                // this counter serves is primary-hand-only (see isPrimaryHand gating
+                // below). Decrementing on both hands' calls halved ForceArmThrowable()'s
+                // intended ~8-frame window to ~4 (~44ms at 90fps) - if VH's equip plus the
+                // game's grip-event processing took longer than that, the injected grip
+                // never overlapped a frame the game could actually process the ready.
+                if (isPrimaryHand) {
                     int forceFrames = modInst._cb_forceArmThrowableFrames.load(std::memory_order_relaxed);
                     if (forceFrames > 0) {
                         aButtonHeldLongEnough = true;
@@ -1973,12 +1992,22 @@ namespace heisenberg
                     yawRot.entry[1][0] = rightY;   yawRot.entry[1][1] = forwardY; yawRot.entry[1][2] = 0.0f;
                     yawRot.entry[2][0] = 0.0f;     yawRot.entry[2][1] = 0.0f;     yawRot.entry[2][2] = 1.0f;
 
-                    // Calculate local offset using yaw-only rotation (inverse/transpose)
+                    // Calculate local offset using yaw-only rotation (inverse/transpose).
+                    // Grab.cpp's TransformPoint (the CHECK side: local -> world) uses
+                    // rotated.x = e[0][0]*local.x + e[1][0]*local.y + e[2][0]*local.z (dot
+                    // against COLUMNS). This capture must be its true inverse - for an
+                    // orthogonal rotation matrix that's the TRANSPOSE, i.e. dot against ROWS
+                    // - but this used the IDENTICAL column-dot pattern as TransformPoint, so
+                    // capture and check were the SAME linear map applied twice instead of
+                    // inverses: the captured local offset was rotated 180 degrees from the
+                    // true inverse, placing the zone check point on the opposite side of
+                    // wherever the player was facing when they set it (correct only when
+                    // facing world +-Y at the moment of capture).
                     RE::NiPoint3 worldOffset = handPos - hmdPos;
                     RE::NiPoint3 localOffset;
-                    localOffset.x = yawRot.entry[0][0] * worldOffset.x + yawRot.entry[1][0] * worldOffset.y + yawRot.entry[2][0] * worldOffset.z;
-                    localOffset.y = yawRot.entry[0][1] * worldOffset.x + yawRot.entry[1][1] * worldOffset.y + yawRot.entry[2][1] * worldOffset.z;
-                    localOffset.z = yawRot.entry[0][2] * worldOffset.x + yawRot.entry[1][2] * worldOffset.y + yawRot.entry[2][2] * worldOffset.z;
+                    localOffset.x = yawRot.entry[0][0] * worldOffset.x + yawRot.entry[0][1] * worldOffset.y + yawRot.entry[0][2] * worldOffset.z;
+                    localOffset.y = yawRot.entry[1][0] * worldOffset.x + yawRot.entry[1][1] * worldOffset.y + yawRot.entry[1][2] * worldOffset.z;
+                    localOffset.z = yawRot.entry[2][0] * worldOffset.x + yawRot.entry[2][1] * worldOffset.y + yawRot.entry[2][2] * worldOffset.z;
                     localOffset.x /= hmdScale;
                     localOffset.y /= hmdScale;
                     localOffset.z /= hmdScale;

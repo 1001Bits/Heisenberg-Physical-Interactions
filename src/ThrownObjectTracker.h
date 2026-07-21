@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace heisenberg
@@ -85,6 +86,12 @@ namespace heisenberg
 
         mutable std::mutex _mutex;
         std::unordered_map<std::uint32_t, Entry> _byBodyId;
+        // Bodies natively subscribed to CONTACT_STARTED this world session. OnThrown has
+        // no unsubscribe path (the native hkSignal subscriber list has no removal API used
+        // here), so re-throwing the SAME object (pick up, throw, repeat) without this would
+        // add another identical subscription every time, fanning out the callback N-fold per
+        // contact. Cleared on SetWorld/Reset (a fresh world means fresh native signals).
+        std::unordered_set<std::uint32_t> _subscribedBodyIds;
 
         // Impacts captured on the Havok worker thread, awaiting game-thread dispatch.
         // Only raw IDs + the world pointer are stored — refr resolution + all engine

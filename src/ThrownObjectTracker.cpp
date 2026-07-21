@@ -350,6 +350,7 @@ namespace heisenberg
         _byBodyId.clear();
         _actorHitCooldown.clear();
         _pendingImpacts.clear();
+        _subscribedBodyIds.clear();
     }
 
     void ThrownObjectTracker::OnThrown(RE::TESObjectREFR* refr, std::uint32_t bodyId,
@@ -410,15 +411,31 @@ namespace heisenberg
             return;
         }
 
-        // Subscribe to per-body CONTACT_STARTED.
-        void* signal = GetEventSignalBodySeh(hknpWorld, bodyId);
-        if (!signal) {
-            spdlog::warn("[THROWN] OnThrown: getEventSignal_Body returned null for body 0x{:08X} (post-enableFlags)", bodyId);
-            return;
+        // Subscribe to per-body CONTACT_STARTED - but only once per body per world session.
+        // There is no unsubscribe path (see the class comment), so re-throwing the same
+        // object (pick up, throw, repeat) would otherwise add another identical
+        // subscription every time: after N throws every contact of that body invokes the
+        // callback N times, each doing a mutex-guarded map lookup, and the engine-side
+        // subscriber list grows for the world's lifetime.
+        bool alreadySubscribed = false;
+        {
+            std::scoped_lock lock(_mutex);
+            alreadySubscribed = !_subscribedBodyIds.insert(bodyId).second;
         }
-        if (!SubscribeSimpleSeh(signal, reinterpret_cast<void*>(&OnContactStartedCallback))) {
-            spdlog::error("[THROWN] subscribeSimple threw for body 0x{:08X}", bodyId);
-            return;
+        if (!alreadySubscribed) {
+            void* signal = GetEventSignalBodySeh(hknpWorld, bodyId);
+            if (!signal) {
+                spdlog::warn("[THROWN] OnThrown: getEventSignal_Body returned null for body 0x{:08X} (post-enableFlags)", bodyId);
+                std::scoped_lock lock(_mutex);
+                _subscribedBodyIds.erase(bodyId);
+                return;
+            }
+            if (!SubscribeSimpleSeh(signal, reinterpret_cast<void*>(&OnContactStartedCallback))) {
+                spdlog::error("[THROWN] subscribeSimple threw for body 0x{:08X}", bodyId);
+                std::scoped_lock lock(_mutex);
+                _subscribedBodyIds.erase(bodyId);
+                return;
+            }
         }
 
         Entry entry;
@@ -615,6 +632,37 @@ namespace heisenberg
         // the closest live actor within a tight radius of the impact point.
         RE::Actor* actor = targetRefr ? targetRefr->As<RE::Actor>() : nullptr;
         if (actor && (actor == player || actor->IsDead(true))) actor = nullptr;
+
+        if (!actor) {
+            // Documented-but-missing fallback (the contact frequently resolves to world
+            // geometry - the thrown object's first registered contact is the floor/wall
+            // beside the NPC, and OnContactStartedCallback's dispatched-latch means no
+            // LATER contact for this throw ever gets a second chance to resolve the real
+            // target). Scan the thrown object's own cell for the closest live actor within
+            // a tight radius of the impact point instead of giving up on "no valid target".
+            constexpr float kFallbackActorRadiusGameUnits = 100.0f;  // ~2.5m
+            if (auto* cell = thrownRefr->GetParentCell()) {
+                RE::Actor* closest = nullptr;
+                float closestDistSq = kFallbackActorRadiusGameUnits * kFallbackActorRadiusGameUnits;
+                for (const auto& ref : cell->references) {
+                    if (!ref) continue;
+                    auto* candidate = ref->As<RE::Actor>();
+                    if (!candidate || candidate == player || candidate->IsDead(true)) continue;
+                    const RE::NiPoint3 delta = candidate->data.location - contactPos;
+                    const float distSq = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
+                    if (distSq < closestDistSq) {
+                        closestDistSq = distSq;
+                        closest = candidate;
+                    }
+                }
+                if (closest) {
+                    spdlog::info("[THROWN] impact resolved to {} - fell back to closest live actor {:08X} ({:.1f}gu away)",
+                                 targetRefr ? "a non-actor refr" : "world geometry",
+                                 closest->formID, std::sqrt(closestDistSq));
+                    actor = closest;
+                }
+            }
+        }
 
         if (!actor) {
             spdlog::info("[THROWN] impact hit no live actor (contact resolved to {}) — no aggro",

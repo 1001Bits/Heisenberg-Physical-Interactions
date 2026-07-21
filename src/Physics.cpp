@@ -1719,8 +1719,10 @@ namespace heisenberg::Physics
     // Saved original player collision filter info for restoration
     // Thread safety: accessed from physics thread and main thread
     static std::atomic<std::uint32_t> g_savedPlayerCollisionFilterInfo{0};
+    static std::atomic<void*> g_savedPlayerCollisionFilterInfoWorld{nullptr};  // hknpWorld the saved value belongs to
     static std::atomic<bool> g_playerCollisionModified{false};
     static std::atomic<std::uint32_t> g_playerBodyId{INVALID_BODY_ID};  // Cached player body ID
+    static std::atomic<void*> g_playerBodyIdWorld{nullptr};  // hknpWorld the cached id belongs to
 
     bool TryFindPlayerBodyAlternative(void* bhkWorld, void* hknpWorld, std::uint32_t& outBodyId);
     bool TryReadBodyFilterInfo(void* hknpWorld, std::uint32_t bodyId, std::uint32_t& outFilterInfo);
@@ -1731,6 +1733,7 @@ namespace heisenberg::Physics
     void InvalidatePlayerBodyId()
     {
         g_playerBodyId = INVALID_BODY_ID;
+        g_playerBodyIdWorld = nullptr;
     }
 
     // bhkCharacterController::SetSupportBody(bhkNPCollisionObject*) — VR 0x1e23150.
@@ -1819,20 +1822,32 @@ namespace heisenberg::Physics
         constexpr std::ptrdiff_t kHknpMotion_angularVelocity = 0x50;
 
         // Resolve writable hknpMotion + world + motionId for a collision object. False if static/invalid.
+        // SEH-guarded: obj is a cached constraint.objectCollisionObject that can outlive the
+        // object/world it points into (grab-abort-on-delete, load-door cell unload while
+        // holding) - every neighbouring engine call in this file is SEH-wrapped, this one
+        // used to be the sole unguarded exception (reached from EndGrab cleanup and the
+        // per-frame UpdateGrab velocity read, i.e. precisely on the "object was deleted"
+        // path this function exists to survive).
         inline bool ResolveMotion(RE::bhkNPCollisionObject* obj, void*& outWorld, void*& outMotion, std::uint32_t& outMotionId)
         {
             outWorld = outMotion = nullptr; outMotionId = 0xFFFFFFFFu;
             if (!obj) return false;
-            void* body = heisenberg::bhkNPCollisionObject_AccessBody(obj);
-            if (!body) return false;
-            std::uint32_t motionId = *reinterpret_cast<std::uint32_t*>(
-                reinterpret_cast<std::uintptr_t>(body) + kHknpBody_motionIndex);
-            if (motionId == 0xFFFFFFFFu || motionId > 0x00FFFFFFu) return false;  // static
-            void* world = heisenberg::bhkNPCollisionObject_AccessWorld(obj);
-            if (!world) return false;
-            void* motion = heisenberg::hknpBSWorld_accessMotion(world, motionId);
-            if (!motion || reinterpret_cast<std::uintptr_t>(motion) < 0x10000) return false;
-            outWorld = world; outMotion = motion; outMotionId = motionId; return true;
+            __try {
+                void* body = heisenberg::bhkNPCollisionObject_AccessBody(obj);
+                if (!body) return false;
+                std::uint32_t motionId = *reinterpret_cast<std::uint32_t*>(
+                    reinterpret_cast<std::uintptr_t>(body) + kHknpBody_motionIndex);
+                if (motionId == 0xFFFFFFFFu || motionId > 0x00FFFFFFu) return false;  // static
+                void* world = heisenberg::bhkNPCollisionObject_AccessWorld(obj);
+                if (!world) return false;
+                void* motion = heisenberg::hknpBSWorld_accessMotion(world, motionId);
+                if (!motion || reinterpret_cast<std::uintptr_t>(motion) < 0x10000) return false;
+                outWorld = world; outMotion = motion; outMotionId = motionId; return true;
+            }
+            __except(EXCEPTION_EXECUTE_HANDLER) {
+                outWorld = outMotion = nullptr; outMotionId = 0xFFFFFFFFu;
+                return false;
+            }
         }
 
         // Leaf SEH wrapper — engine call may deref freed/invalid state.
@@ -1920,12 +1935,22 @@ namespace heisenberg::Physics
         void* hknpWorld = bhkWorld ? GetHknpWorldFromBhk(bhkWorld) : nullptr;
 
         std::uint32_t cachedBodyId = g_playerBodyId.load();
+        void* cachedWorld = g_playerBodyIdWorld.load();
         std::uint32_t cachedFilterInfo = 0;
-        if (hknpWorld && !IsInvalidBodyId(cachedBodyId) && TryReadBodyFilterInfo(hknpWorld, cachedBodyId, cachedFilterInfo)) {
+        // A cache hit requires ALL THREE: the id readable in the CURRENT world (a body
+        // index readable does not mean it's still OUR body - hknp recycles indices
+        // after a world rebuild), the cache belonging to this exact world (not just
+        // "a" world - bodyId alone carries no world identity), and layer==31 (the
+        // player's own layer; a recycled slot now holding an unrelated body would
+        // read a different layer). Any mismatch invalidates and falls through to
+        // full re-resolution below.
+        if (hknpWorld && cachedWorld == hknpWorld && !IsInvalidBodyId(cachedBodyId) &&
+            TryReadBodyFilterInfo(hknpWorld, cachedBodyId, cachedFilterInfo) && (cachedFilterInfo & 0x7Fu) == 31u) {
             return cachedBodyId;
         }
-        if (hknpWorld && !IsInvalidBodyId(cachedBodyId)) {
+        if (!IsInvalidBodyId(cachedBodyId)) {
             g_playerBodyId = INVALID_BODY_ID;
+            g_playerBodyIdWorld = nullptr;
         }
 
         auto* process = actor ? actor->currentProcess : nullptr;
@@ -1953,6 +1978,7 @@ namespace heisenberg::Physics
                             reinterpret_cast<uintptr_t>(proxy) + 0x34);
                         if (proxyBodyId != 0x7FFFFFFF && proxyBodyId != 0xFFFFFFFF && proxyBodyId != 0) {
                             g_playerBodyId = proxyBodyId;
+                            g_playerBodyIdWorld = hknpWorld;
                             spdlog::info("[PHYSICS] GetPlayerBodyId: Resolved via proxy body ID: 0x{:08X}", proxyBodyId);
                             return proxyBodyId;
                         }
@@ -1964,6 +1990,7 @@ namespace heisenberg::Physics
                 std::uint32_t controllerBodyId = INVALID_BODY_ID;
                 if (TryGetCharacterControllerBodyId(charController, hknpWorld, controllerBodyId)) {
                     g_playerBodyId = controllerBodyId;
+                    g_playerBodyIdWorld = hknpWorld;
                     spdlog::info("[PHYSICS] GetPlayerBodyId: Resolved via charController: 0x{:08X}", controllerBodyId);
                     return controllerBodyId;
                 } else {
@@ -1981,6 +2008,7 @@ namespace heisenberg::Physics
             std::uint32_t proxyManagerBodyId = INVALID_BODY_ID;
             if (TryFindPlayerBodyViaProxyManager(bhkWorld, hknpWorld, proxyManagerBodyId)) {
                 g_playerBodyId = proxyManagerBodyId;
+                g_playerBodyIdWorld = hknpWorld;
                 spdlog::info("[PHYSICS] GetPlayerBodyId: Found player body via proxy manager: 0x{:08X}", proxyManagerBodyId);
                 return proxyManagerBodyId;
             }
@@ -1988,6 +2016,7 @@ namespace heisenberg::Physics
             std::uint32_t altBodyId = INVALID_BODY_ID;
             if (TryFindPlayerBodyAlternative(bhkWorld, hknpWorld, altBodyId)) {
                 g_playerBodyId = altBodyId;
+                g_playerBodyIdWorld = hknpWorld;
                 spdlog::info("[PHYSICS] GetPlayerBodyId: Found player body via NiNode search: 0x{:08X}", altBodyId);
                 return altBodyId;
             }
@@ -2768,40 +2797,75 @@ namespace heisenberg::Physics
                          bodyIndex, bodyId);
             return false;
         }
-        void* bodyPtr = reinterpret_cast<void*>(
-            reinterpret_cast<uintptr_t>(bodyBuffer) + static_cast<uintptr_t>(bodyIndex) * hknpBody_Offsets::stride
-        );
-        
-        // Access collisionFilterInfo at offset 0x44
-        std::uint32_t* filterInfoPtr = reinterpret_cast<std::uint32_t*>(
-            reinterpret_cast<uintptr_t>(bodyPtr) + hknpBody_Offsets::collisionFilterInfo
-        );
-        
+        // Read the current filter through the same engine-setter path we write it back
+        // through below (TryReadBodyFilterInfo is the SEH-guarded, index-masked reader
+        // every other candidate-body path in this file already uses).
+        std::uint32_t currentFilterInfo = 0;
+        if (!TryReadBodyFilterInfo(hknpWorld, bodyId, currentFilterInfo)) {
+            spdlog::warn("[PHYSICS] SetPlayerCollisionEnabled: could not read current filter info (bodyId=0x{:08X})", bodyId);
+            return false;
+        }
+        (void)bodyBuffer; (void)hknpBody_Offsets::collisionFilterInfo;
+
         WorldWriteLock lock(bhkWorld);
-        
+
         if (!enabled) {
             // Disable collision - save original and set to kNonCollidable (15)
             if (!g_playerCollisionModified) {
-                g_savedPlayerCollisionFilterInfo = *filterInfoPtr;
+                g_savedPlayerCollisionFilterInfo = currentFilterInfo;
+                g_savedPlayerCollisionFilterInfoWorld = hknpWorld;
                 g_playerCollisionModified = true;
                 spdlog::info("[PHYSICS] Saved player collision filter: 0x{:08X} (layer {})",
                             g_savedPlayerCollisionFilterInfo.load(), g_savedPlayerCollisionFilterInfo.load() & 0x7F);
             }
-            
-            // Set layer to kNonCollidable (15), preserve other bits
+
+            // Set layer to kNonCollidable (15), preserve other bits. Route through the
+            // engine setter (TryWriteBodyFilterInfo -> hknpBSWorld::setBodyCollisionFilterInfo)
+            // instead of a raw field write: a raw write changes the filter word but never
+            // refreshes broadphase PAIRING, so a pair already created against the player
+            // (e.g. while standing inside the hitbox-shrink volume) keeps its cached
+            // no-collide verdict even after this filter is restored (same hknp pair-cache
+            // staleness class fixed at the Jul 18 site referenced below).
             std::uint32_t newFilterInfo = (g_savedPlayerCollisionFilterInfo & ~0x7F) | 15;
-            *filterInfoPtr = newFilterInfo;
+            if (!TryWriteBodyFilterInfo(hknpWorld, bodyId, newFilterInfo)) {
+                spdlog::warn("[PHYSICS] SetPlayerCollisionEnabled: filter write failed (bodyId=0x{:08X})", bodyId);
+                return false;
+            }
             spdlog::info("[PHYSICS] Player collision DISABLED (filter -> 0x{:08X}, layer 15)", newFilterInfo);
         } else {
             // Re-enable collision - restore original
             if (g_playerCollisionModified) {
-                *filterInfoPtr = g_savedPlayerCollisionFilterInfo;
+                // BUGFIX (Jul 21): if the Havok world has changed since the disable was
+                // captured (a cell/worldspace transition, fast travel, etc. - ROCK fully
+                // reinitializes on this; see ROCKMain.cpp's "bhkWorld changed" path), the
+                // saved filter value belongs to a body/world generation that no longer
+                // exists. Blindly writing it onto whatever body GetPlayerBodyId() resolves
+                // in the NEW world was rejected by TryWriteBodyFilterInfo every single time
+                // - permanently, since a world-identity mismatch can never resolve itself -
+                // and the only caller (ActivatorHandler::SetHitboxShrinkEnabled) has no path
+                // back to "not modified" other than a successful restore, so it retried this
+                // identical doomed write forever (observed live: 6000+ consecutive failures
+                // over several minutes, player collision left disabled the entire time). A
+                // new world already starts every body with normal, un-suppressed collision -
+                // there is nothing left to restore, so treat the mismatch as success instead
+                // of retrying a write that can never succeed.
+                if (g_savedPlayerCollisionFilterInfoWorld.load() != hknpWorld) {
+                    spdlog::info(
+                        "[PHYSICS] SetPlayerCollisionEnabled: world changed since disable (saved={:p} current={:p}) - saved filter is stale, treating as already restored",
+                        g_savedPlayerCollisionFilterInfoWorld.load(), hknpWorld);
+                    g_playerCollisionModified = false;
+                    return true;
+                }
+                if (!TryWriteBodyFilterInfo(hknpWorld, bodyId, g_savedPlayerCollisionFilterInfo)) {
+                    spdlog::warn("[PHYSICS] SetPlayerCollisionEnabled: restore filter write failed (bodyId=0x{:08X})", bodyId);
+                    return false;
+                }
                 g_playerCollisionModified = false;
                 spdlog::info("[PHYSICS] Player collision ENABLED (filter -> 0x{:08X}, layer {})",
                             g_savedPlayerCollisionFilterInfo.load(), g_savedPlayerCollisionFilterInfo.load() & 0x7F);
             }
         }
-        
+
         return true;
     }
     

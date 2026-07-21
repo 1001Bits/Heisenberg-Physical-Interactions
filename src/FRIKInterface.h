@@ -19,9 +19,9 @@
 namespace heisenberg
 {
     // Convenient aliases for the official FRIK types
-    using FRIKHand            = frik::api::FRIKApi::Hand;
-    using FRIKHandPoses       = frik::api::FRIKApi::HandPoseKind;  // v5 renamed HandPoses -> HandPoseKind
-    using FRIKHandPoseTagState = frik::api::FRIKApi::HandPoseTagState;
+    using FRIKHand            = frik::host_api::FRIKApi::Hand;
+    using FRIKHandPoses       = frik::host_api::FRIKApi::HandPoseKind;  // v5 renamed HandPoses -> HandPoseKind
+    using FRIKHandPoseTagState = frik::host_api::FRIKApi::HandPoseTagState;
 
     // Tag used for Heisenberg hand pose overrides
     constexpr const char* HEISENBERG_HAND_POSE_TAG = "Heisenberg_Grab";
@@ -105,6 +105,6 @@ namespace heisenberg
         static FRIKHand ToHand(bool isLeft) { return isLeft ? FRIKHand::Left : FRIKHand::Right; }
 
         // Helper: get the API pointer (null if not initialized)
-        const frik::api::FRIKApi* Api() const { return frik::api::FRIKApi::inst; }
+        const frik::host_api::FRIKApi* Api() const { return frik::host_api::FRIKApi::inst; }
     };
 }

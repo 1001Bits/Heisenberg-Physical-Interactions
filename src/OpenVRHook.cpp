@@ -595,7 +595,15 @@ namespace heisenberg
         if (m_usingFO4VRTools && g_fo4vrToolsAPI) {
             // Unregister our bridge callback from FO4VRTools
             g_fo4vrToolsAPI->UnregisterControllerStateCB(FO4VRToolsControllerStateCallback);
-            g_fo4vrToolsCallbacks.clear();
+            // g_fo4vrToolsCallbacks is documented as "protected by g_fo4vrToolsCallbacksMutex
+            // (same pattern)" (see the header contract) - unregistering does not synchronize
+            // with an in-flight callback already inside FO4VRToolsControllerStateCallback's
+            // own lock_guard-protected copy of this vector, so an unlocked clear() here could
+            // free the vector's storage mid-copy on another thread.
+            {
+                std::lock_guard<std::mutex> lock(g_fo4vrToolsCallbacksMutex);
+                g_fo4vrToolsCallbacks.clear();
+            }
             spdlog::info("[OpenVRHook] Unregistered from FO4VRTools");
         } else {
             RestoreIAT();
@@ -632,7 +640,25 @@ namespace heisenberg
             // (like Virtual Holsters) which bypass the FO4VRTools callback system
             vr::IVRSystem* realSystem = g_fo4vrToolsAPI->GetVRSystem();
             if (realSystem) {
-                OpenVRHook::GetSingleton().HookRealVRSystemVtable(realSystem);
+                const bool vtableHooked = OpenVRHook::GetSingleton().HookRealVRSystemVtable(realSystem);
+                // A callback registered while the vtable hook wasn't up yet (FO4VRTools
+                // loaded but not fully initialized) falls back into g_fo4vrToolsCallbacks
+                // (see RegisterControllerStateCallback's own comment on why the two paths
+                // must never both be live). If THIS lazy Ensure call is what finally makes
+                // the vtable hook succeed, those fallback entries are now redundant AND
+                // dangerous: every controller poll would run the callback twice (vtable
+                // hook, then the bridge on the already-modified state), advancing per-hand
+                // edge-tracking statics twice per poll and misrouting native buttons. Clear
+                // them now that the vtable hook - the intended, non-double-executing path -
+                // is confirmed up.
+                if (vtableHooked) {
+                    std::lock_guard<std::mutex> lock(g_fo4vrToolsCallbacksMutex);
+                    if (!g_fo4vrToolsCallbacks.empty()) {
+                        spdlog::info("[OpenVRHook] Vtable hook succeeded on lazy Ensure - clearing {} stale FO4VRTools bridge fallback callback(s)",
+                            g_fo4vrToolsCallbacks.size());
+                        g_fo4vrToolsCallbacks.clear();
+                    }
+                }
             }
         }
         
@@ -797,8 +823,16 @@ namespace heisenberg
             thisPtr, unControllerDeviceIndex, pControllerState, unControllerStateSize);
 
         if (result && pControllerState) {
-            // Update controller indices if needed
-            if (g_openVRHookInstance->m_leftControllerIndex == vr::k_unTrackedDeviceIndexInvalid) {
+            // Update controller indices if needed: either never resolved yet, or a
+            // controller died mid-session (battery swap) and reconnected under a NEW
+            // tracked-device index (SteamVR re-enumeration) - both cached indices stayed
+            // "valid" (pointing at the OLD index), so this poll's device index matches
+            // NEITHER cached slot. Without this, the real left controller (say) polls as
+            // IsLeftController()==false forever after a reconnect, and ApplyCallbacksToState
+            // below misroutes the A+Grip strip/inject to the wrong physical hand.
+            if (g_openVRHookInstance->m_leftControllerIndex == vr::k_unTrackedDeviceIndexInvalid ||
+                (unControllerDeviceIndex != g_openVRHookInstance->m_leftControllerIndex &&
+                 unControllerDeviceIndex != g_openVRHookInstance->m_rightControllerIndex)) {
                 g_openVRHookInstance->UpdateControllerIndices(thisPtr);
             }
 
@@ -812,7 +846,7 @@ namespace heisenberg
 
         return result;
     }
-    
+
     // Our hooked GetControllerStateWithPose
     static bool __fastcall Hooked_GetControllerStateWithPose(vr::IVRSystem* thisPtr,
                                                               vr::ETrackingUniverseOrigin eOrigin,
@@ -831,8 +865,11 @@ namespace heisenberg
             thisPtr, eOrigin, unControllerDeviceIndex, pControllerState, unControllerStateSize, pTrackedDevicePose);
         
         if (result && pControllerState) {
-            // Update controller indices if needed
-            if (g_openVRHookInstance->m_leftControllerIndex == vr::k_unTrackedDeviceIndexInvalid) {
+            // Update controller indices if needed (see the identical comment in
+            // Hooked_GetControllerState above - same mid-session reconnect fix).
+            if (g_openVRHookInstance->m_leftControllerIndex == vr::k_unTrackedDeviceIndexInvalid ||
+                (unControllerDeviceIndex != g_openVRHookInstance->m_leftControllerIndex &&
+                 unControllerDeviceIndex != g_openVRHookInstance->m_rightControllerIndex)) {
                 g_openVRHookInstance->UpdateControllerIndices(thisPtr);
             }
 

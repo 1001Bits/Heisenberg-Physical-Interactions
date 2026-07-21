@@ -32,6 +32,15 @@ namespace heisenberg
         // (a key absent from the MCM file otherwise falls through to the stale external INI).
         void SeedMCMDefaultsIfMissing();
 
+        // Converts the conversion-block fields (naturalGrabDistance, itemStorageZoneRadius,
+        // mouthRadius, zone radii/offsets, etc.) from their ORIGINAL cm units to game units
+        // in place. Load() calls this once after reading raw cm values from the INI;
+        // SeedMCMDefaultsIfMissing() must call it too on a fresh default-constructed Config
+        // before BuildIni() (which always multiplies by GAME_UNITS_TO_CM, i.e. expects a
+        // post-conversion, game-units Config) - a default-constructed Config still holds the
+        // raw cm defaults, so skipping this doubles the conversion (1.4x too large seeded).
+        void ApplyCmToGameUnitsConversion();
+
         HeldBodyMode GetHeldBodyMode() const
         {
             switch (heldBodyMode) {

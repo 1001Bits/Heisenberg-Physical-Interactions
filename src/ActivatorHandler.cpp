@@ -504,6 +504,21 @@ sTargetNode=
         _trackedActivators.clear();
         _trackedTerminals.clear();
 
+        // _cachedLeftResult/_cachedRightResult hold a raw TrackedActivator* into the
+        // vector just cleared above; the throttled path in CheckProximity returns that
+        // cache on 2 of every 3 calls without checking it against the current vector,
+        // so a stale pointer here is a dangling-pointer read/write on the very next
+        // throttled frame after a cell change. Reset both, and reset the per-hand
+        // pointing-range latches + re-run UpdateHitboxShrink so a cell with zero
+        // activators doesn't leave player collision permanently disabled from a
+        // hitbox-shrink that was active in the PREVIOUS cell (CheckProximity's own
+        // empty-vector early return never reaches that flag update).
+        _cachedLeftResult = ProximityResult{};
+        _cachedRightResult = ProximityResult{};
+        _leftHandInPointingRange = false;
+        _rightHandInPointingRange = false;
+        UpdateHitboxShrink();
+
         if (!_currentCell) {
             spdlog::debug("[ActivatorHandler] No current cell");
             return;
@@ -775,6 +790,16 @@ sTargetNode=
         ProximityResult result;
 
         if (_trackedActivators.empty()) {
+            // Still update the pointing-range latch + hitbox shrink for this hand even
+            // with nothing tracked, so a hand that WAS in range before the list emptied
+            // (cell change, whitelist filtering) doesn't leave collision disabled forever.
+            if (isLeftHand) {
+                _leftHandInPointingRange = false;
+            } else {
+                _rightHandInPointingRange = false;
+            }
+            UpdateHitboxShrink();
+            (isLeftHand ? _cachedLeftResult : _cachedRightResult) = result;
             return result;
         }
 

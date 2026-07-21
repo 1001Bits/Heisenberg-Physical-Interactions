@@ -32,7 +32,20 @@
 //     frik::api::FRIKApi::inst->clearHandPose("MyMod_Interaction", frik::api::FRIKApi::Hand::Primary);
 // }
 
-namespace frik::api
+// ODR FIX (Jul 20 audit): this header and external/ROCK/src/api/FRIKApi.h both used to
+// declare `namespace frik::api { struct FRIKApi { ... inline static const FRIKApi* inst;
+// } }` - identical qualified name, so the linker folds BOTH definitions into ONE inst
+// pointer slot across this shared DLL, even though the two struct layouts diverge (this
+// side stayed the pre-visual-authority contract; ROCK's is the newer "canonical 22-float
+// hand-pose and visual-authority" contract). Whichever side calls initialize() LAST wins
+// the slot, and the OTHER side then calls through its own (different) member-function
+// offsets into a vtable-like layout it doesn't match - e.g. a slot-22/26 mismatch reads a
+// 22-float struct through a 15-float stack array, an out-of-bounds stack read applying
+// garbage finger/palm values to the rendered hand. Renamed to frik::host_api so each side
+// gets its OWN independent inst slot; this does NOT by itself guarantee this side's own
+// layout matches the real FRIK.dll export (that still needs verification against FRIK's
+// actual current source), but it eliminates the cross-talk between the two definitions.
+namespace frik::host_api
 {
 #if defined(FRIK_API_EXPORTS)
 #   define FRIK_API extern "C" __declspec(dllexport)

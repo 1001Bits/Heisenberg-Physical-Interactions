@@ -685,6 +685,30 @@ namespace heisenberg
     {
         spdlog::debug("[DropToHand] TryGrabPendingDrop: Processing RefID {:08X}", drop.referenceFormID);
 
+        // _weaponSheatheWait[drop.referenceFormID] is created further down (only when this
+        // drop targets a drawn weapon hand) and erased once the wait resolves - but several
+        // EARLIER guards in this function (refID-recycled, item already grabbed, target hand
+        // occupied, etc.) can remove the drop from the queue on a LATER call without ever
+        // reaching that erase, permanently leaking the entry at whatever frame count it had
+        // reached. If the engine later recycles that FF refID for an unrelated drop
+        // targeting the same hand, the stale nonzero count skips the sheathe-request branch
+        // entirely (waited!=0) and the item is placed while the weapon is still drawn.
+        // RAII: erase on every exit from this function except the deliberate
+        // still-waiting-for-holster retry (which sets keepSheatheWaitEntry itself).
+        bool keepSheatheWaitEntry = false;
+        struct SheatheWaitGuard
+        {
+            DropToHand* self;
+            std::uint32_t formID;
+            const bool* keep;
+            ~SheatheWaitGuard()
+            {
+                if (!*keep) {
+                    self->_weaponSheatheWait.erase(formID);
+                }
+            }
+        } sheatheWaitGuard{ this, drop.referenceFormID, &keepSheatheWaitEntry };
+
         // Look up the reference by form ID
         auto* form = RE::TESForm::GetFormByID(drop.referenceFormID);
         if (!form) {
@@ -895,6 +919,7 @@ namespace heisenberg
                     spdlog::debug("[DropToHand] Weapon drawn on target hand — sheathing before placing {:08X}", drop.referenceFormID);
                 }
                 if (++waited < 90) {  // ~1.5s failsafe at 60fps
+                    keepSheatheWaitEntry = true;
                     return false;     // keep in queue; retry next frame until holstered
                 }
                 spdlog::warn("[DropToHand] Sheathe wait timed out for {:08X} — placing anyway", drop.referenceFormID);
@@ -1418,6 +1443,21 @@ namespace heisenberg
                 if (expectedBound) {
                     auto* player = RE::PlayerCharacter::GetSingleton();
                     if (player) {
+                        // Unlike TryGrabPendingDrop's refID-recycling recovery, the original
+                        // dropped world reference here is NOT known-gone — it just hasn't
+                        // finished streaming its 3D in within the 2s window, and can finish
+                        // loading moments later. Reclaim it before fabricating a fresh
+                        // inventory copy, or the slow-loading original lands on the ground as
+                        // a genuine duplicate of the item the player is about to receive.
+                        if (auto* staleRef = RE::TESForm::GetFormByID(drop.referenceFormID)) {
+                            if (auto* staleObjRef = staleRef->As<RE::TESObjectREFR>()) {
+                                if (!staleObjRef->IsDeleted() && !staleObjRef->IsDisabled()) {
+                                    heisenberg::SafeDisable(staleObjRef);
+                                    spdlog::debug("[DropToHand] Disabled slow-loading original ref {:08X} before re-queueing {:08X}",
+                                        drop.referenceFormID, drop.expectedBaseFormID);
+                                }
+                            }
+                        }
                         RE::BSTSmartPointer<RE::ExtraDataList> nullExtra;
                         heisenberg::AddObjectToContainer(player, expectedBound, &nullExtra, 1, nullptr, 0);
                         bool isLeft = drop.forceHand ? drop.forcedIsLeft : true;

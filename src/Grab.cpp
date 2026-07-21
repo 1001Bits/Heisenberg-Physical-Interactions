@@ -36,6 +36,7 @@
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <memory>
 #include <sstream>
 
 // =====================================================================
@@ -3586,36 +3587,54 @@ namespace
         // we let go. This is independent of motion-type/layer restoration: the bit was
         // ORed in on grab to stop the body shoving the player, and must be cleared so the
         // dropped object collides normally again.
-        TryRestoreHeldObjectCollision(state);
+        //
+        // WORLD LOCK (Jul 20): this file's own invariant (see the *Locked wrapper comments
+        // below) is that all physics modifications must go through a world write lock -
+        // this cluster (filter restore + native cache rebuild + CCD look-ahead) was the one
+        // release-path mutation that skipped it, racing background cell streaming or other
+        // in-flight Havok tasks that hold the SAME lock while mutating the same hknpWorld.
+        // Resolve the lock target the same way the physics-restore block below does.
+        RE::bhkWorld* poserLockWorld = refr ? GetBhkWorldFromRefr(refr) : state.savedState.savedBhkWorld;
+        if (!poserLockWorld) {
+            poserLockWorld = state.savedState.savedBhkWorld;
+        }
+        {
+            std::unique_ptr<heisenberg::Physics::WorldWriteLock> poserLock;
+            if (poserLockWorld) {
+                poserLock = std::make_unique<heisenberg::Physics::WorldWriteLock>(poserLockWorld);
+            }
 
-        // PAIR-CACHE POKE (Jul 18): even with byte-exact filter restore through the native
-        // setter, the hand<->object narrowphase pair CREATED while the hold suppressed it
-        // keeps its cached no-collide verdict as long as the two stay overlapping — the
-        // "must pull my hand back a few cm before it collides" symptom. Force the pair to be
-        // destroyed+rebuilt by cycling the object's filter through the suppression bit and
-        // back via the BS setter (each transition refreshes the body's pairing).
-        if (state.collisionObject && state.collisionObject->spSystem) {
-            if (void* pokeWorld = AccessWorld(state.collisionObject)) {
-                std::uint32_t pokeBodyId = 0x7FFFFFFF;
-                heisenberg::ConstraintFunctions::BhkPhysicsSystemGetBodyId(
-                    state.collisionObject->spSystem.get(), &pokeBodyId, state.collisionObject->systemBodyIdx);
-                std::uint32_t pokeCur = 0;
-                if (pokeBodyId != 0x7FFFFFFF &&
-                    heisenberg::Physics::TryReadBodyFilterInfo(pokeWorld, pokeBodyId, pokeCur)) {
-                    // v3 (Jul 18): the REAL engine primitive. v2's 3-frame no-collide window let
-                    // resting objects sink into surfaces and tunnel through. PDB names the exact
-                    // call for this: hknpWorld::rebuildBodyCollisionCaches(hknpBodyId) @0x14153C5A0
-                    // — destroys and rebuilds ALL of this body's collision caches (incl. the stale
-                    // hand<->object pair created no-collide during the hold) with the CURRENT,
-                    // already-restored filter. No collision gap, no deferred state.
-                    RebuildBodyCollisionCachesNative(pokeWorld, pokeBodyId);
-                    // CATCH FIX (Jul 18): a moving released object tunnels through the thin
-                    // hand colliders in one physics step ("collides only after it stops",
-                    // drop-to-other-hand passes through the palm). Enable per-body CCD
-                    // look-ahead (0.25 Havok m ~= 17.5 gu) while it flies; ThrownObjectTracker
-                    // drops it back to ~0 when tracking expires.
-                    heisenberg::Physics::TrySetBodyCollisionLookAhead(pokeWorld, pokeBodyId, 0.25f);
-                    spdlog::debug("[REL-DIAG] rebuildBodyCollisionCaches body=0x{:08X} filter=0x{:08X}", pokeBodyId, pokeCur);
+            TryRestoreHeldObjectCollision(state);
+
+            // PAIR-CACHE POKE (Jul 18): even with byte-exact filter restore through the native
+            // setter, the hand<->object narrowphase pair CREATED while the hold suppressed it
+            // keeps its cached no-collide verdict as long as the two stay overlapping — the
+            // "must pull my hand back a few cm before it collides" symptom. Force the pair to be
+            // destroyed+rebuilt by cycling the object's filter through the suppression bit and
+            // back via the BS setter (each transition refreshes the body's pairing).
+            if (state.collisionObject && state.collisionObject->spSystem) {
+                if (void* pokeWorld = AccessWorld(state.collisionObject)) {
+                    std::uint32_t pokeBodyId = 0x7FFFFFFF;
+                    heisenberg::ConstraintFunctions::BhkPhysicsSystemGetBodyId(
+                        state.collisionObject->spSystem.get(), &pokeBodyId, state.collisionObject->systemBodyIdx);
+                    std::uint32_t pokeCur = 0;
+                    if (pokeBodyId != 0x7FFFFFFF &&
+                        heisenberg::Physics::TryReadBodyFilterInfo(pokeWorld, pokeBodyId, pokeCur)) {
+                        // v3 (Jul 18): the REAL engine primitive. v2's 3-frame no-collide window let
+                        // resting objects sink into surfaces and tunnel through. PDB names the exact
+                        // call for this: hknpWorld::rebuildBodyCollisionCaches(hknpBodyId) @0x14153C5A0
+                        // — destroys and rebuilds ALL of this body's collision caches (incl. the stale
+                        // hand<->object pair created no-collide during the hold) with the CURRENT,
+                        // already-restored filter. No collision gap, no deferred state.
+                        RebuildBodyCollisionCachesNative(pokeWorld, pokeBodyId);
+                        // CATCH FIX (Jul 18): a moving released object tunnels through the thin
+                        // hand colliders in one physics step ("collides only after it stops",
+                        // drop-to-other-hand passes through the palm). Enable per-body CCD
+                        // look-ahead (0.25 Havok m ~= 17.5 gu) while it flies; ThrownObjectTracker
+                        // drops it back to ~0 when tracking expires.
+                        heisenberg::Physics::TrySetBodyCollisionLookAhead(pokeWorld, pokeBodyId, 0.25f);
+                        spdlog::debug("[REL-DIAG] rebuildBodyCollisionCaches body=0x{:08X} filter=0x{:08X}", pokeBodyId, pokeCur);
+                    }
                 }
             }
         }
@@ -4884,9 +4903,30 @@ namespace heisenberg
             state.isPulling = false;
             state.grabOffsetLocal = objectPos - handPos;
             RE::NiMatrix3 handRot = wandNode ? wandNode->world.rotate : RE::NiMatrix3();
+            // Preserve the saved per-item finger curls the block above (the `else` of
+            // `!useTelekinesis`, just before this) may have just populated - the
+            // documented contract ("saved per-item finger curls ALWAYS win", consumed via
+            // HasStoredFingerCurls) requires them to survive this reset. A full
+            // `state.itemOffset = ItemOffset()` here wiped them every time, silently
+            // making that block dead code for every natural/telekinesis grab.
+            const bool preservedHasFingerCurls = state.itemOffset.hasFingerCurls;
+            const bool preservedHasJointCurls = state.itemOffset.hasJointCurls;
+            const ItemOffset preservedCurls = state.itemOffset;
             // Compute hand-local offset that preserves the object's current world position.
             // F4VR row-vector convention (see project_f4vr_matrix_convention).
             state.itemOffset = ItemOffset();  // Clear any stored offset completely
+            if (preservedHasFingerCurls) {
+                state.itemOffset.hasFingerCurls = true;
+                state.itemOffset.thumbCurl = preservedCurls.thumbCurl;
+                state.itemOffset.indexCurl = preservedCurls.indexCurl;
+                state.itemOffset.middleCurl = preservedCurls.middleCurl;
+                state.itemOffset.ringCurl = preservedCurls.ringCurl;
+                state.itemOffset.pinkyCurl = preservedCurls.pinkyCurl;
+            }
+            if (preservedHasJointCurls) {
+                state.itemOffset.hasJointCurls = true;
+                for (int ji = 0; ji < 15; ++ji) state.itemOffset.jointCurls[ji] = preservedCurls.jointCurls[ji];
+            }
             state.itemOffset.position = handRot * state.grabOffsetLocal;
             state.itemOffset.rotation = worldTransform.rotate * handRot.Transpose();
             state.hasItemOffset = false;  // Not a stored offset
@@ -5210,7 +5250,18 @@ namespace heisenberg
         }
 
         // Two-handed secondary aim hand is a marker only — no target/storage/consume work.
+        // Still validate the ref though: if the co-held object is deleted (cell reset/
+        // despawn/script) the PRIMARY hand's own invalid-refr abort below only clears
+        // `state` (its own slot) — nothing clears THIS marker, so it stays active=true
+        // forever and rock::HostNotifyExternalGrab keeps reporting a grab on this hand,
+        // leasing its collider suite (can't push/collide) until the user happens to
+        // press-and-release grip or start a new grab on this hand.
         if (state.coHeldSecondary) {
+            if (!state.HasValidRefr()) {
+                spdlog::debug("[GRAB] UpdateGrab: {} hand co-held secondary marker reference invalid - clearing", isLeft ? "Left" : "Right");
+                state.Clear();
+                Heisenberg::GetSingleton().OnGrabEnded(isLeft);
+            }
             return;
         }
 
@@ -5235,9 +5286,15 @@ namespace heisenberg
             frik.ClearHandPoseFingerPositions(isLeft);
             Heisenberg::GetSingleton().SetFingerCurlValue(isLeft, 1.0f);
             Heisenberg::GetSingleton().OnGrabEnded(isLeft);
+            // Every other teardown path in this file also notifies ItemPositionConfigMode
+            // (it nulls _currentGrabState there) - this one didn't, so reposition mode kept
+            // a pointer to the now-Clear()ed GrabState after an invalid-refr abort, and
+            // thumbstick adjustment writes kept landing on the dead state under a stale
+            // item name instead of resetting.
+            heisenberg::ItemPositionConfigMode::GetSingleton().OnGrabEnded(isLeft);
             return;
         }
-        
+
         // Legacy constraint manager only runs when HeldBody is explicitly disabled.
         RE::TESObjectREFR* refr = state.GetRefr();
         int effectiveGrabMode = GetEffectiveGrabMode();
@@ -7635,8 +7692,14 @@ namespace heisenberg
                             const RE::NiPoint3 primaryFwd(parentRot.entry[1][0], parentRot.entry[1][1], parentRot.entry[1][2]);
                             const RE::NiPoint3 aimVec = aimWand->world.translate - parentPos;
                             if (Utils::VectorLength(aimVec) > 5.0f) {  // hands ≥5cm apart
+                                // MakeVectorAlignmentRotation builds a standard COLUMN-vector
+                                // Rodrigues rotation. Composing it directly into this function's
+                                // row-vector world (targetRot = targetRot * swing) makes each
+                                // world axis transform as row*S = S^T*row = R(-theta)*row - the
+                                // object swings the WRONG way (mirrored, growing with angle).
+                                // Right-compose the transpose to get the intended R(+theta).
                                 const RE::NiMatrix3 swing = MakeVectorAlignmentRotation(primaryFwd, aimVec);
-                                targetRot = targetRot * swing;  // F4VR row-vector compose
+                                targetRot = targetRot * swing.Transpose();  // F4VR row-vector compose
                             }
                         }
                     }

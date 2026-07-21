@@ -151,6 +151,8 @@ namespace heisenberg
         double _stateEnterTime = 0.0;
         double _lastSelectionTime = 0.0;
         float _lastDeltaTime = 1.0f / 90.0f;
+        double _lastTrackingTime = 0.0;   // Utils::GetTime() at the previous UpdateTracking() call
+        bool _hasLastTrackingTime = false;
 
         // A/X grab hold detection: hold = grab, tap = native game action.
         // Lets users put grab on A/X without losing the native button function.

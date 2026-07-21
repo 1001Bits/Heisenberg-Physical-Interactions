@@ -377,21 +377,34 @@ namespace heisenberg
             s_pushScratch.pushVel[3] = 0.0f;
         }
 
-        CollisionFunctions::SetLinearVelocity(colObj, pushVel);
+        // colObj's physics system can be torn down between the guarded GET above and here
+        // (cell detach / Havok rebuild racing this call — the exact race the __try on the
+        // read exists for). IsCollisionObjectValid only checks spSystem non-null, the same
+        // precondition that already held when the guarded Get faulted, so it doesn't rule
+        // this out. SEH-guard the write + wake the same way the read is guarded, instead of
+        // converting a survivable fault into a guaranteed follow-up crash two statements
+        // later.
+        __try {
+            CollisionFunctions::SetLinearVelocity(colObj, pushVel);
 
-        // WAKE the pushed object — a settled (asleep) body ignores SetLinearVelocity, which is the
-        // "sometimes pushes, sometimes not". The per-frame hand wake only covers ~15u around the
-        // wand; a large object's body centre can sit outside that box, so wake THIS object directly.
-        if (node) {
-            if (void* hknpW = GetCurrentHknpWorld()) {
-                auto activateInAabb = reinterpret_cast<void(__fastcall*)(void*, void*)>(
-                    REL::Module::get().base() + 0x1546f80);
-                const RE::NiPoint3& op = node->world.translate;
-                const float wr = 12.0f * kGameToHavok;
-                const float ox = op.x * kGameToHavok, oy = op.y * kGameToHavok, oz = op.z * kGameToHavok;
-                alignas(16) float aabb[8] = { ox - wr, oy - wr, oz - wr, 0.0f, ox + wr, oy + wr, oz + wr, 0.0f };
-                activateInAabb(hknpW, aabb);
+            // WAKE the pushed object — a settled (asleep) body ignores SetLinearVelocity, which is the
+            // "sometimes pushes, sometimes not". The per-frame hand wake only covers ~15u around the
+            // wand; a large object's body centre can sit outside that box, so wake THIS object directly.
+            if (node) {
+                if (void* hknpW = GetCurrentHknpWorld()) {
+                    auto activateInAabb = reinterpret_cast<void(__fastcall*)(void*, void*)>(
+                        REL::Module::get().base() + 0x1546f80);
+                    const RE::NiPoint3& op = node->world.translate;
+                    const float wr = 12.0f * kGameToHavok;
+                    const float ox = op.x * kGameToHavok, oy = op.y * kGameToHavok, oz = op.z * kGameToHavok;
+                    alignas(16) float aabb[8] = { ox - wr, oy - wr, oz - wr, 0.0f, ox + wr, oy + wr, oz + wr, 0.0f };
+                    activateInAabb(hknpW, aabb);
+                }
             }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            spdlog::warn("[HAND_COLLISION] ApplyPushForce: SetLinearVelocity/wake faulted for refr {:08X} — object's physics system torn down mid-push", refr->formID);
+            return;
         }
 
         spdlog::debug("[HAND_COLLISION] Swept push refr {:08X} from ({:.1f},{:.1f},{:.1f}) hkVel=({:.2f},{:.2f},{:.2f}) preservedZ={:.2f}",

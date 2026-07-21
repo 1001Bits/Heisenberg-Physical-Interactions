@@ -479,10 +479,38 @@ namespace heisenberg
                 std::string cleanName = StripCategoryPrefix(itemName);
                 
                 _offsets[cleanName] = offset;
-                
-                // Update form ID index (formId is already loaded from JSON above)
+
+                // Update form ID index (formId is already loaded from JSON above).
+                // SaveOffset's base-name invariant (see its own "use base name, not
+                // suffixed" comment) means the RUNTIME index built during THIS session
+                // always maps formId -> the base item name. But the JSON top-level key
+                // (itemName here) is the SUFFIXED name (SaveOffsetToJsonFile is always
+                // called with the _L/_R/_PA/_T-suffixed variant), so re-deriving the index
+                // from disk after a restart mapped formId -> a suffixed name instead
+                // (e.g. "Nuka-Cola_R") - GetOffsetWithFallback/GetExactOffset's Priority 1
+                // formId lookup then returned that right-hand-space offset as an EXACT
+                // match for the LEFT hand too, with none of the hand-variant/mirror
+                // resolution a same-session left-hand grab would have gone through. Strip
+                // the known suffixes (using the variant flags just loaded above) before
+                // indexing, matching SaveOffset's base-name invariant. Safe no-op for
+                // entries that never had a given suffix (exact-match compare only).
+                std::string formIdIndexName = cleanName;
+                auto stripSuffix = [&](const std::string& suffix) {
+                    if (formIdIndexName.size() > suffix.size() &&
+                        formIdIndexName.compare(formIdIndexName.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                        formIdIndexName.erase(formIdIndexName.size() - suffix.size());
+                    }
+                };
+                if (offset.isThrowable) {
+                    stripSuffix("_T");
+                }
+                if (offset.isPowerArmor) {
+                    stripSuffix("_PA");
+                }
+                stripSuffix(offset.isLeftHanded ? "_L" : "_R");
+
                 if (!offset.formId.empty() && offset.formId != "00000000") {
-                    _formIdToName[offset.formId] = cleanName;
+                    _formIdToName[offset.formId] = formIdIndexName;
                 }
                 
                 spdlog::debug("[ItemOffsets] Loaded offset for '{}' (from '{}')", cleanName, itemName);

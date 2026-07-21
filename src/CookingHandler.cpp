@@ -160,7 +160,12 @@ namespace heisenberg
                 if (!reqItem) continue;
                 CookingIngredient ing;
                 ing.formID = reqItem->GetFormID();
-                ing.count = 1;  // Default to 1, most cooking recipes use 1 of each
+                // reqVal is the COBJ's real required count (BGSTypedFormValuePair::i) -
+                // this used to hardcode 1 regardless, so any vanilla/DLC/mod recipe
+                // requiring 2+ of an ingredient cooked from a single unit (and, combined
+                // with HasIngredients' held-item short-circuit below, consumed only 1 of
+                // each ingredient for the full output).
+                ing.count = reqVal.i > 0 ? reqVal.i : 1;
                 recipe.ingredients.push_back(ing);
             }
 
@@ -285,19 +290,22 @@ namespace heisenberg
         if (!player || !player->inventoryList) return false;
 
         for (auto& ing : recipe.ingredients) {
-            if (ing.formID == heldFormID) continue;  // The held item counts
+            // The held item counts as 1 toward this ingredient's requirement - it used to
+            // skip the ingredient's count check ENTIRELY, treating a single held unit as
+            // satisfying the whole requirement regardless of ing.count.
+            const int heldContribution = (ing.formID == heldFormID) ? 1 : 0;
 
             // Check player inventory for this ingredient
-            bool found = false;
+            int inventoryCount = 0;
             for (auto& invItem : player->inventoryList->data) {
                 if (invItem.object && invItem.object->GetFormID() == ing.formID) {
-                    if (invItem.GetCount() >= ing.count) {
-                        found = true;
-                    }
+                    inventoryCount = invItem.GetCount();
                     break;
                 }
             }
-            if (!found) return false;
+            if (inventoryCount + heldContribution < ing.count) {
+                return false;
+            }
         }
         return true;
     }

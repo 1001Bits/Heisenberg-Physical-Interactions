@@ -1248,6 +1248,19 @@ namespace heisenberg
         angularMotor = nullptr;
         linearMotor = nullptr;
         constraintData = nullptr;
+        // Previously left set from the PREVIOUS grab: StartGrab re-assigns
+        // objectCollisionObject/inertiaModified/objectFilterSaved but never resets
+        // hasLastHandPos, so UpdateGrab's damping block (gated only on
+        // constraint.hasLastHandPos) computed the first frame's hand velocity from this
+        // grab's new hand position minus the PREVIOUS grab's lastHandPos - a grab across
+        // the room from where the last one ended produced a spurious multi-thousand-u/s
+        // velocity spike, flinging the newly grabbed object on its first frame.
+        objectCollisionObject = nullptr;
+        cachedObjectMass = 0.0f;
+        inertiaModified = false;
+        objectFilterSaved = false;
+        lastHandPos = RE::NiPoint3{ 0.0f, 0.0f, 0.0f };
+        hasLastHandPos = false;
     }
 
     // =========================================================================

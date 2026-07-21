@@ -3,7 +3,7 @@
 
 namespace heisenberg
 {
-    using FRIKApi = frik::api::FRIKApi;
+    using FRIKApi = frik::host_api::FRIKApi;
 
     bool FRIKInterface::Initialize()
     {
@@ -178,18 +178,18 @@ namespace heisenberg
         bool s_loggedDisable = false;
 
         // SEH leaves (no C++ objects needing unwind — NiTransform is trivially destructible).
-        bool ApplyExtSEH(const frik::api::FRIKApi* api, const char* tag, frik::api::FRIKApi::Hand h,
+        bool ApplyExtSEH(const frik::host_api::FRIKApi* api, const char* tag, frik::host_api::FRIKApi::Hand h,
                          const RE::NiTransform& w, int prio)
         {
             __try { return api->applyExternalHandWorldTransform(tag, h, w, prio); }
             __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
         }
-        bool ClearExtSEH(const frik::api::FRIKApi* api, const char* tag, frik::api::FRIKApi::Hand h)
+        bool ClearExtSEH(const frik::host_api::FRIKApi* api, const char* tag, frik::host_api::FRIKApi::Hand h)
         {
             __try { return api->clearExternalHandWorldTransform(tag, h); }
             __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
         }
-        bool GetHandWorldSEH(const frik::api::FRIKApi* api, frik::api::FRIKApi::Hand h, RE::NiTransform& out)
+        bool GetHandWorldSEH(const frik::host_api::FRIKApi* api, frik::host_api::FRIKApi::Hand h, RE::NiTransform& out)
         {
             __try { out = api->getHandWorldTransform(h); return true; }
             __except (EXCEPTION_EXECUTE_HANDLER) { return false; }

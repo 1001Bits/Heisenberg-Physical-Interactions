@@ -814,6 +814,13 @@ iLogLevel = 2
         throwableZoneRadius = kDefaults.throwableZoneRadius;
 
         // User-facing values in INI are in cm for intuitive configuration
+        ApplyCmToGameUnitsConversion();
+
+        spdlog::info("Config loaded");
+    }
+
+    void Config::ApplyCmToGameUnitsConversion()
+    {
         maxGrabDistance *= CM_TO_GAME_UNITS;
         naturalGrabDistance *= CM_TO_GAME_UNITS;
         naturalGrabDistanceNoMatch *= CM_TO_GAME_UNITS;
@@ -833,18 +840,16 @@ iLogLevel = 2
         headZoneOffsetY *= CM_TO_GAME_UNITS;
         headZoneOffsetZ *= CM_TO_GAME_UNITS;
         headZoneRadius *= CM_TO_GAME_UNITS;
-        
+
         chestZoneOffsetX *= CM_TO_GAME_UNITS;
         chestZoneOffsetY *= CM_TO_GAME_UNITS;
         chestZoneOffsetZ *= CM_TO_GAME_UNITS;
         chestZoneRadius *= CM_TO_GAME_UNITS;
-        
+
         legZoneOffsetX *= CM_TO_GAME_UNITS;
         legZoneOffsetY *= CM_TO_GAME_UNITS;
         legZoneOffsetZ *= CM_TO_GAME_UNITS;
         legZoneRadius *= CM_TO_GAME_UNITS;
-
-        spdlog::info("Config loaded");
     }
 
     void Config::Save()
@@ -1013,6 +1018,12 @@ iLogLevel = 2
         ini.SetLongValue("Equipping", "iArmorEquipZone", armorEquipZone, "; 0=Disabled, 1=Enabled (drop armor on body to equip)");
         ini.SetDoubleValue("Equipping", "fHeadZoneRadius", headZoneRadius * GAME_UNITS_TO_CM, "; cm - head zone radius for glasses/hats/helmets");
         ini.SetDoubleValue("Equipping", "fChestZoneRadius", chestZoneRadius * GAME_UNITS_TO_CM, "; cm - chest zone radius for shirts/armor");
+        // fLegZoneRadius is loaded (Load() reads+clamps+converts it) but was never written
+        // here - every BuildIni() (Save(), the intro-ceremony auto-save, item-positioning
+        // config-mode saves) silently dropped the user's value back to the embedded default
+        // on the next launch. The leg OFFSET fields below were already written; only the
+        // radius itself was missing.
+        ini.SetDoubleValue("Equipping", "fLegZoneRadius", legZoneRadius * GAME_UNITS_TO_CM, "; cm - leg zone radius for pants/boots");
         ini.SetDoubleValue("Equipping", "fHeadZoneOffsetX", headZoneOffsetX * GAME_UNITS_TO_CM, "; cm - armor zone offset");
         ini.SetDoubleValue("Equipping", "fHeadZoneOffsetY", headZoneOffsetY * GAME_UNITS_TO_CM, "; cm - armor zone offset");
         ini.SetDoubleValue("Equipping", "fHeadZoneOffsetZ", headZoneOffsetZ * GAME_UNITS_TO_CM, "; cm - armor zone offset");
@@ -1239,8 +1250,13 @@ iLogLevel = 2
         }
         if (mcmKeys.empty()) return;
 
-        // Field defaults from a freshly-constructed Config.
+        // Field defaults from a freshly-constructed Config. A default-constructed Config
+        // holds the conversion-block fields in their ORIGINAL cm units (same as
+        // Load's kDefaults), but BuildIni always multiplies by GAME_UNITS_TO_CM expecting
+        // a post-Load, already-in-game-units Config - so convert cm->game units first,
+        // the same step Load() applies, or the seeded defaults come out 1.4x too large.
         Config def;
+        def.ApplyCmToGameUnitsConversion();
         CSimpleIniA defIni;
         defIni.SetUnicode();
         def.BuildIni(&defIni);

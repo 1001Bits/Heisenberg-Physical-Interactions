@@ -109,6 +109,24 @@ namespace heisenberg::FrikArmGoalHook
             }
         }
 
+        // Pointer-only liveness check (never dereferences target - safe even if target is
+        // a freed/dangling pointer), mirroring HandAuthority.cpp's inLiveSubtree. The
+        // fp-skeleton ROOT pointer can compare EQUAL after a rebuild (same-size slab
+        // allocator reuse), so the root-change check in resolveGoalNode below cannot be
+        // trusted alone - this walks the CURRENT tree looking for the cached node.
+        bool nodeInLiveSubtree(const RE::NiAVObject* target, RE::NiAVObject* liveRoot, int depth = 0)
+        {
+            if (!target || !liveRoot) return false;
+            if (liveRoot == target) return true;
+            if (depth > 20) return false;
+            if (auto* node = liveRoot->IsNode()) {
+                for (const auto& child : node->children) {
+                    if (child && nodeInLiveSubtree(target, child.get(), depth + 1)) return true;
+                }
+            }
+            return false;
+        }
+
         RE::NiNode* resolveGoalNode(bool isLeft)
         {
             RE::NiNode* fp = f4cf::f4vr::getFirstPersonSkeleton();
@@ -120,10 +138,28 @@ namespace heisenberg::FrikArmGoalHook
                 s_cachedFpSkeleton = fp;
                 s_cachedHandNode[0] = s_cachedHandNode[1] = nullptr;
             }
+            if (s_cachedHandNode[i] && !nodeInLiveSubtree(s_cachedHandNode[i], fp)) {
+                // Skeleton root pointer matched but the subtree was rebuilt underneath it
+                // (power-armor entry/exit, FRIK skeleton refresh, save load) - the cached
+                // node is stale even though the generation check above didn't fire.
+                s_cachedHandNode[i] = nullptr;
+            }
             if (!s_cachedHandNode[i]) {
                 s_cachedHandNode[i] = f4cf::f4vr::findNode(fp, isLeft ? "LArm_Hand" : "RArm_Hand");
             }
             return s_cachedHandNode[i];
+        }
+
+        // SEH raw world read (no destructor-bearing locals in __try), the read-side twin
+        // of sehWriteGoalWorld/sehWriteOffsetWorld below.
+        bool sehReadWorld(const RE::NiNode* node, RE::NiTransform& out)
+        {
+            __try {
+                out = node->world;
+                return true;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                return false;
+            }
         }
 
         // ---- The shim (v2, Jul 19 frame-order audit) ----
@@ -195,7 +231,14 @@ namespace heisenberg::FrikArmGoalHook
             }
 
             // Publish controller truth for this hand (ROCK's weapon-solve input seam).
-            s_truthHand[hi] = fpHand->world;
+            // SEH-guarded: fpHand is the revalidated-per-call cached node above, but
+            // revalidation only proves reachability a moment ago - guard the actual
+            // dereference too (matches every other raw engine read in this file).
+            RE::NiTransform fpHandWorld{};
+            if (!sehReadWorld(fpHand, fpHandWorld)) {
+                return ret;
+            }
+            s_truthHand[hi] = fpHandWorld;
             s_truthValid[hi] = true;
             // Capture the anatomical frame beside the clean pass, before this shim's
             // authority re-solve can move the arm. ROCK consumes the copied center/radius
@@ -292,9 +335,11 @@ namespace heisenberg::FrikArmGoalHook
             //   handPos = offPos + d, d in offset basis: d_local = (handPos - offPos) * offRot^T
             // Desired: hand' = target  =>  offRot' = Kinv * targetRot = (offRot * handRot^T) * targetRot
             //          offPos' = targetPos - d_world' where d_world' = d_local * offRot'
+            // Reuse fpHandWorld (already SEH-read above) instead of dereferencing fpHand
+            // a second time.
             const RE::NiMatrix3 offRot = off->world.rotate;
-            const RE::NiMatrix3 handRot = fpHand->world.rotate;
-            const RE::NiPoint3 dWorld = fpHand->world.translate - off->world.translate;
+            const RE::NiMatrix3 handRot = fpHandWorld.rotate;
+            const RE::NiPoint3 dWorld = fpHandWorld.translate - off->world.translate;
 
             RE::NiTransform offT;
             offT.rotate = offRot * handRot.Transpose() * target.rotate;

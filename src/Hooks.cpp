@@ -31,6 +31,7 @@
 #include "rock_integration/WeaponCollision.h"
 #include "rock_integration/TwoHandedGrip.h"
 
+#include <array>
 #include <atomic>
 
 namespace heisenberg::Hooks
@@ -562,46 +563,31 @@ namespace heisenberg::Hooks
             }
 
             if (!MenuChecker::GetSingleton().IsLoading()) {
-                __try {
-                    PipboyInteraction::GetSingleton().UpdateTapeDeckAnimation();
-                }
-                __except (EXCEPTION_EXECUTE_HANDLER) {
-                    static bool loggedOnce = false;
-                    if (!loggedOnce) {
-                        spdlog::error("[HOOKS] Exception in HookEndUpdate - tape deck skipped");
-                        loggedOnce = true;
-                    }
-                }
+                // NO catch-all SEH around these four calls (Jul 20 audit fix): this
+                // project's own rule (see the narrow SEH used elsewhere in this file) is
+                // that /EHsc means __except skips C++ destructors on unwind, so wrapping
+                // RAII-holding code (WorldWriteLock, NiPointer refcounts, scene-graph
+                // locks - all of which these callees can hold internally) in a catch-all
+                // leaks whatever was held on any fault, turning a diagnosable crash into a
+                // next-frame deadlock or a permanently-leaked reference. A catch-all here
+                // is WORSE than no guard. Narrow SEH belongs only around the specific raw
+                // pointer reads inside these functions, not around calls that own RAII.
+                PipboyInteraction::GetSingleton().UpdateTapeDeckAnimation();
 
                 // Process deferred VH holster requests here (NOT in PostPhysics)
                 // VH's displayWeapon() does cloneNode/AttachChild/loadNifFromFile
                 // which deadlocks during post-physics when scene graph locks are held.
                 // EndUpdate runs AFTER all animation/skeleton/bone processing,
                 // so the scene graph is fully available for NIF cloning.
-                __try {
-                    GrabManager::GetSingleton().ProcessPendingHolster();
-                }
-                __except (EXCEPTION_EXECUTE_HANDLER) {
-                    spdlog::error("[HOOKS] Exception in ProcessPendingHolster");
-                }
+                GrabManager::GetSingleton().ProcessPendingHolster();
 
                 // Process deferred weapon unequip from storage zone grip
                 // UnEquipItem crashes during HookPostPhysics (physics locks held),
                 // so we defer to EndUpdate where game state is stable.
-                __try {
-                    g_heisenberg.ProcessPendingWeaponUnequip();
-                }
-                __except (EXCEPTION_EXECUTE_HANDLER) {
-                    spdlog::error("[HOOKS] Exception in ProcessPendingWeaponUnequip");
-                }
+                g_heisenberg.ProcessPendingWeaponUnequip();
 
                 // Process deferred weapon re-equip from storage zone grip
-                __try {
-                    g_heisenberg.ProcessPendingWeaponReequip();
-                }
-                __except (EXCEPTION_EXECUTE_HANDLER) {
-                    spdlog::error("[HOOKS] Exception in ProcessPendingWeaponReequip");
-                }
+                g_heisenberg.ProcessPendingWeaponReequip();
 
                 // Hand collision: body creation + pair filter
                 // Uses BSWriteLocker like HIGGS to safely modify the physics world.
@@ -1816,8 +1802,18 @@ namespace heisenberg::Hooks
     static EquipObject_t g_originalEquipObject = nullptr;
     static ULONGLONG s_holotapeRedirectTick = 0;
     // Temporarily changed holotape type to prevent game's secondary TerminalMenu open
-    static std::uint32_t s_redirectedNoteFormID = 0;
-    static int s_redirectedNoteOrigType = -1;
+    // Small array, not a single slot: a second holotape redirect within the ~500ms window
+    // (two terminal/program holotapes activated in quick succession) used to overwrite
+    // both single-slot statics with no restore of the first one, permanently latching its
+    // BGSNote::type to kVoice (playing it as a voice recording / never opening its
+    // terminal program until the game restarts).
+    struct RedirectedNoteEntry
+    {
+        std::uint32_t formID = 0;
+        int origType = -1;
+    };
+    static constexpr std::size_t kMaxPendingHolotapeRedirects = 4;
+    static std::array<RedirectedNoteEntry, kMaxPendingHolotapeRedirects> s_redirectedNotes{};
 
     bool HookEquipObject(RE::ActorEquipManager* equipManager,
                           RE::Actor* actor,
@@ -2055,11 +2051,31 @@ namespace heisenberg::Hooks
                     auto* note = baseForm->As<RE::BGSNote>();
                     if (note && (note->type == RE::BGSNote::NOTE_TYPE::kTerminal ||
                                  note->type == RE::BGSNote::NOTE_TYPE::kProgram)) {
-                        s_redirectedNoteFormID = baseForm->formID;
-                        s_redirectedNoteOrigType = static_cast<int>(note->type);
+                        // First still-pending (formID != 0) entry, or overwrite the same
+                        // formID if it's already pending (re-redirect before its restore
+                        // ran) - never silently overwrite a DIFFERENT pending entry, which
+                        // is what the old single-slot statics did on a second redirect
+                        // within the ~500ms window.
+                        RedirectedNoteEntry* slot = nullptr;
+                        for (auto& entry : s_redirectedNotes) {
+                            if (entry.formID == baseForm->formID) { slot = &entry; break; }
+                        }
+                        if (!slot) {
+                            for (auto& entry : s_redirectedNotes) {
+                                if (entry.formID == 0) { slot = &entry; break; }
+                            }
+                        }
+                        if (slot) {
+                            slot->formID = baseForm->formID;
+                            slot->origType = static_cast<int>(note->type);
+                        } else {
+                            spdlog::warn("[EquipHook] Holotape redirect slots full ({}) - {:08X} type restore will be skipped",
+                                kMaxPendingHolotapeRedirects, baseForm->formID);
+                        }
+                        const int loggedOrigType = slot ? slot->origType : -1;
                         note->type = RE::BGSNote::NOTE_TYPE::kVoice;
                         spdlog::debug("[EquipHook] Temporarily changed holotape {:08X} type {} → kVoice",
-                            baseForm->formID, s_redirectedNoteOrigType);
+                            baseForm->formID, loggedOrigType);
                     }
 
                     return true;  // Skip original equip (prevents holotape playback)
@@ -2096,16 +2112,22 @@ namespace heisenberg::Hooks
 
     void RestoreRedirectedHolotapeType()
     {
-        if (s_redirectedNoteFormID == 0 || s_redirectedNoteOrigType < 0) return;
-        auto* form = RE::TESForm::GetFormByID(s_redirectedNoteFormID);
-        if (form && form->GetFormType() == RE::ENUM_FORM_ID::kNOTE) {
-            auto* note = static_cast<RE::BGSNote*>(form);
-            note->type = static_cast<RE::BGSNote::NOTE_TYPE>(s_redirectedNoteOrigType);
-            spdlog::debug("[EquipHook] Restored holotape {:08X} type to {}",
-                s_redirectedNoteFormID, s_redirectedNoteOrigType);
+        // Drain ALL pending entries, not just one - a second redirect within the ~500ms
+        // window used to overwrite the single slot with no restore of the first form,
+        // permanently latching its BGSNote::type to kVoice.
+        for (auto& entry : s_redirectedNotes) {
+            if (entry.formID == 0 || entry.origType < 0) {
+                continue;
+            }
+            auto* form = RE::TESForm::GetFormByID(entry.formID);
+            if (form && form->GetFormType() == RE::ENUM_FORM_ID::kNOTE) {
+                auto* note = static_cast<RE::BGSNote*>(form);
+                note->type = static_cast<RE::BGSNote::NOTE_TYPE>(entry.origType);
+                spdlog::debug("[EquipHook] Restored holotape {:08X} type to {}",
+                    entry.formID, entry.origType);
+            }
+            entry = RedirectedNoteEntry{};
         }
-        s_redirectedNoteFormID = 0;
-        s_redirectedNoteOrigType = -1;
     }
 
     void InstallEquipObjectHook()

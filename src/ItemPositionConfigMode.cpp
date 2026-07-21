@@ -377,15 +377,17 @@ namespace heisenberg
         if (_repositionModeActive) {
             spdlog::info("[ItemPositionConfig] Disabling reposition mode");
             _repositionModeActive = false;
-            
-            // Restore player controls if they were disabled
-            auto* player = RE::PlayerCharacter::GetSingleton();
-            if (player) {
-                auto* controls = RE::PlayerControls::GetSingleton();
-                if (controls) {
-                    controls->blockPlayerInput = false;
-                }
-            }
+
+            // Restore player controls the same way every other exit path does
+            // (SetPlayerControlsEnabled(true)) - this used to only clear
+            // PlayerControls::blockPlayerInput, a flag SetPlayerControlsEnabled(false)
+            // never actually sets. The real disable path restrains the actor
+            // (SetActorRestrained) and force-disables user events (kMainFour|kVATS|
+            // kActivate|kMenu + VR other-events via BSInputEnableManager), none of which
+            // this undid - a save load during reposition mode left A/B/X/Y, VATS,
+            // Activate and Menu dead (and the actor restrained) until the player
+            // re-entered and cleanly exited reposition mode.
+            SetPlayerControlsEnabled(true);
         }
         
         // Clear all state

@@ -293,6 +293,8 @@ namespace heisenberg
         struct ArmEpisodeBase
         {
             bool valid = false;
+            bool hasForearm2 = false;
+            bool hasForearm3 = false;
             RE::NiTransform shoulder{}, upper{}, forearm1{}, forearm2{}, forearm3{}, hand{};
         };
         ArmEpisodeBase g_armBase[2];
@@ -303,7 +305,9 @@ namespace heisenberg
             base.shoulder = arm.shoulder->local;
             base.upper = arm.upperArm->local;
             base.forearm1 = arm.foreArm->local;
+            base.hasForearm2 = arm.foreArm2 != nullptr;
             if (arm.foreArm2) base.forearm2 = arm.foreArm2->local;
+            base.hasForearm3 = arm.foreArm3 != nullptr;
             if (arm.foreArm3) base.forearm3 = arm.foreArm3->local;
             base.hand = arm.hand->local;
             base.valid = true;
@@ -314,8 +318,13 @@ namespace heisenberg
             arm.shoulder->local = base.shoulder;
             arm.upperArm->local = base.upper;
             arm.foreArm->local = base.forearm1;
-            if (arm.foreArm2) arm.foreArm2->local = base.forearm2;
-            if (arm.foreArm3) arm.foreArm3->local = base.forearm3;
+            // Only restore forearm2/3 if THIS episode's capture actually saw them - the
+            // struct default-constructs to a zero (non-identity) NiTransform, and gating
+            // on the CURRENT chain having these bones (not on whether the slot was
+            // captured) writes a degenerate zero-scale transform onto live bones when an
+            // episode started in power armor (no forearm2/3) and ends after exiting it.
+            if (arm.foreArm2 && base.hasForearm2) arm.foreArm2->local = base.forearm2;
+            if (arm.foreArm3 && base.hasForearm3) arm.foreArm3->local = base.forearm3;
             arm.hand->local = base.hand;
             f4cf::f4vr::updateTransformsDown(arm.shoulder, true);
         }
@@ -349,7 +358,14 @@ namespace heisenberg
             // Body direction context (FRIK derives these in its body pass): forward = the
             // skinned chest facing projected to XY; sideways = right of forward. These shape
             // elbow-direction heuristics only.
-            RE::NiPoint3 fwd3 = arm.chest->world.rotate * RE::NiPoint3(0, 1, 0);
+            // Row-vector convention (world = local*parent): a node's world-space local-Y
+            // axis is ROW 1 of its rotation matrix, i.e. rotate.Transpose() * v - NOT
+            // rotate * v (that extracts COLUMN 1, which is only correct under a
+            // column-vector convention this project doesn't use). The hand-axis math
+            // three lines below (handRot.Transpose() * ...) already uses the correct
+            // form; this was the one holdout, and being column-extracted meant it was
+            // silently yaw-mirrored (correct facing north/south, reversed facing east/west).
+            RE::NiPoint3 fwd3 = arm.chest->world.rotate.Transpose() * RE::NiPoint3(0, 1, 0);
             RE::NiPoint3 forwardDir = MU::vec3Norm(RE::NiPoint3(fwd3.x, fwd3.y, 0.0f));
             if (MU::vec3Len(forwardDir) < 0.001f) forwardDir = RE::NiPoint3(0, 1, 0);
             const float negLeft = isLeft ? -1.0f : 1.0f;
@@ -585,7 +601,12 @@ namespace heisenberg
             // the skinned mesh between forearm and hand ("stretches like chewing gum"). Place
             // the hand at the CLAMPED reachable wrist instead; keep the target's orientation.
             RE::NiTransform handT = worldT;
-            if (dRaw > dmax) {
+            // Mirror the beyond-reach clamp on the too-close side: dRaw < dmin (target
+            // pulled within |L1-L2| of the shoulder) leaves the forearm chain solved to
+            // the dmin ring while the hand was still being placed at the full unclamped
+            // target - the same skinned-mesh tear the beyond-reach case was fixed for,
+            // just on the near side.
+            if (dRaw > dmax || dRaw < dmin) {
                 handT.translate = vadd(S, vmul(n, d));
             }
             placeNodeAtWorld(arm.hand, handT);

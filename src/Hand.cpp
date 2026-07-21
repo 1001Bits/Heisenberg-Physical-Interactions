@@ -28,6 +28,7 @@
 #include <RE/Bethesda/BSStringT.h>
 #include <RE/Bethesda/TESBoundObjects.h>
 
+#include <algorithm>
 #include <cmath>
 
 namespace
@@ -129,7 +130,19 @@ namespace heisenberg
             if (grabState.active) {
                 VRButton grabBtn = _isLeft ? (g_config.useXForLeftGrab  ? VRButton::X : VRButton::Grip)
                                            : (g_config.useAForRightGrab ? VRButton::A : VRButton::Grip);
+                const bool wasPressed = _grabPressed;
                 _grabPressed = g_vrInput.IsPressed(_isLeft, grabBtn);
+                // A/X hold-to-grab: UpdateInput's hold-confirmation branch computes the
+                // held duration from _axGrabPressTime, which is only written on a press
+                // edge THERE - but that code doesn't run while blocked, so a press that
+                // begins while the menu is open leaves _axGrabPressTime stale (0 or a
+                // much earlier press). Refresh it here on the rising edge we DO see, so
+                // the post-menu hold timer starts from the real press instead of
+                // instantly reading as an already-long hold and phantom-confirming.
+                if (_grabPressed && !wasPressed) {
+                    _axGrabPressTime = Utils::GetTime();
+                    _axGrabHoldConfirmed = false;
+                }
             } else {
                 _grabPressed = false;
             }
@@ -398,8 +411,22 @@ namespace heisenberg
         _position = wandNode->world.translate;
         _rotation = wandNode->world.rotate;
 
-        // Calculate velocity
-        float dt = 1.0f / 90.0f; // Assume 90Hz for now - TODO: get actual frame time
+        // Calculate velocity from REAL frame time (QPC delta between UpdateTracking calls).
+        // A hardcoded 1/90 assumption reads 2x too fast under SteamVR motion-smoothing /
+        // reprojection at 45fps (routine on this project's own recommended timing dial) -
+        // every derived quantity below (hand velocity, player velocity, angular velocity)
+        // would double, so every thrown object leaves the hand at ~2x intended speed.
+        // Clamped to a sane range: guards the first-ever call (no previous sample) and any
+        // freak long stall (loading screen, breakpoint) from producing a near-zero or
+        // huge dt that would spike velocity instead of measuring it.
+        const double now = Utils::GetTime();
+        float dt = 1.0f / 90.0f;
+        if (_hasLastTrackingTime) {
+            const double rawDt = now - _lastTrackingTime;
+            dt = static_cast<float>(std::clamp(rawDt, 1.0 / 250.0, 1.0 / 15.0));
+        }
+        _lastTrackingTime = now;
+        _hasLastTrackingTime = true;
         _lastDeltaTime = dt;
         if (dt > 0.0f) {
             RE::NiPoint3 newVelocity = (_position - _prevPosition) / dt;
@@ -520,8 +547,31 @@ namespace heisenberg
             return;
         }
         
-        // Only process if target changed (avoid redundant work)
+        // Only process if target changed (avoid redundant work: grabbable-type check,
+        // activate-text probe, collision-overlap scan). But distance/isClose/hitPoint are
+        // cheap world-space numbers that go stale while the laser stays on the same
+        // object - OnGrabPressed branches on _selection.distance (pull-to-hand vs direct
+        // grab), so walking up to (or backing away from) a target without the laser
+        // leaving it must still update these every frame.
         if (!targetChanged && _selection.IsValid()) {
+            RE::TESObjectREFR* selRefr = _selection.GetRefr();
+            RE::NiAVObject* selNode = selRefr ? selRefr->Get3D() : nullptr;
+            if (selNode) {
+                const RE::NiPoint3 objPos = selNode->world.translate;
+                const float dx = objPos.x - _position.x;
+                const float dy = objPos.y - _position.y;
+                const float dz = objPos.z - _position.z;
+                _selection.hitPoint = objPos;
+                _selection.distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+                const auto& cfg = Config::GetSingleton();
+                _selection.isClose = (_selection.distance <= cfg.closeGrabThreshold);
+                if (cfg.useCollisionOverlapForGrabCandidates && !_selection.isClose) {
+                    auto overlaps = ContactImpulseListener::GetSingleton().GetOverlappingBodies(_isLeft);
+                    if (!overlaps.empty()) {
+                        _selection.isClose = true;
+                    }
+                }
+            }
             return;  // Same target, already selected
         }
         
@@ -827,12 +877,20 @@ namespace heisenberg
                 TransitionToIdle();
                 return;
             }
-            if (_state == State::Idle) {
-                // Non-sticky grab active but Hand is in Idle (desync from DropToHand timing).
-                // The grip release that should have ended this grab was missed because
-                // DropToHand hadn't processed yet. Release it now on press as recovery.
-                spdlog::debug("[GRAB] {} hand: Grip pressed on desynced non-sticky grab - releasing (recovery)",
-                            _isLeft ? "Left" : "Right");
+            if (_state == State::Idle || _state == State::Held || _state == State::Pulling) {
+                // Non-sticky grab active. _state==Idle is the desync-from-DropToHand-timing
+                // case (release missed because DropToHand hadn't processed yet); _state==
+                // Held/Pulling is the NORMAL case for a non-sticky grab (DropToHand.cpp
+                // passes stickyGrab=false for world weapon pickups) with the grip
+                // physically still up - state-sync in Update() forces _state=Held for any
+                // GrabManager-started grab, so without this branch a press here fell
+                // through the switch below into `default:` ("no valid target"), which
+                // spawns SmartGrab / queues a weapon unequip while THIS hand is still
+                // holding something. Release it now on press instead (same recovery as
+                // the Idle case) so the no-target default branch is unreachable while
+                // GrabManager holds an object for this hand.
+                spdlog::debug("[GRAB] {} hand: Grip pressed on {} non-sticky grab - releasing",
+                            _isLeft ? "Left" : "Right", _state == State::Idle ? "desynced" : "active");
                 Release(true);
                 TransitionToIdle();
                 return;

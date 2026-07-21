@@ -140,6 +140,16 @@ namespace heisenberg
             _trackedActivators.clear();
             _trackedTerminals.clear();
             _currentCell = nullptr;
+            // _cachedLeftResult/_cachedRightResult hold a raw pointer into the vector just
+            // cleared above (see the matching reset in ScanCellForActivators) - without
+            // this, a throttled CheckProximity call right after a save load can return a
+            // pointer into freed vector storage. Also reset the pointing-range latches so
+            // a save load mid-hitbox-shrink doesn't leave player collision disabled.
+            _cachedLeftResult = ProximityResult{};
+            _cachedRightResult = ProximityResult{};
+            _leftHandInPointingRange = false;
+            _rightHandInPointingRange = false;
+            UpdateHitboxShrink();
             spdlog::info("[ActivatorHandler] Cleared state (save/load cleanup)");
         }
 
