@@ -14,6 +14,11 @@ external/*
 external/ROCK/*
 !external/ROCK/src/
 external/ROCK/src/*
+!external/ROCK/src/api/
+external/ROCK/src/api/*
+!external/ROCK/src/api/ROCKProviderApi.cpp
+!external/ROCK/src/api/ROCKProviderApi.h
+!external/ROCK/src/api/WeaponPartDriveLeasePolicy.h
 !external/ROCK/src/ROCKMain.cpp
 !external/ROCK/src/physics-interaction/
 external/ROCK/src/physics-interaction/*
@@ -27,4 +32,7 @@ external/ROCK/src/physics-interaction/weapon/*
 !external/ROCK/src/physics-interaction/weapon/TwoHandedGrip.h
 !external/ROCK/src/physics-interaction/weapon/TwoHandedWeaponPolicy.h
 !external/ROCK/src/physics-interaction/weapon/WeaponSupport.h
+!docs/
+docs/*
+!docs/ROCKProviderAPI_ViaHeisenberg.md
 !.gitignore

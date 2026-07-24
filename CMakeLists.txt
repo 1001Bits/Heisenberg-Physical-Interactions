@@ -243,6 +243,15 @@ if(BUILD_HEISENBERG_TESTS)
   target_compile_features(HeisenbergPipboyMeshContactPolicyTests PRIVATE cxx_std_23)
   target_include_directories(HeisenbergPipboyMeshContactPolicyTests PRIVATE "${SOURCE_DIR}")
   add_test(NAME HeisenbergPipboyMeshContactPolicyTests COMMAND HeisenbergPipboyMeshContactPolicyTests)
+
+  add_executable(HeisenbergRockProviderApiPolicyTests
+    tests/RockProviderApiPolicyTests.cpp
+    external/ROCK/src/api/ROCKProviderApi.h
+    external/ROCK/src/api/WeaponPartDriveLeasePolicy.h
+  )
+  target_compile_features(HeisenbergRockProviderApiPolicyTests PRIVATE cxx_std_23)
+  target_include_directories(HeisenbergRockProviderApiPolicyTests PRIVATE "${ROCK_DIR}/src")
+  add_test(NAME HeisenbergRockProviderApiPolicyTests COMMAND HeisenbergRockProviderApiPolicyTests)
 endif()
 
 
