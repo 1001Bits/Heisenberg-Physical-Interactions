@@ -24,13 +24,14 @@
  * sidearms whose records do not expose a stronger semantic signal.
  */
 
-#include "rock_integration/TransformMath.h"
+#include "physics-interaction/TransformMath.h"
+#include "physics-interaction/weapon/TwoHandedWeaponPolicy.h"
 
 #include <array>
 #include <cstdint>
 #include <string_view>
 
-namespace heisenberg::rock_core::weapon_support_authority_policy
+namespace rock::weapon_support_authority_policy
 {
     enum class WeaponSupportAuthorityMode
     {
@@ -71,6 +72,34 @@ namespace heisenberg::rock_core::weapon_support_authority_policy
         WeaponSupportWeaponClass weaponClass)
     {
         return visualOnlySidearmSupportEnabled && weaponClass == WeaponSupportWeaponClass::Sidearm ?
+                   WeaponSupportAuthorityMode::VisualOnlySupport :
+                   WeaponSupportAuthorityMode::FullTwoHandedSolver;
+    }
+
+    /*
+     * Sidearm hybrid support grip: a sidearm support grab that lands close to
+     * the firing grip is a shooting cup and stays visual-only so the two
+     * authorities do not fight over the short pistol frame, while a grab
+     * farther out is a manipulation grip and takes the same full two-handed
+     * authority long guns use (enabling detach/part-carry when realistic
+     * handling is on, and plain two-handed manipulation when it is off).
+     * Provider-mandated grab modes are exempt: a part whitelisted as
+     * AttachOnly must never be upgraded to full authority by proximity.
+     * The decision is made once at grip capture; changing modes requires
+     * releasing and re-grabbing.
+     */
+    inline constexpr bool canApplySidearmHybridAuthority(
+        WeaponSupportAuthorityMode resolvedMode,
+        bool providerGrabModeOverride)
+    {
+        return resolvedMode == WeaponSupportAuthorityMode::VisualOnlySupport && !providerGrabModeOverride;
+    }
+
+    inline constexpr WeaponSupportAuthorityMode resolveSidearmHybridSupportAuthorityMode(
+        float supportPalmToFiringGripDistance,
+        float visualOnlyRadius)
+    {
+        return supportPalmToFiringGripDistance <= visualOnlyRadius ?
                    WeaponSupportAuthorityMode::VisualOnlySupport :
                    WeaponSupportAuthorityMode::FullTwoHandedSolver;
     }
@@ -190,9 +219,9 @@ namespace heisenberg::rock_core::weapon_support_authority_policy
 
 // ---- WeaponSupportGripPolicy.h ----
 
-#include "rock_integration/weapon/WeaponTypes.h"
+#include "physics-interaction/weapon/WeaponTypes.h"
 
-namespace heisenberg::rock_core::weapon_support_grip_policy
+namespace rock::weapon_support_grip_policy
 {
     /*
      * ROCK gates two-handing by whether the equipped item can accept support
@@ -262,7 +291,7 @@ namespace heisenberg::rock_core::weapon_support_grip_policy
  * path and the provider can actually accept those transforms.
  */
 
-namespace heisenberg::rock_core::weapon_support_thumb_pose_policy
+namespace rock::weapon_support_thumb_pose_policy
 {
     [[nodiscard]] constexpr bool shouldPublishAlternateThumbLocalOverride(
         const bool solvedFingerPose,
@@ -306,9 +335,99 @@ namespace heisenberg::rock_core::weapon_support_thumb_pose_policy
     }
 }
 
+// ---- EquippedWeaponManualOwnershipPolicy.h ----
+
+namespace rock::equipped_weapon_manual_ownership_policy
+{
+    struct RuntimeState
+    {
+        bool active{ false };
+        std::uint64_t weaponGenerationKey{ 0 };
+    };
+
+    struct Input
+    {
+        bool weaponEquipped{ false };
+        std::uint64_t weaponGenerationKey{ 0 };
+        bool startRequested{ false };
+        bool primaryGripRetained{ false };
+        bool supportGripRetained{ false };
+    };
+
+    struct Decision
+    {
+        bool active{ false };
+        bool started{ false };
+        bool cleared{ false };
+        bool dropRequested{ false };
+    };
+
+    struct PendingPrimaryOnlyStartInput
+    {
+        bool pending{ false };
+        bool gripHeld{ false };
+        bool configEnabled{ true };
+        bool primaryPoseBlockerAvailable{ true };
+        bool virtualHolstersOwnsInput{ false };
+    };
+
+    [[nodiscard]] inline constexpr bool featureAvailable(
+        bool configEnabled,
+        bool primaryPoseBlockerAvailable,
+        bool weaponNodeAvailable,
+        std::uint64_t weaponGenerationKey) noexcept
+    {
+        return configEnabled &&
+               primaryPoseBlockerAvailable &&
+               weaponNodeAvailable &&
+               weaponGenerationKey != 0;
+    }
+
+    [[nodiscard]] inline constexpr bool shouldKeepPendingPrimaryOnlyStart(const PendingPrimaryOnlyStartInput& input) noexcept
+    {
+        // Keep trigger-equip's already-held grip alive across equipped weapon node/collision generation latency.
+        return input.pending &&
+               input.gripHeld &&
+               input.configEnabled &&
+               input.primaryPoseBlockerAvailable &&
+               !input.virtualHolstersOwnsInput;
+    }
+
+    inline constexpr Decision update(RuntimeState& state, const Input& input) noexcept
+    {
+        Decision decision{};
+
+        if (!input.weaponEquipped || input.weaponGenerationKey == 0) {
+            decision.cleared = state.active;
+            state = {};
+            return decision;
+        }
+
+        if (state.active && state.weaponGenerationKey != input.weaponGenerationKey) {
+            decision.cleared = true;
+            state = {};
+        }
+
+        if (!state.active && input.startRequested) {
+            state.active = true;
+            state.weaponGenerationKey = input.weaponGenerationKey;
+            decision.started = true;
+        }
+
+        if (state.active && !input.primaryGripRetained && !input.supportGripRetained) {
+            decision.dropRequested = true;
+            state = {};
+            return decision;
+        }
+
+        decision.active = state.active;
+        return decision;
+    }
+}
+
 // ---- WeaponTwoHandedGripMath.h ----
 
-namespace heisenberg::rock_core
+namespace rock
 {
     template <class Vector>
     inline Vector weaponSolverSub(const Vector& lhs, const Vector& rhs);
@@ -317,8 +436,15 @@ namespace heisenberg::rock_core
     inline Vector weaponSolverAdd(const Vector& lhs, const Vector& rhs);
 }
 
-namespace heisenberg::rock_core::weapon_two_handed_grip_math
+namespace rock::weapon_two_handed_grip_math
 {
+    enum class SupportReleaseManualAction
+    {
+        EndSupportOnly = 0,
+        KeepPrimaryOwnership = 1,
+        DropEquippedWeapon = 2,
+    };
+
     /*
      * Equipped weapon two-hand support has two independent ownership rules:
      * the support hand must be attached to the mesh point it actually touched,
@@ -346,24 +472,78 @@ namespace heisenberg::rock_core::weapon_two_handed_grip_math
         return gripPressed && !supportHandHoldingObject;
     }
 
-    inline bool canProcessNormalGrabInput(bool isLeft, bool equippedWeaponSupportGripActive, bool rightHandWeaponEquipped)
+    inline constexpr SupportReleaseManualAction resolveSupportReleaseManualAction(bool primaryDetachEnabled, bool primaryGripHeld)
+    {
+        if (!primaryDetachEnabled) {
+            return SupportReleaseManualAction::EndSupportOnly;
+        }
+
+        return primaryGripHeld ? SupportReleaseManualAction::KeepPrimaryOwnership : SupportReleaseManualAction::DropEquippedWeapon;
+    }
+
+    inline bool canProcessNormalGrabInput(bool isLeft, bool equippedWeaponSupportGripActive, bool rightHandWeaponEquipped, bool primaryHandDetached)
     {
         if (isLeft) {
             return !equippedWeaponSupportGripActive;
         }
 
-        return !rightHandWeaponEquipped;
+        return !rightHandWeaponEquipped || primaryHandDetached;
+    }
+
+    struct FiringGripReattachInput
+    {
+        bool partCarryActive{ false };
+        bool menuInputActive{ false };
+        bool handHoldingObject{ false };
+    };
+
+    inline constexpr bool canAttemptFiringGripReattach(const FiringGripReattachInput& input)
+    {
+        return input.partCarryActive && !input.menuInputActive && !input.handHoldingObject;
+    }
+
+    /*
+     * Firing-grip reattach contract: the grab button is the hand. A held grab
+     * with the free firing palm inside the reattach radius re-takes the grip;
+     * nothing ever attaches to an open hand. The gesture cannot re-capture a
+     * fresh detach because the detach itself requires the grab to be open,
+     * and the same squeeze outside the radius stays available for weapon part
+     * grips and world grabs.
+     */
+    inline constexpr bool shouldReattachFiringGripOnGrab(bool gripHeld, float palmToGripDistance, float reattachRadius)
+    {
+        return gripHeld && palmToGripDistance <= reattachRadius;
+    }
+
+    /*
+     * Hover twin of the reattach gate: an OPEN firing palm inside the radius
+     * means a squeeze right now would re-take the firing grip, so the runtime
+     * owner drives continuous haptic feedback while this holds. A held grab
+     * is never a hover -- it is the reattach itself.
+     */
+    inline constexpr bool isFiringGripReattachHoverCandidate(bool gripHeld, float palmToGripDistance, float reattachRadius)
+    {
+        return !gripHeld && palmToGripDistance <= reattachRadius;
+    }
+
+    inline constexpr bool canStartFreeHandPartGrip(
+        bool routedSupportGrip,
+        bool gripPressed,
+        bool handHoldingObject,
+        bool handAlreadyGripping)
+    {
+        return routedSupportGrip && gripPressed && !handHoldingObject && !handAlreadyGripping;
     }
 }
 
 // ---- WeaponTwoHandedSolver.h ----
 
-#include "rock_integration/TransformMath.h"
+#include "physics-interaction/TransformMath.h"
 
 #include <algorithm>
 #include <cmath>
 
-namespace heisenberg::rock_core
+namespace rock
 {
     /*
      * FRIK's suppressed offhand grip works because it solves the weapon
@@ -479,7 +659,16 @@ namespace heisenberg::rock_core
         const Vector to = weaponSolverNormalize(toRaw);
         float cosTheta = (std::max)(-1.0f, (std::min)(1.0f, weaponSolverDot(from, to)));
 
-        if (cosTheta > 0.9999f) {
+        /*
+         * The parallel guard exists only to keep the cross-product axis
+         * numerically stable; it must stay far below perception. At 0.9999
+         * (0.81deg) it becomes a visible deadzone for any solve whose base
+         * transform is its own previous output: part-carry accumulated slow
+         * hand motion inside the deadzone and released it as ~1deg snaps at
+         * ~10Hz. 0.999999 (~0.08deg) still leaves sin(theta) ~1.4e-3, orders
+         * of magnitude above float32 cross-product noise.
+         */
+        if (cosTheta > 0.999999f) {
             return transform_math::makeIdentityRotation<Matrix>();
         }
 
@@ -588,6 +777,64 @@ namespace heisenberg::rock_core
         }
 
         const Vector direction = weaponSolverNormalize(targetAxis);
+        return weaponSolverAdd(primaryTargetWorld, weaponSolverScale(direction, lockedGripDistance));
+    }
+
+    // FIX C (power-armor jitter insurance, secondary): a raw single-frame discontinuity
+    // in the tracked support direction -- from a hand-tracking glitch, a generation-key
+    // rebuild, or a Fix-B-class bone-lookup mismatch -- otherwise latches straight into
+    // the aim target and shows up as unattenuated weapon-aim wobble. This wraps
+    // makeLockedSupportGripTarget with a small per-frame exponential low-pass filter on
+    // the tracked direction so a single bad sample is spread over a few frames instead of
+    // applied immediately, dt-scaled so it does not depend on frame rate. The default time
+    // constant settles roughly 2-4 frames' worth of a step at typical VR frame rates
+    // without perceptibly lagging intentional fast aim motion. smoothedDirectionWorld and
+    // hasSmoothedDirection are caller-owned persistent per-hand state (reset at grip
+    // start/end so a new hold never blends against a stale direction).
+    template <class Vector>
+    inline Vector makeSmoothedLockedSupportGripTarget(
+        const Vector& primaryTargetWorld,
+        const Vector& supportControllerWorld,
+        const Vector& fallbackSupportTargetWorld,
+        float lockedGripDistance,
+        float minimumSeparation,
+        Vector& smoothedDirectionWorld,
+        bool& hasSmoothedDirection,
+        float dt,
+        float smoothingTimeConstantSeconds = 0.03f)
+    {
+        if (lockedGripDistance <= minimumSeparation) {
+            hasSmoothedDirection = false;
+            return fallbackSupportTargetWorld;
+        }
+
+        Vector targetAxis = weaponSolverSub(supportControllerWorld, primaryTargetWorld);
+        if (weaponSolverLength(targetAxis) <= minimumSeparation) {
+            targetAxis = weaponSolverSub(fallbackSupportTargetWorld, primaryTargetWorld);
+        }
+        if (weaponSolverLength(targetAxis) <= minimumSeparation) {
+            hasSmoothedDirection = false;
+            return fallbackSupportTargetWorld;
+        }
+
+        const Vector rawDirection = weaponSolverNormalize(targetAxis);
+        Vector direction = rawDirection;
+        if (hasSmoothedDirection && smoothingTimeConstantSeconds > 0.0f && dt > 0.0f) {
+            // Exponential low-pass: alpha -> 1 as dt grows relative to the time constant,
+            // so a hitch/stall does not freeze the filter open indefinitely.
+            const float alpha = 1.0f - std::exp(-dt / smoothingTimeConstantSeconds);
+            const Vector blended = weaponSolverAdd(
+                weaponSolverScale(smoothedDirectionWorld, 1.0f - alpha),
+                weaponSolverScale(rawDirection, alpha));
+            const Vector normalizedBlended = weaponSolverNormalize(blended);
+            if (weaponSolverLength(normalizedBlended) > 0.0001f) {
+                direction = normalizedBlended;
+            }
+        }
+
+        smoothedDirectionWorld = direction;
+        hasSmoothedDirection = true;
+
         return weaponSolverAdd(primaryTargetWorld, weaponSolverScale(direction, lockedGripDistance));
     }
 

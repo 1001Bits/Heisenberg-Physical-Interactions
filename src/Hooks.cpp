@@ -22,14 +22,9 @@
 #include "HandCollision.h"
 #include "Physics.h"
 #include "ThrownObjectTracker.h"
-#include "HandWallPushback.h"
 #include "HandAuthority.h"
 #include "FrikArmGoalHook.h"
 #include "../external/ROCK/src/ROCKMain.h"
-#include "rock_integration/HandBoneColliderSet.h"
-#include "rock_integration/BodyBoneColliderSet.h"
-#include "rock_integration/WeaponCollision.h"
-#include "rock_integration/TwoHandedGrip.h"
 
 #include <array>
 #include <atomic>
@@ -340,11 +335,6 @@ namespace heisenberg::Hooks
             // their damage/knockback/aggro here on the game thread (engine-safe).
             heisenberg::ThrownObjectTracker::GetSingleton().DrainPendingImpacts();
 
-            // Hand wall-pushback: push the rendered hand out of static geometry (FRIK v9).
-            // No-op when iHandWallPushbackMode=0. Runs post-physics so FRIK's hand transform
-            // for this frame is available.
-            heisenberg::hand_wall_pushback::Update();
-
             // Hand collision body management.
             {
                 static bool wasLoading = false;
@@ -413,23 +403,19 @@ namespace heisenberg::Hooks
             //   * External ROCK present AND actually running its physics (IsRunning) -> ROCK
             //     owns hands; Heisenberg's hand collision is OFF (return here).
             //   * Embedded ROCK -> its real hand/arm collider bodies remain the sole physics
-            //     bodies, but Heisenberg's old body-less proximity/depenetration push may coexist
-            //     when explicitly enabled and bUsePhysicsHandBodies=false.
+            //     bodies, but Heisenberg's body-less proximity/depenetration push may coexist
+            //     when bEnableHandCollision is on.
             //   * ROCK present but DISABLED / torn down at runtime -> Heisenberg reclaims
             //     hands automatically (fall through to the proximity push below). No INI
             //     change needed — this is the "turn ROCK off, get our push back" case.
             //   * ROCK absent -> Heisenberg owns hands.
-            // SAFETY: only ONE mod may create hand BODIES per frame — running both during
-            // ROCK's startup races hknpWorld::setBodyPosition and crashes. So while ROCK is
-            // merely PRESENT (loaded) we NEVER create our own physics hand bodies (see the
-            // usePhysicsBodies gate below). The auto-reclaim path uses PROXIMITY push only,
-            // which creates no bodies and is safe to run during ROCK's startup window.
+            // Heisenberg never creates its own physics hand bodies (two-scenario cleanup);
+            // the proximity push creates no bodies and is safe during ROCK's startup window.
             auto& rock = heisenberg::RockBridge::GetSingleton();
             const bool embeddedRockHosted = heisenberg::IsRockEngineHosted();
             const bool useEmbeddedBodylessProximity =
                 embeddedRockHosted &&
-                heisenberg::g_config.enableHandCollision &&
-                !heisenberg::g_config.usePhysicsHandBodies;
+                heisenberg::g_config.enableHandCollision;
 
             // Tell only the embedded engine to stand down its scripted HAND push while the
             // old proximity path supplies that impulse. ROCK's actual collision bodies,
@@ -457,29 +443,17 @@ namespace heisenberg::Hooks
                 }
             }
 
-            // [RockIntegration] collider/grip modules tick HERE, before the enableHandCollision
-            // gate, so each runs whenever its own [RockIntegration] toggle is on — independent of
-            // the cup/finger hand-collision setting (bEnableHandCollision). Previously these lived
-            // inside HandCollision::Update, which is unreachable past the !enableHandCollision
-            // return below, so BodyBoneCollider/WeaponCollision/TwoHandedGrip could never tick
-            // unless an unrelated flag was also set. Each self-gates via IsActive() (a no-op when
-            // its toggle is off); HandBoneColliderSet keeps its own enableHandCollision dependency
-            // inside IsActive(). Kept BELOW the ROCK.dll IsRunning() return: when ROCK.dll runs it
-            // owns these colliders. PostPhysics-only so they tick exactly once per frame.
-            if (!embeddedRockHosted && phase == HandCollisionUpdatePhase::PostPhysics) {
-                heisenberg::rock_hand_collider::Update();
-                heisenberg::rock_body_collider::Update();
-                heisenberg::rock_weapon_collision::Update();
-                heisenberg::rock_two_handed_grip::Update();
-            }
+            // (Two-scenario cleanup: the legacy [RockIntegration] per-frame ticks —
+            // rock_hand_collider / rock_body_collider / rock_weapon_collision /
+            // rock_two_handed_grip — were removed with those hand-ported modules; the
+            // embedded engine or the external ROCK.dll owns those subsystems now.)
 
             if (!heisenberg::g_config.enableHandCollision) {
                 static bool loggedOnce = false;
                 if (!loggedOnce) {
                     spdlog::warn("[HOOKS] Hand collision disabled (bEnableHandCollision=false) — "
                                  "hand strikes won't push objects. Set bEnableHandCollision=true in "
-                                 "Heisenberg_F4VR.ini or via MCM to enable. (ROCK collider modules "
-                                 "above still tick independently when their own toggles are on.)");
+                                 "Heisenberg_F4VR.ini or via MCM to enable.");
                     loggedOnce = true;
                 }
                 return;
@@ -498,22 +472,10 @@ namespace heisenberg::Hooks
 
             auto& hc = heisenberg::HandCollision::GetSingleton();
 
-            // Physics-body path (full Havok hand bodies) is opt-in and gated separately;
-            // proximity-based push always runs when enableHandCollision is true so a
-            // user with usePhysicsHandBodies=false still gets hand-strike impulse.
-            // Never create our own physics hand bodies while external ROCK is loaded OR the
-            // embedded engine is hosted. The explicit embedded check is defense-in-depth:
-            // RockBridge cannot see the in-process engine, so !rock.IsActive() alone is true
-            // in the embed. Proximity push (no bodies) is the only allowed coexistence path.
-            const bool usePhysicsBodies =
-                heisenberg::g_config.usePhysicsHandBodies &&
-                !rock.IsActive() &&
-                !embeddedRockHosted;
-            if (usePhysicsBodies && phase == HandCollisionUpdatePhase::PrePhysics) {
-                hc.CreateBodiesIfNeeded(leftWand->world.translate, rightWand->world.translate);
-                hc.ApplyPlayerPairFilterIfNeeded();
-            }
-
+            // Two-scenario cleanup: Heisenberg no longer creates its own physics hand
+            // bodies — real hand colliders come from the embedded ROCK engine (S1) or
+            // the external ROCK.dll (S2). Only the body-less proximity push remains,
+            // which runs post-physics.
             if (phase == HandCollisionUpdatePhase::PrePhysics) {
                 return;
             }
@@ -525,17 +487,7 @@ namespace heisenberg::Hooks
             // transform; the world transform is recomputed later in the scene graph
             // traversal, so reading world.translate here yielded a stale (frozen)
             // position and the collision body never followed the hand.
-            // hc.Update() is also where the per-frame ROCK integration modules
-            // (HandBoneCollider / BodyBoneCollider / WeaponCollision / TwoHandedGrip)
-            // get ticked, so include their active state in the gate — otherwise enabling
-            // any of them while the cup bodies are intentionally torn down means none
-            // of them ever build anything.
-            const bool rockOwnsHandPhysics =
-                heisenberg::rock_hand_collider::IsActive() ||
-                heisenberg::rock_body_collider::IsActive() ||
-                heisenberg::rock_weapon_collision::IsActive() ||
-                heisenberg::rock_two_handed_grip::IsActive();
-            if (hc.HasHandBodies() || !usePhysicsBodies || rockOwnsHandPhysics) {
+            {
                 RE::NiPoint3 leftPos = leftWand->world.translate;
                 RE::NiPoint3 rightPos = rightWand->world.translate;
                 RE::NiMatrix3 leftRot = leftWand->world.rotate;

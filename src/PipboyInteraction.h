@@ -46,15 +46,6 @@ namespace heisenberg
         bool IsTapeDeckOpen() const { return _tapeDeckOpen; }
         TapeDeckState GetTapeDeckState() const { return _tapeDeckState; }
 
-        // Force close tape deck
-        void CloseTapeDeck();
-
-        // Insert holotape (stores world ref, marks loaded, closes deck)
-        bool InsertHolotape(RE::TESObjectREFR* holotapeRef);
-
-        // Check if a world position is near the tape deck slot
-        bool IsInTapeDeckSlotZone(const RE::NiPoint3& pos) const;
-
         // Holotape state
         bool HasHolotapeLoaded() const { return _holotapeLoaded; }
         std::uint32_t GetLoadedHolotapeFormID() const { return _loadedHolotapeFormID; }
@@ -73,7 +64,6 @@ namespace heisenberg
         // workaround. Returns false (and changes nothing) if the file couldn't be read/written.
         bool SetFrikHoloPipboyEnabled(bool enabled);
         void SetTapREFVisible(bool visible);
-        void EjectCurrentHolotape();
 
         // Inventory activation of the intro tape while it is physically loaded means
         // "take it from the deck", not "play it again". Clears playback/deck state and
@@ -105,8 +95,6 @@ namespace heisenberg
         // (regardless of projected/Holo preference) on first pickup and sends the same native
         // event the vanilla animation would have sent.
         void BeginPipboyBootSequence();
-        void UpdatePipboyBootSequenceTransition();
-        void ResetPipboyBootSequenceTransition();
 
         // Check if a form ID is the Heisenberg intro holotape
         bool IsIntroHolotape(std::uint32_t formID) const;
@@ -133,9 +121,7 @@ namespace heisenberg
         void StopIntroPlayback();
         void BeginIntroProgramPlayback(std::uint32_t formID);
         void QueueProgramHolotapePlayback(std::uint32_t formID);
-        void UpdateIntroWristTransition();
         void UpdateIntroHoloOverride();
-        void ResetIntroWristTransition();
 
         // Mesh diffuse SRV helpers (used by terminal screen redirect)
         static uintptr_t GetMeshDiffuseSRV(RE::NiAVObject* mesh);
@@ -158,18 +144,15 @@ namespace heisenberg
         float           _ejectCooldown        = 0.0f;
         bool            _holotapeLoaded       = false;
         std::uint32_t   _loadedHolotapeFormID = 0;
-        std::uint32_t   _pendingHolotapeRefrID = 0;  // World ref to ActivateRef when deck closes (deferred playback)
         int             _logCooldown          = 0;
         bool            _dumpedNodes          = false;
         float           _buttonOriginalZ      = 0.0f;    // Captured from node on first find
         bool            _buttonOriginalZSet   = false;
         bool            _ejectContactLatched  = false;   // Sticky contact; resets outside release radius
-        bool            _tapeRefInitialHideDone = false;  // True once we've hidden the default tape on first update
         float           _holotapeGrabCooldown   = 0.0f;   // Insertion-only grace; prevents a removed/just-spawned tape re-entering the deck
         float           _holotapeRemovalCooldown = 0.0f;  // Separate short post-insert guard; ejecting never has to wait on insertion grace
         float           _closeAnimSpeed         = ANIM_SPEED; // Current close animation speed (variable for slam)
         float           _slamCooldown           = 0.0f;   // Prevent multiple slam detections
-        float           _pushStartDistance      = 0.0f;   // Hand distance when push started (for mapping)
         float           _pushProgress           = 1.0f;   // Hand-driven progress during Pushing state (1=open, 0=closed)
         float           _frikPipboyScale        = -1.0f;  // Cached FRIK PipboyScale (-1 = not yet read)
         int             _frikHoloPipboy         = -1;     // Cached FRIK HoloPipBoyEnabled (-1=unread, 0=false, 1=true)
@@ -194,9 +177,6 @@ namespace heisenberg
         RE::NiPoint3    _previousInteractionFingerPos{};
         bool            _interactionFingerValid = false;
         bool            _previousInteractionFingerValid = false;
-        bool            _deckContactLatched = false;
-        RE::NiPoint3    _prevDeckWorldPos{};             // Deck node position last frame — push-close direction is classified in DECK-relative motion so locomotion/turning can't contaminate it
-        bool            _prevDeckWorldPosValid = false;
 
         // Deferred Disable() for inserted holotape world refs — prevents crash in
         // Inventory3DManager::FinishItemLoadTask when async 3D load races with Disable.
@@ -220,22 +200,11 @@ namespace heisenberg
         bool            _introSWFMenuSeen           = false; // True once PipboyMenu was seen open (prevents false trigger)
         std::chrono::steady_clock::time_point _introSWFStartTime{};  // Real wall-clock start (matches SWF getTimer())
         int             _introSWFLastLogSec         = 0;     // Last logged second (for periodic debug logging)
-        bool            _introSWFCloseStep2Done     = false; // (legacy, unused — kept for binary compat)
-        bool            _introBootSoundPlayed       = false; // (legacy, unused)
 
         // Intro SWF sound event timeline (precomputed to match SWF animation timing)
         std::vector<std::pair<float, std::string>> _introSoundEvents;
         int             _introSoundEventIndex       = 0;     // Next event to play
         bool            _introAudioStarted          = false;  // True after intro WAV playback thread launched
-
-        // Staged HMD/projected + FRIK-Holo -> wrist transition. FRIK restores the
-        // original root on one frame and installs its replacement root on a later frame;
-        // activating the screen before that swap lights a node that is about to detach.
-        std::uint32_t   _introWristTransitionFormID = 0;
-        RE::NiNode*     _introWristPreFlipRoot       = nullptr;
-        RE::NiNode*     _introWristCandidateRoot     = nullptr;
-        int             _introWristStableFrames      = 0;
-        int             _introWristTimeoutFrames     = 0;
 
         // ── Terminal-on-Pipboy redirect state ──
         bool            _pendingTerminalRedirect    = false; // True = TerminalMenu pending redirect to Pipboy (holotape)
@@ -248,13 +217,6 @@ namespace heisenberg
         // ── Vanilla Pip-Boy boot sequence (auto-fired on first pickup) ──
         bool            _bootSequenceFired          = false; // One-way latch: never re-send the native event this game session
         bool            _bootWristOverrideOwned     = false; // True if the boot sequence itself started the projected->wrist override
-        bool            _bootWristStaged            = false; // True while waiting on FRIK's Holo root swap before the Pip-Boy can be forced open
-        bool            _bootWristOpened            = false; // True once the plain (non-Holo) wrist-open path has fired ActivatePipboyScreen() — guards against re-calling it every frame while waiting for the settle check
-        RE::NiNode*     _bootWristPreFlipRoot       = nullptr; // Root captured before a staged Holo transition, to detect FRIK's replacement
-        RE::NiNode*     _bootWristCandidateRoot     = nullptr;
-        int             _bootWristStableFrames      = 0;
-        int             _bootWristTimeoutFrames     = 0;
-        int             _bootPipboyOpenSettleFrames = 0; // Frames PipboyMenu has been continuously open; event fires once this reaches 3
         // Temporary FRIK HoloPipBoyEnabled override so the boot sequence renders on the
         // flat wrist model even when the player's real preference is Holo. Written to
         // FRIK.ini directly, before FRIK's own Pip-Boy model is ever constructed this
@@ -263,8 +225,6 @@ namespace heisenberg
         bool            _bootHoloIniOverrideActive   = false; // True from a successful false-write until restored back to true
         float           _bootHoloIniWaitSeconds      = 0.0f;  // Countdown after writing false, before forcing the Pip-Boy open (lets FRIK's debounced file-watcher reload)
         float           _bootHoloIniRestoreSeconds   = -1.0f; // Countdown after firing the boot event, before restoring true (-1 = not started)
-        bool            _bootScreenHiddenPendingSwf  = false; // True while the screen is deliberately re-culled so normal Pip-Boy content never flashes before the boot SWF takes over
-        float           _bootScreenRevealSeconds     = -1.0f; // Countdown after firing the boot event, before revealing the screen (-1 = not started)
         // Jul 24 boot redesign: completion is detected from the game's own
         // PipboyOpeningSequenceMenu open->closed transition (the boot SWF drives its
         // own teardown); the Holo/projected restores hang off that, not fixed timers.
@@ -289,11 +249,7 @@ namespace heisenberg
         bool            _radioWasEnabled            = false; // Radio was playing before Console opened
         int             _radioRestoreFrames         = 0;     // Countdown to re-enable radio after audio system settles
         bool            _consoleOpenedForTerminal   = false; // True = we opened console to suppress darkening
-        int             _consoleOpenDelayFrames     = 0;     // Delay console open to let initial terminal sounds play
-        bool            _terminalSoundPending       = false; // True = play boot sound after console opens
-        int             _terminalSoundDelay         = 0;     // Frames to wait after console opens before playing sound
         bool            _worldTerminalChecked       = false; // Prevent re-checking same world terminal
-        int             _wtWaitFrames               = 0;     // Frames waiting for InitRenderer to complete
         RE::NiAVObject* _savedHmdScreenNode         = nullptr; // Original HMD Screen node (hidden during redirect)
         RE::NiNode*     _savedHmdScreenParent       = nullptr; // Original parent of HMD Screen node
         void*           _savedRendererPtr            = nullptr; // PipboyMenu I3D renderer for cleanup
@@ -356,7 +312,6 @@ namespace heisenberg
         static constexpr float EJECT_SKIN_RADIUS      =  0.45f;  // Visible fingertip flesh around the tracked bone point — the button starts moving exactly when the SKIN touches it, not when the padded contact bubble does
         static constexpr float EJECT_COOLDOWN_TIME    =  0.5f;   // Seconds between presses
         // Holotape slot
-        static constexpr float TAPE_SLOT_RADIUS       =  8.0f;
         static constexpr float TAPE_GRAB_RADIUS       = 15.0f;   // Distance from controller to tape deck tray for holotape removal
         static constexpr float TAPE_GRAB_COOLDOWN     =  1.5f;   // Seconds after removal before allowing that hand-held tape to reinsert
         static constexpr float TAPE_REMOVAL_CONTACT_RADIUS = 5.0f; // Grip fingertip padding around the visible TapREF mesh

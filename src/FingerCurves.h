@@ -258,20 +258,6 @@ namespace heisenberg
         float handSize = 1.0f);
 
     /**
-     * Drop-in alternative to CalculateFingerCurlFromGeometry that uses ROCK's
-     * ported parametric curl-disk solver (RockFingerPose.h) instead of the
-     * HIGGS curve tables. Same inputs and same output convention (1.0 = open,
-     * 0.0 = closed). Selected at the call site via g_config.useRockFingerPose.
-     */
-    FingerCurlResult CalculateFingerCurlFromGeometryRock(
-        RE::NiAVObject* objectNode,
-        RE::NiAVObject* handNode,
-        const RE::NiPoint3& palmPos,
-        const RE::NiPoint3& palmDirection,
-        bool isLeft,
-        float handSize = 1.0f);
-
-    /**
      * Extract triangles from an object's mesh hierarchy
      * 
      * @param root Root node to extract from

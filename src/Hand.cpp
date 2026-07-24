@@ -11,7 +11,6 @@
 #include "Highlight.h"
 #include "Hooks.h"
 #include "MenuChecker.h"
-#include "ContactImpulseListener.h"
 #include "Physics.h"
 #include "PickpocketHandler.h"
 #include "RockReleaseVelocity.h"
@@ -565,12 +564,6 @@ namespace heisenberg
                 _selection.distance = std::sqrt(dx * dx + dy * dy + dz * dz);
                 const auto& cfg = Config::GetSingleton();
                 _selection.isClose = (_selection.distance <= cfg.closeGrabThreshold);
-                if (cfg.useCollisionOverlapForGrabCandidates && !_selection.isClose) {
-                    auto overlaps = ContactImpulseListener::GetSingleton().GetOverlappingBodies(_isLeft);
-                    if (!overlaps.empty()) {
-                        _selection.isClose = true;
-                    }
-                }
             }
             return;  // Same target, already selected
         }
@@ -623,22 +616,6 @@ namespace heisenberg
         newSelection.distance = distance;
         const auto& cfg = Config::GetSingleton();
         newSelection.isClose = (distance <= cfg.closeGrabThreshold);
-
-        // Task #12: HIGGS-style collision-overlap candidate bias. When the hand
-        // body is currently in CONTACT_STARTED with at least one dynamic body,
-        // force isClose = true so a ViewCaster pick at borderline distance still
-        // counts as grabbable. This is intentionally a soft signal: we don't
-        // reverse-lookup REFR→bodyId here (no helper exists), we just trust that
-        // any overlap means the user is physically interacting with nearby
-        // clutter and relax the threshold.
-        if (cfg.useCollisionOverlapForGrabCandidates && !newSelection.isClose) {
-            auto overlaps = ContactImpulseListener::GetSingleton().GetOverlappingBodies(_isLeft);
-            if (!overlaps.empty()) {
-                newSelection.isClose = true;
-                spdlog::debug("[SELECT-VC] {} hand: overlap-set ({} bodies) promoted refr {:08X} to isClose",
-                             _isLeft ? "Left" : "Right", overlaps.size(), refr->formID);
-            }
-        }
 
         _selection = newSelection;
         _lastSelectionTime = Utils::GetTime();
@@ -855,10 +832,10 @@ namespace heisenberg
             return;
         }
 
-        // iGrabMode=9 (RockNativeGrab): the embedded ROCK engine reads grip input itself and owns
+        // iGrabMode=9 (Full Dynamic): the embedded ROCK engine reads grip input itself and owns
         // grab+selection end-to-end. Heisenberg must not contend for the grip or start its own
         // grabs (double-grab / input-flap — see the two-handed offhand grip conflict).
-        if (g_config.grabMode == static_cast<int>(GrabMode::RockNativeGrab) && heisenberg::IsRockEngineHosted()) {
+        if (g_config.grabMode == static_cast<int>(GrabMode::FullDynamic) && heisenberg::IsRockEngineHosted()) {
             return;
         }
 
@@ -1087,8 +1064,8 @@ namespace heisenberg
     {
         _grabPressed = false;
 
-        // iGrabMode=9 (RockNativeGrab): release is ROCK's to handle too.
-        if (g_config.grabMode == static_cast<int>(GrabMode::RockNativeGrab) && heisenberg::IsRockEngineHosted()) {
+        // iGrabMode=9 (Full Dynamic): release is ROCK's to handle too.
+        if (g_config.grabMode == static_cast<int>(GrabMode::FullDynamic) && heisenberg::IsRockEngineHosted()) {
             return;
         }
         
@@ -1157,12 +1134,6 @@ namespace heisenberg
                              "Heisenberg will not initiate world grabs.");
                 loggedDelegate = true;
             }
-            return false;
-        }
-
-        // ROCK dynamic handoff: while we're injecting a synthetic grip edge to hand the
-        // just-placed object to ROCK, don't let Heisenberg re-grab on that same edge.
-        if (Heisenberg::GetSingleton().IsRockHandoffSuppressingGrab(_isLeft)) {
             return false;
         }
 

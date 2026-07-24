@@ -2,13 +2,6 @@
 
 namespace heisenberg
 {
-    enum class HeldBodyMode
-    {
-        Spring = 0,
-        Custom6DOF = 1,
-        NativeConstraint = 2
-    };
-
     /**
      * Configuration settings for Heisenberg.
      * Loaded from INI file.
@@ -40,52 +33,6 @@ namespace heisenberg
         // post-conversion, game-units Config) - a default-constructed Config still holds the
         // raw cm defaults, so skipping this doubles the conversion (1.4x too large seeded).
         void ApplyCmToGameUnitsConversion();
-
-        HeldBodyMode GetHeldBodyMode() const
-        {
-            switch (heldBodyMode) {
-            case static_cast<int>(HeldBodyMode::Spring):
-                return HeldBodyMode::Spring;
-            case static_cast<int>(HeldBodyMode::Custom6DOF):
-                return HeldBodyMode::Custom6DOF;
-            case static_cast<int>(HeldBodyMode::NativeConstraint):
-            default:
-                return HeldBodyMode::NativeConstraint;
-            }
-        }
-
-        bool UseHeldBodySpringMode() const
-        {
-            return GetHeldBodyMode() == HeldBodyMode::Spring;
-        }
-
-        bool UseHeldBodyManagedGrab() const
-        {
-            return useHeldBodyGrab;
-        }
-
-        bool UseHeldBodyConstraintGrab() const
-        {
-            return UseHeldBodyManagedGrab() && !UseHeldBodySpringMode();
-        }
-
-        bool UseHeldBodyNativeConstraint() const
-        {
-            return GetHeldBodyMode() == HeldBodyMode::NativeConstraint;
-        }
-
-        const char* GetHeldBodyModeName() const
-        {
-            switch (GetHeldBodyMode()) {
-            case HeldBodyMode::Spring:
-                return "spring held";
-            case HeldBodyMode::Custom6DOF:
-                return "custom 6-DOF";
-            case HeldBodyMode::NativeConstraint:
-            default:
-                return "native constraint";
-            }
-        }
 
         // Selection settings - 2 METER RANGE
         float maxGrabDistance = 500.0f;      // cm fallback (converted *CM_TO_GAME_UNITS on load) — 500cm = 5m
@@ -150,12 +97,12 @@ namespace heisenberg
         float grabStartAngularSpeed = 360.0f; // Degrees/s
         float pullSpeedThreshold = 1.2f;      // m/s - speed needed to initiate pull
 
-        // Grab mode - determines how physics grabbing works
-        // 0 = Keyframe (direct position control; always stays on the original keyframed backend)
-        // 1/2 = Legacy constraint modes (kept for fallback when HeldBody is disabled)
-        // 3 = Post-physics grab path (recommended; HeldBody overrides this when enabled)
-        // 4 = MouseSpring (native game spring system - doesn't stay grabbed)
-        int grabMode = 3;
+        // Grab mode - determines how physics grabbing works (two-scenario architecture)
+        // 0 = Keyframed (Heisenberg's own backend - direct position control)
+        // 9 = Full Dynamic (embedded ROCK engine owns grab+selection natively; needs
+        //     bUseRockEngineArchitecture=1, else degrades to Keyframed).
+        // Any other value degrades to Keyframed (historical modes 1-8 removed).
+        int grabMode = 0;
         // Two-handed single-object grab (HIGGS-style): grab one object with both hands; the
         // second hand acts as an aim/stabilize hand (object swings to point along the line
         // between the two hands). Default OFF. When off, a second-hand grab transfers the
@@ -168,7 +115,7 @@ namespace heisenberg
 
         // When the KEYFRAMED backend holds an object, keep it on a collidable layer
         // (instead of kNonCollidable) so it can hit/push other objects. Only affects
-        // iGrabMode=0; the dynamic HeldBody path is always collidable.
+        // the keyframed hold (iGrabMode=0).
         bool heldObjectCollidable = true;
         bool heldObjectWallClamp = true;  // keyframed grab: stop held object at walls/NPCs
         // Block the A/activate button from looting/using a grabbable item just because it's
@@ -176,14 +123,6 @@ namespace heisenberg
         // and secondary actions (Tune The Radios, Sentinel PA) at 0.7.9. The held-item block
         // already covers the Grip>A binding case, so this extra block is not needed.
         bool blockActivateOnGrabSelection = false;
-
-        // EXPERIMENTAL: after Heisenberg pulls in + places a grabbed object at the saved
-        // offset, hand it off to ROCK's DYNAMIC grab (so the held object gets full
-        // collision / wall-blocking). ROCK's grab is edge-triggered, so this releases the
-        // Heisenberg hold in place and injects a synthetic grip release->press edge for
-        // ROCK to catch. Off by default; needs ROCK active. See ROCK_forceGrab request —
-        // this is the no-API stopgap until forceGrab exists.
-        bool rockDynamicHandoff = false;
 
         // Remap grab from Grip to A/X for users with custom controller bindings
         bool useAForRightGrab = false;  // Right hand uses A button instead of Grip
@@ -262,19 +201,6 @@ namespace heisenberg
         // out distant triangles that would spuriously trip a finger's curl
         // plane on the far side of the object. See HIGGS hand.cpp:1438-1444.
         float grabMaxTriangleDistance = 100.0f;
-
-        // Use ROCK's ported parametric curl-disk finger solver
-        // (RockFingerPose.h / CalculateFingerCurlFromGeometryRock) instead of
-        // Heisenberg's HIGGS curve-table solver. A/B toggle for natural-grab
-        // hand wrapping. Default false = keep the table solver.
-        bool useRockFingerPose = false;
-        // ROCK solver back-face rejection: discard finger hits that sit behind
-        // the seated mesh surface plane (uses the closest-mesh-point triangle
-        // normal). Off by default; the behind-curl-plane open detection is
-        // always active regardless.
-        bool rockFingerRejectBackside = false;
-        // Surface-plane tolerance (game units) for the above back-face gate.
-        float rockFingerSurfaceTolerance = 1.5f;
 
         // Weights for GetClosestPointOnGeometryToLine metric: distance =
         // directionalWeight * dirDist² + lateralWeight * latDist². HIGGS
@@ -441,16 +367,9 @@ namespace heisenberg
         // unaffected, as is release/drop of those items. Default off (Heisenberg owns grab).
         bool delegateWorldGrabToRock = false;
 
-        // Hand collision settings
-            bool enableHandCollision = true;       // Re-enabled Apr 2026 after removing deadlock loop
-        bool usePhysicsHandBodies = false;     // DISABLED — see above
-        bool useSimpleHandBodyCreation = false; // Use simple box body instead of physics system approach
-        // When usePhysicsHandBodies is true AND useBethesdaPhysicsBody is true, use the
-        // ROCK-style BethesdaPhysicsBody pipeline (engine heap allocator + proper systemData
-        // setup) instead of the legacy _aligned_malloc path. The legacy path crashes in TBB
-        // scalable_aligned_free during the engine's destruction phase; this new path uses
-        // the engine's own allocator so the destructor's TBB free works.
-        bool useBethesdaPhysicsBody = true;     // default to NEW path — old one is known-broken
+        // Hand collision settings (two-scenario cleanup: gates the body-less proximity
+        // push only — Heisenberg no longer creates its own physics hand bodies)
+        bool enableHandCollision = true;       // Re-enabled Apr 2026 after removing deadlock loop
 
         // ============================================================================
         // ROCK Integration Toggles (May 2026)
@@ -458,25 +377,9 @@ namespace heisenberg
         // See rock_integration/ for each module's implementation.
         // ============================================================================
 
-        // CollisionSuppressionRegistry — lease-based 0x000B-bit suppression registry.
-        // Tracks who's holding what suppression and restores cleanly when all owners
-        // release. Refined replacement for our current ad-hoc bit-OR/restore in Grab.cpp.
-        bool rockCollisionSuppressionRegistry = false;
-
-        // HandBoneColliderSet — 16 keyframed bodies per hand (palm + 5 fingers × 3 segments)
-        // matching ROCK's full per-finger fidelity. Replaces our 3-body cup. Heavier
-        // (~32 hand bodies total) but contacts follow finger curl exactly. Requires
-        // bUseBethesdaPhysicsBody=true and bEnableHandCollision=true.
-        bool rockHandBoneColliderSet = false;
-
-        // BodyBoneColliderSet — collision bodies for the player's own avatar (torso,
-        // arms, legs) so things can touch / push you and FRIK avatar visuals are
-        // grabbable. Independent of HandBoneColliderSet.
-        bool rockBodyBoneColliderSet = false;
-
         // Hand/arm collider radius padding (game units) — the hand and arm collision
-        // capsules are fixed-radius approximations of the skinned mesh (HandBoneColliderSet's
-        // roleRadius(), BodyBoneColliderSet's per-bone descriptor table), not derived from
+        // capsules are fixed-radius approximations of the skinned mesh (the embedded ROCK
+        // engine's roleRadius() / per-bone descriptor table), not derived from
         // the actual mesh surface, so small objects resting on fingers/forearm can visually
         // clip through. Added uniformly to every hand and arm capsule radius; 0 = unchanged
         // (original ROCK-matched sizing). Affects self-collision, wall pushback, and soft
@@ -489,50 +392,20 @@ namespace heisenberg
         // non-zero starting point — still tunable via MCM "Hand/Arm Collider Padding".
         float handColliderRadiusPadding = 0.2f;
 
-        // WeaponCollision — generates collision hulls for equipped weapons so they
-        // physically interact with the world (melee swings push objects, scoped
-        // rifles bump off walls, etc.).
-        bool rockWeaponCollision = false;
-
-        // TwoHandedGrip — support-hand grip on the foregrip of rifles, for rifle
-        // stabilization. Requires WeaponCollision (it operates on the same bodies).
-        bool rockTwoHandedGrip = false;
         // HandBumpGuard — suppress player char-proxy bumps generated by physics hand
         // bodies (the CTD guard ported from ROCK's HandleBumpedCharacter hook). Enable
         // only with physics hand bodies on; the hook is installed regardless and is a
         // no-op when this is off.
         bool rockHandBumpGuard = false;
-        // PushAssist — ROCK's impulse-based hand->object push (alternative to Heisenberg's
-        // velocity-replace push). When on, ApplyPushForce computes a push impulse along the
-        // hand velocity (clamped by fPushAssistMaxImpulse, scaled by fHandPushForceMultiplier,
-        // gated by fHandPushVelocityThreshold) and ACCUMULATES it onto the object's current
-        // velocity instead of overwriting it. 1:1 with rock::push_assist::computePushImpulse.
-        bool rockPushAssist = false;
-        float pushAssistMaxImpulse = 600.0f; // Havok units - clamp on the per-frame push impulse magnitude (0 = unclamped)
-        // GrabNodeAnchor — if the grabbed object has an authored ROCK:GrabR/L NiNode, seat
-        // the grip to that node (capture the offset relative to the node instead of the
-        // hand) so the authored grip pose is used. 1:1 with ROCK's grab-node convention;
-        // falls back to normal placement when the object has no such node.
-        bool rockGrabNodeAnchor = false;
         float handCollisionRadius = 8.0f;    // Game units - radius of hand collision sphere (broadphase reach)
         float handContactSlop = 1.5f;        // Game units - bone-to-mesh distance that counts as TRUE contact (push trigger). ~finger flesh radius; smaller = must touch closer
         float handPushVelocityThreshold = 10.0f; // Min hand speed to push objects (lower = more sensitive)
         float handPushForceMultiplier = 1.0f;    // Push force multiplier (higher = stronger push)
 
-        // Collision-driven haptics (ContactImpulseListener → TriggerCollisionHaptics)
+        // Collision-driven haptics (proximity push → TriggerCollisionHaptics)
         bool  enableHandCollisionHaptics = true;   // Pulse controller on hand contact
         float handCollisionHapticScale   = 500.0f; // Microseconds per unit (mass·speed); 500 = prior hardcoded value, now live
 
-        // Per-finger-segment KEYFRAMED colliders (Task #11)
-        bool  enableFingerSegmentColliders = false; // Off by default — pending live tuning
-        float fingerSegmentHalfExtentX     = 0.8f;
-        float fingerSegmentHalfExtentY     = 1.6f;
-        float fingerSegmentHalfExtentZ     = 0.8f;
-
-        // Hand wall-pushback (FRIK v9 applyExternalHandWorldTransform). Pushes the rendered
-        // hand back out of walls. 0=off, 1=linear depenetration, 2=ROCK soft-contact feel,
-        // 3=full multi-target soft contact (world + hand-vs-hand finger capsules; ROCK 1:1).
-        int   handWallPushbackMode   = 0;
         // FRIK-GOAL seam (FrikArmGoalHook): 1 = swap FRIK's arm-solve goal via the U1PA
         // slot (v5-equivalent, default), 0 = legacy post-FRIK analytic bone IK only.
         int   handAuthorityApplyMode = 1;  // 1 = U1PA double-solve seam (v2: FP arm + Pip-Boy +
@@ -547,48 +420,12 @@ namespace heisenberg
                                                  // grip: 0=off (FRIK grip fist), 1=ROCK's
                                                  // mesh-solved grip pose via base FRIK API,
                                                  // 2=HIGGS geometry solve vs weapon mesh
-        float handPushbackProbeRadius = 6.0f;   // game units — hand probe sphere radius
-        float handPushbackMaxPush     = 14.0f;  // game units — max correction
-        float handPushbackSmoothing   = 18.0f;  // exponential smoothing speed (higher=snappier)
-        float handPushbackHardStop    = 8.0f;   // mode 2: penetration at which full correction applies
-        float handPushbackScale       = 0.5f;   // mode 2: shallow-penetration response scale (0..1)
-        float handPushbackHandRadiusPadding = 0.75f; // mode 3: extra radius padding on hand-vs-hand capsule contact (ROCK default 0.75)
-        // Weapon-tip pushback (modes 1/2): probe the equipped weapon's capsule (tip+mid) and
-        // retract the HAND when the barrel penetrates a wall — the welded weapon comes out with it.
-        // Jul 6: DEFAULT OFF — instrumentation showed the raycast reported garbage 20-42gu "depths"
-        // and drove constant weapon-hand jitter. Weapon-vs-wall should come from the real weapon
-        // collision contact evidence, not this raycast (TODO). Kept behind the flag, off.
-        bool  weaponWallPushback     = false;
-        float weaponPushbackMaxPush  = 20.0f;   // game units — max hand retraction from a barrel hit
-        // Hand-follows-object (iGrabMode 5/8): slave the rendered hand to the held object's actual
-        // position so it doesn't visibly trail while walking. Jul 6: DEFAULT OFF — it also moves the
-        // hand when the held object bounces off another object (user wants the hand to stay put; the
-        // object should yield, not the hand). The velocity drive / mode-8 constraint keep the object
-        // near the hand without this coupling.
-        bool  handFollowsHeldObject  = false;
-        // Mode-3 per-target enables (ROCK rockSoftContact{HandHand,Body,WeaponHand,World}Enabled).
-        bool  softContactHandHand = true;   // mode 3: hand-vs-hand
-        bool  softContactBody     = true;   // mode 3: hand-vs-body (avatar capsules)
-        bool  softContactWeapon   = true;   // mode 3: hand-vs-equipped-weapon
-        bool  softContactWorld    = true;   // mode 3: hand-vs-world geometry
-        // Mode-3 per-kind correction clamps + weapon compliance — ROCK's ABSOLUTE tunables at
-        // stock defaults (rockSoftContact*GameUnits). World/hand-body are hard projections;
-        // weapon-hand is compliant (scale ramps to hard stop at deep penetration).
-        float softContactMaxCorrection        = 7.0f;   // hand-hand + body clamp (game units)
-        float softContactWorldMaxCorrection   = 18.0f;  // world clamp
-        float softContactWeaponMaxCorrection  = 3.0f;   // weapon-hand clamp
-        float softContactWeaponRadiusPadding  = 0.25f;  // weapon-hand capsule padding (vs generic 0.75)
-        float softContactWeaponCorrectionScale = 0.35f; // weapon shallow-penetration response scale
-        float softContactWeaponHardStop       = 4.0f;   // weapon penetration where response ramps to 1.0
         // Havok timing fix (ROCK HAVOK_TIMING_FIX): override the engine's physics substep
         // delta/count so physics steps at >= the min rate even on long render frames — keeps
         // held-object / hand physics stable at low FPS.
         bool  havokTimingFix = false;
         float havokTimingMinFrameRate = 70.0f;  // clamped [30,240]
         int   havokTimingMaxSubsteps  = 3;       // clamped [1,6] (engine max)
-        // ROCK grab core (1:1 port) as grab backend iGrabMode=8. Master gate; default OFF.
-        bool  useRockGrabCore = false;
-
         // ─── SECOND ARCHITECTURE: embedded full ROCK engine (rock_engine static lib) ───
         // When ON, Heisenberg hosts ROCK's *complete* vendored engine in-process via
         // rock::HostLoad() — ROCK's own PhysicsInteraction/grab/hand/weapon pipeline runs
@@ -599,76 +436,6 @@ namespace heisenberg
         // Read EARLY (during F4SEPlugin_Load) so ROCK registers its lifecycle listener
         // before kGameLoaded fires — see Heisenberg::OnF4SELoad.
         bool  useRockEngineArchitecture = false;
-
-        // Collision-driven grab candidate selection (Task #12)
-        bool  useCollisionOverlapForGrabCandidates = false; // Off by default
-
-        // Approach/Contact/Grip FSM substates + motor tau/damping ramp (Task #13)
-        bool  enableGrabApproachSubstates = false;  // Off by default; smooths snap-in
-        float grabApproachRampSeconds     = 0.12f;  // Lerp window for motor tau from 0 → configured
-
-        // Weapon collision settings
-        bool enableWeaponCollision = false;       // DISABLED by default - experimental
-        float weaponCollisionLength = 50.0f;      // Game units (~50cm)
-        float weaponCollisionWidth = 5.0f;        // Game units (~5cm)
-        float weaponCollisionHeight = 5.0f;       // Game units (~5cm)
-        float weaponCollisionHandleOffset = 5.0f; // Game units (~5cm)
-
-        // HeldBody constraint grab settings
-        bool useHeldBodyGrab = true;                // HIGGS-style constraint grab (object stays DYNAMIC)
-        int heldBodyMode = static_cast<int>(HeldBodyMode::NativeConstraint);  // 0=spring, 1=custom 6-DOF, 2=native constraint
-        bool useNativeRagdollConstraint = false;  // Legacy mirror of heldBodyMode for compatibility
-        // Tau lerp: motors start soft, firm up over time (HIGGS: 0.1s lerp)
-        float heldBodyTauLerpTime = 0.1f;           // Seconds to reach full tau. HIGGS: 0.1
-
-        // =====================================================================
-        // GRAB CONSTRAINT MOTOR PARAMETERS — matched to HIGGS Skyrim
-        // HIGGS uses separate start/target tau and lerps between them.
-        // "Tau" = initial resting value, "TauBody" = steady-state held value.
-        // =====================================================================
-
-        // Angular motor (rotation control)
-        float grabConstraintAngularTau = 0.03f;                   // Resting/default tau. HIGGS: 0.03
-        float grabConstraintAngularTauBody = 0.65f;               // HIGGS: 0.65
-        float grabConstraintAngularTauBodyStart = 0.1f;           // Start moderately stiff
-        float grabConstraintAngularDamping = 0.8f;                // HIGGS: 0.8
-        float grabConstraintAngularProportionalRecoveryVelocity = 5.0f;  // Faster error correction
-        float grabConstraintAngularConstantRecoveryVelocity = 2.0f;
-        float grabConstraintAngularMaxForce = 160.0f;             // HIGGS: 2000/12.5
-
-        // Linear motor (position control)
-        float grabConstraintLinearTau = 0.03f;                    // Resting/default tau
-        float grabConstraintLinearTauBody = 0.80f;                // HIGGS: 0.80
-        float grabConstraintLinearTauBodyStart = 0.1f;            // Start moderately stiff
-        float grabConstraintLinearDamping = 0.8f;                 // HIGGS: 0.8
-        float grabConstraintLinearProportionalRecoveryVelocity = 5.0f;   // Faster error correction
-        float grabConstraintLinearConstantRecoveryVelocity = 2.0f;
-        float grabConstraintLinearMaxForce = 2000.0f;             // HIGGS: 2000
-        float grabConstraintLinearMaxForceWeapon = 9000.0f;       // HIGGS: 9000
-
-        // Collision tau — softer when object is colliding to prevent jitter
-        float grabConstraintCollidingAngularTau = 0.01f;          // HIGGS: 0.01
-        float grabConstraintCollidingLinearTau = 0.01f;           // HIGGS: 0.01
-        float grabConstraintTauLerpSpeed = 0.5f;                  // HIGGS: 0.5 (per-frame lerp rate)
-
-        // Force ratio and mass clamping
-        float grabConstraintAngularToLinearForceRatio = 12.5f;    // HIGGS: 12.5
-        float grabConstraintMaxForceToMassRatio = 500.0f;         // HIGGS: 500
-        float grabConstraintFadeInStartAngularMaxForceRatio = 100.0f; // HIGGS: 100
-        float grabConstraintFadeInTime = 0.1f;                    // HIGGS: 0.1s
-
-        // Soft constraint limits (Task #2). Implemented as per-frame target clamps
-        // rather than Havok limit atoms, because modifying the solver atom array
-        // on hknp 2014 risks breaking hknpSolverBuildJacobianFromAtomsNotContact.
-        // Clamping the motor target produces the same practical "hard stop" feel.
-        bool  grabConstraintEnableSoftLimits = true;              // Master gate for soft stretch/twist limits
-        float grabConstraintLinearMaxStretch = 40.0f;             // Max distance (game units) object can drift from hand
-        float grabConstraintAngularMaxAngleDeg = 90.0f;           // Max angular deviation from initial grab orientation
-
-        // Force DYNAMIC-held-body guard (Task #1). When the motor constraint is
-        // active, never permit the grabbed object to flip to KEYFRAMED — that
-        // would neutralize the motor. Default true; disable only for debugging.
-        bool  grabConstraintForceDynamicHeldBody = true;
 
         // Throw settings  
         float throwVelocityThreshold = 3.0f;  // m/s - minimum speed for throw (increased to reduce accidental throws)

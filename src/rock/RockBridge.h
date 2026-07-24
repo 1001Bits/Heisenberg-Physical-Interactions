@@ -73,20 +73,6 @@ namespace heisenberg
         // must check the return and fall back when false.
         bool ForceGrab(bool isLeft, RE::TESObjectREFR* refr) const;
 
-        // ---- PREPARED for the future "ROCK owns the dynamic hold" model ----
-        // (GrabMode::RockForceGrab). Not wired into the live grab path yet.
-        //
-        // True when ROCK can hold a Heisenberg-chosen object via its dynamic grab API
-        // (needs forceGrab; ROCK < v5 returns false). The RockForceGrab grab mode is
-        // gated on this so it safely degrades to keyframed until ROCK ships forceGrab.
-        //
-        // The integration primitive is the existing ForceGrab(isLeft, refr): Heisenberg
-        // SELECTS, then hands the object to ROCK, and ROCK does the PLACEMENT (mesh/contact
-        // grab pockets) + dynamic hold. We deliberately do NOT pass a Heisenberg offset —
-        // ROCK seats the object at the real contact point, which supersedes our keyframed
-        // dimension-table offset. Plain v5 forceGrab(hand, refr) is therefore sufficient.
-        bool SupportsDynamicHold() const { return _hasForceGrab; }
-
         // F4SE message from ROCK (sender "ROCK"). Phase 0: log; Phase 2: dispatch
         // touch/grab/release into Heisenberg feature logic.
         void OnRockMessage(std::uint32_t type, const void* data, std::uint32_t dataLen);

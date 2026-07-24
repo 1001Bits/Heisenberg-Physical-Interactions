@@ -105,21 +105,6 @@ namespace heisenberg
         // few frames; no-op unless a throwable is actually in hand.
         void ForceArmThrowable() { _cb_forceArmThrowableFrames.store(8, std::memory_order_relaxed); }
 
-        // EXPERIMENTAL ROCK dynamic handoff: inject a synthetic grip release->press edge
-        // on the given hand so ROCK's (edge-triggered) grab catches an object Heisenberg
-        // just placed at the hand. Also opens a window where Heisenberg suppresses its own
-        // re-grab so it doesn't fight ROCK on the synthetic edge.
-        void TriggerRockGripHandoff(bool isLeft) {
-            _rockHandoffHand.store(isLeft ? 1 : 0, std::memory_order_relaxed);
-            _rockHandoffGripOffFrames.store(3, std::memory_order_relaxed);   // release phase
-            _rockHandoffGripOnFrames.store(5, std::memory_order_relaxed);    // forced press phase (overrides primary-hand grip strip)
-            _rockHandoffSuppressGrabFrames.store(20, std::memory_order_relaxed);
-        }
-        bool IsRockHandoffSuppressingGrab(bool isLeft) const {
-            return _rockHandoffHand.load(std::memory_order_relaxed) == (isLeft ? 1 : 0)
-                && _rockHandoffSuppressGrabFrames.load(std::memory_order_relaxed) > 0;
-        }
-
         // Check if Virtual Holsters mod is detected (for compatibility mode)
         bool IsVirtualHolstersActive() const { return _virtualHolstersDetected; }
 
@@ -314,12 +299,6 @@ namespace heisenberg
         // forces the grip-injection while > 0, holding it a few frames so the arm
         // reliably triggers, then decrements to 0.
         std::atomic<int>    _cb_forceArmThrowableFrames{0};
-
-        // EXPERIMENTAL ROCK dynamic-handoff grip injection state (see TriggerRockGripHandoff).
-        std::atomic<int>    _rockHandoffHand{-1};               // 0=right, 1=left, -1=none
-        std::atomic<int>    _rockHandoffGripOffFrames{0};       // frames to force grip OFF (release edge for ROCK)
-        std::atomic<int>    _rockHandoffGripOnFrames{0};        // frames to force grip ON after release (press edge; overrides primary-hand strip)
-        std::atomic<int>    _rockHandoffSuppressGrabFrames{0};  // frames to suppress Heisenberg re-grab
 
         // A/X grab hold-timing state (per hand)
         // Blocks A/X from game while pressed; injects tap on quick release

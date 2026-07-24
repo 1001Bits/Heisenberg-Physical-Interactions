@@ -222,23 +222,6 @@ bHideWandHUD = true
 ; Hide all wand HUD messages (actions AND item display) when pointing with wands
 bHideAllWandHUD = false
 
-[HeldBody]
-; Enable HIGGS-style HeldBody grabbing (object stays DYNAMIC)
-; Note: iGrabMode=0 still forces the original keyframed backend for testing.
-bUseHeldBodyGrab = true
-
-; HeldBody runtime mode:
-; 0 = dynamic spring held mode
-; 1 = custom 6-DOF constraint
-; 2 = native ragdoll constraint
-iHeldBodyMode = 0
-
-; Legacy fallback if iHeldBodyMode is absent
-bUseNativeRagdollConstraint = false
-
-; Use Bethesda CreateInstance path for HeldBody hand bodies
-bUseSimpleHandBodyCreation = true
-
 [Debug]
 ; Log level: 0=trace, 1=debug, 2=info, 3=warn, 4=error
 ; Default: 2 (info)
@@ -364,7 +347,6 @@ iLogLevel = 2
         heldObjectCollidable = ini.GetBoolValue("ObjectPickup", "bHeldObjectCollidable", heldObjectCollidable);
         heldObjectWallClamp = ini.GetBoolValue("ObjectPickup", "bHeldObjectWallClamp", heldObjectWallClamp);
         blockActivateOnGrabSelection = ini.GetBoolValue("ObjectPickup", "bBlockActivateOnGrabSelection", blockActivateOnGrabSelection);
-        rockDynamicHandoff = ini.GetBoolValue("ObjectPickup", "bRockDynamicHandoff", rockDynamicHandoff);
         useXForLeftGrab  = ini.GetBoolValue("ObjectPickup", "bUseXForLeftGrab",  useXForLeftGrab);
         useAForRightGrab = ini.GetBoolValue("ObjectPickup", "bUseAForRightGrab", useAForRightGrab);
         grabStartSpeed = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fGrabStartSpeed", grabStartSpeed));
@@ -385,9 +367,6 @@ iLogLevel = 2
         enableAxialPlacement = ini.GetBoolValue("ObjectPickup", "bEnableAxialPlacement", enableAxialPlacement);
         axialPlacementClearance = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fAxialPlacementClearance", axialPlacementClearance));
         grabMaxTriangleDistance = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fGrabMaxTriangleDistance", grabMaxTriangleDistance));
-        useRockFingerPose = ini.GetBoolValue("ObjectPickup", "bUseRockFingerPose", useRockFingerPose);
-        rockFingerRejectBackside = ini.GetBoolValue("ObjectPickup", "bRockFingerRejectBackside", rockFingerRejectBackside);
-        rockFingerSurfaceTolerance = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fRockFingerSurfaceTolerance", rockFingerSurfaceTolerance));
         grabDirectionalWeight = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fGrabDirectionalWeight", grabDirectionalWeight));
         grabLateralWeight = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fGrabLateralWeight", grabLateralWeight));
         palmDepthOffset = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fPalmDepthOffset", palmDepthOffset));
@@ -486,128 +465,31 @@ iLogLevel = 2
 
         // Hand collision
         enableHandCollision = ini.GetBoolValue("ObjectPickup", "bEnableHandCollision", enableHandCollision);
-        usePhysicsHandBodies = ini.GetBoolValue("ObjectPickup", "bUsePhysicsHandBodies", usePhysicsHandBodies);
-        useBethesdaPhysicsBody = ini.GetBoolValue("ObjectPickup", "bUseBethesdaPhysicsBody", useBethesdaPhysicsBody);
 
-        // ROCK integration toggles — section [RockIntegration]
-        rockCollisionSuppressionRegistry = ini.GetBoolValue("RockIntegration", "bCollisionSuppressionRegistry", rockCollisionSuppressionRegistry);
-        rockHandBoneColliderSet          = ini.GetBoolValue("RockIntegration", "bHandBoneColliderSet",          rockHandBoneColliderSet);
-        rockBodyBoneColliderSet          = ini.GetBoolValue("RockIntegration", "bBodyBoneColliderSet",          rockBodyBoneColliderSet);
+        // [RockIntegration] — two-scenario cleanup: only CollisionLayerPolicy (header-only),
+        // HavokTimingFixPolicy (keys read further below) and the fHandColliderRadiusPadding
+        // embed-engine bridge survive from the old hand-ported subsystem set.
         handColliderRadiusPadding        = static_cast<float>(ini.GetDoubleValue("RockIntegration", "fHandColliderRadiusPadding", handColliderRadiusPadding));
-        rockWeaponCollision              = ini.GetBoolValue("RockIntegration", "bWeaponCollision",              rockWeaponCollision);
-        rockTwoHandedGrip                = ini.GetBoolValue("RockIntegration", "bTwoHandedGrip",                rockTwoHandedGrip);
         rockHandBumpGuard                = ini.GetBoolValue("RockIntegration", "bHandBumpGuard",                rockHandBumpGuard);
-        rockPushAssist                   = ini.GetBoolValue("RockIntegration", "bPushAssist",                   rockPushAssist);
-        pushAssistMaxImpulse = static_cast<float>(ini.GetDoubleValue("RockIntegration", "fPushAssistMaxImpulse", pushAssistMaxImpulse));
-        rockGrabNodeAnchor               = ini.GetBoolValue("RockIntegration", "bGrabNodeAnchor",               rockGrabNodeAnchor);
-        spdlog::info("[Config] RockIntegration: CSR={} HBCS={} BBCS={} WC={} THG={} BumpGuard={} PushAssist={}",
-                     rockCollisionSuppressionRegistry, rockHandBoneColliderSet, rockBodyBoneColliderSet,
-                     rockWeaponCollision, rockTwoHandedGrip, rockHandBumpGuard, rockPushAssist);
+        spdlog::info("[Config] RockIntegration: BumpGuard={} colliderPadding={:.2f}",
+                     rockHandBumpGuard, handColliderRadiusPadding);
         handCollisionRadius = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fHandCollisionRadius", handCollisionRadius));
         handContactSlop = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fHandContactSlop", handContactSlop));
         handPushVelocityThreshold = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fHandPushVelocityThreshold", handPushVelocityThreshold));
         handPushForceMultiplier = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fHandPushForceMultiplier", handPushForceMultiplier));
         enableHandCollisionHaptics = ini.GetBoolValue("ObjectPickup", "bEnableHandCollisionHaptics", enableHandCollisionHaptics);
         handCollisionHapticScale = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fHandCollisionHapticScale", handCollisionHapticScale));
-        enableFingerSegmentColliders = ini.GetBoolValue("ObjectPickup", "bEnableFingerSegmentColliders", enableFingerSegmentColliders);
-        fingerSegmentHalfExtentX = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fFingerSegmentHalfExtentX", fingerSegmentHalfExtentX));
-        fingerSegmentHalfExtentY = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fFingerSegmentHalfExtentY", fingerSegmentHalfExtentY));
-        fingerSegmentHalfExtentZ = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fFingerSegmentHalfExtentZ", fingerSegmentHalfExtentZ));
-        useCollisionOverlapForGrabCandidates = ini.GetBoolValue("ObjectPickup", "bUseCollisionOverlapForGrabCandidates", useCollisionOverlapForGrabCandidates);
 
-        // Hand wall-pushback
-        handWallPushbackMode    = static_cast<int>(ini.GetLongValue("ObjectPickup", "iHandWallPushbackMode", handWallPushbackMode));
         handAuthorityApplyMode  = static_cast<int>(ini.GetLongValue("ObjectPickup", "iHandAuthorityApplyMode", handAuthorityApplyMode));
         handAuthorityGoalHookLog = ini.GetBoolValue("ObjectPickup", "bHandAuthorityGoalHookLog", handAuthorityGoalHookLog);
         suppressThumbstickTouch = ini.GetBoolValue("VRInput", "bSuppressThumbstickTouch", suppressThumbstickTouch);
         twoHandedFingerPoseMode = static_cast<int>(ini.GetLongValue("ObjectPickup", "iTwoHandedFingerPoseMode", twoHandedFingerPoseMode));
-        handPushbackProbeRadius = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fHandPushbackProbeRadius", handPushbackProbeRadius));
-        handPushbackMaxPush     = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fHandPushbackMaxPush", handPushbackMaxPush));
-        handPushbackSmoothing   = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fHandPushbackSmoothing", handPushbackSmoothing));
-        handPushbackHardStop    = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fHandPushbackHardStop", handPushbackHardStop));
-        handPushbackScale       = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fHandPushbackScale", handPushbackScale));
-        handPushbackHandRadiusPadding = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fHandPushbackHandRadiusPadding", handPushbackHandRadiusPadding));
-        weaponWallPushback      = ini.GetBoolValue("ObjectPickup", "bWeaponWallPushback", weaponWallPushback);
-        weaponPushbackMaxPush   = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fWeaponPushbackMaxPush", weaponPushbackMaxPush));
-        handFollowsHeldObject   = ini.GetBoolValue("ObjectPickup", "bHandFollowsHeldObject", handFollowsHeldObject);
-        softContactHandHand = ini.GetBoolValue("ObjectPickup", "bSoftContactHandHand", softContactHandHand);
-        softContactBody     = ini.GetBoolValue("ObjectPickup", "bSoftContactBody",     softContactBody);
-        softContactWeapon   = ini.GetBoolValue("ObjectPickup", "bSoftContactWeapon",   softContactWeapon);
-        softContactWorld    = ini.GetBoolValue("ObjectPickup", "bSoftContactWorld",    softContactWorld);
-        softContactMaxCorrection         = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fSoftContactMaxCorrection", softContactMaxCorrection));
-        softContactWorldMaxCorrection    = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fSoftContactWorldMaxCorrection", softContactWorldMaxCorrection));
-        softContactWeaponMaxCorrection   = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fSoftContactWeaponMaxCorrection", softContactWeaponMaxCorrection));
-        softContactWeaponRadiusPadding   = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fSoftContactWeaponRadiusPadding", softContactWeaponRadiusPadding));
-        softContactWeaponCorrectionScale = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fSoftContactWeaponCorrectionScale", softContactWeaponCorrectionScale));
-        softContactWeaponHardStop        = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fSoftContactWeaponHardStop", softContactWeaponHardStop));
         havokTimingFix = ini.GetBoolValue("RockIntegration", "bHavokTimingFix", havokTimingFix);
         havokTimingMinFrameRate = static_cast<float>(ini.GetDoubleValue("RockIntegration", "fHavokTimingMinFrameRate", havokTimingMinFrameRate));
         havokTimingMaxSubsteps = static_cast<int>(ini.GetLongValue("RockIntegration", "iHavokTimingMaxSubsteps", havokTimingMaxSubsteps));
-        useRockGrabCore = ini.GetBoolValue("RockIntegration", "bUseRockGrabCore", useRockGrabCore);
         useRockEngineArchitecture = ini.GetBoolValue("RockEngine", "bUseRockEngineArchitecture", useRockEngineArchitecture);
-        spdlog::info("[Config] HandWallPushback mode={} (0=off,1=linear,2=rock) probeR={:.1f} maxPush={:.1f}",
-                     handWallPushbackMode, handPushbackProbeRadius, handPushbackMaxPush);
-        enableGrabApproachSubstates = ini.GetBoolValue("HeldBody", "bEnableGrabApproachSubstates", enableGrabApproachSubstates);
-        grabApproachRampSeconds = static_cast<float>(ini.GetDoubleValue("HeldBody", "fGrabApproachRampSeconds", grabApproachRampSeconds));
 
         // Hand collision enabled — pair filter + proxy listener handle player capsule
-
-        // HeldBody constraint grab
-        if (ini.GetValue("HeldBody", "bUseHeldBodyGrab", nullptr)) {
-            useHeldBodyGrab = ini.GetBoolValue("HeldBody", "bUseHeldBodyGrab", useHeldBodyGrab);
-        } else {
-            useHeldBodyGrab = ini.GetBoolValue("ObjectPickup", "bUseHeldBodyGrab", useHeldBodyGrab);
-        }
-        if (ini.GetValue("HeldBody", "iHeldBodyMode", nullptr)) {
-            heldBodyMode = static_cast<int>(ini.GetLongValue("HeldBody", "iHeldBodyMode", heldBodyMode));
-        } else if (ini.GetValue("HeldBody", "bUseNativeRagdollConstraint", nullptr)) {
-            heldBodyMode = ini.GetBoolValue("HeldBody", "bUseNativeRagdollConstraint", useNativeRagdollConstraint)
-                ? static_cast<int>(HeldBodyMode::NativeConstraint)
-                : static_cast<int>(HeldBodyMode::Custom6DOF);
-        } else if (ini.GetValue("HeldBody", "bUse6DOFGrabConstraint", nullptr)) {
-            heldBodyMode = ini.GetBoolValue("HeldBody", "bUse6DOFGrabConstraint", false)
-                ? static_cast<int>(HeldBodyMode::Custom6DOF)
-                : static_cast<int>(HeldBodyMode::NativeConstraint);
-        }
-        heldBodyMode = static_cast<int>(GetHeldBodyMode());
-        useNativeRagdollConstraint = UseHeldBodyNativeConstraint();
-        if (ini.GetValue("HeldBody", "bUseSimpleHandBodyCreation", nullptr)) {
-            useSimpleHandBodyCreation = ini.GetBoolValue("HeldBody", "bUseSimpleHandBodyCreation", useSimpleHandBodyCreation);
-        } else {
-            useSimpleHandBodyCreation = ini.GetBoolValue("ObjectPickup", "bUseSimpleHandBodyCreation", useSimpleHandBodyCreation);
-        }
-        heldBodyTauLerpTime = static_cast<float>(ini.GetDoubleValue("HeldBody", "fTauLerpTime", heldBodyTauLerpTime));
-        grabConstraintAngularTauBodyStart = static_cast<float>(ini.GetDoubleValue("HeldBody", "fAngularTauBodyStart", grabConstraintAngularTauBodyStart));
-        grabConstraintAngularTauBody = static_cast<float>(ini.GetDoubleValue("HeldBody", "fAngularTauBody", grabConstraintAngularTauBody));
-        grabConstraintLinearTauBodyStart = static_cast<float>(ini.GetDoubleValue("HeldBody", "fLinearTauBodyStart", grabConstraintLinearTauBodyStart));
-        grabConstraintLinearTauBody = static_cast<float>(ini.GetDoubleValue("HeldBody", "fLinearTauBody", grabConstraintLinearTauBody));
-        grabConstraintAngularTau = static_cast<float>(ini.GetDoubleValue("HeldBody", "fAngularTau", grabConstraintAngularTau));
-        grabConstraintAngularDamping = static_cast<float>(ini.GetDoubleValue("HeldBody", "fAngularDamping", grabConstraintAngularDamping));
-        grabConstraintAngularMaxForce = static_cast<float>(ini.GetDoubleValue("HeldBody", "fAngularMaxForce", grabConstraintAngularMaxForce));
-        grabConstraintLinearTau = static_cast<float>(ini.GetDoubleValue("HeldBody", "fLinearTau", grabConstraintLinearTau));
-        grabConstraintLinearDamping = static_cast<float>(ini.GetDoubleValue("HeldBody", "fLinearDamping", grabConstraintLinearDamping));
-        grabConstraintLinearMaxForce = static_cast<float>(ini.GetDoubleValue("HeldBody", "fLinearMaxForce", grabConstraintLinearMaxForce));
-        grabConstraintAngularToLinearForceRatio = static_cast<float>(ini.GetDoubleValue("HeldBody", "fAngularToLinearForceRatio", grabConstraintAngularToLinearForceRatio));
-        grabConstraintEnableSoftLimits = ini.GetBoolValue("HeldBody", "bEnableSoftLimits", grabConstraintEnableSoftLimits);
-        grabConstraintLinearMaxStretch = static_cast<float>(ini.GetDoubleValue("HeldBody", "fLinearMaxStretch", grabConstraintLinearMaxStretch));
-        grabConstraintAngularMaxAngleDeg = static_cast<float>(ini.GetDoubleValue("HeldBody", "fAngularMaxAngleDeg", grabConstraintAngularMaxAngleDeg));
-        grabConstraintForceDynamicHeldBody = ini.GetBoolValue("HeldBody", "bForceDynamicHeldBody", grabConstraintForceDynamicHeldBody);
-
-        if (UseHeldBodyManagedGrab() && grabMode == 0) {
-            spdlog::info("[Config] iGrabMode=0 keeps the original keyframed backend even while bUseHeldBodyGrab=true");
-        }
-        if (UseHeldBodyManagedGrab() && (grabMode == 1 || grabMode == 2)) {
-            spdlog::info("[Config] iGrabMode={} is a legacy constraint mode; HeldBody will override it while bUseHeldBodyGrab=true", grabMode);
-        }
-        if (UseHeldBodyManagedGrab()) {
-            spdlog::info("[Config] HeldBody mode: {}", GetHeldBodyModeName());
-            if (UseHeldBodySpringMode() && (grabMode == 1 || grabMode == 2)) {
-                spdlog::info("[Config] HeldBody spring mode selected; iGrabMode={} will be overridden by the HeldBody dynamic spring backend", grabMode);
-            }
-        }
-        if (enableHandCollision && !usePhysicsHandBodies) {
-            spdlog::warn("[Config] Hand collision is enabled but bUsePhysicsHandBodies=false; only proximity fallback collision is active");
-        }
 
         // Consumable zones (mouth)
         consumableActivationZone = static_cast<int>(ini.GetLongValue("Consumables", "iConsumableActivationZone", consumableActivationZone));
@@ -803,7 +685,7 @@ iLogLevel = 2
         clampFloat(collisionBaseHapticStrength, 0.0f, 1.0f, "fCollisionBaseHapticStrength");
 
         // Enum values
-        clampInt(grabMode, 0, 9, "iGrabMode");  // 6=NativeMouseSpring(no backend->Keyframed), 7=RockForceGrab(prepared), 8=RockGrabCore; all degrade safely via GetEffectiveGrabMode()
+        clampInt(grabMode, 0, 9, "iGrabMode");  // only 0 (Keyframed) and 9 (Full Dynamic) are real backends; every other value degrades to 0 via GetEffectiveGrabMode()
         clampInt(weaponEquipMode, 0, 2, "iWeaponEquipMode");
         clampInt(throwableActivationZone, 0, 1, "iThrowableActivationZone");
         clampInt(consumableActivationZone, 0, 1, "iConsumableActivationZone");
@@ -910,7 +792,7 @@ iLogLevel = 2
         ini.SetBoolValue("ObjectPickup", "bShowUnequipMessages", showUnequipMessages, "; Show HUD message when unequipping weapons");
         ini.SetBoolValue("ObjectPickup", "bEnableTwoHandedGrab", enableTwoHandedGrab, "; Two-handed single-object grab: second hand aims/stabilizes the held object");
         ini.SetBoolValue("ObjectPickup", "bEnableLimbGrab", enableLimbGrab, "; Limb grab: grab the nearest ragdoll limb of an actor (needs bEnableGrabActors); CTD-prone, opt-in");
-        ini.SetLongValue("ObjectPickup", "iGrabMode", grabMode, "; 0=Keyframe (always original backend), 1/2=Legacy constraint fallback, 3=Post-physics/HeldBody wrapper (recommended), 4=MouseSpring, 5=DynamicRock (self-contained dynamic hold), 8=RockGrabCore (motor-constraint port, needs bUseRockGrabCore=1), 9=RockNativeGrab (embedded ROCK engine owns grab+selection 1:1; needs bUseRockEngineArchitecture=1)");
+        ini.SetLongValue("ObjectPickup", "iGrabMode", grabMode, "; 0=Keyframed (Heisenberg keyframed backend), 9=Full Dynamic (embedded ROCK engine owns grab+selection; needs bUseRockEngineArchitecture=1). Other values degrade to 0.");
         ini.SetBoolValue("ObjectPickup", "bHeldObjectCollidable", heldObjectCollidable, "; Keyframed hold keeps object collidable so it can hit other objects (iGrabMode=0 only)");
         ini.SetBoolValue("ObjectPickup", "bHeldObjectWallClamp", heldObjectWallClamp, "; Keyframed hold: sweep-cast the held object so it STOPS at walls and NPCs instead of clipping through (iGrabMode=0)");
         ini.SetBoolValue("ObjectPickup", "bBlockActivateOnGrabSelection", blockActivateOnGrabSelection, "; Block A/activate looting an item just because you're aiming at it. OFF by default (ON broke A-looting + mod secondary actions). Only enable for a Grip>A SteamVR binding.");
@@ -933,9 +815,6 @@ iLogLevel = 2
         ini.SetBoolValue("ObjectPickup", "bEnableAxialPlacement", enableAxialPlacement, "; Place object near-face at palm with small clearance, extending forward along palmDir");
         ini.SetDoubleValue("ObjectPickup", "fAxialPlacementClearance", axialPlacementClearance, "; cm from palm to object near face when axial placement is enabled");
         ini.SetDoubleValue("ObjectPickup", "fGrabMaxTriangleDistance", grabMaxTriangleDistance, "; Squared distance (game units) from closest-mesh-point to consider a triangle nearby for finger intersection (HIGGS default 100)");
-        ini.SetBoolValue("ObjectPickup", "bUseRockFingerPose", useRockFingerPose, "; Use ROCK's ported curl-disk finger solver instead of the HIGGS curve tables (A/B toggle, default false)");
-        ini.SetBoolValue("ObjectPickup", "bRockFingerRejectBackside", rockFingerRejectBackside, "; ROCK solver: reject finger hits behind the seated mesh surface plane (default false)");
-        ini.SetDoubleValue("ObjectPickup", "fRockFingerSurfaceTolerance", rockFingerSurfaceTolerance, "; ROCK solver back-face plane tolerance in game units (default 1.5)");
         ini.SetDoubleValue("ObjectPickup", "fGrabDirectionalWeight", grabDirectionalWeight, "; Weight on directional distance squared when scoring closest-point-on-geometry (HIGGS default 0.4)");
         ini.SetDoubleValue("ObjectPickup", "fGrabLateralWeight", grabLateralWeight, "; Weight on lateral distance squared when scoring closest-point-on-geometry (HIGGS default 0.6)");
         ini.SetDoubleValue("ObjectPickup", "fPalmDepthOffset", palmDepthOffset, "; cm to shift palm anchor from knuckle centroid into palm cup (palmar side)");
@@ -1048,42 +927,12 @@ iLogLevel = 2
 
         // Hand collision
         ini.SetBoolValue("ObjectPickup", "bEnableHandCollision", enableHandCollision, "; Enable hand collision with world");
-        ini.SetBoolValue("ObjectPickup", "bUsePhysicsHandBodies", usePhysicsHandBodies, "; Use actual physics bodies for hands (required for full physical hand collision)");
         ini.SetDoubleValue("ObjectPickup", "fHandCollisionRadius", handCollisionRadius, "; Game units - radius of hand collision sphere (broadphase reach)");
         ini.SetDoubleValue("ObjectPickup", "fHandContactSlop", handContactSlop, "; Game units - bone-to-mesh distance counted as TRUE contact (push trigger); ~finger flesh radius, smaller = must touch closer");
         ini.SetDoubleValue("ObjectPickup", "fHandPushVelocityThreshold", handPushVelocityThreshold, "; Min hand speed to push objects (lower = more sensitive)");
         ini.SetDoubleValue("ObjectPickup", "fHandPushForceMultiplier", handPushForceMultiplier, "; Push force multiplier (higher = stronger)");
         ini.SetBoolValue("ObjectPickup", "bEnableHandCollisionHaptics", enableHandCollisionHaptics, "; Controller buzz on hand-object contact");
         ini.SetDoubleValue("ObjectPickup", "fHandCollisionHapticScale", handCollisionHapticScale, "; Microseconds per mass-speed unit for haptic pulse");
-        ini.SetBoolValue("ObjectPickup", "bEnableFingerSegmentColliders", enableFingerSegmentColliders, "; Per-finger KEYFRAMED bodies (experimental)");
-        ini.SetDoubleValue("ObjectPickup", "fFingerSegmentHalfExtentX", fingerSegmentHalfExtentX, "; Finger collider half-extent along finger X axis");
-        ini.SetDoubleValue("ObjectPickup", "fFingerSegmentHalfExtentY", fingerSegmentHalfExtentY, "; Finger collider half-extent along finger Y axis (length)");
-        ini.SetDoubleValue("ObjectPickup", "fFingerSegmentHalfExtentZ", fingerSegmentHalfExtentZ, "; Finger collider half-extent along finger Z axis");
-        ini.SetBoolValue("ObjectPickup", "bUseCollisionOverlapForGrabCandidates", useCollisionOverlapForGrabCandidates, "; HIGGS-style collision-driven grab candidate pool");
-        ini.SetBoolValue("HeldBody", "bEnableGrabApproachSubstates", enableGrabApproachSubstates, "; Approach/Contact/Grip FSM smoothing");
-        ini.SetDoubleValue("HeldBody", "fGrabApproachRampSeconds", grabApproachRampSeconds, "; Seconds to ramp motor tau on grab onset");
-
-        // HeldBody constraint grab
-        ini.SetBoolValue("HeldBody", "bUseHeldBodyGrab", useHeldBodyGrab, "; HIGGS-style HeldBody grab (object stays DYNAMIC)");
-        ini.SetLongValue("HeldBody", "iHeldBodyMode", static_cast<long>(static_cast<int>(GetHeldBodyMode())), "; 0=Dynamic spring, 1=Custom 6-DOF, 2=Native ragdoll constraint");
-        ini.SetBoolValue("HeldBody", "bUseNativeRagdollConstraint", UseHeldBodyNativeConstraint(), "; Legacy fallback if iHeldBodyMode is absent");
-        ini.SetBoolValue("HeldBody", "bUseSimpleHandBodyCreation", useSimpleHandBodyCreation, "; Use Bethesda CreateInstance path for HeldBody hand bodies");
-        ini.SetDoubleValue("HeldBody", "fTauLerpTime", heldBodyTauLerpTime, "; Seconds to lerp spring strength from start to target");
-        ini.SetDoubleValue("HeldBody", "fAngularTau", grabConstraintAngularTau, "; Angular resting tau (0=soft, 1=hard)");
-        ini.SetDoubleValue("HeldBody", "fAngularTauBody", grabConstraintAngularTauBody, "; Angular steady-state tau for held bodies");
-        ini.SetDoubleValue("HeldBody", "fAngularTauBodyStart", grabConstraintAngularTauBodyStart, "; Angular tau at grab start");
-        ini.SetDoubleValue("HeldBody", "fAngularDamping", grabConstraintAngularDamping, "; Angular damping factor");
-        ini.SetDoubleValue("HeldBody", "fAngularMaxForce", grabConstraintAngularMaxForce, "; Max angular force");
-        ini.SetDoubleValue("HeldBody", "fLinearTau", grabConstraintLinearTau, "; Linear resting tau");
-        ini.SetDoubleValue("HeldBody", "fLinearTauBody", grabConstraintLinearTauBody, "; Linear steady-state tau for held bodies");
-        ini.SetDoubleValue("HeldBody", "fLinearTauBodyStart", grabConstraintLinearTauBodyStart, "; Linear tau at grab start");
-        ini.SetDoubleValue("HeldBody", "fLinearDamping", grabConstraintLinearDamping, "; Linear damping factor");
-        ini.SetDoubleValue("HeldBody", "fLinearMaxForce", grabConstraintLinearMaxForce, "; Max linear force");
-        ini.SetDoubleValue("HeldBody", "fAngularToLinearForceRatio", grabConstraintAngularToLinearForceRatio, "; Force ratio between angular and linear");
-        ini.SetBoolValue("HeldBody",   "bEnableSoftLimits", grabConstraintEnableSoftLimits, "; Clamp motor targets to prevent runaway stretch/twist (soft 6DOF limits)");
-        ini.SetDoubleValue("HeldBody", "fLinearMaxStretch", grabConstraintLinearMaxStretch, "; Max distance (game units) grabbed object can drift from hand when soft limits on");
-        ini.SetDoubleValue("HeldBody", "fAngularMaxAngleDeg", grabConstraintAngularMaxAngleDeg, "; Max angular deviation (degrees) from initial grab orientation when soft limits on");
-        ini.SetBoolValue("HeldBody",   "bForceDynamicHeldBody", grabConstraintForceDynamicHeldBody, "; Guard: never KEYFRAME the grabbed body while motor constraint is active");
 
         // Throw
         ini.SetDoubleValue("Throw", "fThrowVelocityThreshold", throwVelocityThreshold);
@@ -1156,64 +1005,34 @@ iLogLevel = 2
         ini.SetBoolValue("Debug", "bDebugLogging", debugLogging, "; Enable verbose debug logging (PERFORMANCE IMPACT!)");
         ini.SetLongValue("Debug", "iLogLevel", logLevel, "; 0=trace, 1=debug, 2=info, 3=warn, 4=error");
 
-        // [RockIntegration] — hand-ported ROCK subsystems (all default OFF). These keys are READ
-        // in Load(); they MUST also be serialized here or Save() (which overwrites the INI) would
-        // silently drop the user's settings back to the embedded defaults.
-        ini.SetBoolValue  ("RockIntegration", "bCollisionSuppressionRegistry", rockCollisionSuppressionRegistry, "; ROCK collision-suppression lease registry");
-        ini.SetBoolValue  ("RockIntegration", "bHandBoneColliderSet",          rockHandBoneColliderSet,          "; ROCK 16-body-per-hand colliders");
-        ini.SetBoolValue  ("RockIntegration", "bBodyBoneColliderSet",          rockBodyBoneColliderSet,          "; ROCK 23 avatar body capsules");
+        // [RockIntegration] — surviving keys only: the hand-ported subsystems were removed in the
+        // two-scenario cleanup; what remains is CollisionLayerPolicy (header-only, no key),
+        // HavokTimingFixPolicy (bHavokTimingFix / fHavokTimingMinFrameRate / iHavokTimingMaxSubsteps)
+        // and fHandColliderRadiusPadding (bridged into the embedded ROCK engine via
+        // rock::HostSetHandColliderRadiusPadding). Keys READ in Load() MUST also be serialized here
+        // or Save() (which overwrites the INI) would silently drop the user's settings.
         ini.SetDoubleValue("RockIntegration", "fHandColliderRadiusPadding",    handColliderRadiusPadding,        "; Padding (game units) added to every hand/arm collider radius — reduces resting-object clip-through, 0=unchanged");
-        ini.SetBoolValue  ("RockIntegration", "bWeaponCollision",              rockWeaponCollision,              "; ROCK equipped-weapon physics hull");
-        ini.SetBoolValue  ("RockIntegration", "bTwoHandedGrip",                rockTwoHandedGrip,                "; ROCK two-handed support grip");
-        ini.SetBoolValue  ("RockIntegration", "bHandBumpGuard",                rockHandBumpGuard,                "; Char-proxy bump CTD guard (auto-armed with physics hand bodies)");
-        ini.SetBoolValue  ("RockIntegration", "bPushAssist",                   rockPushAssist,                   "; ROCK impulse push-assist on hand collision");
-        ini.SetDoubleValue("RockIntegration", "fPushAssistMaxImpulse",         pushAssistMaxImpulse,             "; Max impulse for push-assist (default 600)");
-        ini.SetBoolValue  ("RockIntegration", "bGrabNodeAnchor",               rockGrabNodeAnchor,               "; Seat grip to authored ROCK:GrabR/L node (close grabs only)");
+        ini.SetBoolValue  ("RockIntegration", "bHandBumpGuard",                rockHandBumpGuard,                "; Char-proxy bump CTD guard (auto-armed when the embedded engine is hosted)");
         ini.SetBoolValue  ("RockIntegration", "bHavokTimingFix",               havokTimingFix,                   "; Override physics substeps to hold a min physics rate on long frames");
         ini.SetDoubleValue("RockIntegration", "fHavokTimingMinFrameRate",      havokTimingMinFrameRate,          "; Min physics frame rate, clamped [30,240] (default 70)");
         ini.SetLongValue  ("RockIntegration", "iHavokTimingMaxSubsteps",       havokTimingMaxSubsteps,           "; Max substeps, clamped [1,6] (default 3)");
-        ini.SetBoolValue  ("RockIntegration", "bUseRockGrabCore",              useRockGrabCore,                  "; 1:1 ROCK grab core as grab backend (select with iGrabMode=8)");
         ini.SetBoolValue  ("RockEngine",      "bUseRockEngineArchitecture",    useRockEngineArchitecture,        "; SECOND ARCHITECTURE: host the full embedded ROCK engine (rock_engine) in-process, driven by ROCK.ini. Default 0 = engine dormant (identical to today).");
 
-        // [ObjectPickup] hand wall-pushback + mode-3 soft contact (read in Load(); serialize too).
-        ini.SetLongValue  ("ObjectPickup", "iHandWallPushbackMode",        handWallPushbackMode,           "; 0=off, 1=linear depen, 2=ROCK soft-contact, 3=multi-target soft contact");
+        // [ObjectPickup] hand-authority / input keys (read in Load(); serialize too).
         ini.SetLongValue  ("ObjectPickup", "iHandAuthorityApplyMode",      handAuthorityApplyMode,         "; hand authority: 1=FRIK-goal seam (FRIK's own arm solver carries the hand, v5-equivalent; auto-degrades), 0=legacy post-FRIK bone IK");
         ini.SetBoolValue  ("ObjectPickup", "bHandAuthorityGoalHookLog",    handAuthorityGoalHookLog,       "; per-apply [FRIK-GOAL] debug logging");
         ini.SetBoolValue  ("VRInput",      "bSuppressThumbstickTouch",      suppressThumbstickTouch,        "; strip thumbstick capacitive-touch bit (stops FRIK thumb twitch on stick edge-touch)");
         ini.SetLongValue  ("ObjectPickup", "iTwoHandedFingerPoseMode",      twoHandedFingerPoseMode,        "; support-hand fingers during two-handed grip: 0=off, 1=ROCK grip pose, 2=geometry solve vs weapon mesh");
-        ini.SetDoubleValue("ObjectPickup", "fHandPushbackProbeRadius",     handPushbackProbeRadius,        "; 6-axis world probe radius (game units)");
-        ini.SetDoubleValue("ObjectPickup", "fHandPushbackMaxPush",         handPushbackMaxPush,            "; Max hand depenetration distance");
-        ini.SetDoubleValue("ObjectPickup", "fHandPushbackSmoothing",       handPushbackSmoothing,          "; Correction smoothing speed");
-        ini.SetDoubleValue("ObjectPickup", "fHandPushbackHardStop",        handPushbackHardStop,           "; Mode 2: penetration at which response ramps to full");
-        ini.SetDoubleValue("ObjectPickup", "fHandPushbackScale",           handPushbackScale,              "; Mode 2: shallow-penetration response scale (0..1)");
-        ini.SetDoubleValue("ObjectPickup", "fHandPushbackHandRadiusPadding", handPushbackHandRadiusPadding, "; Mode 3: extra hand-vs-hand capsule padding (ROCK default 0.75)");
-        ini.SetBoolValue  ("ObjectPickup", "bWeaponWallPushback",           weaponWallPushback,             "; Modes 1/2: retract the hand when the equipped weapon's barrel penetrates a wall (default OFF - raycast was buggy)");
-        ini.SetDoubleValue("ObjectPickup", "fWeaponPushbackMaxPush",        weaponPushbackMaxPush,          "; Max hand retraction from a weapon-barrel wall hit (game units)");
-        ini.SetBoolValue  ("ObjectPickup", "bHandFollowsHeldObject",        handFollowsHeldObject,          "; Slave rendered hand to held object position (default OFF - kept the hand from staying put on collision)");
-        ini.SetBoolValue  ("ObjectPickup", "bSoftContactHandHand",         softContactHandHand,            "; Mode 3: hand-vs-hand");
-        ini.SetBoolValue  ("ObjectPickup", "bSoftContactBody",             softContactBody,                "; Mode 3: hand-vs-body capsules");
-        ini.SetBoolValue  ("ObjectPickup", "bSoftContactWeapon",           softContactWeapon,              "; Mode 3: hand-vs-equipped-weapon");
-        ini.SetBoolValue  ("ObjectPickup", "bSoftContactWorld",            softContactWorld,               "; Mode 3: hand-vs-world (raycast + native manifold)");
-        ini.SetDoubleValue("ObjectPickup", "fSoftContactMaxCorrection",        softContactMaxCorrection,        "; Mode 3: hand-hand/body correction clamp (ROCK default 7)");
-        ini.SetDoubleValue("ObjectPickup", "fSoftContactWorldMaxCorrection",   softContactWorldMaxCorrection,   "; Mode 3: world correction clamp (ROCK default 18)");
-        ini.SetDoubleValue("ObjectPickup", "fSoftContactWeaponMaxCorrection",  softContactWeaponMaxCorrection,  "; Mode 3: weapon-hand correction clamp (ROCK default 3)");
-        ini.SetDoubleValue("ObjectPickup", "fSoftContactWeaponRadiusPadding",  softContactWeaponRadiusPadding,  "; Mode 3: weapon-hand capsule padding (ROCK default 0.25)");
-        ini.SetDoubleValue("ObjectPickup", "fSoftContactWeaponCorrectionScale", softContactWeaponCorrectionScale, "; Mode 3: weapon shallow-penetration response scale (ROCK default 0.35)");
-        ini.SetDoubleValue("ObjectPickup", "fSoftContactWeaponHardStop",       softContactWeaponHardStop,       "; Mode 3: weapon penetration where response ramps to full (ROCK default 4)");
 
         // Round-trip serializers — these keys were LOADED in Config::Load but never written here,
         // so Save()/MCM rewrites silently dropped the user's value (it reverted to default next
         // load). Adding them keeps every loaded setting round-tripping. (Skipped intentionally:
-        // bEnableDropToHand/bUse6DOFGrabConstraint are legacy bool aliases shadowed by iDropToHandMode/
-        // iHeldBodyMode; fLegZoneRadius needs the game->cm conversion and is handled elsewhere.)
+        // bEnableDropToHand is a legacy bool alias shadowed by iDropToHandMode;
+        // fLegZoneRadius needs the game->cm conversion and is handled elsewhere.)
         ini.SetBoolValue  ("ItemStorage",  "bEnableStorageZoneWeaponEquip",    enableStorageZoneWeaponEquip,    "; Equip weapon dropped on a storage zone");
         ini.SetBoolValue  ("ObjectPickup", "bEnableAutomaticFingerCurls",      enableAutomaticFingerCurls,      "; Geometry-based finger curl solving");
         ini.SetBoolValue  ("ObjectPickup", "bEnableAutomaticHandPlacement",    enableAutomaticHandPlacement,    "; Geometry-based hand placement on grab");
         ini.SetBoolValue  ("ObjectPickup", "bEnableGrabActors",                enableGrabActors,                "; Allow grabbing actors/ragdolls");
-        ini.SetBoolValue  ("ObjectPickup", "bRockDynamicHandoff",              rockDynamicHandoff,              "; ROCK dynamic hand-off");
-        ini.SetBoolValue  ("ObjectPickup", "bUseBethesdaPhysicsBody",          useBethesdaPhysicsBody,          "; Use Bethesda physics bodies for hand colliders");
-        ini.SetBoolValue  ("ObjectPickup", "bUseHeldBodyGrab",                 useHeldBodyGrab,                 "; HeldBody constraint grab (dynamic held object)");
-        ini.SetBoolValue  ("ObjectPickup", "bUseSimpleHandBodyCreation",       useSimpleHandBodyCreation,       "; Simple hand-body creation path");
         ini.SetDoubleValue("ObjectPickup", "fFingerAnimCloseSpeed",            fingerAnimCloseSpeed,            "; Finger closing animation speed");
         ini.SetDoubleValue("ObjectPickup", "fFingerAnimOpenSpeed",             fingerAnimOpenSpeed,             "; Finger opening animation speed");
         ini.SetLongValue  ("ObjectPickup", "iFingerPoseMode",                  fingerPoseMode,                  "; 0=FRIK resumes after release, 1=keep override");

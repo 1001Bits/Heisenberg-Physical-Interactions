@@ -522,17 +522,13 @@ namespace HeisenbergPluginAPI {
 
         void* GetHandRigidBody(bool isLeft) override
         {
-            if (!IsHandCollisionEnabled()) return nullptr;
-            const auto& body = heisenberg::HandCollision::GetSingleton().GetHandBody(isLeft);
-            if (!body.IsValid()) return nullptr;
-            // The published contract (HeisenbergInterface001.h) documents this as
-            // "Pointer to bhkNPCollisionObject" - this used to return body.hknpWorld
-            // instead (an unrelated type with a completely different layout). An external
-            // plugin following the documented contract and casting the result to
-            // RE::bhkNPCollisionObject* would read a garbage pointer from inside the
-            // hknpWorld and crash or corrupt on first use. Return what's actually
-            // documented: PhysicsHandBody::collisionObject IS the bhkNPCollisionObject*.
-            return body.collisionObject;
+            // Two-scenario cleanup: Heisenberg no longer creates its own physics hand
+            // bodies (real hand colliders live in the embedded ROCK engine or the
+            // external ROCK.dll). Kept as a benign no-op to preserve the published
+            // HeisenbergInterface001 vtable ABI — always returns nullptr, which the
+            // documented contract already allows ("nullptr if not available").
+            (void)isLeft;
+            return nullptr;
         }
 
         bool IsHandInContact(bool isLeft) override

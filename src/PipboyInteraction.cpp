@@ -110,7 +110,6 @@ static bool s_projOverrideActive   = false;
 static bool s_projSavedAlways      = false;
 static bool s_projSavedHMD         = false;
 static bool s_projOverrideSawPipOpen = false;  // Pipboy was open during the override
-static bool s_projOverridePlaybackPending = false; // Staged Holo root swap has not queued playback yet
 static int  s_projRestoreDelayFrames = 0;          // Let FRIK settle before changing back to HMD mode
 // Saved VRPipboy scale angles, captured the first time ActivatePipboyScreen() zeroes them and
 // restored by DeactivatePipboyScreen(). Previously close wrote hardcoded 20/5/20/5, which is wrong
@@ -157,7 +156,6 @@ static void EndWristOverrideForHolotape() {
     *PipboyAttachToHMDFlag()     = s_projSavedHMD;
     s_projOverrideActive = false;
     s_projOverrideSawPipOpen = false;
-    s_projOverridePlaybackPending = false;
     s_projRestoreDelayFrames = 0;
     spdlog::info("[PIPBOY] Projected->wrist override OFF — restored (always={} hmd={})",
                  s_projSavedAlways, s_projSavedHMD);
@@ -172,7 +170,7 @@ static void UpdateWristOverrideRestore() {
     if (!s_projOverrideActive) return;
     // A terminal redirect owns the override right now — let it restore on terminal
     // close, don't restore here on a transient Pipboy open/close.
-    if (s_termAppliedWristOverride || s_projOverridePlaybackPending) return;
+    if (s_termAppliedWristOverride) return;
     bool pipOpen = heisenberg::MenuChecker::GetSingleton().IsPipboyOpen();
     if (pipOpen) {
         s_projOverrideSawPipOpen = true;
@@ -656,27 +654,6 @@ namespace heisenberg
         s_pipAnglesSaved = false;
     }
 
-    // Toggle only the ScreenNode's AppCulled bit — unlike ActivatePipboyScreen/
-    // DeactivatePipboyScreen this doesn't touch scale-angle INI settings, so it's
-    // safe to flip on/off repeatedly without disturbing the player's real Pip-Boy
-    // configuration. Used to keep the screen mesh hidden while the vanilla boot
-    // SWF is loading, so the normal Pip-Boy inventory content (and a partially-
-    // loaded SWF's placeholder graphic) never becomes visible before the boot
-    // sequence actually takes over.
-    static void SetPipboyScreenCulled(bool culled) {
-        auto* player = f4vr::getPlayer();
-        if (!player) return;
-        auto addr = reinterpret_cast<uintptr_t>(player);
-        auto screenPtr = *reinterpret_cast<uintptr_t*>(addr + 0x07B8);
-        if (screenPtr <= 0x10000) return;
-        auto* screen = reinterpret_cast<RE::NiNode*>(screenPtr);
-        if (culled) {
-            screen->flags.flags |= static_cast<uint64_t>(0x1);
-        } else {
-            screen->flags.flags &= ~static_cast<uint64_t>(0x1);
-        }
-    }
-
     // Pre-flip to wrist mode on terminal ACTIVATION (before TerminalMenu opens) so the
     // terminal initializes on the wrist Pipboy renderer instead of the projected VR overlay.
     // Mirrors how the holotape override is applied before playback opens the display.
@@ -786,16 +763,6 @@ namespace heisenberg
         }
     }
 
-    void PipboyInteraction::ResetIntroWristTransition()
-    {
-        _introWristTransitionFormID = 0;
-        _introWristPreFlipRoot = nullptr;
-        _introWristCandidateRoot = nullptr;
-        _introWristStableFrames = 0;
-        _introWristTimeoutFrames = 0;
-        s_projOverridePlaybackPending = false;
-    }
-
     // ════════════════════════════════════════════════════════════════════════
     // Vanilla Pip-Boy boot sequence (RobCo boot SWF)
     // ════════════════════════════════════════════════════════════════════════
@@ -858,41 +825,11 @@ namespace heisenberg
         return root.SetMember("visible", vis);
     }
 
-    void PipboyInteraction::ResetPipboyBootSequenceTransition()
-    {
-        _bootWristStaged = false;
-        _bootWristOpened = false;
-        _bootWristPreFlipRoot = nullptr;
-        _bootWristCandidateRoot = nullptr;
-        _bootWristStableFrames = 0;
-        _bootWristTimeoutFrames = 0;
-    }
-
     void PipboyInteraction::BeginPipboyBootSequence()
     {
-        if (_bootSequenceFired || _bootWristStaged || _bootWristOpened) return;
+        if (_bootSequenceFired) return;
 
-        const bool projected = IsProjectedPipboyNow();
-        const bool stagedHolo = projected && IsFrikHoloPipboyEnabled();
-
-        if (stagedHolo) {
-            // Same staged dance as BeginIntroProgramPlayback: only flip the mode flags
-            // here, then wait for FRIK to install and settle its replacement wrist root
-            // before touching the screen (see UpdatePipboyBootSequenceTransition).
-            auto* playerNodes = f4cf::f4vr::getPlayerNodes();
-            _bootWristPreFlipRoot = playerNodes ? playerNodes->PipboyRoot_nif_only_node : nullptr;
-            if (BeginWristOverrideForHolotape(true)) {
-                _bootWristOverrideOwned = true;
-                _bootWristStaged = true;
-                _bootWristCandidateRoot = nullptr;
-                _bootWristStableFrames = 0;
-                _bootWristTimeoutFrames = 120;
-                spdlog::info("[PIPBOY] Boot sequence: staged Holo wrist transition started (oldRoot={} timeout=120)",
-                             static_cast<void*>(_bootWristPreFlipRoot));
-                return;
-            }
-            // Declined for a reason other than Holo staging — fall through.
-        } else if (projected) {
+        if (IsProjectedPipboyNow()) {
             _bootWristOverrideOwned = BeginWristOverrideForHolotape();
         }
 
@@ -913,53 +850,7 @@ namespace heisenberg
             // watcher in the update loop) — this stays -1 until then. Ceiling only.
             _bootHoloIniRestoreSeconds = -1.0f;
         }
-        _bootWristOpened = true;  // one-shot guard: the caller loop re-invokes until fired
         spdlog::info("[PIPBOY] Boot sequence: fired PipboyOpeningSequenceMenu on the wrist Pip-Boy");
-    }
-
-    void PipboyInteraction::UpdatePipboyBootSequenceTransition()
-    {
-        if (!_bootWristStaged) return;
-
-        auto* playerNodes = f4cf::f4vr::getPlayerNodes();
-        RE::NiNode* currentRoot = playerNodes ? playerNodes->PipboyRoot_nif_only_node : nullptr;
-        RE::NiNode* currentScreen = playerNodes ? playerNodes->ScreenNode : nullptr;
-        const bool replacementReady = currentRoot
-            && currentRoot != _bootWristPreFlipRoot
-            && currentScreen
-            && IsAncestorOf(currentRoot, currentScreen);
-
-        if (replacementReady) {
-            if (currentRoot == _bootWristCandidateRoot) {
-                ++_bootWristStableFrames;
-            } else {
-                _bootWristCandidateRoot = currentRoot;
-                _bootWristStableFrames = 1;
-            }
-        } else {
-            _bootWristCandidateRoot = nullptr;
-            _bootWristStableFrames = 0;
-        }
-
-        // Jul 24: both completion branches converge on the same direct boot-menu fire the
-        // plain path uses (see BeginPipboyBootSequence) — the old ActivatePipboyScreen +
-        // cull sequence belonged to the animation-event design and would leave the screen
-        // permanently hidden now that no reveal countdown runs.
-        const bool stableRoot = _bootWristStableFrames >= 2;
-        if (stableRoot || --_bootWristTimeoutFrames <= 0) {
-            if (stableRoot) {
-                spdlog::info("[PIPBOY] Boot sequence: Holo wrist root stable for 2 frames — firing boot menu");
-            } else {
-                spdlog::warn("[PIPBOY] Boot sequence: Holo wrist transition timed out — firing boot menu without a confirmed root swap");
-            }
-            ResetPipboyBootSequenceTransition();
-            FireNativePipboyBootEvent();
-            _bootSequenceFired = true;
-            _bootMenuSeen = false;
-            _bootMenuFinished = false;
-            _bootMenuAppearWaitSeconds = 3.0f;
-            _bootWristOpened = true;  // convergence guard: BeginPipboyBootSequence's entry check bails on re-entry
-        }
     }
 
     void PipboyInteraction::QueueProgramHolotapePlayback(std::uint32_t formID)
@@ -1006,12 +897,6 @@ namespace heisenberg
         }
         if (Utils::IsPlayerInPowerArmor()) {
             spdlog::debug("[PIPBOY] Intro holotape {:08X} playback deferred — player in power armor", formID);
-            return;
-        }
-
-        if (_introWristTransitionFormID != 0) {
-            spdlog::debug("[PIPBOY] Intro wrist transition already pending for {:08X}",
-                         _introWristTransitionFormID);
             return;
         }
 
@@ -1087,56 +972,6 @@ namespace heisenberg
             _introHoloIniOverrideActive = false;
             _introHoloSawPipOpen = false;
             spdlog::info("[PIPBOY] Intro display ended — restored FRIK HoloPipBoyEnabled=true");
-        }
-    }
-
-    void PipboyInteraction::UpdateIntroWristTransition()
-    {
-        if (_introWristTransitionFormID == 0) return;
-
-        const auto formID = _introWristTransitionFormID;
-        if (!_holotapeLoaded || _loadedHolotapeFormID != formID || Utils::IsPlayerInPowerArmor()) {
-            spdlog::info("[PIPBOY] Intro Holo wrist transition cancelled — tape unavailable or power armor entered");
-            ResetIntroWristTransition();
-            EndWristOverrideForHolotape();
-            RestoreIntroHolotapeType(formID);
-            return;
-        }
-
-        auto* playerNodes = f4cf::f4vr::getPlayerNodes();
-        RE::NiNode* currentRoot = playerNodes ? playerNodes->PipboyRoot_nif_only_node : nullptr;
-        RE::NiNode* currentScreen = playerNodes ? playerNodes->ScreenNode : nullptr;
-        const bool replacementReady = currentRoot
-            && currentRoot != _introWristPreFlipRoot
-            && currentScreen
-            && IsAncestorOf(currentRoot, currentScreen);
-
-        if (replacementReady) {
-            if (currentRoot == _introWristCandidateRoot) {
-                ++_introWristStableFrames;
-            } else {
-                _introWristCandidateRoot = currentRoot;
-                _introWristStableFrames = 1;
-                spdlog::debug("[PIPBOY] Intro Holo wrist transition found replacement root {}",
-                             static_cast<void*>(currentRoot));
-            }
-        } else {
-            _introWristCandidateRoot = nullptr;
-            _introWristStableFrames = 0;
-        }
-
-        if (_introWristStableFrames >= 2) {
-            spdlog::info("[PIPBOY] Intro Holo wrist root stable for 2 frames — activating wrist playback");
-            ResetIntroWristTransition();
-            QueueProgramHolotapePlayback(formID);
-            return;
-        }
-
-        if (--_introWristTimeoutFrames <= 0) {
-            spdlog::warn("[PIPBOY] Intro Holo wrist transition timed out — restoring HMD mode and falling back to projected playback");
-            ResetIntroWristTransition();
-            EndWristOverrideForHolotape();
-            QueueProgramHolotapePlayback(formID);
         }
     }
 
@@ -1383,9 +1218,8 @@ namespace heisenberg
                 if (readyToProceed) {
                     // Jul 24 redesign: BeginPipboyBootSequence now fires the real boot menu
                     // (PipboyOpeningSequenceMenu) directly — no pre-opened PipboyMenu, no
-                    // IsPipboyOpen settle wait, no screen-cull dance. The old staged-Holo
-                    // transition machinery is bypassed too (holo is already forced off by
-                    // the ini override above before this point is ever reached).
+                    // IsPipboyOpen settle wait, no screen-cull dance (holo is already forced
+                    // off by the ini override above before this point is ever reached).
                     BeginPipboyBootSequence();
                 }
             }
@@ -1484,7 +1318,6 @@ namespace heisenberg
         // FRIK Holo mode replaces PlayerNodes->PipboyRoot_nif_only_node only after
         // the projected/HMD flags change. Wait for that replacement to settle before
         // lighting the screen or queueing the intro SWF.
-        UpdateIntroWristTransition();
         UpdateIntroHoloOverride();
 
         // ── Intro holotape audio playback ──
@@ -2010,9 +1843,6 @@ namespace heisenberg
                 spdlog::info("[PIPBOY] Terminal redirect ACTIVATED (holotape path) — checking HUD vtable");
                 heisenberg::Hooks::CheckHUDRolloverVtableIntegrity();
 
-                // Sound will be played right before console opens (in the per-frame block)
-                _terminalSoundPending = true;
-
                 // WorldRoot swap to FRIK's Pipboy ScreenNode
                 void* pipRend = I3D_GetByName("PipboyMenu");
                 if (pipRend && frikScreen) {
@@ -2259,7 +2089,6 @@ namespace heisenberg
                         spdlog::debug("[PIPBOY] Closed console (terminal redirect ended)");
                     }
                     _consoleOpenedForTerminal = false;
-                    _consoleOpenDelayFrames = 0;
                 }
 
                 // 3. Restore SRV on screen node
@@ -2465,9 +2294,6 @@ namespace heisenberg
 
                 spdlog::info("[PIPBOY] Terminal redirect ACTIVATED (world terminal path) — checking HUD vtable");
                 heisenberg::Hooks::CheckHUDRolloverVtableIntegrity();
-
-                // Sound will be played right before console opens (in the per-frame block)
-                _terminalSoundPending = true;
             } else if (!termMenuOpen) {
                 _worldTerminalChecked = false;
             }
@@ -2683,7 +2509,6 @@ namespace heisenberg
             // missing-frame rule: no continuous pair, no sweep.
             _interactionFingerValid = false;
             _previousInteractionFingerValid = false;
-            _prevDeckWorldPosValid = false;
         }
 
         // NOTE: UpdateTapeDeckAnimation() is now called from HookEndUpdate (0xd84f2c)
@@ -2899,7 +2724,6 @@ namespace heisenberg
         _fingerPosCached = false;
         _interactionFingerValid = false;
         _previousInteractionFingerValid = false;
-        _deckContactLatched = false;
         _ejectContactLatched = false;
     }
 
@@ -3158,13 +2982,6 @@ namespace heisenberg
                 _holotapeGrabCooldown = 0.5f;  // Prevent immediate insertion when deck opens
                 _holotapeRemovalCooldown = 0.0f; // Eject means the player may take the loaded tape immediately
 
-                if (_introWristTransitionFormID != 0) {
-                    spdlog::debug("[PIPBOY] Cancelled staged intro wrist transition (deck opened)");
-                    ResetIntroWristTransition();
-                    EndWristOverrideForHolotape();
-                    RestoreIntroHolotapeType(_introHolotapeFormID);
-                }
-
                 // Cancel any pending delayed playback
                 if (_pendingPlaybackFormID != 0) {
                     spdlog::debug("[PIPBOY] Cancelled pending playback for {:08X} (deck opened)", _pendingPlaybackFormID);
@@ -3355,9 +3172,8 @@ namespace heisenberg
         }
 
         // Update tape deck state when animation reaches endpoints.
-        // This is OUTSIDE the interpolation block because the push system can set
-        // _tapeDeckAnimProgress to 1.0 directly (finger moved beyond PUSH_ENTER_DISTANCE
-        // during Pushing), then transition to Opening — which would skip the interpolation
+        // This is OUTSIDE the interpolation block because the push/removal paths can set
+        // _tapeDeckAnimProgress to 1.0 directly, which would skip the interpolation
         // block entirely (|1.0 - 1.0| < 0.001) and leave the state stuck in Opening.
         if (std::fabs(_tapeDeckAnimProgress - 1.0f) < 0.001f) {
             if (_tapeDeckState == TapeDeckState::Opening) {
@@ -3735,13 +3551,11 @@ namespace heisenberg
         std::uint32_t holotapeFormID = _loadedHolotapeFormID;
 
         // Tape removed — restore projected mode if we overrode it for playback.
-        ResetIntroWristTransition();
         EndWristOverrideForHolotape();
 
         // Hide TapREF and clear loaded state
         _holotapeLoaded = false;
         _loadedHolotapeFormID = 0;
-        _pendingHolotapeRefrID = 0;  // Clear pending ref to prevent stale playback
         _holotapeGrabCooldown = TAPE_GRAB_COOLDOWN;
         _tapREFForceHidden = true;   // Persistent flag — overrides per-frame visibility
         _insertionOpenHandActive = false;  // Player is now holding the holotape — let grab system handle curls
@@ -4066,8 +3880,6 @@ namespace heisenberg
         if (!tapeDeck) return;
 
         if (!_interactionFingerValid) {
-            _deckContactLatched = false;
-            _prevDeckWorldPosValid = false;  // don't pair a deck delta across a tracking gap
             return;
         }
 
@@ -4198,37 +4010,6 @@ namespace heisenberg
         }
     }
 
-    // ════════════════════════════════════════════════════════════════════════
-    // Tape deck state helpers
-    // ════════════════════════════════════════════════════════════════════════
-
-    void PipboyInteraction::CloseTapeDeck()
-    {
-        if (_tapeDeckState != TapeDeckState::Closed && _tapeDeckState != TapeDeckState::Closing) {
-            _tapeDeckOpen = false;
-            _tapeDeckState = TapeDeckState::Closing;
-            _insertionOpenHandActive = false;
-            spdlog::debug("[PIPBOY] Force-closing tape deck");
-        }
-    }
-
-    void PipboyInteraction::EjectCurrentHolotape()
-    {
-        if (_holotapeLoaded) {
-            if (_introWristTransitionFormID != 0) {
-                ResetIntroWristTransition();
-                EndWristOverrideForHolotape();
-            }
-            StopIntroPlayback();  // Cancel intro audio if playing
-            RestoreIntroHolotapeType(_introHolotapeFormID);
-            spdlog::debug("[PIPBOY] Ejecting holotape (FormID {:08X})", _loadedHolotapeFormID);
-            _holotapeLoaded = false;
-            _loadedHolotapeFormID = 0;
-            _pendingHolotapeRefrID = 0;
-            SetTapREFVisible(false);
-        }
-    }
-
     bool PipboyInteraction::TakeLoadedIntroHolotapeToRightHand(std::uint32_t formID)
     {
         if (!_holotapeLoaded || _loadedHolotapeFormID != formID || !IsIntroHolotape(formID)) {
@@ -4308,13 +4089,11 @@ namespace heisenberg
         }
 
         DeactivatePipboyScreen();
-        ResetIntroWristTransition();
         EndWristOverrideForHolotape();
         RestoreIntroHolotapeType(formID);
 
         _holotapeLoaded = false;
         _loadedHolotapeFormID = 0;
-        _pendingHolotapeRefrID = 0;
         _tapREFForceHidden = true;
         _holotapeGrabCooldown = TAPE_GRAB_COOLDOWN;
         _insertionOpenHandActive = false;
@@ -4345,77 +4124,6 @@ namespace heisenberg
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // Holotape insertion zone
-    // ════════════════════════════════════════════════════════════════════════
-
-    bool PipboyInteraction::IsInTapeDeckSlotZone(const RE::NiPoint3& pos) const
-    {
-        RE::NiAVObject* arm = const_cast<PipboyInteraction*>(this)->GetPipboyArmNode();
-        if (!arm) return false;
-
-        RE::NiAVObject* tapeDeck = const_cast<PipboyInteraction*>(this)->GetCachedTapeDeckNode();
-        if (!tapeDeck) return false;
-
-        RE::NiPoint3 slotPos = tapeDeck->world.translate;
-        RE::NiPoint3 diff = pos - slotPos;
-        float distance = std::sqrt(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z);
-
-        return distance < TAPE_SLOT_RADIUS;
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // Holotape insertion
-    // ════════════════════════════════════════════════════════════════════════
-
-    bool PipboyInteraction::InsertHolotape(RE::TESObjectREFR* holotapeRef)
-    {
-        if (!holotapeRef) {
-            spdlog::warn("[PIPBOY] InsertHolotape: null ref");
-            return false;
-        }
-
-        auto* baseForm = holotapeRef->GetObjectReference();
-        if (!baseForm || baseForm->GetFormType() != RE::ENUM_FORM_ID::kNOTE) {
-            spdlog::warn("[PIPBOY] InsertHolotape: not a holotape");
-            return false;
-        }
-
-        std::uint32_t formID = baseForm->GetFormID();
-        std::string name(RE::TESFullName::GetFullName(*baseForm, false));
-
-        spdlog::info("[PIPBOY] Holotape inserted: '{}' ({:08X})", name.empty() ? "unknown" : name, formID);
-
-        // Disable the world object so it can't be re-grabbed.
-        // Do NOT call SetDelete — see CheckHolotapeInsertion comment for details.
-        heisenberg::SafeDisable(holotapeRef);
-
-        // Add holotape to inventory NOW so it's available for removal via DropToHand
-        {
-            auto* player = RE::PlayerCharacter::GetSingleton();
-            if (player) {
-                RE::BSTSmartPointer<RE::ExtraDataList> nullExtra;
-                heisenberg::AddObjectToContainer(player, static_cast<RE::TESBoundObject*>(baseForm),
-                                                 &nullExtra, 1, nullptr, 0);
-                spdlog::debug("[PIPBOY] Added holotape {:08X} to inventory at insertion", formID);
-            }
-        }
-
-        _holotapeLoaded = true;
-        _loadedHolotapeFormID = formID;
-
-        SetTapREFVisible(true);
-
-        // Keep deck open — player must close it
-
-        VRInput::GetSingleton().TriggerHaptic(false, 3000);
-        VRInput::GetSingleton().TriggerHaptic(true, 3000);
-
-        spdlog::info("[PIPBOY] Holotape inserted, deck stays open");
-        PlayWavSound("Holotape place inside tray.wav");
-        return true;
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
     // Reset all state on save/load — prevents stale transforms and ghost holotapes
     // ════════════════════════════════════════════════════════════════════════
 
@@ -4424,7 +4132,6 @@ namespace heisenberg
         spdlog::info("[PIPBOY] ClearState — resetting all tape deck state for load");
 
         // Safety: never leave projected mode overridden across a load.
-        ResetIntroWristTransition();
         EndWristOverrideForHolotape();
 
         _tapeDeckState          = TapeDeckState::Closed;
@@ -4435,17 +4142,14 @@ namespace heisenberg
         _deckOpenedByEject      = false;
         _holotapeLoaded         = false;
         _loadedHolotapeFormID   = 0;
-        _pendingHolotapeRefrID  = 0;
         _logCooldown            = 0;
         _buttonOriginalZ        = 0.0f;
         _buttonOriginalZSet     = false;
         _ejectContactLatched    = false;
-        _tapeRefInitialHideDone = false;
         _holotapeGrabCooldown   = 0.0f;
         _holotapeRemovalCooldown = 0.0f;
         _closeAnimSpeed         = ANIM_SPEED;
         _slamCooldown           = 0.0f;
-        _pushStartDistance      = 0.0f;
         _pushProgress           = 1.0f;
         _tapREFForceHidden      = false;
         _meshesInitialized      = false;   // Force re-init of mesh rotations on next frame
@@ -4465,7 +4169,6 @@ namespace heisenberg
         _previousInteractionFingerPos = {};
         _interactionFingerValid = false;
         _previousInteractionFingerValid = false;
-        _deckContactLatched = false;
         _pendingPlaybackDelay       = 0.0f;
         _pendingPlaybackFormID      = 0;
         _pendingAudioFormID         = 0;
@@ -4484,8 +4187,6 @@ namespace heisenberg
         _programSWFActive           = false;
         _introSWFMenuSeen           = false;
         _introSWFLastLogSec         = 0;
-        _introSWFCloseStep2Done     = false;
-        _introBootSoundPlayed       = false;
         _introAudioStarted          = false;
         _introSoundEvents.clear();
         _introSoundEventIndex       = 0;
@@ -4499,9 +4200,6 @@ namespace heisenberg
         _radioWasEnabled            = false;
         _radioRestoreFrames         = 0;
         _consoleOpenedForTerminal   = false;
-        _consoleOpenDelayFrames     = 0;
-        _terminalSoundPending       = false;
-        _terminalSoundDelay         = 0;
         _pendingTerminalRedirect    = false;
         _terminalRedirectActive     = false;
         _isWorldTerminalRedirect    = false;
@@ -4522,11 +4220,6 @@ namespace heisenberg
         if (_bootHoloIniOverrideActive) {
             SetFrikHoloPipboyEnabled(true);
         }
-        // Same idea for the screen-hide: never leave the Pip-Boy screen culled across
-        // a save/reload/quit that interrupts mid-sequence.
-        if (_bootScreenHiddenPendingSwf) {
-            SetPipboyScreenCulled(false);
-        }
         // And for the intro ceremony's Holo override — same never-strand-the-preference rule.
         if (_introHoloIniOverrideActive) {
             SetFrikHoloPipboyEnabled(true);
@@ -4537,13 +4230,10 @@ namespace heisenberg
         _introHoloSawPipOpen        = false;
         _bootSequenceFired          = false;
         _bootWristOverrideOwned     = false;
-        _bootPipboyOpenSettleFrames = 0;
         _bootHoloIniHandled         = false;
         _bootHoloIniOverrideActive  = false;
         _bootHoloIniWaitSeconds     = 0.0f;
         _bootHoloIniRestoreSeconds  = -1.0f;
-        _bootScreenHiddenPendingSwf = false;
-        _bootScreenRevealSeconds    = -1.0f;
         _bootMenuSeen               = false;
         _bootMenuFinished           = false;
         _bootMenuAppearWaitSeconds  = 0.0f;
@@ -4559,7 +4249,6 @@ namespace heisenberg
         _bootPipboyMenuBlanked      = false;
         _bootContentOpenSeconds     = 0.0f;
         _bootSawPipboyAbsent        = false;
-        ResetPipboyBootSequenceTransition();
         _terminalScreenNode         = nullptr;
         _savedDiffuseSRV            = 0;
         _savedRendererPtr           = nullptr;
@@ -4567,7 +4256,6 @@ namespace heisenberg
         _savedHmdScreenNode         = nullptr;
         _savedHmdScreenParent       = nullptr;
         _worldTerminalChecked       = false;
-        _wtWaitFrames               = 0;
         // World screen redirect state
         _worldScreenRedirectActive  = false;
         _worldScreenChecked         = false;

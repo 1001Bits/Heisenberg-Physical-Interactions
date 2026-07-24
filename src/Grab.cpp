@@ -2,9 +2,6 @@
 #include "Config.h"
 #include "rock/RockBridge.h"
 #include "../external/ROCK/src/ROCKMain.h"  // rock::HostNotifyExternalGrab — embedded-engine grab-lifecycle seam (audit rank 2)
-#include "rock_integration/CollisionSuppressionRegistry.h"
-#include "rock_integration/grab/GrabNodeNamePolicy.h"
-#include "rock_integration/grab/RockGrabCoreManager.h"
 #include "../external/ROCK/src/physics-interaction/grab/TouchGrabBridge.h"
 #include "DropToHand.h"
 #include "DualWieldAPI.h"
@@ -14,7 +11,6 @@
 #include "GrabConstraint.h"
 #include "HandCollision.h"
 #include "Hand.h"
-#include "HeldBodyGrab.h"
 #include "Heisenberg.h"
 #include "Hooks.h"
 #include "ItemOffsets.h"
@@ -751,18 +747,14 @@ namespace
         return nullptr;
     }
 
-    // Dispatch between the HIGGS curve-table solver and ROCK's ported
-    // curl-disk solver based on g_config.useRockFingerPose. Both return the
-    // same FingerCurlResult convention (1.0 open, 0.0 closed).
+    // HIGGS curve-table geometry solver (1.0 open, 0.0 closed). The ROCK
+    // curl-disk A/B solver (bUseRockFingerPose) was removed in the
+    // two-scenario cleanup.
     static heisenberg::FingerCurlResult SolveGeometryFingerCurls(
         RE::NiAVObject* objectNode, RE::NiAVObject* handNode,
         const RE::NiPoint3& palmPos, const RE::NiPoint3& palmDir,
         bool isLeft, float handSize)
     {
-        if (heisenberg::g_config.useRockFingerPose) {
-            return heisenberg::CalculateFingerCurlFromGeometryRock(
-                objectNode, handNode, palmPos, palmDir, isLeft, handSize);
-        }
         return heisenberg::CalculateFingerCurlFromGeometry(
             objectNode, handNode, palmPos, palmDir, isLeft, handSize);
     }
@@ -1023,108 +1015,18 @@ namespace
     {
         int configuredGrabMode = heisenberg::g_config.grabMode;
 
-        // RockNativeGrab (iGrabMode=9): the embedded ROCK engine owns grab+selection.
+        // Full Dynamic (iGrabMode=9): the embedded ROCK engine owns grab+selection.
         // Only honored while the engine is actually hosted; else degrade to Keyframed so
         // selecting 9 without bUseRockEngineArchitecture=1 never disables grabbing.
-        if (configuredGrabMode == static_cast<int>(heisenberg::GrabMode::RockNativeGrab)) {
+        if (configuredGrabMode == static_cast<int>(heisenberg::GrabMode::FullDynamic)) {
             return heisenberg::IsRockEngineHosted()
                        ? configuredGrabMode
                        : static_cast<int>(heisenberg::GrabMode::Keyframed);
         }
 
-        // RockForceGrab (PREPARED): only honor it when ROCK can actually hold via forceGrab.
-        // Until ROCK ships that API, degrade to Keyframed so the mode is safe to select early
-        // without disabling grab. This is the gate that keeps the whole scaffold inert on v4.
-        if (configuredGrabMode == static_cast<int>(heisenberg::GrabMode::RockForceGrab)) {
-            return heisenberg::RockBridge::GetSingleton().SupportsDynamicHold()
-                       ? configuredGrabMode
-                       : static_cast<int>(heisenberg::GrabMode::Keyframed);
-        }
-
-        // RockGrabCore (iGrabMode=8, 1:1 ROCK grab-core port): honor only when the master toggle
-        // is on AND the manager initialized; else degrade to Keyframed so selecting it is safe.
-        if (configuredGrabMode == static_cast<int>(heisenberg::GrabMode::RockGrabCore)) {
-            return (heisenberg::g_config.useRockGrabCore &&
-                    heisenberg::rock_grab_core::RockGrabCoreManager::IsAvailable())
-                       ? configuredGrabMode
-                       : static_cast<int>(heisenberg::GrabMode::Keyframed);
-        }
-
-        // Explicit keyframed and MouseSpring modes should never be rewritten
-        // into HeldBody-capable modes. This keeps iGrabMode=0 on the original
-        // keyframed backend while still allowing automatic placement/curl logic.
-        if (configuredGrabMode == static_cast<int>(heisenberg::GrabMode::Keyframed) ||
-            configuredGrabMode == static_cast<int>(heisenberg::GrabMode::MouseSpring) ||
-            configuredGrabMode == static_cast<int>(heisenberg::GrabMode::DynamicRock)) {
-            return configuredGrabMode;
-        }
-
-        if (heisenberg::g_config.UseHeldBodySpringMode() &&
-            heisenberg::g_config.useHeldBodyGrab) {
-            return static_cast<int>(heisenberg::GrabMode::VirtualSpring);
-        }
-        return configuredGrabMode;
-    }
-
-    bool ShouldUseHeldBodyConstraintGrab()
-    {
-        return heisenberg::g_config.UseHeldBodyConstraintGrab();
-    }
-
-    bool ShouldUseRockGrabCore(int effectiveGrabMode)
-    {
-        return effectiveGrabMode == static_cast<int>(heisenberg::GrabMode::RockGrabCore)
-               && heisenberg::rock_grab_core::RockGrabCoreManager::IsAvailable();
-    }
-
-    bool ShouldUseHeldBodyManagedGrab(int effectiveGrabMode)
-    {
-        if (!heisenberg::g_config.UseHeldBodyManagedGrab()) {
-            return false;
-        }
-
-        return effectiveGrabMode != static_cast<int>(heisenberg::GrabMode::Keyframed) &&
-               effectiveGrabMode != static_cast<int>(heisenberg::GrabMode::MouseSpring) &&
-               effectiveGrabMode != static_cast<int>(heisenberg::GrabMode::DynamicRock) &&
-               effectiveGrabMode != static_cast<int>(heisenberg::GrabMode::RockGrabCore);  // P4 co-fire guard: mode 8 owns its own constraint
-    }
-
-    // ============================================================================
-    // PREPARED scaffold: GrabMode::RockForceGrab — "ROCK owns the dynamic hold".
-    // NOT WIRED YET. Inert on ROCK 0.5 (forceGrab absent). See GrabMode::RockForceGrab
-    // in Grab.h for the full wiring checklist. The pieces below are the entry points
-    // a future implementation fills in; today they exist only so the seam is in place
-    // and the mode degrades safely.
-    // ============================================================================
-    bool ShouldUseRockForceGrabHold()
-    {
-        return GetEffectiveGrabMode() == static_cast<int>(heisenberg::GrabMode::RockForceGrab)
-               && heisenberg::RockBridge::GetSingleton().SupportsDynamicHold();
-    }
-
-    // Hand a freshly-selected object to ROCK's dynamic hold via forceGrab, keeping Heisenberg
-    // as the brain (fingers/semantics) and creating NO keyframed body. ROCK does the PLACEMENT
-    // (mesh/contact grab pocket) — we pass no offset. Returns true if ROCK committed the hold
-    // (caller returns success); false => caller falls through to the keyframed path. Returns
-    // false today — fill in when ROCK ships forceGrab.
-    bool TryStartRockForceGrabHold(heisenberg::GrabState& state, RE::TESObjectREFR* refr, bool isLeft)
-    {
-        if (!ShouldUseRockForceGrabHold() || !refr) {
-            return false;
-        }
-        // TODO(rock-forcegrab): when ROCK ships forceGrab, replace the body of this guard:
-        //   if (heisenberg::RockBridge::GetSingleton().ForceGrab(isLeft, refr)) {
-        //       state.rockForceGrabHold = true;   // PostPhysics/EndGrab take ROCK branches
-        //       return true;                      // skip keyframed setup; ROCK holds + places it
-        //   }
-        (void)state; (void)isLeft;
-        static bool loggedOnce = false;
-        if (!loggedOnce) {
-            spdlog::info("[ROCK] RockForceGrab selected but TryStartRockForceGrabHold is not wired yet "
-                         "(awaiting ROCK forceGrab) — using keyframed hold.");
-            loggedOnce = true;
-        }
-        return false;
+        // Two-scenario cleanup: every other historical mode (1-8) was removed.
+        // Anything that isn't Full Dynamic degrades to the keyframed backend.
+        return static_cast<int>(heisenberg::GrabMode::Keyframed);
     }
     
     // =====================================================================
@@ -1399,28 +1301,7 @@ namespace
             return false;
         }
 
-        // ROCK CollisionSuppressionRegistry path — when the toggle is on, route through
-        // the lease registry instead of doing a raw bit OR. The registry handles multi-
-        // owner suppression (a body can be suppressed by Grab + WeaponDominantHand at
-        // the same time) and restores the original filter on full release.
-        if (heisenberg::g_config.rockCollisionSuppressionRegistry) {
-            auto& csr = heisenberg::rock_csr::globalRegistry();
-            const auto r = csr.acquire(hknpWorld, objBodyId,
-                                       heisenberg::rock_csr::Owner::Grab, "Grab.held");
-            if (r.readFailed) {
-                if (firstApply) spdlog::warn("[GRAB-FILTER:CSR] acquire failed (read) for body 0x{:08X}", objBodyId);
-                return false;
-            }
-            if (firstApply) {
-                state.heldOriginalFilterInfo = r.filterBefore;
-                state.heldHadSuppressionBitOriginally = r.wasNoCollideBeforeSuppression;
-                spdlog::info("[GRAB-FILTER:CSR] body 0x{:08X} acquired Grab lease (filter 0x{:08X}->0x{:08X}, leases={})",
-                             objBodyId, r.filterBefore, r.filterAfter, r.activeLeaseCount);
-            }
-            return true;
-        }
-
-        // Default path — direct 0x000B group-bit OR (proven to work; see
+        // Direct 0x000B group-bit OR (proven to work; see
         // feedback_rock_hand_layer_for_no_player_push.md).
         std::uint32_t cur = 0;
         if (!heisenberg::Physics::TryReadBodyFilterInfo(hknpWorld, objBodyId, cur)) {
@@ -1529,24 +1410,7 @@ namespace
             state.collisionObject->spSystem.get(), &objBodyId, state.collisionObject->systemBodyIdx);
         if (objBodyId == 0x7FFFFFFF) return;
 
-        // ROCK CSR path — release the Grab lease; registry handles restoring
-        // filter only when the LAST owner releases (so e.g. a weapon dominant-hand
-        // lease keeps the body suppressed after the grab releases).
-        if (heisenberg::g_config.rockCollisionSuppressionRegistry) {
-            auto& csr = heisenberg::rock_csr::globalRegistry();
-            const auto r = csr.release(hknpWorld, objBodyId,
-                                       heisenberg::rock_csr::Owner::Grab, "Grab.released");
-            if (r.bodyFullyReleased) {
-                spdlog::info("[GRAB-FILTER:CSR] body 0x{:08X} fully released (filter 0x{:08X}->0x{:08X})",
-                             objBodyId, r.filterBefore, r.filterAfter);
-            } else if (r.valid) {
-                spdlog::debug("[GRAB-FILTER:CSR] body 0x{:08X} Grab released, leases remain={}",
-                              objBodyId, r.activeLeaseCount);
-            }
-            return;
-        }
-
-        // Simple path — clear the 0x000B hand-group bits we OR'd in during disable.
+        // Clear the 0x000B hand-group bits we OR'd in during disable.
         // Since we no longer call SetLayerLocked on grab, the body's layer/system are
         // untouched and only the group bits diverge. heldOriginalFilterInfo holds the
         // exact pre-grab filter (captured before we OR'd anything), so we can either
@@ -1915,7 +1779,7 @@ namespace heisenberg
     {
         auto& grabManager = GrabManager::GetSingleton();
         const GrabState& state = grabManager.GetGrabState(isLeft);
-        if (grabManager.IsGrabbing(isLeft) || state.active || state.isPulling || state.usingHeldBodyGrab) {
+        if (grabManager.IsGrabbing(isLeft) || state.active || state.isPulling) {
             return;
         }
 
@@ -3478,18 +3342,8 @@ namespace
     }
     
     // =====================================================================
-    // MOUSE SPRING FUNCTIONS (Not used in VR, keeping for reference)
+    // NATIVE MOUSE SPRING OVERRIDE (live: OverrideNativeGrabPosition)
     // =====================================================================
-    // PlayerCharacter::CreateMouseSpring(TESObjectREFR*, GrabbingType, float, NiAVObject*, NiPoint3&)
-    // VR offset: 0x0f1bf70
-    using CreateMouseSpring_t = void(*)(RE::PlayerCharacter*, RE::TESObjectREFR*, int, float, RE::NiAVObject*, RE::NiPoint3&);
-    REL::Relocation<CreateMouseSpring_t> CreateMouseSpring{ REL::Offset(0x0f1bf70) };
-    
-    // PlayerCharacter::DestroyMouseSprings(void)
-    // VR offset: 0x0f1d4a0
-    using DestroyMouseSprings_t = void(*)(RE::PlayerCharacter*);
-    REL::Relocation<DestroyMouseSprings_t> DestroyMouseSprings{ REL::Offset(0x0f1d4a0) };
-    
     // hknpBSMouseSpringAction::setWorldPosition(hkVector4f&)
     // VR offset: 0x1e4a960
     using SetSpringPosition_t = void(*)(void*, RE::NiPoint4&);
@@ -3911,165 +3765,9 @@ namespace
         return true;
     }
 
-    void SnapDeferredHeldBodyObjectToTarget(heisenberg::GrabState& state, bool isLeft,
-                                            const RE::NiPoint3& handPos, const RE::NiMatrix3& handRot)
-    {
-        if (!state.node) {
-            return;
-        }
-
-        RE::NiTransform desiredTransform;
-        if (!ComputeHeldGrabTargetTransform(state, isLeft, handPos, handRot, desiredTransform)) {
-            return;
-        }
-
-        heisenberg::Utils::UpdateKeyframedNode(state.node.get(), desiredTransform);
-
-        if (state.physicsNode && state.physicsNode.get() != state.node.get()) {
-            RE::NiTransform physicsTransform = desiredTransform;
-            if (state.collisionObject && heisenberg::Utils::HasPhysicsBodyOffset(state.collisionObject, state.node.get())) {
-                RE::NiTransform bodyOffset = heisenberg::Utils::GetPhysicsBodyOffset(state.collisionObject, state.node.get());
-                physicsTransform = heisenberg::Utils::ApplyPhysicsBodyOffset(desiredTransform, bodyOffset);
-            }
-            heisenberg::Utils::UpdateKeyframedNode(state.physicsNode.get(), physicsTransform);
-        }
-
-        if (RE::TESObjectREFR* refr = state.GetRefr()) {
-            refr->data.location.x = desiredTransform.translate.x;
-            refr->data.location.y = desiredTransform.translate.y;
-            refr->data.location.z = desiredTransform.translate.z;
-        }
-    }
-
-    bool PrepareKeyframedGrabForHeldBody(heisenberg::GrabState& state)
-    {
-        if (!state.node || !state.collisionObject || !IsCollisionObjectValid(state.collisionObject)) {
-            return false;
-        }
-
-        RE::bhkWorld* bhkWorld = ResolveGrabBhkWorld(state);
-        if (!bhkWorld) {
-            spdlog::warn("[GRAB-HELDBODY] No bhkWorld while preparing deferred HeldBody transition");
-            return false;
-        }
-
-        auto restoreFlags = state.savedState.collisionObjectFlags;
-        if (restoreFlags == 0) {
-            restoreFlags = 0x8C;
-        }
-        state.collisionObject->flags.flags = restoreFlags;
-
-        RE::NiAVObject* syncNode = state.isProxyCollision && state.physicsNode ? state.physicsNode.get() : state.node.get();
-        if (syncNode) {
-            RE::hkTransformf currentTransform;
-            currentTransform.rotation = syncNode->world.rotate;
-            currentTransform.translation = RE::NiPoint4(
-                syncNode->world.translate.x * HAVOK_WORLD_SCALE,
-                syncNode->world.translate.y * HAVOK_WORLD_SCALE,
-                syncNode->world.translate.z * HAVOK_WORLD_SCALE,
-                0.0f);
-            SetTransformLocked(state.collisionObject, currentTransform, bhkWorld);
-        }
-
-        if (!IsCollisionObjectValid(state.collisionObject)) {
-            spdlog::warn("[GRAB-HELDBODY] Collision object became invalid while preparing deferred HeldBody transition");
-            return false;
-        }
-
-        RE::NiPoint4 zeroVel(0.0f, 0.0f, 0.0f, 0.0f);
-        SetLinearVelocityLocked(state.collisionObject, zeroVel, bhkWorld);
-        SetAngularVelocityLocked(state.collisionObject, zeroVel, bhkWorld);
-        SetMotionTypeLocked(state.collisionObject, RE::hknpMotionPropertiesId::Preset::DYNAMIC, bhkWorld);
-
-        if (!IsCollisionObjectValid(state.collisionObject)) {
-            spdlog::warn("[GRAB-HELDBODY] Collision object became invalid after restoring DYNAMIC motion for deferred HeldBody transition");
-            return false;
-        }
-
-        // Only restore a layer if the keyframed grab actually re-layered the body (audit
-        // rank 7). In the bHeldObjectCollidable path the body is still on its native layer
-        // and an unconditional write here would force never-captured default 4 onto it.
-        // rank 7c: skip when the 0x000B filter path handled restore byte-exactly.
-        if (state.savedState.collisionLayerChanged && !state.heldPlayerFilterApplied) {
-            bhkUtilFunctions_SetLayerLocked(state.node.get(), state.savedState.collisionLayer, bhkWorld);
-        }
-        return true;
-    }
-
-    bool RestoreDeferredHeldBodyFallbackToKeyframed(heisenberg::GrabState& state)
-    {
-        if (!state.node || !state.collisionObject || !IsCollisionObjectValid(state.collisionObject)) {
-            return false;
-        }
-
-        RE::bhkWorld* bhkWorld = ResolveGrabBhkWorld(state);
-        if (!bhkWorld) {
-            return false;
-        }
-
-        bhkWorld_SetMotionLocked(state.node.get(), RE::hknpMotionPropertiesId::Preset::KEYFRAMED, true, true, true, bhkWorld);
-
-        RE::NiPoint4 zeroVel(0.0f, 0.0f, 0.0f, 0.0f);
-        SetLinearVelocityLocked(state.collisionObject, zeroVel, bhkWorld);
-        SetAngularVelocityLocked(state.collisionObject, zeroVel, bhkWorld);
-        CaptureHeldObjectLayerBeforeChange(state);  // idempotent — first capture per grab wins (audit rank 7)
-        bhkUtilFunctions_SetLayerLocked(state.node.get(), 15, bhkWorld);
-        return true;
-    }
-
-    bool TryActivateDeferredHeldBodyGrab(heisenberg::GrabState& state, bool isLeft,
-                                         const RE::NiPoint3& handPos, const RE::NiMatrix3& handRot)
-    {
-        if (!state.deferredHeldBodyStart) {
-            return false;
-        }
-
-        state.deferredHeldBodyStart = false;
-
-        RE::TESObjectREFR* refr = state.GetRefr();
-        if (!refr || !state.node || !state.collisionObject) {
-            return false;
-        }
-
-        RE::NiPoint3 heldBodyPos = handPos;
-        RE::NiMatrix3 heldBodyRot = handRot;
-
-        // Pull completion reaches 1.0 before the normal KEYFRAMED update applies
-        // the final in-hand pose. Snap to that final pose now so HeldBody starts
-        // from the same transform the keyframed grab was targeting.
-        SnapDeferredHeldBodyObjectToTarget(state, isLeft, heldBodyPos, heldBodyRot);
-
-        if (!PrepareKeyframedGrabForHeldBody(state)) {
-            RestoreDeferredHeldBodyFallbackToKeyframed(state);
-            spdlog::warn("[GRAB-HELDBODY] Failed to prepare deferred HeldBody activation for {:08X}", refr->formID);
-            return false;
-        }
-
-        auto& heldBodyMgr = heisenberg::HeldBodyGrabManager::GetSingleton();
-        if (heldBodyMgr.StartGrab(state, isLeft, heldBodyPos, heldBodyRot,
-                                  refr, state.node.get(), state.collisionObject)) {
-            // Prevent capsule bounce — kNonCollidable fallback if pair filter unavailable
-            std::uint32_t playerBody = heisenberg::Physics::GetPlayerBodyId();
-            if (playerBody == 0x7FFFFFFF) {
-                RE::bhkWorld* bhkWorld = GetBhkWorldFromRefr(refr);
-                if (bhkWorld) {
-                    // audit rank 7a: HeldBody manages its own filter restore (objectOriginalFilter);
-                    // don't mark collisionLayerChanged here (see the twin site above).
-                    bhkUtilFunctions_SetLayerLocked(state.node.get(), 15, bhkWorld);
-                    spdlog::warn("[GRAB-HELDBODY] Deferred: Set kNonCollidable (pair filter unavailable)");
-                }
-            }
-            spdlog::info("[GRAB-HELDBODY] Deferred HeldBody activation succeeded for {:08X}", refr->formID);
-            return true;
-        }
-
-        spdlog::warn("[GRAB-HELDBODY] Deferred HeldBody activation failed for {:08X} - continuing in KEYFRAMED mode",
-                     refr->formID);
-        if (!RestoreDeferredHeldBodyFallbackToKeyframed(state)) {
-            spdlog::error("[GRAB-HELDBODY] Failed to restore KEYFRAMED fallback after deferred HeldBody activation failure");
-        }
-        return false;
-    }
+    // (Two-scenario cleanup: the deferred-HeldBody activation helpers that lived here
+    // were removed with the HeldBodyGrab system. ComputeHeldGrabTargetTransform above
+    // stays — the instant-grab path still uses it.)
 }
 
 namespace heisenberg
@@ -4327,31 +4025,8 @@ namespace heisenberg
         // Auto-equip on grab is DISABLED - weapons can be equipped by dropping on body (mode 1) or holster (mode 2)
         // weaponEquipMode: 0=disabled, 1=zone equip, 2=VH zone holster
         
-        // Legacy constraint grab modes (1/2) are superseded by HeldBody when it is
-        // enabled. Keep the old manager only as an explicit fallback for configs
-        // that disable HeldBody.
-        int effectiveGrabMode = GetEffectiveGrabMode();
-        bool legacyConstraintMode =
-            effectiveGrabMode == static_cast<int>(GrabMode::BallSocket) ||
-            effectiveGrabMode == static_cast<int>(GrabMode::Motor);
-        if (!ShouldUseHeldBodyManagedGrab(effectiveGrabMode) && legacyConstraintMode)
-        {
-            const char* modeStr = (effectiveGrabMode == 2) ? "MOTOR (6-DOF)" : "BALL-SOCKET";
-            spdlog::debug("[GRAB] {} hand: Using {} CONSTRAINT mode", isLeft ? "Left" : "Right", modeStr);
-            auto& constraintMgr = ConstraintGrabManager::GetSingleton();
-            return constraintMgr.StartConstraintGrab(selection, handPos, handRot, isLeft);
-        }
-        if (ShouldUseHeldBodyManagedGrab(effectiveGrabMode) && legacyConstraintMode)
-        {
-            spdlog::info("[GRAB] {} hand: iGrabMode={} requested legacy constraint mode, routing through HeldBody instead",
-                         isLeft ? "Left" : "Right", effectiveGrabMode);
-        }
+        spdlog::debug("[GRAB] {} hand: Using KEYFRAME mode", isLeft ? "Left" : "Right");
 
-        // Virtual Spring mode (3) or Keyframed mode (0)
-        const char* modeStr = (effectiveGrabMode == static_cast<int>(GrabMode::VirtualSpring)) 
-                              ? "VIRTUAL-SPRING" : "KEYFRAME";
-        spdlog::debug("[GRAB] {} hand: Using {} mode", isLeft ? "Left" : "Right", modeStr);
-        
         // Keyframe mode - directly control object position via ApplyHardKeyframe
         GrabState& state = isLeft ? _leftGrab : _rightGrab;
         GrabState& otherState = isLeft ? _rightGrab : _leftGrab;
@@ -4483,34 +4158,12 @@ namespace heisenberg
         }
         
         // ═══════════════════════════════════════════════════════════════════════════
-        // PHYSICS MODE SELECTION
-        // HeldBody constraint grab (object stays DYNAMIC) or KEYFRAMED fallback
+        // PHYSICS MODE — KEYFRAMED (the only Heisenberg-owned backend after the
+        // two-scenario cleanup; iGrabMode=9 hands grab ownership to the embedded engine
+        // before this path is ever reached).
         // ═══════════════════════════════════════════════════════════════════════════
-        // RockGrabCore (iGrabMode=8): mark the state + notify the manager. P3 is log-only, so the
-        // keyframed fallback below still holds the object; P4 makes the manager own the grab and
-        // gates the keyframed path off.
-        if (ShouldUseRockGrabCore(GetEffectiveGrabMode())) {
-            state.rockGrabCoreActive = true;
-            state.rockGrabCoreConstraintCreated = false;
-            state.rockGrabCoreSettleFrames = 0;
-            heisenberg::rock_grab_core::RockGrabCoreManager::GetSingleton().StartGrab(state, isLeft, handPos, handRot);
-        }
-
-        if (!state.rockGrabCoreActive &&  // P4: mode 8 owns the post-settle hold — never defer HeldBody for it
-            heisenberg::g_config.useHeldBodyGrab && state.collisionObject &&
-            heisenberg::g_config.UseHeldBodyConstraintGrab())
-        {
-            // ALWAYS defer HeldBody — let keyframed path handle initial pull/positioning,
-            // then switch to constraint once object is in hand.
-            state.deferredHeldBodyStart = true;
-            spdlog::debug("[GRAB-HELDBODY] Deferring HeldBody setup until object reaches hand");
-        }
-
-        // KEYFRAMED fallback (or if HeldBody not configured)
-        if (!state.usingHeldBodyGrab && !state.deferredHeldBodyStart) {
-            state.usingKeyframedMode = true;
-            spdlog::debug("[GRAB-KEYFRAMED] Using KEYFRAMED mode");
-        }
+        state.usingKeyframedMode = true;
+        spdlog::debug("[GRAB-KEYFRAMED] Using KEYFRAMED mode");
         
         // Reset room tracking state for keyframed mode (prevents jitter from stale data)
         state.lastRoomPos = RE::NiPoint3(0, 0, 0);
@@ -5063,35 +4716,6 @@ namespace heisenberg
             }
         }
 
-        // ROCK grab-node anchoring (toggle bGrabNodeAnchor): if the grabbed object exposes
-        // an authored ROCK:GrabR/L marker node, seat the grip to it by capturing the offset
-        // relative to that node instead of the hand — reusing the EXACT F4VR row-vector
-        // capture convention above (grab node substituted for the hand). The hand-frame drive
-        // then reproduces this offset, which seats the authored node onto the hand.
-        //
-        // GATE TO CLOSE GRABS ONLY (not telekinesis, not pull-to-hand): the seat moves the
-        // object so the authored node coincides with the hand by (hand − grabNode). For a
-        // close/palm grab the grab node is already at the hand → a small, natural adjustment.
-        // For a FAR pull/telekinesis grab that delta is large → the object would teleport
-        // across the room. So only seat when the object is already in hand. Wins over the
-        // geometry fallback (sets hasItemOffset); silently no-ops when the node is absent.
-        if (g_config.rockGrabNodeAnchor && !state.isTelekinesis && !state.isPulling && state.node) {
-            const char* anchorNodeName = heisenberg::rock_core::grab_node_name_policy::defaultGrabNodeName(isLeft).data();
-            if (RE::NiAVObject* grabNode = heisenberg::Utils::FindNode(state.node.get(), anchorNodeName, 100)) {
-                const RE::NiPoint3 gnPos = grabNode->world.translate;
-                const RE::NiMatrix3 gnRot = grabNode->world.rotate;
-                state.itemOffset = ItemOffset();
-                state.itemOffset.position = gnRot * (objectPos - gnPos);
-                state.itemOffset.rotation = worldTransform.rotate * gnRot.Transpose();
-                state.grabOffsetLocal = state.itemOffset.position;
-                state.hasItemOffset = true;        // resolved offset — wins over geometry fallback
-                state.isFRIKOffset = false;
-                state.ClearRuntimeHandPlacement();
-                spdlog::info("[GRAB] ROCK grab-node anchor '{}' on '{}' — seated grip to authored node",
-                             anchorNodeName, itemName);
-            }
-        }
-
         // Geometry-based placement runs as a fallback when the item has no
         // saved offset at all. ANY saved-offset match (FormID, name, editor-ID
         // partial, NOTE form-type default, or dims-match — Priority 1-5) wins
@@ -5297,13 +4921,9 @@ namespace heisenberg
             if (selRefr) {
                 RockBridge::GetSingleton().ClaimObject(selRefr);
             }
-            // Only suspend ROCK's hand rig for DYNAMIC (HeldBody) holds, where its
-            // capsules would shove the dynamic object. For a KEYFRAMED hold the object
-            // is infinite-mass and unaffected — and re-enabling ROCK's hand on release
-            // would fling the just-released (now collidable) object. So skip for keyframed.
-            if (ShouldUseHeldBodyManagedGrab(GetEffectiveGrabMode())) {
-                RockBridge::GetSingleton().DisablePhysicsHand(isLeft);
-            }
+            // Keyframed holds never suspend ROCK's hand rig: the held object is
+            // infinite-mass and unaffected by the hand capsules, and re-enabling
+            // ROCK's hand on release would fling the just-released object.
         }
 
         // EMBEDDED ROCK engine hand-collision suppression is driven LEVEL-triggered from
@@ -5362,15 +4982,6 @@ namespace heisenberg
         // This prevents crashes when the game deletes objects we're holding.
         if (!state.HasValidRefr()) {
             spdlog::debug("[GRAB] UpdateGrab: {} hand reference invalid (object deleted?)", isLeft ? "Left" : "Right");
-            // Release any HeldBody constraint before clearing — else it leaks on deletion.
-            if (state.usingHeldBodyGrab) {
-                HeldBodyGrabManager::GetSingleton().EndGrab(state, isLeft, nullptr);
-            }
-            // Review B1: also tear down a committed mode-8 constraint — else the manager keeps
-            // a live native constraint on the dying body (solver CTD) + stale _committed state.
-            if (state.rockGrabCoreActive) {
-                heisenberg::rock_grab_core::RockGrabCoreManager::GetSingleton().EndGrab(state, isLeft, nullptr);
-            }
             // Clean up grab state
             state.Clear();
             // Reset fingers and release FRIK override
@@ -5388,24 +4999,7 @@ namespace heisenberg
             return;
         }
 
-        // Legacy constraint manager only runs when HeldBody is explicitly disabled.
         RE::TESObjectREFR* refr = state.GetRefr();
-        int effectiveGrabMode = GetEffectiveGrabMode();
-        bool legacyConstraintMode =
-            effectiveGrabMode == static_cast<int>(GrabMode::BallSocket) ||
-            effectiveGrabMode == static_cast<int>(GrabMode::Motor);
-        if (!ShouldUseHeldBodyManagedGrab(effectiveGrabMode) && legacyConstraintMode)
-        {
-            auto& constraintMgr = ConstraintGrabManager::GetSingleton();
-            constraintMgr.UpdateConstraintGrab(handPos, handRot, isLeft, deltaTime);
-            return;
-        }
-
-        // RockGrabCore (iGrabMode=8): per-frame seam. No-op today (P3 manager body is empty);
-        // wired here so P4/P5 only fill the manager, not also add the host call site.
-        if (state.rockGrabCoreActive) {
-            heisenberg::rock_grab_core::RockGrabCoreManager::GetSingleton().UpdateGrab(state, isLeft, handPos, handRot, deltaTime);
-        }
 
         // =====================================================================
         // OBJECT VALIDITY CHECK - Detect when game has deleted our grabbed object
@@ -5418,12 +5012,6 @@ namespace heisenberg
         // Check that the refr still has valid 3D and it matches our cached node
         if (!refr) {
             spdlog::debug("[GRAB] Reference became invalid - aborting grab");
-            if (state.usingHeldBodyGrab) {
-                HeldBodyGrabManager::GetSingleton().EndGrab(state, isLeft, nullptr);
-            }
-            if (state.rockGrabCoreActive) {  // Review B1: mode-8 constraint teardown on abort
-                heisenberg::rock_grab_core::RockGrabCoreManager::GetSingleton().EndGrab(state, isLeft, nullptr);
-            }
             state.Clear();
             auto& frik = FRIKInterface::GetSingleton();
             frik.SetHandPoseFingerPositions(isLeft, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f);
@@ -5442,15 +5030,6 @@ namespace heisenberg
                         reinterpret_cast<uintptr_t>(state.node.get()),
                         reinterpret_cast<uintptr_t>(currentNode));
 
-            // Release the HeldBody constraint before clearing — a respawn/recreate here
-            // otherwise leaks the native ragdoll constraint + motors.
-            if (state.usingHeldBodyGrab) {
-                HeldBodyGrabManager::GetSingleton().EndGrab(state, isLeft, nullptr);
-            }
-            if (state.rockGrabCoreActive) {  // Review B1: mode-8 constraint teardown on abort
-                heisenberg::rock_grab_core::RockGrabCoreManager::GetSingleton().EndGrab(state, isLeft, nullptr);
-            }
-
             // Clear state safely (don't try to restore physics on deleted object)
             state.Clear();
 
@@ -5466,7 +5045,7 @@ namespace heisenberg
             cfgMode.OnGrabEnded(isLeft);
             return;
         }
-        
+
         // Update our cached node pointer (in case it was recreated at same address)
         if (state.node.get() != currentNode)
         {
@@ -5936,139 +5515,13 @@ namespace heisenberg
         }
 
         // ═══════════════════════════════════════════════════════════════════════════
-        // HELDBODY MODE: Skip all keyframed positioning / lag detection.
-        // The HeldBody backend handles object position via physics simulation.
-        // Zone detection (storage, mouth, equip) already ran above.
-        // Hand body update happens in PostPhysicsGrabUpdate.
-        // ═══════════════════════════════════════════════════════════════════════════
-        if (state.usingHeldBodyGrab && state.keyframedSetupComplete)
-        {
-            if (!state.heldBodyConstraintActive)
-            {
-                spdlog::warn("[GRAB-HELDBODY] {} hand backend no longer active - releasing grab",
-                             isLeft ? "Left" : "Right");
-                EndGrab(isLeft, nullptr);
-                return;
-            }
-
-            // Still need pull animation progress for deferred finger curls
-            if (state.isPulling)
-            {
-                float distToTarget = (state.initialObjectPos - handPos).Length();
-                if (distToTarget > 0.01f) {
-                    float pullDelta = (heisenberg::g_config.pullSpeed * deltaTime) / distToTarget;
-                    state.pullProgress = (std::min)(state.pullProgress + pullDelta, 1.0f);
-                } else {
-                    state.pullProgress = 1.0f;
-                }
-                if (state.pullProgress >= 1.0f)
-                {
-                    state.isPulling = false;
-                    auto* playerNodes = f4cf::f4vr::getPlayerNodes();
-                    RE::NiNode* wandNode = playerNodes ? heisenberg::GetWandNode(playerNodes, isLeft) : nullptr;
-                    ResolvePendingFingerCurls(state, wandNode, isLeft, "Pull complete (HeldBody)");
-
-                    // Diagnostic mesh-distance log — skip the (expensive) triangle extraction for
-                    // saved-curl items: geometry is irrelevant when the pose is offset-driven.
-                    if (wandNode && state.node && !HasStoredFingerCurls(state)) {
-                        RE::NiPoint3 palmPosPP = GetPalmPosition(wandNode, isLeft);
-                        RE::NiPoint3 objPosPP = state.node->world.translate;
-                        float pivotDist = (objPosPP - palmPosPP).Length();
-                        std::vector<heisenberg::TriangleData> trisPP;
-                        trisPP.reserve(256);
-                        heisenberg::GetTriangles(state.node.get(), trisPP);
-                        RE::NiPoint3 meshPt;
-                        float meshDist = -1.0f;
-                        if (!trisPP.empty()) {
-                            heisenberg::GetClosestMeshPointToPoint(trisPP, palmPosPP, meshPt, meshDist);
-                        }
-                        spdlog::warn("[POST-PULL-HB] '{}' palm=({:.1f},{:.1f},{:.1f}) pivot=({:.1f},{:.1f},{:.1f}) pivotDist={:.2f}cm meshDist={:.2f}cm meshPt=({:.1f},{:.1f},{:.1f}) tris={}",
-                                     state.node->name.c_str(),
-                                     palmPosPP.x, palmPosPP.y, palmPosPP.z,
-                                     objPosPP.x, objPosPP.y, objPosPP.z,
-                                     pivotDist, meshDist,
-                                     meshPt.x, meshPt.y, meshPt.z,
-                                     trisPP.size());
-                    }
-                }
-            }
-
-            // Per-frame finger curl re-application (FRIK overrides our curls)
-            if (!state.isPulling && (!state.isTelekinesis || state.naturalFingerPosing) && !state.pendingFingerCurls &&
-                !(configMode.IsRepositionModeActive() && state.stickyGrab))
-            {
-                // Task #4 — geometry recompute before applying curls.
-                auto* playerNodesFc = f4cf::f4vr::getPlayerNodes();
-                RE::NiNode* wandNodeFc = playerNodesFc ? heisenberg::GetWandNode(playerNodesFc, isLeft) : nullptr;
-                TryRecalculateFingerCurlsPerFrame(state, wandNodeFc, isLeft);
-
-                if (HasConfiguredFingerCurls(state)) {
-                    ApplyConfiguredFingerCurls(state, isLeft);
-                }
-            }
-
-            return;  // Skip keyframed setup, target calculation, and lag detection
-        }
-
-        // ═══════════════════════════════════════════════════════════════════════════
-        // PHYSICS SETUP (runs once on first update after grab)
-        // Two modes: HELDBODY (dynamic object, spring or constraint driven) or
-        //            KEYFRAMED (direct position control, object set to KEYFRAMED)
+        // PHYSICS SETUP (runs once on first update after grab) — KEYFRAMED
+        // (direct position control, object set to KEYFRAMED)
         // ═══════════════════════════════════════════════════════════════════════════
         if (!state.keyframedSetupComplete && state.node)
         {
             // Save original parent (we'll stay parented to it, not reparent to wand)
             state.originalParent.reset(state.node->parent);
-
-            // ── HELDBODY GRAB ──
-            // Object stays DYNAMIC — a KEYFRAMED hand body drives either a
-            // velocity spring or a constraint backend toward the hand.
-            if (ShouldUseHeldBodyManagedGrab(effectiveGrabMode) && state.collisionObject && !state.isPulling)
-            {
-                spdlog::debug("[GRAB-HELDBODY] Setting up HeldBody backend");
-
-                RE::bhkWorld* bhkWorld = GetBhkWorldFromRefr(refr);
-                state.savedState.savedBhkWorld = bhkWorld;
-                state.savedState.motionType = RE::hknpMotionPropertiesId::Preset::DYNAMIC;
-                state.savedState.collisionObjectFlags = state.collisionObject->flags.flags;
-
-                auto& heldBodyMgr = heisenberg::HeldBodyGrabManager::GetSingleton();
-                if (heldBodyMgr.StartGrab(state, isLeft, handPos,
-                                          handRot, refr, state.node.get(),
-                                          state.collisionObject)) {
-                    state.usingHeldBodyGrab = true;
-                    state.heldBodyConstraintActive = true;
-
-                    // Prevent grabbed object from bouncing off player capsule.
-                    // Pair filter is attempted in HeldBodyGrab; if it failed (no player body),
-                    // fall back to kNonCollidable.
-                    std::uint32_t playerBody = heisenberg::Physics::GetPlayerBodyId();
-                    if (playerBody == 0x7FFFFFFF && bhkWorld) {
-                        // audit rank 7a: do NOT CaptureHeldObjectLayerBeforeChange here —
-                        // HeldBodyGrabManager::StartGrab already ran and snapshotted the true
-                        // pre-grab filter (objectOriginalFilter, taken BEFORE it re-layered the
-                        // body to 43), and its own EndGrab restores that byte-exactly. Marking
-                        // collisionLayerChanged would make the keyframed gated-restore
-                        // additionally (and wrongly) write this fallback layer back over it.
-                        bhkUtilFunctions_SetLayerLocked(state.node.get(), 15, bhkWorld);
-                        spdlog::warn("[GRAB-HELDBODY] Set collision to kNonCollidable (pair filter unavailable)");
-                    }
-
-                    spdlog::info("[GRAB-HELDBODY] Constraint grab started for {:08X}", refr->formID);
-                } else {
-                    spdlog::warn("[GRAB-HELDBODY] StartGrab failed for {:08X} — falling back to KEYFRAMED", refr->formID);
-                }
-
-                state.savedState.wasDeactivated = false;
-                if (state.usingHeldBodyGrab) {
-                    state.keyframedSetupComplete = true;
-                }
-            }
-            else if (ShouldUseHeldBodyManagedGrab(effectiveGrabMode) && state.collisionObject && state.isPulling)
-            {
-                state.deferredHeldBodyStart = true;
-                spdlog::debug("[GRAB-HELDBODY] Deferring HeldBody setup until pull-to-hand completes");
-            }
 
             // ── KEYFRAMED MODE (original path) ──
             // KEYFRAMED = infinite mass, can't be pushed, but still collides with world
@@ -6201,9 +5654,6 @@ namespace heisenberg
                     }
                 }
 
-                    if (TryActivateDeferredHeldBodyGrab(state, isLeft, handPos, handRot)) {
-                        return;
-                    }
             }
         }
 
@@ -6223,84 +5673,6 @@ namespace heisenberg
                 if (TryDisablePlayerHeldObjectCollision(state)) {
                     state.heldPlayerFilterApplied = true;
                 }
-            }
-        }
-
-        // =====================================================================
-        // SELF-CONTAINED DYNAMIC GRAB (iGrabMode=5, GrabMode::DynamicRock)
-        // =====================================================================
-        // Object was pulled in + placed at the saved offset under KEYFRAMED motion
-        // (so it snaps cleanly to the hand). Once placement settles, flip the held
-        // body KEYFRAMED -> DYNAMIC so the physics solver actually stops it at walls
-        // and lets it push NPCs, then drive it toward the hand target via velocity
-        // each frame (see UpdateVirtualSpring's rockDynamicActive branch). This is the
-        // full ROCK-style dynamic hold WITHOUT needing ROCK.dll.
-        if (GetEffectiveGrabMode() == static_cast<int>(heisenberg::GrabMode::DynamicRock) &&
-            !state.isPulling && state.keyframedSetupComplete && !state.rockDynamicActive &&
-            state.collisionObject && state.node)
-        {
-            if (++state.rockDynamicSettleFrames >= 3) {
-                RE::bhkWorld* drWorld = state.savedState.savedBhkWorld
-                    ? state.savedState.savedBhkWorld : GetBhkWorldFromRefr(refr);
-                if (drWorld) {
-                    // MANDATORY before going dynamic: apply the per-pair player filter so the
-                    // now-dynamic body can't shove the player or feed a dangling support body
-                    // into the character proxy (the char-proxy crash). The cadence block above
-                    // only runs when bHeldObjectCollidable=true, so force it here regardless.
-                    if (!state.heldPlayerFilterApplied) {
-                        if (TryDisablePlayerHeldObjectCollision(state)) {
-                            state.heldPlayerFilterApplied = true;
-                        }
-                    }
-                    // KEYFRAMED -> DYNAMIC. The per-pair player filter (just applied) keeps it
-                    // from shoving the player/char-proxy; the 0x000B group bits keep it off
-                    // FRIK/weapon pairs; everything else (walls, NPCs) now blocks it.
-                    bhkWorld_SetMotionLocked(state.node.get(),
-                        RE::hknpMotionPropertiesId::Preset::DYNAMIC, true, true, true, drWorld);
-                    state.rockDynamicActive = true;
-                    spdlog::info("[ROCK-DYNAMIC] {:08X} settled — held body now DYNAMIC, velocity-driven ({} hand)",
-                                 refr->formID, isLeft ? "L" : "R");
-                }
-            }
-        }
-
-        // =====================================================================
-        // ROCK DYNAMIC HANDOFF (experimental — bRockDynamicHandoff)
-        // =====================================================================
-        // Object is now pulled in + placed at the saved offset. Hand it to ROCK's
-        // DYNAMIC grab so it gains full collision (blocked by walls). ROCK's grab is
-        // edge-triggered, so we release our hold in place (dynamic, collidable, no
-        // throw) and inject a synthetic grip release->press edge for ROCK to catch.
-        // Hand off to ROCK on BOTH hands. The right (primary) hand needs the forced grip
-        // press phase (see TriggerRockGripHandoff) to beat Heisenberg's primary-hand grip
-        // strip; the left hand grabs but currently hits ROCK's own left-hand palm-basis
-        // ~180° flip (wrist 360) — that's a ROCK-side bug to fix separately.
-        // PREPARED: GrabMode::RockForceGrab — the clean successor to the grip-injection
-        // handoff below. Once the object is placed at its offset, hand it to ROCK's dynamic
-        // hold via forceGrab and KEEP driving fingers/semantics (unlike the handoff which
-        // fully releases). Inert on ROCK 0.5 (ShouldUseRockForceGrabHold() is false), and
-        // TryStartRockForceGrabHold returns false until wired, so this never changes behavior.
-        if (ShouldUseRockForceGrabHold() && !state.isPulling && state.keyframedSetupComplete &&
-            !state.rockForceGrabHold)
-        {
-            if (TryStartRockForceGrabHold(state, state.GetRefr(), isLeft)) {
-                return;  // ROCK now owns the dynamic hold + placement; Heisenberg keeps the brain
-            }
-            // else: fall through to the keyframed update path unchanged
-        }
-
-        if (g_config.rockDynamicHandoff && !state.isPulling && state.keyframedSetupComplete &&
-            !state.rockHandoffDone && RockBridge::GetSingleton().IsActive())
-        {
-            if (++state.rockHandoffSettleFrames >= 3) {
-                RE::TESObjectREFR* hoRefr = state.GetRefr();
-                state.rockHandoffDone = true;
-                spdlog::info("[ROCK-HANDOFF] Placement settled — releasing {:08X} in place + injecting grip edge for ROCK ({} hand)",
-                             hoRefr ? hoRefr->formID : 0, isLeft ? "L" : "R");
-                heisenberg::Heisenberg::GetSingleton().TriggerRockGripHandoff(isLeft);
-                RE::NiPoint3 zeroVel(0.0f, 0.0f, 0.0f);   // release in place, no throw (drop)
-                EndGrab(isLeft, &zeroVel);
-                return;  // grab ended; ROCK takes over
             }
         }
 
@@ -6456,11 +5828,7 @@ namespace heisenberg
         // (happens when Pipboy closes in PA: right arm transition reverts KEYFRAMED to DYNAMIC)
         RE::NiPoint3 objPos = state.node->world.translate;
         float lag = (objPos - targetPos).Length();
-        // AUDIT FIX (Jul 19): also exclude mode-8 (rockGrabCoreActive) — the motor-constraint
-        // hold legitimately lags >50 during fast swings while the motor catches up; demoting
-        // it to keyframed tears down the constraint mid-hold (prime suspect for the mode-8
-        // "falls out of hand" reports, task #145).
-        if (lag > 50.0f && state.keyframedSetupComplete && !state.rockDynamicActive && !state.rockGrabCoreActive) {
+        if (lag > 50.0f && state.keyframedSetupComplete) {
             auto* bhkWorld = GetBhkWorldFromRefr(refr);
             if (bhkWorld) {
                 bhkWorld_SetMotionLocked(state.node.get(), RE::hknpMotionPropertiesId::Preset::KEYFRAMED, true, true, true, bhkWorld);
@@ -6512,15 +5880,6 @@ namespace heisenberg
         // Get state for this hand first
         GrabState& state = isLeft ? _leftGrab : _rightGrab;
 
-        // HAND-FOLLOWS-OBJECT cleanup: if the dynamic hold was slaving the FRIK hand to the
-        // held object (state.handFollowActive), release the external hand override now so the
-        // rendered hand snaps back to the controller on drop/throw. Covers ALL release paths
-        // (this runs before every EndGrab exit, incl. the co-held early-return below).
-        if (state.handFollowActive) {
-            FRIKInterface::GetSingleton().ClearExternalHandWorldTransform(isLeft);
-            state.handFollowActive = false;
-        }
-
         // Two-handed grab cleanup:
         // (a) If THIS hand is the secondary aim hand, it owns no physics — just clear the
         //     marker and return; the primary keeps holding (its next drive sees no partner).
@@ -6539,13 +5898,6 @@ namespace heisenberg
             }
         }
 
-        // RockGrabCore (iGrabMode=8): release the manager's grab first (P4+ tears down the
-        // constraint crash-safely; P3 just logs). Done before the keyframed/HeldBody teardown.
-        if (state.rockGrabCoreActive) {
-            heisenberg::rock_grab_core::RockGrabCoreManager::GetSingleton().EndGrab(state, isLeft, throwVelocity);
-            state.rockGrabCoreActive = false;
-        }
-
         if (!state.active)
             return;
         
@@ -6557,13 +5909,6 @@ namespace heisenberg
         // own the object again, and re-enable ROCK's hand collision rig on this
         // hand (it was disabled during the grab). No-op when ROCK inactive.
         if (RockBridge::GetSingleton().IsActive()) {
-            // PREPARED: if ROCK holds this object via forceGrab (RockForceGrab mode), tell
-            // ROCK to drop it on our release. Inert today — rockForceGrabHold is never set on
-            // ROCK 0.5 (TryStartRockForceGrabHold returns false), so this is a no-op until wired.
-            if (state.rockForceGrabHold) {
-                RockBridge::GetSingleton().ForceDrop(isLeft);
-                state.rockForceGrabHold = false;
-            }
             if (refrValid) {
                 if (auto* heldRefr = state.GetRefr()) {
                     RockBridge::GetSingleton().ReleaseObject(heldRefr);
@@ -6581,12 +5926,6 @@ namespace heisenberg
         // If refr was deleted, just clean up state and exit
         if (!refrValid) {
             spdlog::debug("[GRAB] EndGrab: {} hand reference invalid (object deleted?)", isLeft ? "Left" : "Right");
-            // Tear down any active HeldBody constraint + motors + proxy/subscription/pair-filter
-            // registrations FIRST — state.Clear() alone orphans the live Havok constraint, leaking
-            // it (and its motors) on every respawn / cell reload. EndGrab is a no-op if not HeldBody.
-            if (state.usingHeldBodyGrab) {
-                HeldBodyGrabManager::GetSingleton().EndGrab(state, isLeft, nullptr);
-            }
             state.Clear();
             // Reset fingers to extended position and release FRIK override
             auto& frik = FRIKInterface::GetSingleton();
@@ -6599,19 +5938,8 @@ namespace heisenberg
             return;
         }
         
-        // Legacy constraint manager only runs when HeldBody is explicitly disabled.
         RE::TESObjectREFR* refr = state.GetRefr();
-        int effectiveGrabMode = GetEffectiveGrabMode();
-        bool legacyConstraintMode =
-            effectiveGrabMode == static_cast<int>(GrabMode::BallSocket) ||
-            effectiveGrabMode == static_cast<int>(GrabMode::Motor);
-        if (!ShouldUseHeldBodyManagedGrab(effectiveGrabMode) && legacyConstraintMode)
-        {
-            auto& constraintMgr = ConstraintGrabManager::GetSingleton();
-            constraintMgr.EndConstraintGrab(isLeft, throwVelocity);
-            return;
-        }
-        
+
         // =====================================================================
         // OBJECT VALIDITY CHECK - Detect when game has deleted our grabbed object
         // =====================================================================
@@ -6621,13 +5949,6 @@ namespace heisenberg
         {
             spdlog::warn("[GRAB] EndGrab: Object {:08X} 3D changed - clearing state only",
                         refr->formID);
-
-            // Release the HeldBody constraint/motors/registrations before clearing — otherwise
-            // a respawn (3D change) leaks the native ragdoll constraint. EndGrab works off the
-            // cached constraint, not the (now-stale) 3D node, so it is safe here.
-            if (state.usingHeldBodyGrab) {
-                HeldBodyGrabManager::GetSingleton().EndGrab(state, isLeft, nullptr);
-            }
 
             // Clear state safely (don't try to restore physics on deleted object)
             state.Clear();
@@ -7211,14 +6532,6 @@ namespace heisenberg
         {
             spdlog::debug("[GRAB] EndGrab for storage - simplified cleanup");
 
-            // Storing a dynamically-held object (grab clutter → drop into a storage zone) still
-            // has a live HeldBody constraint. This block sits BEFORE the normal HeldBody release,
-            // so tear the constraint/motors/registrations down here too — otherwise the object is
-            // removed to inventory while its native ragdoll constraint leaks.
-            if (state.usingHeldBodyGrab) {
-                HeldBodyGrabManager::GetSingleton().EndGrab(state, isLeft, nullptr);
-            }
-
             // NOTE: We no longer reparent nodes to the wand (KEYFRAMED mode keeps original parent),
             // so no unparenting is needed. Just clear state.
             
@@ -7260,54 +6573,6 @@ namespace heisenberg
             HeisenbergPluginAPI::InvokeDroppedCallbacks(isLeft, refr);
         }
 
-        // ── HELDBODY GRAB RELEASE ──
-        if (state.usingHeldBodyGrab && state.node)
-        {
-            auto& heldBodyMgr = heisenberg::HeldBodyGrabManager::GetSingleton();
-            heldBodyMgr.EndGrab(state, isLeft, throwVelocity);
-
-            // audit rank 7b: clear the 0x000B hand-group bits we OR'd onto the held object
-            // during the keyframed pull phase (Grab.cpp ~5809, heldPlayerFilterApplied=true).
-            // Without this, a deferred-HeldBody grab leaks those bits into the released body's
-            // filter (HeldBody's own restore snapshots the ALREADY-polluted filter). Writes
-            // back heldOriginalFilterInfo, captured pre-pollution, so it is byte-exact.
-            TryRestoreHeldObjectCollision(state);
-
-            // Object stayed DYNAMIC throughout HeldBody; restore collision state.
-            // Throw velocity is applied inside HeldBodyGrabManager::EndGrab.
-            if (state.collisionObject && IsCollisionObjectValid(state.collisionObject))
-            {
-                state.collisionObject->flags.flags = state.savedState.collisionObjectFlags;
-
-                RE::bhkWorld* bhkWorld = state.savedState.savedBhkWorld;
-                if (refr) {
-                    RE::bhkWorld* currentWorld = GetBhkWorldFromRefr(refr);
-                    if (currentWorld) {
-                        bhkWorld = currentWorld;
-                    }
-                }
-
-                if (bhkWorld && state.savedState.collisionLayerChanged && !state.heldPlayerFilterApplied) {
-                    // Only restore if the grab actually re-layered the body (audit rank 7 —
-                    // unconditional restore-to-default clobbered non-clutter layers), and not
-                    // when the 0x000B group-bit filter path already did a byte-exact restore
-                    // (rank 7c — preset SetLayer would clobber its group/system bits).
-                    bhkUtilFunctions_SetLayerLocked(state.node.get(), state.savedState.collisionLayer, bhkWorld);
-                }
-            }
-
-            // Reset fingers + cleanup
-            auto& frik = FRIKInterface::GetSingleton();
-            frik.SetHandPoseFingerPositions(isLeft, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f);
-            frik.ClearHandPoseFingerPositions(isLeft);
-            Heisenberg::GetSingleton().SetFingerCurlValue(isLeft, 1.0f);
-            Heisenberg::GetSingleton().OnGrabEnded(isLeft);
-            auto& cfgMode = ItemPositionConfigMode::GetSingleton();
-            cfgMode.OnGrabEnded(isLeft);
-            state.Clear();
-            return;
-        }
-
         // ── KEYFRAMED MODE RELEASE ──
         // Restores motion type to DYNAMIC and applies throw velocity
         if (state.node)
@@ -7330,15 +6595,6 @@ namespace heisenberg
 
     bool GrabManager::IsGrabbing(bool isLeft) const
     {
-        // Check if we should use constraint-based grabbing (modes 1 or 2)
-        int effectiveGrabMode = GetEffectiveGrabMode();
-        if (!ShouldUseHeldBodyManagedGrab(effectiveGrabMode) &&
-            (effectiveGrabMode == static_cast<int>(GrabMode::BallSocket) ||
-             effectiveGrabMode == static_cast<int>(GrabMode::Motor)))
-        {
-            auto& constraintMgr = ConstraintGrabManager::GetSingleton();
-            return constraintMgr.IsGrabbing(isLeft);
-        }
         return isLeft ? _leftGrab.active : _rightGrab.active;
     }
 
@@ -7645,9 +6901,6 @@ namespace heisenberg
             }
             if (tickWorld) { TickDeferredFilterRestores(tickWorld); }
         }
-        // ROCK grab core: drain the constraint deferred-free retire ring once per completed
-        // physics step (cheap no-op until P4 creates constraints).
-        heisenberg::rock_grab_core::RockGrabCoreManager::GetSingleton().ServicePhysicsStep(1);
 
         // EMBEDDED ROCK engine (audit rank 2): publish the per-hand grab state LEVEL-triggered
         // every frame. The embedded engine leases the grabbing hand's collider suite + forearm
@@ -7712,32 +6965,6 @@ namespace heisenberg
             RE::TESObjectREFR* stateRefr = state.GetRefr();
             if (!stateRefr || !stateRefr->Get3D())
                 return;
-
-            // ── HELDBODY MODE: Update hand body position, spring/constraint backend pulls object ──
-            if (state.usingHeldBodyGrab && state.heldBodyConstraintActive)
-            {
-                RE::NiNode* wandNode = heisenberg::GetWandNode(playerNodes, isLeft);
-                if (!wandNode)
-                    return;
-
-                auto& heldBodyMgr = heisenberg::HeldBodyGrabManager::GetSingleton();
-                heldBodyMgr.UpdateGrab(state, isLeft, wandNode->world.translate,
-                                        wandNode->world.rotate, frameDeltaTime);
-
-                bool suppressFingerReapply = repositionActive && state.stickyGrab;
-                if ((!state.isTelekinesis || state.naturalFingerPosing) && !suppressFingerReapply) {
-                    if (!ResolvePendingFingerCurls(state, wandNode, isLeft, "HeldBody post-physics")) {
-                        if (!state.isPulling && HasConfiguredFingerCurls(state)) {
-                            ApplyConfiguredFingerCurls(state, isLeft);
-                        }
-                    }
-                }
-
-                // HeldBody keeps the object fully physics-driven. Forcing TESObjectREFR
-                // location updates here can wake navmesh obstacle/pathing work for
-                // held clutter and has been crashing in NavMeshObstacleManager.
-                return;
-            }
 
             // ── KEYFRAMED MODE: Direct visual positioning ──
             RE::NiPoint3 targetPos;
@@ -7897,211 +7124,6 @@ namespace heisenberg
                 }
             }
 
-            // ═════════════════════════════════════════════════════════════════
-            // ROCKGRABCORE (iGrabMode=8) SETTLE-GATE COMMIT — P4. After the keyframed
-            // pull-in has placed the object at the offset for a few frames, flip it
-            // DYNAMIC and hand it to the motor constraint (HIGGS HeldBody architecture:
-            // proxy body A keyframed to the hand + finite-force motors pull object B).
-            // On any failure the object flips back KEYFRAMED and this grab degrades to
-            // the plain keyframed hold.
-            // ═════════════════════════════════════════════════════════════════
-            if (state.rockGrabCoreActive && !state.rockGrabCoreConstraintCreated
-                && !state.isPulling && state.collisionObject && wandNode
-                && !state.isProxyCollision  // review F1: proxy/limb bodies get a root-derived pocket (wrong) — keep those keyframed
-                && ++state.rockGrabCoreSettleFrames >= 3)
-            {
-                RE::bhkWorld* gcWorld = state.savedState.savedBhkWorld;
-                RE::bhkWorld* gcCur = GetBhkWorldFromRefr(stateRefr);
-                if (gcCur) gcWorld = gcCur;
-                void* gcHknp = nullptr;
-                if (gcWorld) {
-                    gcHknp = *reinterpret_cast<void**>(reinterpret_cast<std::uintptr_t>(gcWorld) + 0x60);
-                }
-                std::uint32_t gcBodyId = 0x7FFFFFFF;
-                if (state.collisionObject->spSystem) {
-                    heisenberg::ConstraintFunctions::BhkPhysicsSystemGetBodyId(
-                        state.collisionObject->spSystem.get(), &gcBodyId, state.collisionObject->systemBodyIdx);
-                }
-                if (gcWorld && gcHknp && gcBodyId != 0x7FFFFFFF) {
-                    // Player pair-filter BEFORE the dynamic flip (same order as DynamicRock).
-                    if (TryDisablePlayerHeldObjectCollision(state)) {
-                        state.heldPlayerFilterApplied = true;
-                    }
-                    bhkWorld_SetMotionLocked(state.node.get(), RE::hknpMotionPropertiesId::Preset::DYNAMIC,
-                                             true, true, true, gcWorld);
-                    RE::NiTransform gcHand;
-                    gcHand.translate = wandNode->world.translate;
-                    gcHand.rotate = wandNode->world.rotate;
-                    gcHand.scale = 1.0f;
-                    auto& gcMgr = heisenberg::rock_grab_core::RockGrabCoreManager::GetSingleton();
-                    if (gcMgr.TryCommitGrab(state, isLeft, gcWorld, gcHknp, gcBodyId, gcHand)) {
-                        state.rockGrabCoreConstraintCreated = true;
-                    } else {
-                        // Degrade: back to the keyframed hold for this grab.
-                        bhkWorld_SetMotionLocked(state.node.get(), RE::hknpMotionPropertiesId::Preset::KEYFRAMED,
-                                                 true, true, true, gcWorld);
-                        state.rockGrabCoreActive = false;
-                        spdlog::warn("[ROCK::GrabCore] commit failed — degraded to keyframed hold this grab");
-                    }
-                } else {
-                    // Unresolvable world/body — degrade quietly.
-                    state.rockGrabCoreActive = false;
-                }
-            }
-
-            if ((state.rockDynamicActive || state.rockGrabCoreConstraintCreated) && state.collisionObject)
-            {
-                // =================================================================
-                // DYNAMIC ROCK GRAB (iGrabMode=5) — body is DYNAMIC after settle.
-                // iGrabMode=8 (constraint committed) shares this branch for the
-                // refr-location sync + hand-follows-object visual; its DRIVE is the
-                // motor constraint (proxy keyframed pre-physics), NOT the velocity
-                // overwrite below.
-                // =================================================================
-                // A keyframed body is driven by its NiNode (graphics->physics); a
-                // DYNAMIC body is the reverse (physics->graphics). So do NOT update the
-                // node here — instead DIRECTLY set the body's linear+angular velocity to
-                // close the gap to the hand target this frame, and let the solver stop it
-                // at walls / push NPCs. The engine syncs the visual node from the body.
-                //
-                // NOTE: ApplyHardKeyframe does NOT work on a DYNAMIC body (it only drives
-                // KEYFRAMED motion) — using it left the object falling under damped gravity
-                // instead of tracking the hand. SetLinearVelocity/SetAngularVelocity DO
-                // work on dynamic motion and counter gravity (recomputed every frame, so a
-                // blocked body simply re-aims next frame).
-                float clampedDelta = (frameDeltaTime > 0.001f) ? frameDeltaTime : 0.016f;
-                float invDeltaTime = 1.0f / clampedDelta;
-                RE::bhkWorld* drWorld = GetBhkWorldFromRefr(stateRefr);
-                // Mode-8 committed hands: the MOTOR CONSTRAINT owns the object's motion —
-                // never velocity-overwrite it (that would fight the solver = jitter, the
-                // exact HIGGS lesson). Only the iGrabMode=5 velocity-chase drives here.
-                if (drWorld && state.rockDynamicActive) {
-                    // ---- Linear: velocity that closes the position gap (game units/s) ----
-                    // FEED-FORWARD: aiming only at the current target converges one frame late,
-                    // so at constant locomotion speed the object trails the hand by exactly one
-                    // frame of motion (~6-8 game units at sprint = visible grip separation /
-                    // "stretching" while moving). Adding the target's own velocity (hand motion,
-                    // incl. player locomotion) keeps the object ON a moving hand: steady-state
-                    // lag -> 0. First frame after grab has no history -> no feed-forward.
-                    // JITTER FIX (Jul 6): the position-correction term used FULL gain (*invDeltaTime =
-                    // "reach the target in ONE frame"), an undamped P-controller that overshoots against
-                    // physics/contact response and oscillates = the held-object jitter. Damp the
-                    // correction gain (<1) so it eases to the target over a few frames, while keeping the
-                    // FEED-FORWARD term at full gain (that's what tracks a walking hand with zero lag).
-                    const float kPositionGain = 0.55f;  // damped approach; lower = smoother/softer
-                    const RE::NiPoint3 curPos = state.node->world.translate;
-                    RE::NiPoint3 gameVel = (targetPos - curPos) * (invDeltaTime * kPositionGain);
-                    if (state.hasLastDynamicTarget) {
-                        gameVel += (targetPos - state.lastDynamicTargetPos) * invDeltaTime;  // feed-forward: full gain
-                    }
-                    state.lastDynamicTargetPos = targetPos;
-                    state.hasLastDynamicTarget = true;
-                    const float kMaxLinear = 800.0f;  // game u/s (~11 m/s) anti-fling clamp
-                    float lm = std::sqrt(gameVel.x * gameVel.x + gameVel.y * gameVel.y + gameVel.z * gameVel.z);
-                    if (lm > kMaxLinear) { float s = kMaxLinear / lm; gameVel.x *= s; gameVel.y *= s; gameVel.z *= s; }
-                    RE::NiPoint4 hkLin(gameVel.x * HAVOK_WORLD_SCALE, gameVel.y * HAVOK_WORLD_SCALE,
-                                       gameVel.z * HAVOK_WORLD_SCALE, 0.0f);
-                    SetLinearVelocityLocked(state.collisionObject, hkLin, drWorld);
-
-                    // ---- Angular: velocity that aligns the body's world axes to target ----
-                    // F4VR row-vector convention: the body's world-space X/Y/Z axes are the
-                    // ROWS of the rotation matrix. omega ~= 0.5*sum(curAxis x targetAxis)*invDt
-                    // (== theta/dt * axis for small per-frame deltas). World-frame rad/s — no
-                    // world-scale on angular velocity.
-                    const RE::NiMatrix3& C = state.node->world.rotate;
-                    const RE::NiMatrix3& T = targetRot;
-                    RE::NiPoint3 w{ 0.0f, 0.0f, 0.0f };
-                    for (int r = 0; r < 3; ++r) {
-                        const float cx = C.entry[r][0], cy = C.entry[r][1], cz = C.entry[r][2];
-                        const float tx = T.entry[r][0], ty = T.entry[r][1], tz = T.entry[r][2];
-                        w.x += cy * tz - cz * ty;
-                        w.y += cz * tx - cx * tz;
-                        w.z += cx * ty - cy * tx;
-                    }
-                    const float g = 0.5f * invDeltaTime;
-                    RE::NiPoint3 angVel{ w.x * g, w.y * g, w.z * g };
-                    const float kMaxAngular = 30.0f;  // rad/s clamp
-                    float am = std::sqrt(angVel.x * angVel.x + angVel.y * angVel.y + angVel.z * angVel.z);
-                    if (am > kMaxAngular) { float s = kMaxAngular / am; angVel.x *= s; angVel.y *= s; angVel.z *= s; }
-                    RE::NiPoint4 hkAng(angVel.x, angVel.y, angVel.z, 0.0f);
-                    SetAngularVelocityLocked(state.collisionObject, hkAng, drWorld);
-                }
-                // Sync refr location from where the engine actually put the body
-                // (anti-cull / save-safe), NOT from the unreachable target.
-                const RE::NiPoint3 bodyPos = state.node->world.translate;
-                stateRefr->data.location.x = bodyPos.x;
-                stateRefr->data.location.y = bodyPos.y;
-                stateRefr->data.location.z = bodyPos.z;
-
-                // HAND-FOLLOWS-OBJECT (HIGGS technique, hand.cpp:3884): slave the visual FRIK
-                // hand to the held object's ACTUAL position, so a dynamic object that lags/bounces
-                // never visibly DETACHES from the hand. Jul 6: DEFAULT OFF (bHandFollowsHeldObject)
-                // — it also moved the hand when the object bounced off other objects, which the user
-                // wants to NOT happen (hand stays put, object yields). Gated so it can be A/B'd.
-                if (heisenberg::g_config.handFollowsHeldObject)
-                {
-                    auto& frikFollow = FRIKInterface::GetSingleton();
-                    RE::NiTransform handWorld;
-                    // Native v5 OR plugin-side hand authority (older FRIK) — GetHandWorldTransform routes to whichever.
-                    if ((frikFollow.SupportsPushback() || heisenberg::HandAuthority::Available())
-                        && frikFollow.GetHandWorldTransform(isLeft, handWorld)) {
-                        // Object lag vs its hand-derived target this frame.
-                        RE::NiPoint3 rawLag{ bodyPos.x - targetPos.x, bodyPos.y - targetPos.y, bodyPos.z - targetPos.z };
-                        // TEMPORAL SMOOTHING: a bouncing/jittering dynamic object transfers its
-                        // bounce straight to the visual hand if applied raw (wrist snap). Exp-lerp
-                        // the follow lag toward the raw value (~35%/frame @ 90Hz) so the hand glides
-                        // to the object instead of snapping. Reset (=raw) on the first follow frame.
-                        constexpr float kFollowSmoothAlpha = 0.35f;
-                        RE::NiPoint3 lag;
-                        if (state.handFollowActive) {
-                            lag.x = state.handFollowSmoothedLag.x + (rawLag.x - state.handFollowSmoothedLag.x) * kFollowSmoothAlpha;
-                            lag.y = state.handFollowSmoothedLag.y + (rawLag.y - state.handFollowSmoothedLag.y) * kFollowSmoothAlpha;
-                            lag.z = state.handFollowSmoothedLag.z + (rawLag.z - state.handFollowSmoothedLag.z) * kFollowSmoothAlpha;
-                        } else {
-                            lag = rawLag;  // first frame: snap-to (no prior smoothed state)
-                        }
-                        // SOFT LEASH (arm-stretch guard): softly ramp the follow to a cap so a
-                        // wall-stuck object can't stretch the arm to infinity. A smooth taper near
-                        // the cap (vs a hard clamp) avoids a discontinuity when the object jitters
-                        // across the leash distance.
-                        constexpr float kMaxFollowGU = 30.0f;
-                        const float lagLen = std::sqrt(lag.x * lag.x + lag.y * lag.y + lag.z * lag.z);
-                        if (lagLen > kMaxFollowGU) {
-                            const float s = kMaxFollowGU / lagLen;
-                            lag.x *= s; lag.y *= s; lag.z *= s;
-                        }
-                        state.handFollowSmoothedLag = lag;
-                        RE::NiTransform adjusted = handWorld;
-                        adjusted.translate.x = handWorld.translate.x + lag.x;
-                        adjusted.translate.y = handWorld.translate.y + lag.y;
-                        adjusted.translate.z = handWorld.translate.z + lag.z;
-                        adjusted.scale = 1.0f;
-                        // Priority 110 > wall-pushback(100)/soft-contact(80): while holding, the
-                        // hand belongs to the object, not to wall pushback.
-                        frikFollow.ApplyExternalHandWorldTransform(isLeft, adjusted, 110);
-                        state.handFollowActive = true;
-
-                        // INSTRUMENTATION (Jul 5): held-object jitter + hand-follow coupling.
-                        // objLagFromTarget = how far the dynamic object is from its hand-derived
-                        // target (oscillation here = drive jitter / bounce); handShift = how far
-                        // that MOVES the rendered hand (the "object hits something -> hand moves"
-                        // coupling the user wants gone). Sampled ~6 Hz -> HeisenbergF4VR.log.
-                        if (spdlog::should_log(spdlog::level::debug)) {
-                            static int s_followDiag[2] = { 0, 0 };
-                            const int fi = isLeft ? 0 : 1;
-                            if ((++s_followDiag[fi] % 15) == 0) {
-                                const float rawLagLen = std::sqrt(rawLag.x * rawLag.x + rawLag.y * rawLag.y + rawLag.z * rawLag.z);
-                                const float lagLen2 = std::sqrt(lag.x * lag.x + lag.y * lag.y + lag.z * lag.z);
-                                spdlog::debug("[GRAB-DIAG] {} mode={} objLagFromTarget={:.2f}gu handShift={:.2f}gu bodyPos=({:.1f},{:.1f},{:.1f}) targetPos=({:.1f},{:.1f},{:.1f})",
-                                    isLeft ? "L" : "R", GetEffectiveGrabMode(),
-                                    rawLagLen, lagLen2,
-                                    bodyPos.x, bodyPos.y, bodyPos.z, targetPos.x, targetPos.y, targetPos.z);
-                            }
-                        }
-                    }
-                }
-            }
-            else
             {
                 // =================================================================
                 // VISUAL UPDATE - Update node and propagate to children (keyframed)

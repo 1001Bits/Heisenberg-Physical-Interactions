@@ -14,23 +14,14 @@
 #include "F4VROffsets.h"
 #include "FRIKInterface.h"
 #include "Grab.h"
-#include "GrabConstraint.h"
 #include "Hand.h"
 #include "HeisenbergInterface001.h"
 #include "Highlight.h"
 #include "HandCollision.h"
 #include "FingerCurves.h"
 #include "WandNodeHelper.h"
-#include "HeldBodyGrab.h"
 #include "HandBumpHook.h"
 #include "HavokTimingFix.h"
-#include "rock_integration/grab/RockGrabCoreManager.h"
-// ROCK integration subsystems (toggled in [RockIntegration] INI section)
-#include "rock_integration/HandBoneColliderSet.h"
-#include "rock_integration/BodyBoneColliderSet.h"
-#include "rock_integration/WeaponCollision.h"
-#include "rock_integration/TwoHandedGrip.h"
-#include "HandWallPushback.h"
 #include "Hooks.h"
 #include "ItemInsertHandler.h"
 #include "ItemOffsets.h"
@@ -292,16 +283,6 @@ namespace heisenberg
             heisenberg::NodeCaptureMode::GetSingleton().ClearState();
             // Destroy hand collision bodies - world/body pointers become invalid on load
             heisenberg::HandCollision::GetSingleton().Shutdown();
-            // Shutdown HeldBody grab system - constraints/hand bodies become invalid
-            heisenberg::HeldBodyGrabManager::GetSingleton().Shutdown();
-            // Shutdown ROCK collider modules - their cached bhk/hknp world + bodies become
-            // invalid on load. Without this they'd drive bodies in a freed world (UAF).
-            heisenberg::rock_hand_collider::Shutdown();
-            heisenberg::rock_body_collider::Shutdown();
-            heisenberg::rock_weapon_collision::Shutdown();
-            heisenberg::rock_grab_core::RockGrabCoreManager::GetSingleton().Shutdown();
-            // Release any active FRIK hand-pushback overrides + reset tracking.
-            heisenberg::hand_wall_pushback::Reset();
             heisenberg::HandAuthority::Reset();
             // Clear thrown-object tracking - tracked bodies, pending impacts, and the cached
             // hknpWorld pointer all become stale across a load (UAF on first post-load throw).
@@ -344,16 +325,6 @@ namespace heisenberg
             heisenberg::NodeCaptureMode::GetSingleton().ClearState();
             // Destroy hand collision bodies - world/body pointers become invalid on load
             heisenberg::HandCollision::GetSingleton().Shutdown();
-            // Shutdown HeldBody grab system - constraints/hand bodies become invalid
-            heisenberg::HeldBodyGrabManager::GetSingleton().Shutdown();
-            // Shutdown ROCK collider modules - their cached bhk/hknp world + bodies become
-            // invalid on load. Without this they'd drive bodies in a freed world (UAF).
-            heisenberg::rock_hand_collider::Shutdown();
-            heisenberg::rock_body_collider::Shutdown();
-            heisenberg::rock_weapon_collision::Shutdown();
-            heisenberg::rock_grab_core::RockGrabCoreManager::GetSingleton().Shutdown();
-            // Release any active FRIK hand-pushback overrides + reset tracking.
-            heisenberg::hand_wall_pushback::Reset();
             heisenberg::HandAuthority::Reset();
             // Clear thrown-object tracking - tracked bodies, pending impacts, and the cached
             // hknpWorld pointer all become stale across a load (UAF on first post-load throw).
@@ -499,7 +470,7 @@ namespace heisenberg
                     // frame — after its weapon write, before the bone-tree flatten — so the
                     // rendered hand tracks the rendered weapon with zero lag.
                     rock::HostSetPostUpdateCallback(&heisenberg::HandAuthority::ApplyWinners);
-                    // iGrabMode=9 (RockNativeGrab): cede grab+selection ownership to the embedded
+                    // iGrabMode=9 (Full Dynamic): cede grab+selection ownership to the embedded
                     // engine for the whole session (read from the boot ini — g_config loads later).
                     // The seam forces the embed's bGrabEnabled/bSelectionEnabled ON across every
                     // ROCK.ini (re)load; Heisenberg's grip handlers stand down via GetEffectiveGrabMode.
@@ -535,23 +506,16 @@ namespace heisenberg
         // Apply grip weapon draw patch based on config (like STUF VR)
         Hooks::SetGripWeaponDrawDisabled(g_config.disableGripWeaponDraw);
 
-        // Arm the player char-proxy bump guard whenever physics hand bodies are active
-        // (they generate the player-proxy bumps that fault without it), or when forced on.
-        // Integration audit C4: the embedded ROCK engine spawns its OWN hand bodies (HBCS)
-        // independent of Heisenberg's hand-body flags, and ROCK's own installBumpHook is a
-        // dead patch (we hooked 0x1E24980 first, so its validation memcmp fails). Force our
-        // guard on whenever the engine is hosted, else the char-proxy bump hits the known CTD.
+        // Arm the player char-proxy bump guard when forced on, or when the embedded engine
+        // is hosted. Integration audit C4: the embedded ROCK engine spawns its OWN hand
+        // bodies (HBCS) and ROCK's own installBumpHook is a dead patch (we hooked 0x1E24980
+        // first, so its validation memcmp fails). Force our guard on whenever the engine is
+        // hosted, else the char-proxy bump hits the known CTD.
         HandBumpHook::SetEnabled(g_config.rockHandBumpGuard
-                                 || g_config.usePhysicsHandBodies
-                                 || g_config.rockHandBoneColliderSet
                                  || s_rockEngineHosted);
 
         // Enable the ROCK Havok timing-fix substep override per config.
         HavokTimingFix::SetEnabled(g_config.havokTimingFix);
-
-        // Initialize the ROCK grab-core host (idempotent). Selectable as iGrabMode=8 once
-        // bUseRockGrabCore is on; harmless otherwise.
-        rock_grab_core::RockGrabCoreManager::GetSingleton().Initialize();
 
         // Apply terminal-on-Pipboy patches based on config (after MCM settings loaded)
         Hooks::ApplyTerminalPatches(g_config.forceTerminalOnWrist);
@@ -596,11 +560,6 @@ namespace heisenberg
             spdlog::warn("Heisenberg will use fallback hand tracking (finger poses may not work)");
         }
 
-        // Initialize constraint grab manager for physics-based grabbing
-        // (Motor constraints not yet implemented - uses keyframe mode)
-        auto& constraintMgr = ConstraintGrabManager::GetSingleton();
-        constraintMgr.Initialize();
-
         // Hand collision system — physics bodies for VR hands (push/touch detection)
         if (g_config.enableHandCollision) {
             auto& handCollision = HandCollision::GetSingleton();
@@ -609,22 +568,10 @@ namespace heisenberg
             }
         }
 
-        // ROCK integration subsystems — each gated by its own INI toggle
-        // (bRockCollisionSuppressionRegistry / bRockHandBoneColliderSet / etc.).
-        // Init is harmless when toggle is off (logs and returns).
-        heisenberg::rock_hand_collider::Init();
-        heisenberg::rock_body_collider::Init();
-        heisenberg::rock_weapon_collision::Init();
-        heisenberg::rock_two_handed_grip::Init();
-        // CollisionSuppressionRegistry has no init — it's lazy-constructed on first acquire.
+        // (Two-scenario cleanup: the [RockIntegration] hand-ported subsystem inits —
+        // rock_hand_collider / rock_body_collider / rock_weapon_collision /
+        // rock_two_handed_grip — were removed with those modules.)
 
-        // HeldBody grab system — HIGGS Skyrim-style dynamic grab backend
-        if (g_config.UseHeldBodyManagedGrab()) {
-            auto& heldBodyMgr = HeldBodyGrabManager::GetSingleton();
-            if (heldBodyMgr.Initialize()) {
-                spdlog::info("HeldBody grab system initialized");
-            }
-        }
 
         // Initialize item offset system for per-item grab positioning
         auto& itemOffsets = ItemOffsetManager::GetSingleton();
@@ -1055,47 +1002,6 @@ namespace heisenberg
                 if (modHandlesThrowable && !inMenu && aButtonHeldLongEnough) {
                     state->ulButtonPressed |= gripMask;
                     state->ulButtonPressed &= ~aButtonMaskTW;
-                }
-
-                // =====================================================================
-                // ROCK DYNAMIC HANDOFF — synthetic grip release->press edge for ROCK
-                // =====================================================================
-                // After Heisenberg places a grabbed object and hands it to ROCK, force
-                // grip OFF for a few frames on the handoff hand. ROCK (edge-triggered)
-                // sees release; once these frames elapse the real (still-held) grip
-                // forms the press edge ROCK needs to grab the placed object. The suppress
-                // counter (decremented here once/frame for this hand) blocks Heisenberg
-                // re-grabbing on that same edge.
-                {
-                    int hoHand = modInst._rockHandoffHand.load(std::memory_order_relaxed);
-                    if (hoHand == (isLeft ? 1 : 0)) {
-                        int off = modInst._rockHandoffGripOffFrames.load(std::memory_order_relaxed);
-                        if (off > 0) {
-                            // Release phase: force grip OFF so ROCK sees a release.
-                            state->ulButtonPressed &= ~gripMask;
-                            modInst._rockHandoffGripOffFrames.store(off - 1, std::memory_order_relaxed);
-                        } else {
-                            int on = modInst._rockHandoffGripOnFrames.load(std::memory_order_relaxed);
-                            if (on > 0) {
-                                // Press phase: force grip ON. This OVERRIDES the primary-hand
-                                // grip strip above (which otherwise hides grip from ROCK on the
-                                // right hand), giving ROCK a clean press edge to grab on.
-                                state->ulButtonPressed |= gripMask;
-                                state->ulButtonPressed &= ~aButtonMaskTW;
-                                modInst._rockHandoffGripOnFrames.store(on - 1, std::memory_order_relaxed);
-                                if (on - 1 == 0) {
-                                    spdlog::info("[ROCK-HANDOFF] forced press window done ({} hand) — ROCK should have grabbed", isLeft ? "L" : "R");
-                                }
-                            }
-                        }
-                        int sup = modInst._rockHandoffSuppressGrabFrames.load(std::memory_order_relaxed);
-                        if (sup > 0) {
-                            modInst._rockHandoffSuppressGrabFrames.store(sup - 1, std::memory_order_relaxed);
-                            if (sup - 1 == 0) {
-                                modInst._rockHandoffHand.store(-1, std::memory_order_relaxed);
-                            }
-                        }
-                    }
                 }
 
                 // (Removed redundant "block grip while grabbing": the A+Grip block earlier
