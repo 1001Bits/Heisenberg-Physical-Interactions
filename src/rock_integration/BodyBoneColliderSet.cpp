@@ -69,6 +69,9 @@ namespace heisenberg::rock_body_collider
     // Live descriptor pointer — flipped on PA state change, triggers rebuild.
     static const Descriptor* g_active = kStandard;
     static bool g_lastPaState = false;
+    // Last fHandColliderRadiusPadding value the real capsule bodies were built with —
+    // lets Update() detect a live MCM slider change and force a rebuild (see Update()).
+    static float g_lastAppliedPadding = 0.0f;
 
     struct Instance
     {
@@ -132,7 +135,11 @@ namespace heisenberg::rock_body_collider
             g_bodies[i].startBone.reset(s);
             g_bodies[i].endBone.reset(e);
 
-            void* shape = BuildHull(d.length * 0.5f, d.radius);
+            // fHandColliderRadiusPadding pads the REAL physics capsule radius here (not just
+            // the geometry-only soft-contact copy in BuildBodyCapsules below) so resting
+            // objects actually clip less against the forearm/torso, matching HandBoneColliderSet's
+            // roleRadius() which reaches both its physics-body and soft-contact build sites.
+            void* shape = BuildHull(d.length * 0.5f, d.radius + heisenberg::g_config.handColliderRadiusPadding);
             if (!shape) continue;
 
             auto* bb = new BPB();
@@ -285,6 +292,20 @@ namespace heisenberg::rock_body_collider
             if (g_built) TearDownAll();
         }
 
+        // Radius-padding change detection: BuildAll() only reads
+        // g_config.handColliderRadiusPadding at build time, so an MCM slider change mid-
+        // session would otherwise have no visible effect until the next world/PA-triggered
+        // rebuild. Force one here instead.
+        const float paddingNow = heisenberg::g_config.handColliderRadiusPadding;
+        if (paddingNow != g_lastAppliedPadding) {
+            if (g_built) {
+                spdlog::info("[ROCK::BodyBoneCollider] Radius padding changed {} -> {} — rebuilding capsule set",
+                             g_lastAppliedPadding, paddingNow);
+                TearDownAll();
+            }
+            g_lastAppliedPadding = paddingNow;
+        }
+
         if (!g_built) {
             // Body bones (SPINE1, Pelvis, Chest, LArm_*, RArm_*, LLeg_*, RLeg_*) live
             // on FRIK's third-person avatar under getCommonNode() ("COM"). They are
@@ -353,7 +374,7 @@ namespace heisenberg::rock_body_collider
             }
             out[i].start = s->world.translate;
             out[i].end = e->world.translate;
-            out[i].radius = desc[i].radius;
+            out[i].radius = desc[i].radius + heisenberg::g_config.handColliderRadiusPadding;
             out[i].id = static_cast<std::uint32_t>(300 + i);
             out[i].valid = true;
             ++n;

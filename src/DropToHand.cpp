@@ -1373,8 +1373,11 @@ namespace heisenberg
                         continue;
                     }
 
-                    // Ready to process? (after 0.1s delay)
-                    if (lootIt->timeQueued >= 0.1f) {
+                    // Ordinary inventory transfers get a short settle for their container
+                    // event/3D. Explicit physical handoffs (such as pulling a tape from the
+                    // visible Pip-Boy deck) already own their source state and can dispatch on
+                    // the very next update, eliminating the visible empty-hand gap.
+                    if (lootIt->bypassInitialDelay || lootIt->timeQueued >= 0.1f) {
                         lootsToProcess.push_back(*lootIt);
                         lootIt = _pendingLoots.erase(lootIt);
                     } else {
@@ -1542,7 +1545,13 @@ namespace heisenberg
         return true;
     }
 
-    void DropToHand::QueueDropToHand(RE::TESFormID baseFormID, bool isLeft, int itemCount, bool stickyGrab, bool markAsSmartGrab)
+    void DropToHand::QueueDropToHand(
+        RE::TESFormID baseFormID,
+        bool isLeft,
+        int itemCount,
+        bool stickyGrab,
+        bool markAsSmartGrab,
+        bool bypassInitialDelay)
     {
         std::lock_guard<std::mutex> lock(_mutex);
         PendingLoot loot;
@@ -1553,9 +1562,11 @@ namespace heisenberg
         loot.forcedIsLeft = isLeft;
         loot.stickyGrab = stickyGrab;
         loot.markAsSmartGrab = markAsSmartGrab;
+        loot.bypassInitialDelay = bypassInitialDelay;
         _pendingLoots.push_back(loot);
 
-        spdlog::debug("[DropToHand] Queued {:08X} x{} for drop to {} hand (sticky={}, smartGrab={})",
-            baseFormID, itemCount, isLeft ? "left" : "right", stickyGrab, markAsSmartGrab);
+        spdlog::debug("[DropToHand] Queued {:08X} x{} for drop to {} hand (sticky={}, smartGrab={}, immediate={})",
+            baseFormID, itemCount, isLeft ? "left" : "right", stickyGrab, markAsSmartGrab,
+            bypassInitialDelay);
     }
 }

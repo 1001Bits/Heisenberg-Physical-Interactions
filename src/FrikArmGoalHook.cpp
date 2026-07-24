@@ -281,11 +281,10 @@ namespace heisenberg::FrikArmGoalHook
                 return ret;
             }
 
-            // Rigid weapon targets are an exact hand-to-gun weld. ROCK has already limited
-            // reach upstream by translating the complete weapon, so neither the controller
-            // escape envelope nor a hand-only reach projection is legal here: either would
-            // visibly separate the palm from the rifle. Keep those safeguards for free hand
-            // authority writers only.
+            // Rigid weapon targets are an exact hand-to-gun weld. A hand-only projection
+            // here would visibly separate the palm from the rifle; the host's final
+            // support-arm solve applies the bounded visual reach allowance after this pass.
+            // Keep the escape envelope and early projection for free-hand writers only.
             if (!reachLimitedRigidWeaponTarget) {
                 constexpr float kFreeRadius = 22.0f;   // perp: anchor fully released beyond this
                 constexpr float kAlongEscape = 40.0f;  // along-barrel bailout distance

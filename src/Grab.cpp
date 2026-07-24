@@ -5,6 +5,7 @@
 #include "rock_integration/CollisionSuppressionRegistry.h"
 #include "rock_integration/grab/GrabNodeNamePolicy.h"
 #include "rock_integration/grab/RockGrabCoreManager.h"
+#include "../external/ROCK/src/physics-interaction/grab/TouchGrabBridge.h"
 #include "DropToHand.h"
 #include "DualWieldAPI.h"
 #include "F4VROffsets.h"
@@ -309,6 +310,15 @@ namespace
 
     bool ApplyConfiguredFingerCurls(const heisenberg::GrabState& state, bool isLeft)
     {
+        // NATURAL (touch) grabs invert the priority: the object is held at an arbitrary
+        // touched pose, so the mesh-solved runtime curls are the ones that actually line
+        // up with it — the authored per-item pose was made for the snapped/offset seat and
+        // curls straight through the mesh here. Without this exception the per-frame
+        // reapply sites would silently revert ResolvePendingFingerCurls' geometry solve to
+        // the stored pose ONE FRAME after it lands (review-confirmed failure).
+        if (state.naturalFingerPosing && state.hasRuntimeFingerCurls && ApplyRuntimeFingerCurls(state, isLeft)) {
+            return true;
+        }
         // A hand-authored per-item pose is authoritative.  Automatic geometry
         // curls are only a fallback for objects that do not have one.
         if (HasStoredFingerCurls(state) && ApplyStoredFingerCurls(state, isLeft)) {
@@ -841,6 +851,26 @@ namespace
     {
         if (!state.pendingFingerCurls || state.isPulling) {
             return false;
+        }
+
+        // NATURAL (touch) grabs hold the object at an arbitrary pose relative to the hand,
+        // so saved offset curls (authored against the snapped/offset pose) don't line up
+        // with the mesh — solve from the actual geometry first and use saved curls only as
+        // a fallback. Snap/offset grabs keep the original saved-curls-first order.
+        if (state.naturalFingerPosing &&
+            TryCalculateRuntimeFingerCurlsFromGeometry(state, wandNode, isLeft) &&
+            ApplyRuntimeFingerCurls(state, isLeft))
+        {
+            state.pendingFingerCurls = false;
+            spdlog::debug(
+                "[GRAB-FINGERS] {} applied geometry curls (natural grab, mesh-first): thumb={:.2f} index={:.2f} mid={:.2f} ring={:.2f} pinky={:.2f}",
+                context,
+                state.runtimeThumbCurl,
+                state.runtimeIndexCurl,
+                state.runtimeMiddleCurl,
+                state.runtimeRingCurl,
+                state.runtimePinkyCurl);
+            return true;
         }
 
         if (ApplyStoredFingerCurls(state, isLeft)) {
@@ -4968,10 +4998,69 @@ namespace heisenberg
         }
         else
         {
-            // Close grab or palm snap — use item offset immediately
+            // Close grab or palm snap.
             state.isPulling = false;
-            state.grabOffsetLocal = state.itemOffset.position;
-            spdlog::debug("[GRAB] StartGrab: using item offset directly (dist={:.1f}cm)", distToObject);
+
+            // TOUCH GRAB (2026-07-23): when the hand is in actual contact with the object
+            // (not just "close" per naturalGrabThreshold), skip the stored/authored item
+            // offset entirely. Move the object exactly like telekinesis — preserve its
+            // current world-space offset from the hand, no snap — and solve finger curl
+            // against the object's real mesh (ROCK's own grab-finger solver) so fingers
+            // stop just short of the surface instead of assuming a pre-authored pose.
+            constexpr float kTouchGrabMaxDistance = 3.0f;  // game units — genuine contact, not just "close"
+            bool touchGrabApplied = false;
+            // Review-hardened gates (Jul 24): with Telekinesis (bEnableNaturalGrab) ON, the
+            // telekinesis branch captures every ordinary in-contact grab before this block —
+            // the only things still reaching it in contact range are (a) HOLOTAPES, whose
+            // forced palm-snap + shared NOTE_DEFAULT offset above is deliberate (a touch-pose
+            // hold also visibly shifts when the 0.7x holotape rescale lands after the offset
+            // capture), and (b) users who explicitly turned Telekinesis OFF, for whom a
+            // no-snap touch hold silently overrides their chosen snap-to-palm behavior. Both
+            // must keep the normal offset path.
+            const bool touchGrabEligible = heisenberg::g_config.enableNaturalGrab && !isHolotape;
+            if (touchGrabEligible && distToObject <= kTouchGrabMaxDistance && state.node && wandNode)
+            {
+                std::array<float, 15> jointCurls{};
+                if (rock::touch_grab_bridge::SolveTouchGrabFingerPose(
+                        state.node.get(), wandNode->world, isLeft, handPos, jointCurls))
+                {
+                    // Preserve item dimensions (just populated above via
+                    // GetItemDimensions) and fingerDistance across the full
+                    // itemOffset reset below - otherwise the calibration UI
+                    // (ItemPositionConfigMode) shows 0x0x0 dimensions for
+                    // touch-grabbed items, and any offset saved from that
+                    // state gets disqualified by FindSimilarOffset's
+                    // dimension check. Same preserve-then-reset idiom as the
+                    // telekinesis branch above.
+                    const float preservedLength = state.itemOffset.length;
+                    const float preservedWidth = state.itemOffset.width;
+                    const float preservedHeight = state.itemOffset.height;
+                    const float preservedFingerDistance = state.itemOffset.fingerDistance;
+                    state.grabOffsetLocal = objectPos - handPos;
+                    state.itemOffset = ItemOffset();
+                    state.itemOffset.length = preservedLength;
+                    state.itemOffset.width = preservedWidth;
+                    state.itemOffset.height = preservedHeight;
+                    state.itemOffset.fingerDistance = preservedFingerDistance;
+                    state.itemOffset.hasJointCurls = true;
+                    for (int ji = 0; ji < 15; ++ji) state.itemOffset.jointCurls[ji] = jointCurls[ji];
+                    state.itemOffset.position = wandNode->world.rotate * state.grabOffsetLocal;
+                    state.itemOffset.rotation = worldTransform.rotate * wandNode->world.rotate.Transpose();
+                    state.hasItemOffset = false;
+                    state.isFRIKOffset = false;
+                    state.isNaturalGrab = true;
+                    touchGrabApplied = true;
+                    spdlog::debug("[GRAB] StartGrab: TOUCH GRAB — mesh-solved finger curl, no snap (dist={:.1f}cm)", distToObject);
+                }
+            }
+
+            if (!touchGrabApplied)
+            {
+                // Fallback: stored/authored item offset (existing palm-snap behavior) for
+                // grabs that are close but not in genuine mesh contact.
+                state.grabOffsetLocal = state.itemOffset.position;
+                spdlog::debug("[GRAB] StartGrab: using item offset directly (dist={:.1f}cm)", distToObject);
+            }
         }
 
         // ROCK grab-node anchoring (toggle bGrabNodeAnchor): if the grabbed object exposes
@@ -5147,10 +5236,14 @@ namespace heisenberg
         state.naturalFingerPosing = naturalPosing;  // persists so per-frame reapply keeps the wrap
         if ((!state.isTelekinesis || naturalPosing) && state.node)
         {
-            // Saved per-item finger curls ALWAYS win — for both hands, including natural
-            // grabs. Only when an item has NO saved curls do we compute geometry curls (and
-            // force them for a natural grab so the hand still wraps the mesh). This makes a
-            // hand-authored pose stick regardless of how the item was grabbed.
+            // Saved per-item finger curls win for SNAP/OFFSET grabs — there the object is
+            // seated in exactly the pose the curls were authored against. For a NATURAL
+            // (touch) grab the object stays wherever it was touched, at an arbitrary pose
+            // relative to the hand, so those same authored curls no longer line up with the
+            // mesh — a near-fist saved pose curls the fingers straight through the object
+            // (user-confirmed with Radroach Meat). Natural grabs therefore solve curls from
+            // the actual geometry first and keep saved curls only as a fallback (see
+            // ResolvePendingFingerCurls, which honors naturalFingerPosing the same way).
             const bool hasStoredCurls = HasStoredFingerCurls(state);
             auto& frik = FRIKInterface::GetSingleton();
             if (frik.IsAvailable()) {
@@ -5162,7 +5255,7 @@ namespace heisenberg
                     state.pendingFingerCurls = true;  // resolved to stored/geometry on arrival
                     state.ClearRuntimeFingerCurls();
                     spdlog::debug("[GRAB-FINGERS] Deferred curls (stored first, geometry fallback) until object reaches the hand");
-                } else if (hasStoredCurls && ApplyStoredFingerCurls(state, isLeft)) {
+                } else if (!naturalPosing && hasStoredCurls && ApplyStoredFingerCurls(state, isLeft)) {
                     spdlog::debug("[GRAB-FINGERS] Applied saved offset curls for '{}'", itemName);
                 } else if (wandNode && (!state.isTelekinesis || state.naturalFingerPosing)) {
                     // POST-SNAP SOLVE (Jul 19 finger audit): solving here reads the object's
@@ -6806,7 +6899,11 @@ namespace heisenberg
                         }
                     }
                     // Check if target is a world container (chest, desk, etc.)
-                    else if (!containerRef) {
+                    // Gated on its OWN MCM toggle — this shared block is entered via
+                    // bEnableDropToCompanion, but the MCM exposes a separate
+                    // "Drop To Container" switcher that was previously wired to nothing
+                    // (review-confirmed dead entry), so container drops ignored it.
+                    else if (!containerRef && g_config.enableDropToContainer) {
                         auto* baseForm = targetRefr->GetObjectReference();
                         if (baseForm && baseForm->GetFormType() == RE::ENUM_FORM_ID::kCONT) {
                             containerRef = targetRefr.get();
@@ -7763,9 +7860,27 @@ namespace heisenberg
                                     std::memcpy(&bodyIdRaw, &hit.bodyId, sizeof(bodyIdRaw));
                                     std::uint32_t filter = 0;
                                     if (hknpWorld &&
-                                        heisenberg::Physics::TryReadBodyFilterInfo(hknpWorld, bodyIdRaw, filter) &&
-                                        (filter & 0x7Fu) == 43u) {
-                                        ownCollider = true;
+                                        heisenberg::Physics::TryReadBodyFilterInfo(hknpWorld, bodyIdRaw, filter)) {
+                                        const std::uint32_t hitLayer = filter & 0x7Fu;
+                                        if (hitLayer == 43u) {
+                                            ownCollider = true;
+                                        }
+                                        // PLAYER-BODY EXCLUSION (Jul 24, "springy coin"): moving a
+                                        // held object DOWN toward yourself sweeps it into the
+                                        // player's own character-controller capsule (kCharController
+                                        // layer 30 / biped 8) — the clamp then stops the object
+                                        // short of the hand every frame, so it visibly lags and the
+                                        // fingers clip through it. Your own body must never wall-
+                                        // clamp what your own hand carries.
+                                        if (hitLayer == 30u || hitLayer == 8u) {
+                                            ownCollider = true;
+                                        }
+                                        // Also exclude by body id: the player's proxy body,
+                                        // whatever layer it reports.
+                                        const std::uint32_t playerBodyId = heisenberg::Physics::GetPlayerBodyId();
+                                        if (playerBodyId != 0 && playerBodyId != 0x7FFFFFFFu && bodyIdRaw == playerBodyId) {
+                                            ownCollider = true;
+                                        }
                                     }
                                 }
                             }

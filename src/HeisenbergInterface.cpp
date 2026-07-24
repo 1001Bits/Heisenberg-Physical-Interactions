@@ -69,7 +69,10 @@ namespace HeisenbergPluginAPI {
     static unsigned long long g_offhandGripBlockedAtMs = 0;       // 0 = unblocked
     static unsigned long long g_handCollisionDisabledAtMs[2] = { 0, 0 };  // [0]=Right [1]=Left; 0 = enabled
 
-    static bool IsExternalLeaseActive(unsigned long long& ts, bool&, const char*)
+    // Jul 24 (user directive: "never use the lease again"): renamed from
+    // IsExternalLeaseActive — the 5s-TTL lease is permanently gone and must not come
+    // back; this is a plain latch check and the name now says so.
+    static bool IsExternalLatchActive(unsigned long long& ts, bool&, const char*)
     {
         return ts != 0;
     }
@@ -760,18 +763,18 @@ namespace HeisenbergPluginAPI {
 
     bool IsWeaponCollisionDisabledByAPI()
     {
-        return IsExternalLeaseActive(g_weaponCollisionDisabledAtMs, g_unusedLeaseLogFlag, "weapon-collision disable");
+        return IsExternalLatchActive(g_weaponCollisionDisabledAtMs, g_unusedLeaseLogFlag, "weapon-collision disable");
     }
 
     bool IsOffHandGripBlockedByAPI()
     {
-        return IsExternalLeaseActive(g_offhandGripBlockedAtMs, g_unusedLeaseLogFlag, "off-hand grip block");
+        return IsExternalLatchActive(g_offhandGripBlockedAtMs, g_unusedLeaseLogFlag, "off-hand grip block");
     }
 
     bool IsHandCollisionDisabledByAPI(bool isLeft)
     {
         const int idx = isLeft ? 1 : 0;
-        return IsExternalLeaseActive(g_handCollisionDisabledAtMs[idx], g_unusedLeaseLogFlag,
+        return IsExternalLatchActive(g_handCollisionDisabledAtMs[idx], g_unusedLeaseLogFlag,
                                      isLeft ? "left hand-collision disable" : "right hand-collision disable");
     }
 

@@ -80,6 +80,10 @@ namespace heisenberg
         // Get FRIK mod version string (e.g. "0.77.1")
         const char* GetModVersion() const;
 
+        // API v2-v4 have no runtime blocker for FRIK's own two-handed weapon solver.
+        // When embedded ROCK owns that job, enforce the live FRIK INI setting instead.
+        bool ReconcileLegacyOffHandGrippingIni() const;
+
         // --- v9 hand pushback API ---------------------------------------------------------
         // True only when the loaded FRIK is API v9+ (the external-hand-transform functions
         // exist). Core FRIK features work on older FRIK; pushback requires v9.

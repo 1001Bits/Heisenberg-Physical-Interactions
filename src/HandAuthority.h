@@ -51,9 +51,9 @@ namespace heisenberg
             bool* rigidWeaponTarget = nullptr);
 
         // Project a free visual target onto the current anatomical wrist-reach sphere.
-        // Full-solver rigid weapon targets are constrained upstream by moving the complete
-        // weapon; TryConsumeLatched reports that specific capability so callers do not
-        // separate its hand with a second hand-only projection.
+        // Full-solver rigid weapon targets are handled by the complete support-arm solve;
+        // TryConsumeLatched reports that capability so callers do not separate a rigid
+        // palm from its weapon with an earlier hand-only projection.
         static bool ConstrainTargetToArmReach(bool isLeft, RE::NiTransform& target,
             float* requestedDistance = nullptr, float* maxReach = nullptr);
 

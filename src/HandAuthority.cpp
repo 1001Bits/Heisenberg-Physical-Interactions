@@ -2,6 +2,7 @@
 #include "WandNodeHelper.h"
 #include "FrikArmGoalHook.h"
 #include "../external/ROCK/src/ROCKMain.h"
+#include "physics-interaction/weapon/TwoHandedWeaponPolicy.h"
 #include "common/MatrixUtils.h"
 #include "f4vr/F4VRUtils.h"
 
@@ -118,6 +119,26 @@ namespace heisenberg
 
         constexpr float kArmReachSafetyMargin = 0.15f;
 
+        // [PA-JITTER FIX] Width (game units) of the blend zone below reachableHsLen over
+        // which the arm-reach clamp in solveArmFrik() eases in, instead of snapping the
+        // whole hand/arm target instantly the moment requestedHsLen crosses the boundary.
+        // Ordinary walk/turn sway repeatedly nudges the support-grip point across a razor
+        // -thin (0.15gu) threshold near full extension, which is common in power armor
+        // (see naturalArmReach's PA-topology branch) - see solveArmFrik for the smoothed
+        // application.
+        constexpr float kArmReachSoftBlend = 3.0f;
+
+        // Cubic (Hermite) smoothstep on [edge0, edge1]: 0 at/below edge0, 1 at/above edge1,
+        // continuous first derivative in between. Used to blend hard numeric discontinuities
+        // in solveArmFrik() into soft transition zones.
+        float smoothstep(float edge0, float edge1, float x)
+        {
+            const float t = edge1 > edge0 ?
+                std::clamp((x - edge0) / (edge1 - edge0), 0.0f, 1.0f) :
+                (x >= edge1 ? 1.0f : 0.0f);
+            return t * t * (3.0f - 2.0f * t);
+        }
+
         constexpr float armReachProjectionScale(float requestedDistance, float maxReach)
         {
             return requestedDistance > maxReach && requestedDistance > 0.0f ?
@@ -144,7 +165,14 @@ namespace heisenberg
             }
 
             const float upperLen = vlen(arm.foreArm->local.translate);
-            const bool inPowerArmor = !arm.foreArm2 || !arm.foreArm3;
+            // PA-CONVENTION FIX (Jul 24, workflow-confirmed): the PA skeleton HAS
+            // ForeArm2/3 (ROCK's PA bone cache resolves 46/46 incl. both), so absence-
+            // detection ran the NON-PA convention in power armor while FRIK 0.77.12 —
+            // PA-aware for the first time since the isInPowerArmor() fix — poses the
+            // same arm with its PA convention every frame. The two writers fighting is
+            // the reported PA arm-armor misrender + per-step glove jitter. Key off the
+            // authoritative flag first; keep the null-topology fallback for safety.
+            const bool inPowerArmor = f4cf::f4vr::isInPowerArmor() || !arm.foreArm2 || !arm.foreArm3;
             const float forearmLen = inPowerArmor ?
                 vlen(arm.hand->local.translate) :
                 vlen(arm.foreArm2->local.translate) +
@@ -332,7 +360,11 @@ namespace heisenberg
         struct FrikSolveDiag { float hsLen = 0, reach = 0; bool stretched = false; };
         FrikSolveDiag g_frikDiag[2];
 
-        bool solveArmFrik(const ArmChain& arm, bool isLeft, const RE::NiTransform& worldT)
+        bool solveArmFrik(
+            const ArmChain& arm,
+            bool isLeft,
+            const RE::NiTransform& worldT,
+            float requestedArmLengthScale)
         {
             using MU = f4cf::common::MatrixUtils;
             if (!arm.shoulder || !arm.chest) {
@@ -352,8 +384,14 @@ namespace heisenberg
             }
 
             // FRIK defaults: g_config.armLength = 36.74 -> adjustedArmLength = 1.0.
+            // A weapon support grip gets one small, bounded extension so a physically
+            // straight offhand can remain seated without translating the gun or primary
+            // grip. No other hand-authority writer receives stretched anatomy.
             constexpr float kArmLength = 36.74f;
-            const float adjustedArmLength = 1.0f;
+            const float adjustedArmLength = std::clamp(
+                std::isfinite(requestedArmLengthScale) ? requestedArmLengthScale : 1.0f,
+                1.0f,
+                rock::two_handed_weapon_policy::kSupportArmLengthScale);
 
             // Body direction context (FRIK derives these in its body pass): forward = the
             // skinned chest facing projected to XY; sideways = right of forward. These shape
@@ -373,7 +411,7 @@ namespace heisenberg
 
             // ---- shoulder IK (verbatim) ----
             RE::NiPoint3 shoulderToHand = handPos - arm.upperArm->world.translate;
-            const float armLength = kArmLength;
+            const float armLength = kArmLength * adjustedArmLength;
             const float adjustAmount = (std::clamp)(MU::vec3Len(shoulderToHand) - armLength * 0.5f, 0.0f, armLength * 0.85f) / (armLength * 0.85f);
             const RE::NiPoint3 shoulderOffset = MU::vec3Norm(shoulderToHand) * (adjustAmount * armLength * 0.08f);
 
@@ -382,14 +420,29 @@ namespace heisenberg
             arm.shoulder->local.rotate = MU::getMatrixFromRotateVectorVec(sLocalDir, RE::NiPoint3(1, 0, 0)) * arm.shoulder->local.rotate;
             f4cf::f4vr::updateTransformsDown(arm.shoulder, true);
 
-            // ---- bone lengths (verbatim; power-armor branch = missing forearm2/3) ----
-            const bool inPowerArmor = !arm.foreArm2 || !arm.foreArm3;
+            // ---- bone lengths ----
+            // PA-CONVENTION FIX (Jul 24, workflow-confirmed): key the PA branch off the
+            // authoritative flag, not ForeArm2/3 absence — the PA skeleton HAS those bones,
+            // so absence-detection ran the non-PA topology here while FRIK's (now correctly
+            // PA-aware) Skeleton posed the same arm with the PA convention every frame.
+            // That per-frame fight is the reported PA arm misrender + per-step jitter.
+            const bool inPowerArmor = f4cf::f4vr::isInPowerArmor() || !arm.foreArm2 || !arm.foreArm3;
             const float originalUpperLen = MU::vec3Len(arm.foreArm->local.translate);
             const float originalForearmLen = inPowerArmor
                 ? MU::vec3Len(arm.hand->local.translate)
                 : MU::vec3Len(arm.hand->local.translate) + MU::vec3Len(arm.foreArm2->local.translate) + MU::vec3Len(arm.foreArm3->local.translate);
-            float upperLen = originalUpperLen * adjustedArmLength;
-            float forearmLen = originalForearmLen * adjustedArmLength;
+            // PA-SCALE FIX (Jul 24, workflow-confirmed): local bone lengths are compared
+            // against WORLD-space targets below, so they must carry the chain's world scale
+            // (PA skeleton ≈ 0.665; exactly 1.0 outside PA, which is why this was invisible
+            // until the PA detection fix went live). Log evidence: solver reach 69.9gu vs
+            // real world-space chain reach 46.5gu — 69.9 × 0.665 = 46.5. naturalArmReach
+            // already applies worldScale; this solve did not.
+            float chainWorldScale = std::abs(arm.upperArm->world.scale);
+            if (!std::isfinite(chainWorldScale) || chainWorldScale < 0.01f) {
+                chainWorldScale = 1.0f;
+            }
+            float upperLen = originalUpperLen * adjustedArmLength * chainWorldScale;
+            float forearmLen = originalForearmLen * adjustedArmLength * chainWorldScale;
 
             const RE::NiPoint3 Uwp = arm.upperArm->world.translate;
             const float armReach = upperLen + forearmLen;
@@ -403,13 +456,39 @@ namespace heisenberg
             }
             g_frikDiag[isLeft ? 1 : 0] = { requestedHsLen, armReach, requestedHsLen > armReach };
 
-            // Do not reproduce FRIK's bone-length extension here. It makes the wrist reach an
-            // arbitrary weapon target by lengthening both arm segments (the visible 1.6x-long
-            // arm in the Jul 19 log). Project only the visual wrist onto the reachable sphere;
-            // weapon aim and wrist orientation stay untouched.
+            // Unlike FRIK's unbounded reach extension, adjustedArmLength is capped at 1.08
+            // and is support-grip-only. Targets beyond that modest allowance are still
+            // projected onto the visual wrist sphere; weapon aim stays untouched.
+            //
+            // [PA-JITTER FIX] This used to be a hard if/else: the instant requestedHsLen
+            // crossed reachableHsLen, the target snapped from "as requested" to "fully
+            // projected onto the wrist sphere" with no blending. solveArmFrik is the last
+            // writer of the visible skinned arm every frame during two-handed support grip
+            // (see needsSameFrameSupportPin below), so that pop was directly visible as
+            // off-hand jitter whenever ordinary walk/turn sway nudged the target back and
+            // forth across the boundary - which happens often in power armor because of the
+            // PA-topology reach difference above. Ease the projection in over
+            // kArmReachSoftBlend game units instead: reachBlendT is 0 well inside reach
+            // (steady state unchanged - target used exactly "as requested") and 1 at/beyond
+            // reachableHsLen (steady state unchanged - target fully projected onto the wrist
+            // sphere, identical to the old hard clamp); only the transition zone is smoothed.
+            //
+            // REVIEW FIX v2 (Jul 24): two prior shapes were both wrong. The original lerp
+            // LENGTHENED sub-reach targets (steady-state palm-past-the-grip bias); the min()
+            // hotfix restored "never lengthen" but algebraically collapsed the blend back
+            // into the exact hard clamp the PA-jitter fix was written to remove (for
+            // requested <= reachable the min always picks requested; beyond it always picks
+            // the boundary — a C0 kink at the crossing). This shape does both jobs: targets
+            // INSIDE reach are honored exactly, and OVERSHOOT beyond the boundary is eased
+            // into the clamp over kArmReachSoftBlend gu (C1 at the crossing — near-zero
+            // overshoot still tracks the target ~1:1 before the clamp takes over), so
+            // walk-sway across the boundary no longer pops.
             const float reachableHsLen = (std::max)(armReach - kArmReachSafetyMargin, 0.1f);
             if (requestedHsLen > reachableHsLen) {
-                shoulderToRequestedHand = MU::vec3Norm(shoulderToRequestedHand) * reachableHsLen;
+                const float overshoot = requestedHsLen - reachableHsLen;
+                const float t = smoothstep(0.0f, kArmReachSoftBlend, overshoot);
+                const float effectiveHsLen = reachableHsLen + overshoot * (1.0f - t);
+                shoulderToRequestedHand = MU::vec3Norm(shoulderToRequestedHand) * effectiveHsLen;
                 handPos = Uwp + shoulderToRequestedHand;
             }
             const RE::NiPoint3 handToShoulder = Uwp - handPos;
@@ -465,6 +544,29 @@ namespace heisenberg
             yDir = MU::vec3Norm(yDir);
 
             // ---- elbow placement (law of cosines, verbatim incl. degenerate fallback) ----
+            // [PA-JITTER FIX] The acos() argument below is the law-of-cosines cosine value,
+            // valid only within [-1,1]; it leaves that domain right around full arm
+            // extension. This used to be a purely reactive fallback: forearmLen/upperLen
+            // were INSTANTLY reassigned to their averaged value only after the argument had
+            // already left [-1,1], popping the elbow position the same frame the boundary
+            // was crossed - the same per-frame walk/turn-sway jitter as the reach clamp
+            // above, and hit for the same PA-topology reason. Pre-blend forearmLen/upperLen
+            // toward that averaged fallback proportionally as the argument APPROACHES the
+            // domain edge (within kWristAngleDomainBlend of +/-1), so the correction is
+            // already smoothly underway well before the hard domain violation would occur.
+            // Steady state away from the edge (|arg| well below 1) is unchanged. The
+            // original post-hoc snap stays as a safety net for any residual out-of-domain
+            // case (e.g. numerical edge cases the pre-blend doesn't fully cover).
+            const float lawOfCosinesDenom = 2.0f * forearmLen * hsLen;
+            const float lawOfCosinesArg = lawOfCosinesDenom > 1e-6f ?
+                (forearmLen * forearmLen + hsLen * hsLen - upperLen * upperLen) / lawOfCosinesDenom : 0.0f;
+            constexpr float kWristAngleDomainBlend = 0.08f;
+            const float wristAngleBlendT = smoothstep(1.0f - kWristAngleDomainBlend, 1.0f, std::abs(lawOfCosinesArg));
+            if (wristAngleBlendT > 0.0f) {
+                const float avgLen = (originalUpperLen + originalForearmLen) / 2.0f * adjustedArmLength;
+                forearmLen = std::lerp(forearmLen, avgLen, wristAngleBlendT);
+                upperLen = std::lerp(upperLen, avgLen, wristAngleBlendT);
+            }
             float wristAngle = std::acos((forearmLen * forearmLen + hsLen * hsLen - upperLen * upperLen) / (2.0f * forearmLen * hsLen));
             if (std::isnan(wristAngle) || std::isinf(wristAngle)) {
                 forearmLen = upperLen = (originalUpperLen + originalForearmLen) / 2.0f * adjustedArmLength;
@@ -871,10 +973,10 @@ namespace heisenberg
                 }
             }
 
-            // A rigid weapon winner is already reach-limited by translating the complete
-            // weapon in TwoHandedGrip. Never project just its hand here: that would break
-            // the captured hand-to-gun transform. Free/non-weapon authority keeps the
-            // visual-only safety projection.
+            // Rigid weapon hands are solved below as complete arm chains. Never project
+            // only their requested hand transform here: that would break the captured
+            // hand-to-gun relation. The support chain receives a bounded 1.08x visual
+            // allowance; the weapon and trigger-hand pivot remain untouched.
             if (!rigidWeaponWinner) {
                 float requestedDistance = 0.0f;
                 float maxReach = 0.0f;
@@ -894,6 +996,13 @@ namespace heisenberg
             // FRIK-SOLVER PORT (Jul 19): prefer the faithful setArms port. Episode base is
             // captured on the first apply (clean controller pose) and restored before every
             // solve (v5's restoreArmNodesToDefault semantics — prevents delta compounding).
+            // WRITER-FIGHT DIAG (Jul 24, PA walk flicker): capture where the OTHER writers
+            // (FRIK's own arm pose, engine anim) left the hand this frame before we re-solve
+            // it. The per-write disagreement is the flicker amplitude — if it oscillates
+            // with walking steps, the two solvers are producing different poses and the
+            // renderer alternates between them.
+            const RE::NiPoint3 preSolveHandWorld = arm.hand->world.translate;
+
             bool applied = false;
             if (arm.shoulder && arm.chest) {
                 auto& base = g_armBase[i];
@@ -902,7 +1011,11 @@ namespace heisenberg
                 } else {
                     restoreArmBase(arm, base);
                 }
-                applied = solveArmFrik(arm, isLeft, liveTarget);
+                applied = solveArmFrik(
+                    arm,
+                    isLeft,
+                    liveTarget,
+                    rock::two_handed_weapon_policy::armLengthScale(rigidSupportGripWinner));
             }
             {
                 static std::uint32_t s_pathDbg = 0;
@@ -910,10 +1023,14 @@ namespace heisenberg
                     const float ex = arm.hand->world.translate.x - liveTarget.translate.x;
                     const float ey = arm.hand->world.translate.y - liveTarget.translate.y;
                     const float ez = arm.hand->world.translate.z - liveTarget.translate.z;
+                    const float fx = preSolveHandWorld.x - arm.hand->world.translate.x;
+                    const float fy = preSolveHandWorld.y - arm.hand->world.translate.y;
+                    const float fz = preSolveHandWorld.z - arm.hand->world.translate.z;
                     const auto& dg = g_frikDiag[i];
-                    spdlog::debug("[FRIK-SOLVER] {} path={} err={:.1f} hsLen={:.1f} reach={:.1f} stretched={}",
+                    spdlog::debug("[FRIK-SOLVER] {} path={} err={:.1f} fight={:.1f} hsLen={:.1f} reach={:.1f} stretched={}",
                                   isLeft ? "L" : "R", applied ? "frik-port" : "LEGACY-FALLBACK",
                                   std::sqrt(ex * ex + ey * ey + ez * ez),
+                                  std::sqrt(fx * fx + fy * fy + fz * fz),
                                   dg.hsLen, dg.reach, dg.stretched ? "YES" : "no");
                 }
             }
@@ -924,6 +1041,9 @@ namespace heisenberg
                 // this fallback carries consecutive frames (77.12 solve-order quirks),
                 // small deltas accumulate and the hand visibly detaches from the forearm.
                 // Always solve the full arm chain; never place the hand alone.
+                // The emergency chain-incomplete fallback keeps the native bone lengths.
+                // Extending locals without a complete episode baseline would compound on
+                // consecutive frames; the normal full-chain path above owns the 1.08x reach.
                 solveArmIK(arm, liveTarget);
             }
             slot.lastApplied = liveTarget;

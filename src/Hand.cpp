@@ -909,7 +909,72 @@ namespace heisenberg
                          _isLeft ? "Left" : "Right");
             return;
         }
-        
+
+        // GRIP-DIAG (Jul 24): the ammo-box repro measured hand→object at 148cm while the
+        // user was TOUCHING the object (their report rules out a second instance, and the
+        // viewcaster pick 0x926EA was the touched box itself) — so either the object's
+        // node or our cached _position lied at the press edge. Snapshot every candidate
+        // hand-position source here so the next repro shows exactly which one diverged.
+        {
+            auto* pnDiag = f4cf::f4vr::getPlayerNodes();
+            RE::NiNode* wandNow = pnDiag ? heisenberg::GetWandNode(pnDiag, _isLeft) : nullptr;
+            const RE::NiPoint3 freshWand = wandNow ? wandNow->world.translate : RE::NiPoint3{};
+            const float staleDelta = wandNow ? (freshWand - _position).Length() : -1.0f;
+            RE::TESObjectREFR* selRefrDiag = _selection.IsValid() ? _selection.GetRefr() : nullptr;
+            RE::NiAVObject* selNodeDiag = selRefrDiag ? selRefrDiag->Get3D() : nullptr;
+            const RE::NiPoint3 selPos = selNodeDiag ? selNodeDiag->world.translate : RE::NiPoint3{};
+            // data.location = the game's SAVED ref position. User-confirmed repro: the box
+            // was visually AT the hand but jumped 148cm at grip press — so the node world,
+            // the saved ref location, and the visual had come apart; this shows which pair.
+            const RE::NiPoint3 refLoc = selRefrDiag
+                ? RE::NiPoint3{ selRefrDiag->data.location.x, selRefrDiag->data.location.y, selRefrDiag->data.location.z }
+                : RE::NiPoint3{};
+            spdlog::info("[GRIP-DIAG] {} press: cachedPos=({:.1f},{:.1f},{:.1f}) freshWand=({:.1f},{:.1f},{:.1f}) cacheStale={:.1f} sel={:08X} selNode=({:.1f},{:.1f},{:.1f}) refLoc=({:.1f},{:.1f},{:.1f}) selDist={:.1f}",
+                         _isLeft ? "Left" : "Right",
+                         _position.x, _position.y, _position.z,
+                         freshWand.x, freshWand.y, freshWand.z,
+                         staleDelta,
+                         selRefrDiag ? selRefrDiag->formID : 0,
+                         selPos.x, selPos.y, selPos.z,
+                         refLoc.x, refLoc.y, refLoc.z,
+                         _selection.IsValid() ? _selection.distance : -1.0f);
+        }
+
+        // TOUCH-PRIORITY SELECTION (Jul 24, user-reported): gripping while physically
+        // TOUCHING an object must grab THAT object, regardless of what the viewcaster
+        // holds selected. ROCK's contact evidence knows the exact touched ref. No
+        // distance sanity gate here: distance is computed from _position, and the
+        // 148cm repro suggests _position itself can lie — the physical touch evidence
+        // (at most a few frames old) outranks any distance derived from it.
+        if (heisenberg::IsRockEngineHosted()) {
+            if (auto* touched = rock::HostGetHandTouchedRef(_isLeft)) {
+                RE::TESObjectREFR* selRefr = _selection.IsValid() ? _selection.GetRefr() : nullptr;
+                if (touched != selRefr && !touched->IsDeleted() && !touched->IsDisabled()
+                    && Physics::IsGrabbable(touched)) {
+                    if (auto* touchedNode = touched->Get3D()) {
+                        const RE::NiPoint3 objPos = touchedNode->world.translate;
+                        const float dx = objPos.x - _position.x;
+                        const float dy = objPos.y - _position.y;
+                        const float dz = objPos.z - _position.z;
+                        const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+                        Selection touchSelection;
+                        touchSelection.SetRefr(touched);
+                        touchSelection.hitPoint = objPos;
+                        touchSelection.hitNormal = RE::NiPoint3(0, 0, 1);
+                        // Report the touch as at-hand: the hand is ON the object per
+                        // contact evidence, whatever the (possibly stale) node math says.
+                        touchSelection.distance = (std::min)(distance, 5.0f);
+                        touchSelection.isClose = true;
+                        _selection = touchSelection;
+                        _state = State::SelectedClose;
+                        spdlog::info("[GRAB] {} hand: touch-priority selection — grabbing touched {:08X} (nodeDist={:.1f}) over viewcaster pick {:08X}",
+                                     _isLeft ? "Left" : "Right", touched->formID, distance,
+                                     selRefr ? selRefr->formID : 0);
+                    }
+                }
+            }
+        }
+
         switch (_state) {
         case State::SelectedClose:
             // Close object - try to grab immediately

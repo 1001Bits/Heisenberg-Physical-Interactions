@@ -148,6 +148,7 @@ target_include_directories(${PROJECT_NAME}
   PRIVATE
     ${BUILD_DIR}/include
     ${SOURCE_DIR}
+    ${ROCK_DIR}/src
 )
 
 
@@ -211,6 +212,38 @@ target_link_options(${PROJECT_NAME}
 )
 
 string(REPLACE "/Ob2" "/Ob3" CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}")
+
+
+# >>> Focused host-side tests
+option(BUILD_HEISENBERG_TESTS "Build small standalone Heisenberg policy tests" OFF)
+if(BUILD_HEISENBERG_TESTS)
+  enable_testing()
+  add_executable(HeisenbergFrikIniReconcilerTests
+    tests/FrikIniCompatibilityTests.cpp
+    src/FrikIniCompatibility.cpp
+    src/FrikIniCompatibility.h
+  )
+  target_compile_features(HeisenbergFrikIniReconcilerTests PRIVATE cxx_std_23)
+  target_include_directories(HeisenbergFrikIniReconcilerTests PRIVATE "${SOURCE_DIR}")
+  add_test(NAME HeisenbergFrikIniReconcilerTests COMMAND HeisenbergFrikIniReconcilerTests)
+
+  add_executable(HeisenbergTwoHandedWeaponPolicyTests
+    tests/TwoHandedWeaponPolicyTests.cpp
+    external/ROCK/src/physics-interaction/weapon/TwoHandedWeaponPolicy.h
+    external/ROCK/src/physics-interaction/TransformMath.h
+  )
+  target_compile_features(HeisenbergTwoHandedWeaponPolicyTests PRIVATE cxx_std_23)
+  target_include_directories(HeisenbergTwoHandedWeaponPolicyTests PRIVATE "${ROCK_DIR}/src")
+  add_test(NAME HeisenbergTwoHandedWeaponPolicyTests COMMAND HeisenbergTwoHandedWeaponPolicyTests)
+
+  add_executable(HeisenbergPipboyMeshContactPolicyTests
+    tests/PipboyMeshContactPolicyTests.cpp
+    src/PipboyMeshContactPolicy.h
+  )
+  target_compile_features(HeisenbergPipboyMeshContactPolicyTests PRIVATE cxx_std_23)
+  target_include_directories(HeisenbergPipboyMeshContactPolicyTests PRIVATE "${SOURCE_DIR}")
+  add_test(NAME HeisenbergPipboyMeshContactPolicyTests COMMAND HeisenbergPipboyMeshContactPolicyTests)
+endif()
 
 
 # >>> Post build command to copy plugin

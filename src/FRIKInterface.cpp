@@ -1,5 +1,12 @@
 #include "FRIKInterface.h"
+#include "FrikIniCompatibility.h"
 #include "HandAuthority.h"   // plugin-side hand placement when native FRIK lacks v5
+
+#include <ShlObj.h>
+
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 
 namespace heisenberg
 {
@@ -163,6 +170,76 @@ namespace heisenberg
             return api->getModVersion();
         }
         return "unknown";
+    }
+
+    bool FRIKInterface::ReconcileLegacyOffHandGrippingIni() const
+    {
+        const std::uint32_t apiVersion = GetApiVersion();
+        if (apiVersion == 0 || apiVersion >= 5) {
+            return false;
+        }
+
+        PWSTR documentsPath = nullptr;
+        const HRESULT hr = SHGetKnownFolderPath(FOLDERID_Documents, KF_FLAG_DEFAULT, nullptr, &documentsPath);
+        if (FAILED(hr) || !documentsPath) {
+            spdlog::warn("[FRIK-COMPAT] Could not resolve Documents folder (HRESULT=0x{:08X}); legacy FRIK offhand grip remains enabled",
+                static_cast<unsigned int>(hr));
+            return false;
+        }
+
+        std::filesystem::path iniPath{ documentsPath };
+        CoTaskMemFree(documentsPath);
+        iniPath /= L"My Games/Fallout4VR/FRIK_Config/FRIK.ini";
+
+        std::ifstream input(iniPath, std::ios::binary);
+        if (!input) {
+            spdlog::warn("[FRIK-COMPAT] Could not open live FRIK INI '{}'; legacy FRIK offhand grip remains enabled",
+                iniPath.string());
+            return false;
+        }
+
+        std::string contents{ std::istreambuf_iterator<char>{ input }, std::istreambuf_iterator<char>{} };
+        if (!input.good() && !input.eof()) {
+            spdlog::warn("[FRIK-COMPAT] Failed while reading live FRIK INI '{}'; file left unchanged", iniPath.string());
+            return false;
+        }
+        input.close();
+
+        const auto rewriteResult = frik_ini_compat::DisableOffHandGripping(contents);
+        if (rewriteResult == frik_ini_compat::RewriteResult::AlreadyDisabled) {
+            spdlog::info("[FRIK-COMPAT] FRIK API v{} legacy offhand gripping already disabled in '{}'",
+                apiVersion, iniPath.string());
+            return true;
+        }
+
+        // FRIK 77's watcher reacts to a modified event for this exact path, so we write the
+        // update at kGameLoaded (well before skeleton/weapon interaction) rather than deferring
+        // it. We used to open the live file with ios::trunc and write in place, but that
+        // truncates FRIK.ini to 0 bytes the instant open() succeeds -- if the write/flush that
+        // follows then fails partway (disk full, a sharing violation from FRIK's own watcher, or
+        // an AV/OneDrive scan racing the write -- "My Games" is a common OneDrive Known-Folder-
+        // Redirection target on Windows 11), the original content is already gone and FRIK.ini is
+        // left empty or partial with no recovery. Instead write the new content to a temp file
+        // and atomically rename it over the original: the live file is never opened for writing
+        // directly, so on any failure it is left completely untouched, and the watcher still sees
+        // a single clean modify event (rename-over-existing reports as a write/modify, not the
+        // remove+add some backends report for a fresh file created at a new path).
+        std::string writeError;
+        if (!frik_ini_compat::WriteFileAtomic(iniPath, contents, writeError)) {
+            spdlog::warn("[FRIK-COMPAT] Could not write live FRIK INI '{}': {}; legacy FRIK offhand grip remains enabled",
+                iniPath.string(), writeError);
+            return false;
+        }
+
+        const char* action = "updated";
+        if (rewriteResult == frik_ini_compat::RewriteResult::AddedMissingKey) {
+            action = "added missing key to";
+        } else if (rewriteResult == frik_ini_compat::RewriteResult::AddedMissingSection) {
+            action = "added missing section to";
+        }
+        spdlog::info("[FRIK-COMPAT] {} '{}' for FRIK API v{}: EnableOffHandGripping=false (embedded ROCK is sole weapon-support owner)",
+            action, iniPath.string(), apiVersion);
+        return true;
     }
 
     // --- v9 hand pushback API -------------------------------------------------------------

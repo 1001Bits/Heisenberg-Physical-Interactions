@@ -65,6 +65,13 @@ namespace heisenberg
         // FRIK.ini). Holo mode requires a staged projected->wrist transition because FRIK
         // replaces the Pip-Boy root on the following frame. Cached until cell/game load.
         bool IsFrikHoloPipboyEnabled();
+
+        // Writes FRIK.ini's HoloPipBoyEnabled directly and updates our own cached read of
+        // it. FRIK has a live file-watcher on this exact file (thomasmonkman-filewatch)
+        // that reloads on external changes, so this affects FRIK's live in-memory value
+        // too - see BeginPipboyBootSequence's use of this for the boot-sequence's holo
+        // workaround. Returns false (and changes nothing) if the file couldn't be read/written.
+        bool SetFrikHoloPipboyEnabled(bool enabled);
         void SetTapREFVisible(bool visible);
         void EjectCurrentHolotape();
 
@@ -92,6 +99,15 @@ namespace heisenberg
         // playback opens the display. Auto-restores if no terminal opens shortly after.
         void PrepareProjectedTerminalOnWrist();
 
+        // Vanilla Pip-Boy boot sequence (RobCo boot SWF) — VR never fires this because it is
+        // triggered by an animation-graph event embedded in the flat-screen pickup animation,
+        // which FRIK's controller-driven arms never play. Forces the Pip-Boy open on the wrist
+        // (regardless of projected/Holo preference) on first pickup and sends the same native
+        // event the vanilla animation would have sent.
+        void BeginPipboyBootSequence();
+        void UpdatePipboyBootSequenceTransition();
+        void ResetPipboyBootSequenceTransition();
+
         // Check if a form ID is the Heisenberg intro holotape
         bool IsIntroHolotape(std::uint32_t formID) const;
 
@@ -118,6 +134,7 @@ namespace heisenberg
         void BeginIntroProgramPlayback(std::uint32_t formID);
         void QueueProgramHolotapePlayback(std::uint32_t formID);
         void UpdateIntroWristTransition();
+        void UpdateIntroHoloOverride();
         void ResetIntroWristTransition();
 
         // Mesh diffuse SRV helpers (used by terminal screen redirect)
@@ -148,7 +165,8 @@ namespace heisenberg
         bool            _buttonOriginalZSet   = false;
         bool            _ejectContactLatched  = false;   // Sticky contact; resets outside release radius
         bool            _tapeRefInitialHideDone = false;  // True once we've hidden the default tape on first update
-        float           _holotapeGrabCooldown   = 0.0f;   // Cooldown to prevent instant re-grab after removal
+        float           _holotapeGrabCooldown   = 0.0f;   // Insertion-only grace; prevents a removed/just-spawned tape re-entering the deck
+        float           _holotapeRemovalCooldown = 0.0f;  // Separate short post-insert guard; ejecting never has to wait on insertion grace
         float           _closeAnimSpeed         = ANIM_SPEED; // Current close animation speed (variable for slam)
         float           _slamCooldown           = 0.0f;   // Prevent multiple slam detections
         float           _pushStartDistance      = 0.0f;   // Hand distance when push started (for mapping)
@@ -157,7 +175,6 @@ namespace heisenberg
         int             _frikHoloPipboy         = -1;     // Cached FRIK HoloPipBoyEnabled (-1=unread, 0=false, 1=true)
         bool            _tapREFForceHidden      = false;  // Set by removal, cleared by insertion — overrides per-frame visibility
         bool            _meshesInitialized      = false;  // True after first rotation init (reset on load)
-        bool            _holsteredWeaponForHolotape = false; // True = we holstered weapon for holotape removal, re-draw when done
 
         // Holotape finger pose — when holding a holotape near Pipboy, extend only the index finger
         bool            _holotapeFingerPoseActive   = false; // True when index finger is overridden to pointing
@@ -170,6 +187,16 @@ namespace heisenberg
 
         // Track last held holotape to set insertion cooldown on new grabs
         std::uint32_t   _lastHeldHolotapeRefID      = 0;     // RefID of last detected holotape grab
+
+        // One shared visible-fingertip motion sample for all Pip-Boy contacts this frame.
+        // The previous point makes thin button/deck meshes sweep-safe at normal VR speeds.
+        RE::NiPoint3    _interactionFingerPos{};
+        RE::NiPoint3    _previousInteractionFingerPos{};
+        bool            _interactionFingerValid = false;
+        bool            _previousInteractionFingerValid = false;
+        bool            _deckContactLatched = false;
+        RE::NiPoint3    _prevDeckWorldPos{};             // Deck node position last frame — push-close direction is classified in DECK-relative motion so locomotion/turning can't contaminate it
+        bool            _prevDeckWorldPosValid = false;
 
         // Deferred Disable() for inserted holotape world refs — prevents crash in
         // Inventory3DManager::FinishItemLoadTask when async 3D load races with Disable.
@@ -217,6 +244,44 @@ namespace heisenberg
         bool            _terminalPatchesSuspended   = false; // True = binary patches reverted (PA/projected mode)
         bool            _hasReachedExterior         = false; // One-way latch: player has LEFT Vault 111 (exterior cell). Terminal redirect gated on this.
         bool            _pipboyOpenedSinceAcquire   = false; // One-way latch: player opened the Pip-Boy at least once after acquiring it (vanilla bootup). Intro ceremony waits for this + Pip-Boy closed.
+
+        // ── Vanilla Pip-Boy boot sequence (auto-fired on first pickup) ──
+        bool            _bootSequenceFired          = false; // One-way latch: never re-send the native event this game session
+        bool            _bootWristOverrideOwned     = false; // True if the boot sequence itself started the projected->wrist override
+        bool            _bootWristStaged            = false; // True while waiting on FRIK's Holo root swap before the Pip-Boy can be forced open
+        bool            _bootWristOpened            = false; // True once the plain (non-Holo) wrist-open path has fired ActivatePipboyScreen() — guards against re-calling it every frame while waiting for the settle check
+        RE::NiNode*     _bootWristPreFlipRoot       = nullptr; // Root captured before a staged Holo transition, to detect FRIK's replacement
+        RE::NiNode*     _bootWristCandidateRoot     = nullptr;
+        int             _bootWristStableFrames      = 0;
+        int             _bootWristTimeoutFrames     = 0;
+        int             _bootPipboyOpenSettleFrames = 0; // Frames PipboyMenu has been continuously open; event fires once this reaches 3
+        // Temporary FRIK HoloPipBoyEnabled override so the boot sequence renders on the
+        // flat wrist model even when the player's real preference is Holo. Written to
+        // FRIK.ini directly, before FRIK's own Pip-Boy model is ever constructed this
+        // session (sidesteps needing FRIK's un-exported swapModel() sequence).
+        bool            _bootHoloIniHandled          = false; // One-way latch: decided whether to override, for this pickup
+        bool            _bootHoloIniOverrideActive   = false; // True from a successful false-write until restored back to true
+        float           _bootHoloIniWaitSeconds      = 0.0f;  // Countdown after writing false, before forcing the Pip-Boy open (lets FRIK's debounced file-watcher reload)
+        float           _bootHoloIniRestoreSeconds   = -1.0f; // Countdown after firing the boot event, before restoring true (-1 = not started)
+        bool            _bootScreenHiddenPendingSwf  = false; // True while the screen is deliberately re-culled so normal Pip-Boy content never flashes before the boot SWF takes over
+        float           _bootScreenRevealSeconds     = -1.0f; // Countdown after firing the boot event, before revealing the screen (-1 = not started)
+        // Jul 24 boot redesign: completion is detected from the game's own
+        // PipboyOpeningSequenceMenu open->closed transition (the boot SWF drives its
+        // own teardown); the Holo/projected restores hang off that, not fixed timers.
+        bool            _bootMenuSeen                = false; // PipboyOpeningSequenceMenu observed open since firing
+        bool            _bootMenuFinished            = false; // Completion (or never-appeared fallback) handled — restores dispatched
+        float           _bootMenuAppearWaitSeconds   = 0.0f;  // Ceiling for the menu to appear after firing before falling back
+        bool            _bootScreenActivated         = false; // Wrist screen lit for the boot menu (ActivatePipboyScreen) — must be deactivated on completion/interruption
+        bool            _bootPipboyMenuBlanked       = false; // PipboyMenu's Scaleform root hidden while the boot SWF owns the screen (restored on completion)
+        float           _bootContentOpenSeconds      = 0.0f;  // Post-boot countdown before opening PipboyMenu so normal content shows (vanilla shows STATS after boot)
+        bool            _bootSawPipboyAbsent         = false; // Armed only after observing the Pip-Boy NOT owned this session — boot fires on the 0->1 acquisition, never on loads
+        // Intro ceremony always-on-wrist rule: FRIK Holo temporarily forced off (same
+        // FRIK.ini override the boot sequence uses) while the intro plays on the wrist;
+        // projected/HMD modes ride the existing projected->wrist override.
+        bool            _introHoloIniOverrideActive  = false; // True from a successful HoloPipBoyEnabled=false write until restored
+        int             _introHoloWaitFrames         = 0;     // Settle frames (FRIK watcher debounce + root reinstall) before the deferred playback starts
+        std::uint32_t   _introHoloWaitFormID         = 0;     // Intro tape whose playback is deferred behind the settle wait
+        bool            _introHoloSawPipOpen         = false; // Display-ended tracking for the Holo restore (open observed, then closed)
         int             _savedLayerLock             = 0;     // Saved render layer singleton lock value (+0x374)
         int             _savedModeLock              = 0;     // Saved render mode singleton lock value (+0x374)
         int             _savedLayerValue            = -1;    // Saved render layer singleton value (+0x36c)
@@ -285,21 +350,18 @@ namespace heisenberg
         // Animation speed (progress per frame, matching FRIK)
         static constexpr float ANIM_SPEED             = 0.05f;
         // Eject button
-        static constexpr float EJECT_CONTACT_ENTER    =  5.0f;   // TapeDeck01 contact radius (matches FRIK physical zone)
-        static constexpr float EJECT_CONTACT_EXIT     =  7.0f;   // Sticky-contact release radius (hysteresis)
+        static constexpr float EJECT_FINGER_RADIUS    =  1.5f;   // Fingertip flesh around the real EjectButton mesh
+        static constexpr float CONTACT_RELEASE_PAD    =  2.0f;   // Mesh-contact hysteresis
         static constexpr float EJECT_Z_MIN            = -0.2f;   // Max button depression (FRIK light: -0.2)
+        static constexpr float EJECT_SKIN_RADIUS      =  0.45f;  // Visible fingertip flesh around the tracked bone point — the button starts moving exactly when the SKIN touches it, not when the padded contact bubble does
         static constexpr float EJECT_COOLDOWN_TIME    =  0.5f;   // Seconds between presses
         // Holotape slot
         static constexpr float TAPE_SLOT_RADIUS       =  8.0f;
         static constexpr float TAPE_GRAB_RADIUS       = 15.0f;   // Distance from controller to tape deck tray for holotape removal
-        static constexpr float TAPE_GRAB_COOLDOWN     =  1.5f;   // Seconds after removal before allowing re-grab
+        static constexpr float TAPE_GRAB_COOLDOWN     =  1.5f;   // Seconds after removal before allowing that hand-held tape to reinsert
+        static constexpr float TAPE_REMOVAL_CONTACT_RADIUS = 5.0f; // Grip fingertip padding around the visible TapREF mesh
         static constexpr float TAPE_INSERT_RADIUS     = 5.0f;    // Distance to detect held holotape for insertion
         static constexpr float TAPE_POINTING_RANGE    = 12.0f;   // Distance at which held holotape triggers index-finger pointing toward deck
-        static constexpr float PUSH_ENTER_DISTANCE    = 5.0f;    // Finger enters push zone = fully open position (wider catch zone)
-        static constexpr float PUSH_EXIT_DISTANCE     = 7.0f;    // Finger exits push zone (hysteresis)
-        static constexpr float PUSH_CLOSED_DISTANCE   = 1.0f;    // Finger at this distance = fully closed (don't go to 0 — hand clips through pipboy)
-        static constexpr float PUSH_COMMIT_PROGRESS   = 0.35f;   // Below this progress (65% closed), auto-commit to close
-        static constexpr float PUSH_SPRING_SPEED      = 0.08f;   // Speed of spring-back to open
         static constexpr float SLAM_COOLDOWN_TIME     = 0.5f;    // Seconds between slam detections
         // Intro holotape
         static constexpr float INTRO_LINE_GAP          = 0.5f;   // Seconds gap between intro lines

@@ -582,6 +582,15 @@ namespace heisenberg
         auto& frik = FRIKInterface::GetSingleton();
         if (frik.Initialize()) {
             spdlog::info("FRIK interface connected (version: {}) - using FRIK for hand tracking", frik.GetModVersion());
+            const std::uint32_t frikApiVersion = frik.GetApiVersion();
+            if (s_rockEngineHosted && frikApiVersion > 0 && frikApiVersion < 5) {
+                if (!frik.ReconcileLegacyOffHandGrippingIni()) {
+                    spdlog::warn("[FRIK-COMPAT] Automatic legacy offhand-grip suppression failed; FRIK and embedded ROCK may both steer the weapon");
+                }
+            } else if (s_rockEngineHosted && frikApiVersion >= 5) {
+                spdlog::info("[FRIK-COMPAT] FRIK API v{} supports ROCK's runtime grip blocker; live FRIK INI left unchanged",
+                    frikApiVersion);
+            }
         } else {
             spdlog::warn("FRIK not available or incompatible version - Heisenberg requires FRIK 0.77+");
             spdlog::warn("Heisenberg will use fallback hand tracking (finger poses may not work)");

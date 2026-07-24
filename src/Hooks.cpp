@@ -293,6 +293,11 @@ namespace heisenberg::Hooks
                 rock::HostSetHandCollisionSuppressed(false, HeisenbergPluginAPI::IsHandCollisionDisabledByAPI(false));
                 rock::HostSetHandHoldingObject(true, heisenberg::GrabManager::GetSingleton().IsGrabbing(true));
                 rock::HostSetHandHoldingObject(false, heisenberg::GrabManager::GetSingleton().IsGrabbing(false));
+                // MCM-tunable collider padding lives in Heisenberg's config, but the ACTIVE
+                // hand colliders are the embedded engine's (the Heisenberg-side
+                // HandBoneColliderSet module is disabled in the embed profile) — bridge the
+                // value in so the slider actually reaches the physics bodies.
+                rock::HostSetHandColliderRadiusPadding(heisenberg::g_config.handColliderRadiusPadding);
             }
 
             // Two-handed support-hand finger pose (Jul 19): drive FRIK's base finger API

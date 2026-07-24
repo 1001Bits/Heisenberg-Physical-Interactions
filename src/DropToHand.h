@@ -69,7 +69,13 @@ namespace heisenberg
          * @param stickyGrab If true, item stays grabbed without holding grip (default true)
          * @param markAsSmartGrab If true, set isFromSmartGrab on grab state (prevents auto-storage)
          */
-        void QueueDropToHand(RE::TESFormID baseFormID, bool isLeft, int itemCount = 1, bool stickyGrab = true, bool markAsSmartGrab = false);
+        void QueueDropToHand(
+            RE::TESFormID baseFormID,
+            bool isLeft,
+            int itemCount = 1,
+            bool stickyGrab = true,
+            bool markAsSmartGrab = false,
+            bool bypassInitialDelay = false);
 
         // BSTEventSink override
         RE::BSEventNotifyControl ProcessEvent(
@@ -217,6 +223,7 @@ namespace heisenberg
             bool forcedIsLeft = false;        // Which hand to force (if forceHand is true)
             bool stickyGrab = true;           // If false, item releases when grip is released (world weapon pickup)
             bool markAsSmartGrab = false;     // If true, set isFromSmartGrab on grab state (prevents auto-storage)
+            bool bypassInitialDelay = false;  // Explicit physical handoff: process on the next update, without the generic 0.1s settle
             std::uint32_t oldContainerFormID = 0;  // Source container (for Take-All bulk detection)
             std::uint64_t burstId = 0;        // Frame-burst id when queued (for Take-All bulk detection)
         };

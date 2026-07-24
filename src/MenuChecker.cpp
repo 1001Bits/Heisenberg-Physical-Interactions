@@ -1,6 +1,7 @@
 #include "MenuChecker.h"
 #include "DropToHand.h"
 #include "Utils.h"
+#include "f4vr/F4VRUtils.h"
 
 namespace heisenberg
 {
@@ -165,6 +166,27 @@ namespace heisenberg
                 heisenberg::DropToHand::SetSessionNotReady();
             } else {
                 heisenberg::DropToHand::SetSessionReady(5000);
+
+                // WORKAROUND (2026-07-22) for a FRIK bug (frik::PlayerControlsHandler,
+                // PlayerControlsHandler.h): its enableControls()/disableControls() guard
+                // themselves on a member flag (_disabledInput) that survives a save load,
+                // but the native restrained/input-enable state does NOT reliably survive
+                // one. If the save happened while FRIK's cached flag already believed
+                // controls were enabled, its post-load onFrameUpdate hits the idempotent
+                // early-return and never re-applies SetActorRestrained(false) - movement
+                // (kMainFour) stays stuck disabled until the player opens (forcing FRIK's
+                // real disableControls() body to run) and closes the Pip-Boy (forcing the
+                // real enableControls() body to run), which is the reported "have to open
+                // the Pip-Boy before I can move" symptom. Reported upstream; this directly
+                // re-asserts the un-restrained state once real loading is done (mirrors
+                // FRIK's own enableControls() call) so a fresh load can't leave movement
+                // blocked even if FRIK's cache disagrees with the fresh native state. Safe
+                // to call unconditionally here - a no-op if the player is legitimately
+                // restrained for an unrelated reason (menus/config-mode reassert their own
+                // restrained state every frame regardless of this one-shot call).
+                if (auto* player = RE::PlayerCharacter::GetSingleton()) {
+                    f4cf::f4vr::SetActorRestrained(player, false);
+                }
             }
         }
         else if (strcmp(menuName, "PauseMenu") == 0) {

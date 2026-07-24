@@ -38,16 +38,19 @@ namespace heisenberg::rock_hand_collider
     };
 
     // ROCK roleRadius(): palm 1.35, base 0.55, middle 0.46, tip 0.38 (game units, non-PA).
+    // fHandColliderRadiusPadding (default 0) adds uniformly on top to reduce resting-object
+    // clip-through against the skinned mesh — see Config.h for the full rationale.
     static float roleRadius(Segment s, bool pa)
     {
         const float k = pa ? kPaScale : 1.0f;
+        const float padding = heisenberg::g_config.handColliderRadiusPadding;
         switch (s) {
-            case Segment::Palm:   return 1.35f * k;
-            case Segment::Base:   return 0.55f * k;
-            case Segment::Middle: return 0.46f * k;
-            case Segment::Tip:    return 0.38f * k;
+            case Segment::Palm:   return 1.35f * k + padding;
+            case Segment::Base:   return 0.55f * k + padding;
+            case Segment::Middle: return 0.46f * k + padding;
+            case Segment::Tip:    return 0.38f * 1.10f * k + padding;  // +10% default — fingertips are where resting-object clip-through is most visible
         }
-        return 0.5f;
+        return 0.5f + padding;
     }
 
     // Roles: palm (LArm_Hand→LArm_Finger31 — wrist-to-middle-base for length anchor),
@@ -102,6 +105,9 @@ namespace heisenberg::rock_hand_collider
     static HandSet g_right;
     static bool s_initialized = false;
     static bool s_loggedDisabled = false;
+    // Last fHandColliderRadiusPadding value the real physics bodies were built with —
+    // lets Update() detect a live MCM slider change and force a rebuild (see Update()).
+    static float g_lastAppliedPadding = 0.0f;
 
     // ──────────────────────────────────────────────────────────────────────────
     bool IsActive()
@@ -232,9 +238,14 @@ namespace heisenberg::rock_hand_collider
         if (createdCount == kRolesPerHand || s_attempts[side01] >= kMaxBuildAttempts) {
             hs.built = (createdCount >= 1);
             if (hs.built) {
-                spdlog::info("[ROCK::HandBoneCollider] {} hand built {}/{} bodies (PA={}{})",
+                // padding/tipRadius in the build line make it verifiable FROM THE LOG whether
+                // the fHandColliderRadiusPadding the user set actually reached the physics
+                // bodies (the MCM slider was silently dead for a while — wrong ini section).
+                spdlog::info("[ROCK::HandBoneCollider] {} hand built {}/{} bodies (PA={}{}) padding={:.2f} tipRadius={:.3f}",
                              isLeft ? "LEFT" : "RIGHT", createdCount, kRolesPerHand, pa ? "yes" : "no",
-                             createdCount < kRolesPerHand ? ", PARTIAL after retry cap" : "");
+                             createdCount < kRolesPerHand ? ", PARTIAL after retry cap" : "",
+                             heisenberg::g_config.handColliderRadiusPadding,
+                             roleRadius(Segment::Tip, pa));
 
                 // Feed the native-contact evidence pipeline. In this 16-body config the cup
                 // path (the only other SubscribeForBody caller) is torn down, so without this
@@ -412,6 +423,23 @@ namespace heisenberg::rock_hand_collider
         if (g_right.built && g_right.builtForPa != paNow) {
             spdlog::info("[ROCK::HandBoneCollider] RIGHT PA state change → rebuild");
             DestroyHand(g_right);
+        }
+
+        // Radius-padding change detection: roleRadius() (and therefore the real physics
+        // body radii) is only re-evaluated when a hand is (re)built, so an MCM slider
+        // change mid-session would otherwise have no visible effect until the next
+        // world/PA-triggered rebuild. Force one here instead.
+        const float paddingNow = heisenberg::g_config.handColliderRadiusPadding;
+        if (paddingNow != g_lastAppliedPadding) {
+            if (g_left.built) {
+                spdlog::info("[ROCK::HandBoneCollider] LEFT radius padding changed {} -> {} — rebuilding", g_lastAppliedPadding, paddingNow);
+                DestroyHand(g_left);
+            }
+            if (g_right.built) {
+                spdlog::info("[ROCK::HandBoneCollider] RIGHT radius padding changed {} -> {} — rebuilding", g_lastAppliedPadding, paddingNow);
+                DestroyHand(g_right);
+            }
+            g_lastAppliedPadding = paddingNow;
         }
 
         if (!g_left.built || !g_right.built) {

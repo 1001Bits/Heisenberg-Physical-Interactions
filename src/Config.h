@@ -474,6 +474,21 @@ namespace heisenberg
         // grabbable. Independent of HandBoneColliderSet.
         bool rockBodyBoneColliderSet = false;
 
+        // Hand/arm collider radius padding (game units) — the hand and arm collision
+        // capsules are fixed-radius approximations of the skinned mesh (HandBoneColliderSet's
+        // roleRadius(), BodyBoneColliderSet's per-bone descriptor table), not derived from
+        // the actual mesh surface, so small objects resting on fingers/forearm can visually
+        // clip through. Added uniformly to every hand and arm capsule radius; 0 = unchanged
+        // (original ROCK-matched sizing). Affects self-collision, wall pushback, and soft
+        // contact too, not just resting objects — tune conservatively.
+        // Was 0.0f (no padding) — moved off that default because the MCM slider that's
+        // supposed to let users tune this was wired to the wrong ini section (fixed
+        // alongside this) and so had no effect even when changed; users had no working
+        // way to raise it themselves, and finger/arm clip-through on small resting
+        // objects (duct tape, coin, etc.) kept getting reported. 0.2 is a conservative
+        // non-zero starting point — still tunable via MCM "Hand/Arm Collider Padding".
+        float handColliderRadiusPadding = 0.2f;
+
         // WeaponCollision — generates collision hulls for equipped weapons so they
         // physically interact with the world (melee swings push objects, scoped
         // rifles bump off walls, etc.).
@@ -766,12 +781,19 @@ namespace heisenberg
         // OpenVR input stream (which broke VirtualHolsters / reload / secondary actions).
         bool useGrenadeReadyHook = true;
         bool enableUnarmedAutoUnequip = true;  // Auto-unequip unarmed when grip pressed
-        bool enableNaturalGrab = false;  // Disabled for testing — always palm snap
+        // Was left at false ("Disabled for testing") from an earlier debugging session and
+        // never reverted — with this off, EVERY grab falls through to palm-snap/offset mode
+        // regardless of how close the hand is to the object (confirmed via live log: distance
+        // check correctly resolves isNatural=true at point-blank range, but the mode decision
+        // below still forces palm-snap because this flag gates it). Reverted to its original
+        // intended default; still user-tunable via the MCM "Telekinesis" switcher.
+        bool enableNaturalGrab = true;
         
         // =====================================================================
         // COMPANION/STORAGE SETTINGS
         // =====================================================================
         bool enableDropToCompanion = true;     // Drop item near companion to give it to them
+        bool enableDropToContainer = true;     // Release while pointing at a chest/desk deposits into it (MCM "Drop To Container" — was a dead switcher before this existed)
         float companionTransferRadius = 150.0f; // Game units - proximity to detect companion
         float handTransferRadius = 30.0f;       // CM - skip companion/storage when hands this close
         bool enableAutoStorage = true;          // Auto-store after holding in zone for duration
@@ -799,7 +821,12 @@ namespace heisenberg
         // false. TODO: detect FRIK holo mode and skip the override automatically only there.
         bool holotapeWristOverrideInProjected = true;
         bool hideTerminalExitPrompt = true;  // Hide "(grip) Exit" button hint during wrist terminal
-        float tapeDeckPushCloseRadius = 3.0f; // Distance at which hand starts pushing holotape deck closed
+        // Contact envelope for the proportional push-close (tray follows the finger inside
+        // this distance of its mesh). 0.6 (bare skin radius) proved unreachable in practice —
+        // log-confirmed: the fingertip's tracked point never came within 20gu of the tray mesh
+        // during real pushes, so the follow never engaged and fingers clipped through. 1.2
+        // still reads as "touching" visually while actually being enterable.
+        float tapeDeckPushCloseRadius = 1.2f; // Fingertip-to-tray-mesh distance that counts as touching (push-close envelope)
         bool hideWandHUD = true;             // Hide action prompts ("[A] Take") from wand HUD (item name still shows)
         bool hideAllWandHUD = false;         // Hide all wand HUD messages (actions + item display) when pointing with wands
         bool introHolotapeGiven = false;     // Persistent flag: intro holotape ceremony done

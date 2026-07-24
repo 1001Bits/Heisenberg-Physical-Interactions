@@ -148,6 +148,10 @@ bBlockConsumptionInPA = true
 ; to drop them to your hand instead of consuming them
 bConsumableToHand = true
 
+; Holotape To Hand: Off = holotape plays immediately when selected from
+; Pipboy inventory. On = it appears in your right hand instead of playing.
+bHolotapeToHand = true
+
 [DropToHand]
 ; Drop to Hand: Items dropped from inventory spawn in your hand instead of falling
 ; If you drop another item while holding one, the held item drops first
@@ -457,6 +461,7 @@ iLogLevel = 2
 
         // Companion / hand transfer
         enableDropToCompanion = ini.GetBoolValue("ItemStorage", "bEnableDropToCompanion", enableDropToCompanion);
+        enableDropToContainer = ini.GetBoolValue("ItemStorage", "bEnableDropToContainer", enableDropToContainer);
         companionTransferRadius = static_cast<float>(ini.GetDoubleValue("ItemStorage", "fCompanionTransferRadius", companionTransferRadius));
         handTransferRadius = static_cast<float>(ini.GetDoubleValue("ItemStorage", "fHandTransferRadius", handTransferRadius));
         enableAutoStorage = ini.GetBoolValue("ItemStorage", "bEnableAutoStorage", enableAutoStorage);
@@ -488,6 +493,7 @@ iLogLevel = 2
         rockCollisionSuppressionRegistry = ini.GetBoolValue("RockIntegration", "bCollisionSuppressionRegistry", rockCollisionSuppressionRegistry);
         rockHandBoneColliderSet          = ini.GetBoolValue("RockIntegration", "bHandBoneColliderSet",          rockHandBoneColliderSet);
         rockBodyBoneColliderSet          = ini.GetBoolValue("RockIntegration", "bBodyBoneColliderSet",          rockBodyBoneColliderSet);
+        handColliderRadiusPadding        = static_cast<float>(ini.GetDoubleValue("RockIntegration", "fHandColliderRadiusPadding", handColliderRadiusPadding));
         rockWeaponCollision              = ini.GetBoolValue("RockIntegration", "bWeaponCollision",              rockWeaponCollision);
         rockTwoHandedGrip                = ini.GetBoolValue("RockIntegration", "bTwoHandedGrip",                rockTwoHandedGrip);
         rockHandBumpGuard                = ini.GetBoolValue("RockIntegration", "bHandBumpGuard",                rockHandBumpGuard);
@@ -758,6 +764,7 @@ iLogLevel = 2
         };
 
         // Distance/radius values (game units or cm, must be non-negative)
+        clampFloat(handColliderRadiusPadding, 0.0f, 1.0f, "fHandColliderRadiusPadding");
         clampFloat(maxGrabDistance, 0.0f, 500.0f, "fMaxGrabDistance");
         clampFloat(proximityRadius, 0.0f, 500.0f, "fProximityRadius");
         clampFloat(nearCastRadius, 0.0f, 500.0f, "fNearCastRadius");
@@ -989,6 +996,7 @@ iLogLevel = 2
         ini.SetDoubleValue("ItemStorage", "fBehindHeadTolerance", behindHeadTolerance, "; game units - allow hand to be this far forward and still count as behind head (~cm)");
         ini.SetDoubleValue("ItemStorage", "fStorageZoneHoldTime", storageZoneHoldTime, "; seconds - how long to hold in zone before auto-storing");
         ini.SetBoolValue("ItemStorage", "bEnableDropToCompanion", enableDropToCompanion, "; Drop item near companion to give it to them");
+        ini.SetBoolValue("ItemStorage", "bEnableDropToContainer", enableDropToContainer, "; Release while pointing at a chest/desk deposits the item into it");
         ini.SetDoubleValue("ItemStorage", "fCompanionTransferRadius", companionTransferRadius, "; Game units - proximity to detect companion");
         ini.SetDoubleValue("ItemStorage", "fHandTransferRadius", handTransferRadius, "; CM - skip companion/storage when hands this close");
         ini.SetBoolValue("ItemStorage", "bEnableAutoStorage", enableAutoStorage, "; Auto-store after holding in zone for duration");
@@ -1154,6 +1162,7 @@ iLogLevel = 2
         ini.SetBoolValue  ("RockIntegration", "bCollisionSuppressionRegistry", rockCollisionSuppressionRegistry, "; ROCK collision-suppression lease registry");
         ini.SetBoolValue  ("RockIntegration", "bHandBoneColliderSet",          rockHandBoneColliderSet,          "; ROCK 16-body-per-hand colliders");
         ini.SetBoolValue  ("RockIntegration", "bBodyBoneColliderSet",          rockBodyBoneColliderSet,          "; ROCK 23 avatar body capsules");
+        ini.SetDoubleValue("RockIntegration", "fHandColliderRadiusPadding",    handColliderRadiusPadding,        "; Padding (game units) added to every hand/arm collider radius — reduces resting-object clip-through, 0=unchanged");
         ini.SetBoolValue  ("RockIntegration", "bWeaponCollision",              rockWeaponCollision,              "; ROCK equipped-weapon physics hull");
         ini.SetBoolValue  ("RockIntegration", "bTwoHandedGrip",                rockTwoHandedGrip,                "; ROCK two-handed support grip");
         ini.SetBoolValue  ("RockIntegration", "bHandBumpGuard",                rockHandBumpGuard,                "; Char-proxy bump CTD guard (auto-armed with physics hand bodies)");
