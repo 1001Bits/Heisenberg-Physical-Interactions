@@ -349,6 +349,30 @@ iLogLevel = 2
         blockActivateOnGrabSelection = ini.GetBoolValue("ObjectPickup", "bBlockActivateOnGrabSelection", blockActivateOnGrabSelection);
         useXForLeftGrab  = ini.GetBoolValue("ObjectPickup", "bUseXForLeftGrab",  useXForLeftGrab);
         useAForRightGrab = ini.GetBoolValue("ObjectPickup", "bUseAForRightGrab", useAForRightGrab);
+        if (useXForLeftGrab && !enableStickyGrab) {
+            // X is a digital alternate grab button, so hold-to-grab would release
+            // immediately after the press. Make the dependency explicit and persist
+            // it in MCM's highest-priority settings file so both runtime and menu
+            // agree. Turning the alternate control back off intentionally leaves
+            // Sticky Grab enabled; the user can then disable it independently.
+            enableStickyGrab = true;
+            mcmIni.SetValue(
+                "ObjectPickup",
+                "bEnableStickyGrab",
+                "1");
+            const SI_Error saveRc =
+                mcmIni.SaveFile(kMCMSettingsPath);
+            if (saveRc >= 0) {
+                spdlog::info(
+                    "[Config] Left Grab Alternate Control enabled — "
+                    "automatically enabled and persisted Sticky Grab");
+            } else {
+                spdlog::warn(
+                    "[Config] Left Grab Alternate Control requires Sticky Grab; "
+                    "runtime enabled it but MCM persistence failed (code {})",
+                    static_cast<int>(saveRc));
+            }
+        }
         grabStartSpeed = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fGrabStartSpeed", grabStartSpeed));
         grabStartAngularSpeed = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fGrabStartAngularSpeed", grabStartAngularSpeed));
         
@@ -483,6 +507,9 @@ iLogLevel = 2
         handAuthorityApplyMode  = static_cast<int>(ini.GetLongValue("ObjectPickup", "iHandAuthorityApplyMode", handAuthorityApplyMode));
         handAuthorityGoalHookLog = ini.GetBoolValue("ObjectPickup", "bHandAuthorityGoalHookLog", handAuthorityGoalHookLog);
         suppressThumbstickTouch = ini.GetBoolValue("VRInput", "bSuppressThumbstickTouch", suppressThumbstickTouch);
+        postLoadInputRecovery = ini.GetBoolValue("VRInput", "bPostLoadInputRecovery", postLoadInputRecovery);
+        pipboyBootOpensContent = ini.GetBoolValue("Pipboy", "bPipboyBootOpensContent", pipboyBootOpensContent);
+        pipboyBootScreenDropGameUnits = static_cast<float>(ini.GetDoubleValue("Pipboy", "fPipboyBootScreenDrop", pipboyBootScreenDropGameUnits));
         twoHandedFingerPoseMode = static_cast<int>(ini.GetLongValue("ObjectPickup", "iTwoHandedFingerPoseMode", twoHandedFingerPoseMode));
         havokTimingFix = ini.GetBoolValue("RockIntegration", "bHavokTimingFix", havokTimingFix);
         havokTimingMinFrameRate = static_cast<float>(ini.GetDoubleValue("RockIntegration", "fHavokTimingMinFrameRate", havokTimingMinFrameRate));
@@ -646,7 +673,13 @@ iLogLevel = 2
         };
 
         // Distance/radius values (game units or cm, must be non-negative)
-        clampFloat(handColliderRadiusPadding, 0.0f, 1.0f, "fHandColliderRadiusPadding");
+        // Ceiling raised 1.0 -> 3.0 (Jul 27). Measured finger-vs-token intersections reached
+        // 1.26gu of overlap, i.e. DEEPER than the largest padding the old clamp would accept — so
+        // the "fingers clip into the token" report was untunable by construction. The overlap is a
+        // render-vs-collision size mismatch (the diagnostic measures the token's RENDER mesh
+        // against the finger's physics capsule, and FO4 clutter hulls are inset), which padding is
+        // exactly the right compensator for.
+        clampFloat(handColliderRadiusPadding, 0.0f, 3.0f, "fHandColliderRadiusPadding");
         clampFloat(maxGrabDistance, 0.0f, 500.0f, "fMaxGrabDistance");
         clampFloat(proximityRadius, 0.0f, 500.0f, "fProximityRadius");
         clampFloat(nearCastRadius, 0.0f, 500.0f, "fNearCastRadius");
@@ -747,6 +780,16 @@ iLogLevel = 2
 
         CSimpleIniA ini;
         ini.SetUnicode();
+
+        // Embedded ROCK uses this same file for [PhysicsInteraction],
+        // [RealisticWeapons], and its [Debug] values. Load the existing file
+        // before replacing Heisenberg-owned keys so Save() preserves every
+        // ROCK setting and any future third-party/unknown sections.
+        const SI_Error loadRc = ini.LoadFile(kConfigPath);
+        if (loadRc < 0) {
+            spdlog::debug("No existing config to merge while saving (code {})", static_cast<int>(loadRc));
+        }
+
         BuildIni(&ini);
 
         SI_Error rc = ini.SaveFile(kConfigPath);
@@ -796,7 +839,7 @@ iLogLevel = 2
         ini.SetBoolValue("ObjectPickup", "bHeldObjectCollidable", heldObjectCollidable, "; Keyframed hold keeps object collidable so it can hit other objects (iGrabMode=0 only)");
         ini.SetBoolValue("ObjectPickup", "bHeldObjectWallClamp", heldObjectWallClamp, "; Keyframed hold: sweep-cast the held object so it STOPS at walls and NPCs instead of clipping through (iGrabMode=0)");
         ini.SetBoolValue("ObjectPickup", "bBlockActivateOnGrabSelection", blockActivateOnGrabSelection, "; Block A/activate looting an item just because you're aiming at it. OFF by default (ON broke A-looting + mod secondary actions). Only enable for a Grip>A SteamVR binding.");
-        ini.SetBoolValue("ObjectPickup", "bUseXForLeftGrab",  useXForLeftGrab,  "; Use X button instead of Grip for left hand grabbing");
+        ini.SetBoolValue("ObjectPickup", "bUseXForLeftGrab",  useXForLeftGrab,  "; Use X instead of Grip for left-hand grabbing; enabling automatically enables Sticky Grab");
         ini.SetBoolValue("ObjectPickup", "bUseAForRightGrab", useAForRightGrab, "; Use A button instead of Grip for right hand grabbing");
         ini.SetDoubleValue("ObjectPickup", "fGrabStartSpeed", grabStartSpeed);
         ini.SetDoubleValue("ObjectPickup", "fGrabStartAngularSpeed", grabStartAngularSpeed);
@@ -1016,12 +1059,14 @@ iLogLevel = 2
         ini.SetBoolValue  ("RockIntegration", "bHavokTimingFix",               havokTimingFix,                   "; Override physics substeps to hold a min physics rate on long frames");
         ini.SetDoubleValue("RockIntegration", "fHavokTimingMinFrameRate",      havokTimingMinFrameRate,          "; Min physics frame rate, clamped [30,240] (default 70)");
         ini.SetLongValue  ("RockIntegration", "iHavokTimingMaxSubsteps",       havokTimingMaxSubsteps,           "; Max substeps, clamped [1,6] (default 3)");
-        ini.SetBoolValue  ("RockEngine",      "bUseRockEngineArchitecture",    useRockEngineArchitecture,        "; SECOND ARCHITECTURE: host the full embedded ROCK engine (rock_engine) in-process, driven by ROCK.ini. Default 0 = engine dormant (identical to today).");
+        ini.SetBoolValue  ("RockEngine",      "bUseRockEngineArchitecture",    useRockEngineArchitecture,        "; SECOND ARCHITECTURE: host the full embedded ROCK engine in-process. ROCK settings share this Heisenberg_F4VR.ini under [PhysicsInteraction].");
 
         // [ObjectPickup] hand-authority / input keys (read in Load(); serialize too).
         ini.SetLongValue  ("ObjectPickup", "iHandAuthorityApplyMode",      handAuthorityApplyMode,         "; hand authority: 1=FRIK-goal seam (FRIK's own arm solver carries the hand, v5-equivalent; auto-degrades), 0=legacy post-FRIK bone IK");
         ini.SetBoolValue  ("ObjectPickup", "bHandAuthorityGoalHookLog",    handAuthorityGoalHookLog,       "; per-apply [FRIK-GOAL] debug logging");
         ini.SetBoolValue  ("VRInput",      "bSuppressThumbstickTouch",      suppressThumbstickTouch,        "; strip thumbstick capacitive-touch bit (stops FRIK thumb twitch on stick edge-touch)");
+        ini.SetBoolValue  ("VRInput",      "bPostLoadInputRecovery",        postLoadInputRecovery,          "; after a save load, log the engine input-enable layers ([INPUT-DIAG]) and re-assert movement (fixes 'cannot move or jump but can turn' after loading some saves)");
+        ini.SetBoolValue  ("Pipboy",       "bPipboyBootOpensContent",       pipboyBootOpensContent,         "; after the Vault 111 boot sequence, auto-open the Pip-Boy on STATS like vanilla flat. OFF by default: that forced-open Pip-Boy cannot be closed with grip (black screen, stuck open)");
         ini.SetLongValue  ("ObjectPickup", "iTwoHandedFingerPoseMode",      twoHandedFingerPoseMode,        "; support-hand fingers during two-handed grip: 0=off, 1=ROCK grip pose, 2=geometry solve vs weapon mesh");
 
         // Round-trip serializers — these keys were LOADED in Config::Load but never written here,

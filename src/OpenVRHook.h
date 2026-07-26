@@ -1,7 +1,11 @@
 #pragma once
 
 #include <openvr.h>
+#include "HeisenbergControllerStateBridge.h"
+#include <atomic>
+#include <condition_variable>
 #include <functional>
+#include <memory>
 #include <vector>
 #include <mutex>
 
@@ -108,12 +112,12 @@ namespace heisenberg
         std::vector<ControllerStateCallback> m_callbacks;
         std::mutex m_callbackMutex;
 
-        // Cached controller indices
-        vr::TrackedDeviceIndex_t m_leftControllerIndex = vr::k_unTrackedDeviceIndexInvalid;
-        vr::TrackedDeviceIndex_t m_rightControllerIndex = vr::k_unTrackedDeviceIndexInvalid;
+        // Cached controller indices. OpenVR can poll from more than one thread.
+        std::atomic<vr::TrackedDeviceIndex_t> m_leftControllerIndex{vr::k_unTrackedDeviceIndexInvalid};
+        std::atomic<vr::TrackedDeviceIndex_t> m_rightControllerIndex{vr::k_unTrackedDeviceIndexInvalid};
         
         void UpdateControllerIndices();
-        bool IsLeftController(vr::TrackedDeviceIndex_t index);
+        controller_bridge::ControllerRole GetControllerRole(vr::TrackedDeviceIndex_t index);
     };
 
     // ============================================================
@@ -146,7 +150,6 @@ namespace heisenberg
      *
      * Thread safety:
      *   - m_callbacks: protected by m_callbackMutex (copy-under-lock pattern for iteration)
-     *   - g_fo4vrToolsCallbacks: protected by g_fo4vrToolsCallbacksMutex (same pattern)
      *   - g_leftControllerIndex/g_rightControllerIndex: std::atomic (OpenVR thread + main thread)
      *   - RegisterControllerStateCallback: main-thread only (during init)
      *   - GetControllerState/WithPose: called from OpenVR thread, iterates callback copy
@@ -186,13 +189,25 @@ namespace heisenberg
         void RegisterControllerStateCallback(ControllerStateCallback callback);
 
         // Check if hook is active
-        bool IsHooked() const { return m_isHooked; }
+        bool IsHooked() const { return m_isHooked.load(std::memory_order_acquire); }
+        bool IsVtableHooked() const { return m_vtableHooked.load(std::memory_order_acquire); }
+        std::uint32_t GetBackendStatusFlags() const;
         
         // Apply callbacks to a controller state (used by vtable hooks)
-        void ApplyCallbacksToState(bool isLeft, vr::VRControllerState_t* state);
+        void ApplyCallbacksToState(controller_bridge::ControllerRole role,
+                                   vr::VRControllerState_t* state,
+                                   std::uint32_t consumer);
+        // Runs only bridge callbacks registered for Heisenberg's private
+        // interaction consumer. The raw controller state is never modified.
+        // Returns true when a callback owns logical Grip for this sample.
+        bool ApplyInteractionCallbacks(
+            controller_bridge::ControllerRole role,
+            vr::TrackedDeviceIndex_t deviceIndex,
+            const vr::VRControllerState_t& rawState,
+            vr::VRControllerState_t& interactionState);
         
         // Get controller hand side
-        bool IsLeftController(vr::TrackedDeviceIndex_t deviceIndex);
+        controller_bridge::ControllerRole GetControllerRole(vr::TrackedDeviceIndex_t deviceIndex) const;
         void UpdateControllerIndices(vr::IVRSystem* vrSystem);
 
     private:
@@ -201,18 +216,22 @@ namespace heisenberg
         OpenVRHook(const OpenVRHook&) = delete;
         OpenVRHook& operator=(const OpenVRHook&) = delete;
 
-        bool m_isHooked = false;
-        bool m_usingFO4VRTools = false;  // True if using FO4VRTools API instead of our own IAT hook
-        bool m_vtableHooked = false;     // True if we've hooked the real IVRSystem vtable
+        std::atomic<bool> m_isHooked{false};
+        std::atomic<bool> m_usingFO4VRTools{false};  // FO4VRTools is present or being retried
+        std::atomic<bool> m_vtableHooked{false};
+        std::atomic<bool> m_iatHooked{false};
+        std::atomic<bool> m_fo4vrToolsCallbackRegistered{false};
+        std::atomic<bool> m_shuttingDown{false};
         std::unique_ptr<VRSystemWrapper> m_vrSystemWrapper;
+        mutable std::mutex m_installMutex;
         
         // Callbacks for button filtering
         std::vector<ControllerStateCallback> m_callbacks;
         std::mutex m_callbackMutex;
         
         // Cached controller indices for vtable hook
-        vr::TrackedDeviceIndex_t m_leftControllerIndex = vr::k_unTrackedDeviceIndexInvalid;
-        vr::TrackedDeviceIndex_t m_rightControllerIndex = vr::k_unTrackedDeviceIndexInvalid;
+        std::atomic<vr::TrackedDeviceIndex_t> m_leftControllerIndex{vr::k_unTrackedDeviceIndexInvalid};
+        std::atomic<vr::TrackedDeviceIndex_t> m_rightControllerIndex{vr::k_unTrackedDeviceIndexInvalid};
         
         // Original vtable function pointers (before our hook)
         GetControllerState_t m_originalGetControllerState = nullptr;
@@ -230,10 +249,19 @@ namespace heisenberg
         // IAT patching helpers
         bool PatchIAT();
         bool RestoreIAT();
+        bool TryActivateFO4VRToolsBackend();
         void* m_originalIATEntry = nullptr;
+        void** m_iatSlot = nullptr;
+
+        void BeginHookCall();
+        void EndHookCall();
+        void WaitForHookCallsToDrain();
+        std::atomic<std::uint32_t> m_activeHookCalls{0};
+        std::mutex m_drainMutex;
+        std::condition_variable m_drainCondition;
         
     public:
-        // Vtable hooking - public so EnsureFO4VRToolsAPI can call it
+        // Vtable hooking is public for the lazy FO4VRTools backend activation path.
         bool HookRealVRSystemVtable(vr::IVRSystem* realSystem);
     private:
         void UnhookRealVRSystemVtable();

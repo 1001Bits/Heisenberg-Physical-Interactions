@@ -8,11 +8,10 @@
 // ---- WeaponSupportAuthorityPolicy.h ----
 
 /*
- * Equipped sidearm support grip is split from full two-handed weapon authority
- * because pistols need the visual stability of a left-hand mesh grab without
- * turning the left controller into a weapon steering input. Long guns use
- * full two-hand solving, while sidearms draw the support wrist from the stored
- * weapon-local grab frame. Runtime classification uses
+ * Equipped pistols and long guns use the same two-handed weapon authority:
+ * the support controller may steer the weapon, while the captured firing-hand
+ * frame remains the immutable root anchor. AttachOnly provider grips remain
+ * the explicit glue-only exception. Runtime classification still uses
  * the weapon animation grip keywords because Fallout 4 VR only exposes "gun" at
  * the weapon-type enum level, while actual vanilla and modded pistol records
  * carry `AnimsGripPistol`. Long-gun grip keywords are checked before the
@@ -68,41 +67,16 @@ namespace rock::weapon_support_authority_policy
     }
 
     inline constexpr WeaponSupportAuthorityMode resolveSupportAuthorityMode(
-        bool visualOnlySidearmSupportEnabled,
-        WeaponSupportWeaponClass weaponClass)
+        WeaponSupportWeaponClass)
     {
-        return visualOnlySidearmSupportEnabled && weaponClass == WeaponSupportWeaponClass::Sidearm ?
-                   WeaponSupportAuthorityMode::VisualOnlySupport :
-                   WeaponSupportAuthorityMode::FullTwoHandedSolver;
+        return WeaponSupportAuthorityMode::FullTwoHandedSolver;
     }
 
-    /*
-     * Sidearm hybrid support grip: a sidearm support grab that lands close to
-     * the firing grip is a shooting cup and stays visual-only so the two
-     * authorities do not fight over the short pistol frame, while a grab
-     * farther out is a manipulation grip and takes the same full two-handed
-     * authority long guns use (enabling detach/part-carry when realistic
-     * handling is on, and plain two-handed manipulation when it is off).
-     * Provider-mandated grab modes are exempt: a part whitelisted as
-     * AttachOnly must never be upgraded to full authority by proximity.
-     * The decision is made once at grip capture; changing modes requires
-     * releasing and re-grabbing.
-     */
-    inline constexpr bool canApplySidearmHybridAuthority(
-        WeaponSupportAuthorityMode resolvedMode,
-        bool providerGrabModeOverride)
-    {
-        return resolvedMode == WeaponSupportAuthorityMode::VisualOnlySupport && !providerGrabModeOverride;
-    }
-
-    inline constexpr WeaponSupportAuthorityMode resolveSidearmHybridSupportAuthorityMode(
-        float supportPalmToFiringGripDistance,
-        float visualOnlyRadius)
-    {
-        return supportPalmToFiringGripDistance <= visualOnlyRadius ?
-                   WeaponSupportAuthorityMode::VisualOnlySupport :
-                   WeaponSupportAuthorityMode::FullTwoHandedSolver;
-    }
+    static_assert(
+        resolveSupportAuthorityMode(WeaponSupportWeaponClass::Sidearm) ==
+        WeaponSupportAuthorityMode::FullTwoHandedSolver,
+        "Ordinary sidearm support grips must steer through the rigid "
+        "two-handed solver");
 
     inline constexpr bool supportGripOwnsWeaponTransform(WeaponSupportAuthorityMode mode)
     {
@@ -566,6 +540,15 @@ namespace rock
         float minimumSeparation{ 0.001f };
         float supportNormalTwistFactor{ 0.0f };
         bool useSupportNormalTwist{ false };
+        // Jul 25 (pistol grip fix B): when set, roll about the aim axis is referenced
+        // to the LIVE FIRING controller's palm normal (captured weapon-local vs live
+        // world target), pivoted at the PRIMARY grip point — both grip points lie on
+        // the twist axis, so the firing weld is exactly preserved while the firing
+        // hand owns roll. Takes precedence over the support-normal twist.
+        Vector primaryRollLocal{};
+        Vector primaryRollTargetWorld{};
+        float primaryRollTwistFactor{ 1.0f };
+        bool usePrimaryRollTwist{ false };
     };
 
     template <class Transform>
@@ -576,6 +559,9 @@ namespace rock
         bool solved{ false };
         float primaryError{ 0.0f };
         float supportError{ 0.0f };
+        // Signed roll twist actually applied about the aim axis this solve (0 when the
+        // twist was skipped as degenerate). Diagnostic only.
+        float appliedTwistRadians{ 0.0f };
     };
 
     template <class Vector>
@@ -867,25 +853,38 @@ namespace rock
         result.primaryError = weaponSolverLength(weaponSolverSub(primaryWorld, input.primaryTargetWorld));
         result.supportError = weaponSolverLength(weaponSolverSub(supportWorld, input.supportTargetWorld));
 
-        if (input.useSupportNormalTwist && input.supportNormalTwistFactor > 0.0f) {
+        // Jul 25 (pistol grip fix B): the twist's roll reference. Legacy path: support
+        // palm normal at the configured (partial) factor, pivoted at the SUPPORT point.
+        // Primary-roll path: the LIVE FIRING controller's palm normal at its own factor,
+        // pivoted at the PRIMARY grip point — the firing hand owns roll, so the gun can
+        // no longer roll out of the captured firing grip; both grip points lie on the
+        // twist axis so both welds are preserved exactly. Degenerate projections (palm
+        // normal near-parallel to the aim axis, i.e. near-vertical aim) skip the twist —
+        // the incremental rotation seed then simply carries last frame's roll.
+        const bool primaryRollActive = input.usePrimaryRollTwist && input.primaryRollTwistFactor > 0.0f;
+        if (primaryRollActive || (input.useSupportNormalTwist && input.supportNormalTwistFactor > 0.0f)) {
             const Vector twistAxis = weaponSolverNormalize(weaponSolverSub(input.supportTargetWorld, input.primaryTargetWorld));
-            const Vector currentNormalWorld = transform_math::localVectorToWorld(result.weaponWorldTransform, input.supportNormalLocal);
-            const Vector desiredNormalWorld = input.supportNormalTargetWorld;
+            const Vector currentNormalWorld = transform_math::localVectorToWorld(
+                result.weaponWorldTransform,
+                primaryRollActive ? input.primaryRollLocal : input.supportNormalLocal);
+            const Vector desiredNormalWorld = primaryRollActive ? input.primaryRollTargetWorld : input.supportNormalTargetWorld;
+            const float twistFactor = primaryRollActive ? input.primaryRollTwistFactor : input.supportNormalTwistFactor;
             const Vector currentProjected = weaponSolverNormalize(weaponSolverProjectOntoPlane(currentNormalWorld, twistAxis));
             const Vector desiredProjected = weaponSolverNormalize(weaponSolverProjectOntoPlane(desiredNormalWorld, twistAxis));
 
             if (weaponSolverLength(currentProjected) > input.minimumSeparation && weaponSolverLength(desiredProjected) > input.minimumSeparation) {
                 const float dotValue = (std::max)(-1.0f, (std::min)(1.0f, weaponSolverDot(currentProjected, desiredProjected)));
                 const Vector crossValue = weaponSolverCross(currentProjected, desiredProjected);
-                const float signedAngle = std::atan2(weaponSolverDot(twistAxis, crossValue), dotValue) * input.supportNormalTwistFactor;
+                const float signedAngle = std::atan2(weaponSolverDot(twistAxis, crossValue), dotValue) * twistFactor;
+                result.appliedTwistRadians = signedAngle;
                 const auto twistRotation = weaponSolverAxisAngleStored<decltype(input.weaponWorldTransform.rotate), Vector>(twistAxis, signedAngle);
                 result.rotationDelta =
                     weaponSolverApplyWorldRotationToStoredBasis<decltype(input.weaponWorldTransform.rotate), Vector>(twistRotation, result.rotationDelta);
 
-                const Vector supportPivot = input.supportTargetWorld;
-                const Vector pivotToWeapon = weaponSolverSub(result.weaponWorldTransform.translate, supportPivot);
+                const Vector twistPivot = primaryRollActive ? input.primaryTargetWorld : input.supportTargetWorld;
+                const Vector pivotToWeapon = weaponSolverSub(result.weaponWorldTransform.translate, twistPivot);
                 const Vector rotatedPivotToWeapon = weaponSolverApplyStoredWorldRotationToVector<decltype(input.weaponWorldTransform.rotate), Vector>(twistRotation, pivotToWeapon);
-                result.weaponWorldTransform.translate = weaponSolverAdd(supportPivot, rotatedPivotToWeapon);
+                result.weaponWorldTransform.translate = weaponSolverAdd(twistPivot, rotatedPivotToWeapon);
                 result.weaponWorldTransform.rotate =
                     weaponSolverApplyWorldRotationToStoredBasis<decltype(input.weaponWorldTransform.rotate), Vector>(twistRotation, result.weaponWorldTransform.rotate);
 

@@ -4,6 +4,13 @@
 #include <Windows.h>
 #include <DbgHelp.h>
 #include <intrin.h>  // _ReturnAddress — per-consumer input routing (audit rank 1)
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <cstring>
+#include <iterator>
+#include <string>
+#include <unordered_map>
 
 #pragma comment(lib, "DbgHelp.lib")
 
@@ -39,12 +46,207 @@ namespace heisenberg
     
     // Global pointer to FO4VRTools API (if available)
     static OpenVRHookManagerAPI* g_fo4vrToolsAPI = nullptr;
+    static std::mutex g_fo4vrToolsApiMutex;
     
-    // Our callbacks stored for FO4VRTools mode
-    static std::vector<ControllerStateCallback> g_fo4vrToolsCallbacks;
-    static std::mutex g_fo4vrToolsCallbacksMutex;
     static std::atomic<vr::TrackedDeviceIndex_t> g_leftControllerIndex{vr::k_unTrackedDeviceIndexInvalid};
     static std::atomic<vr::TrackedDeviceIndex_t> g_rightControllerIndex{vr::k_unTrackedDeviceIndexInvalid};
+
+    namespace bridge_detail
+    {
+        struct Entry
+        {
+            std::uint64_t handle = 0;
+            std::uint32_t phase = controller_bridge::kPreHeisenberg;
+            std::uint32_t consumerMask = controller_bridge::kConsumerGame;
+            std::int32_t priority = 0;
+            std::uint64_t sequence = 0;
+            controller_bridge::Callback callback = nullptr;
+            void* userData = nullptr;
+            std::string ownerName;
+            std::atomic<bool> enabled{true};
+            std::atomic<std::uint32_t> inFlight{0};
+            std::mutex drainMutex;
+            std::condition_variable drainCondition;
+        };
+
+        static std::mutex g_registryMutex;
+        static std::vector<std::shared_ptr<Entry>> g_entries;
+        static std::atomic<std::uint64_t> g_nextHandle{1};
+        static std::atomic<std::uint64_t> g_nextSequence{1};
+        static thread_local std::uint64_t g_currentHandle = 0;
+
+        static bool EntryOrder(const std::shared_ptr<Entry>& lhs, const std::shared_ptr<Entry>& rhs)
+        {
+            if (lhs->phase != rhs->phase) {
+                return lhs->phase < rhs->phase;
+            }
+            if (lhs->priority != rhs->priority) {
+                return lhs->priority < rhs->priority;
+            }
+            return lhs->sequence < rhs->sequence;
+        }
+
+        bool Register(const controller_bridge::Registration* registration, std::uint64_t* handle)
+        {
+            if (!registration || !handle ||
+                registration->structSize < sizeof(controller_bridge::Registration) ||
+                registration->abiVersion != controller_bridge::kAbiVersion ||
+                !registration->callback ||
+                (registration->phase != controller_bridge::kPreHeisenberg &&
+                 registration->phase != controller_bridge::kPostHeisenberg) ||
+                (registration->consumerMask & controller_bridge::kConsumerAll) == 0) {
+                return false;
+            }
+
+            auto entry = std::make_shared<Entry>();
+            entry->handle = g_nextHandle.fetch_add(1, std::memory_order_relaxed);
+            entry->phase = registration->phase;
+            entry->consumerMask = registration->consumerMask & controller_bridge::kConsumerAll;
+            entry->priority = registration->priority;
+            entry->sequence = g_nextSequence.fetch_add(1, std::memory_order_relaxed);
+            entry->callback = registration->callback;
+            entry->userData = registration->userData;
+            entry->ownerName = registration->ownerName ? registration->ownerName : "unnamed";
+
+            {
+                std::lock_guard<std::mutex> lock(g_registryMutex);
+                g_entries.push_back(entry);
+                std::stable_sort(g_entries.begin(), g_entries.end(), EntryOrder);
+            }
+
+            *handle = entry->handle;
+            spdlog::info(
+                "[OpenVRHook] Bridge callback registered: owner='{}', handle={}, phase={}, consumers=0x{:x}, priority={}",
+                entry->ownerName, entry->handle, entry->phase, entry->consumerMask, entry->priority);
+            return true;
+        }
+
+        bool Unregister(std::uint64_t handle, bool drainInFlight)
+        {
+            std::shared_ptr<Entry> entry;
+            {
+                std::lock_guard<std::mutex> lock(g_registryMutex);
+                const auto it = std::find_if(g_entries.begin(), g_entries.end(),
+                    [handle](const auto& candidate) { return candidate->handle == handle; });
+                if (it == g_entries.end()) {
+                    return false;
+                }
+                entry = *it;
+                entry->enabled.store(false, std::memory_order_release);
+                g_entries.erase(it);
+            }
+
+            // A callback cannot synchronously drain itself. Removal still prevents all
+            // future dispatches and shared ownership keeps its state alive until return.
+            if (drainInFlight && g_currentHandle != handle) {
+                std::unique_lock<std::mutex> lock(entry->drainMutex);
+                entry->drainCondition.wait(lock, [&entry] {
+                    return entry->inFlight.load(std::memory_order_acquire) == 0;
+                });
+            }
+
+            spdlog::info("[OpenVRHook] Bridge callback unregistered: owner='{}', handle={}",
+                entry->ownerName, handle);
+            return true;
+        }
+
+        std::uint64_t Dispatch(
+            controller_bridge::ControllerRole role,
+            vr::TrackedDeviceIndex_t deviceIndex,
+            vr::VRControllerState_t* state,
+            vr::VRControllerState_t* heisenbergState,
+            std::uint32_t phase,
+            std::uint32_t consumer,
+            std::uint64_t* resultFlags)
+        {
+            if (!state || role == controller_bridge::kRoleUnknown) {
+                return ~std::uint64_t{0};
+            }
+
+            std::vector<std::shared_ptr<Entry>> snapshot;
+            {
+                std::lock_guard<std::mutex> lock(g_registryMutex);
+                snapshot = g_entries;
+            }
+
+            controller_bridge::CallbackContext context{
+                sizeof(controller_bridge::CallbackContext),
+                controller_bridge::kAbiVersion,
+                phase,
+                consumer,
+                role,
+                deviceIndex,
+                0,
+                heisenbergState,
+                resultFlags,
+            };
+
+            std::uint64_t combinedMask = ~std::uint64_t{0};
+            for (const auto& entry : snapshot) {
+                if (entry->phase != phase ||
+                    (entry->consumerMask & consumer) == 0 ||
+                    !entry->enabled.load(std::memory_order_acquire)) {
+                    continue;
+                }
+
+                entry->inFlight.fetch_add(1, std::memory_order_acq_rel);
+                if (!entry->enabled.load(std::memory_order_acquire)) {
+                    if (entry->inFlight.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                        entry->drainCondition.notify_all();
+                    }
+                    continue;
+                }
+
+                const auto previousHandle = g_currentHandle;
+                g_currentHandle = entry->handle;
+                std::uint64_t mask = ~std::uint64_t{0};
+                try {
+                    mask = entry->callback(&context, state, entry->userData);
+                } catch (...) {
+                    spdlog::error(
+                        "[OpenVRHook] Bridge callback '{}' threw across the C ABI; disabling it",
+                        entry->ownerName);
+                    entry->enabled.store(false, std::memory_order_release);
+                }
+                g_currentHandle = previousHandle;
+                combinedMask &= mask;
+                state->ulButtonPressed &= mask;
+                state->ulButtonTouched &= mask;
+
+                if (entry->inFlight.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    entry->drainCondition.notify_all();
+                }
+            }
+            return combinedMask;
+        }
+
+        std::uint32_t Count()
+        {
+            std::lock_guard<std::mutex> lock(g_registryMutex);
+            return static_cast<std::uint32_t>(g_entries.size());
+        }
+
+        void DisableAndDrainAll()
+        {
+            std::vector<std::shared_ptr<Entry>> entries;
+            {
+                std::lock_guard<std::mutex> lock(g_registryMutex);
+                entries.swap(g_entries);
+                for (const auto& entry : entries) {
+                    entry->enabled.store(false, std::memory_order_release);
+                }
+            }
+            for (const auto& entry : entries) {
+                if (g_currentHandle == entry->handle) {
+                    continue;
+                }
+                std::unique_lock<std::mutex> lock(entry->drainMutex);
+                entry->drainCondition.wait(lock, [&entry] {
+                    return entry->inFlight.load(std::memory_order_acquire) == 0;
+                });
+            }
+        }
+    }
     
     // FO4VRTools callback that bridges to our callback system
     static bool FO4VRToolsControllerStateCallback(vr::TrackedDeviceIndex_t unControllerDeviceIndex, 
@@ -59,37 +261,36 @@ namespace heisenberg
         // Copy input to output first
         *pOutputControllerState = *pControllerState;
         
-        // Update controller indices if needed
-        if (g_fo4vrToolsAPI && (g_leftControllerIndex == vr::k_unTrackedDeviceIndexInvalid || 
-                                g_rightControllerIndex == vr::k_unTrackedDeviceIndexInvalid)) {
+        auto left = g_leftControllerIndex.load(std::memory_order_acquire);
+        auto right = g_rightControllerIndex.load(std::memory_order_acquire);
+        if (g_fo4vrToolsAPI &&
+            (left == vr::k_unTrackedDeviceIndexInvalid ||
+             right == vr::k_unTrackedDeviceIndexInvalid ||
+             (unControllerDeviceIndex != left && unControllerDeviceIndex != right))) {
             vr::IVRSystem* vrSystem = g_fo4vrToolsAPI->GetVRSystem();
             if (vrSystem) {
-                g_leftControllerIndex = vrSystem->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_LeftHand);
-                g_rightControllerIndex = vrSystem->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
+                left = vrSystem->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_LeftHand);
+                right = vrSystem->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
+                g_leftControllerIndex.store(left, std::memory_order_release);
+                g_rightControllerIndex.store(right, std::memory_order_release);
+                OpenVRHook::GetSingleton().UpdateControllerIndices(vrSystem);
             }
         }
-        
-        // Determine if this is left or right controller
-        bool isLeft = (unControllerDeviceIndex == g_leftControllerIndex);
-        
-        // Copy-under-lock: snapshot callbacks to avoid holding mutex during execution
-        std::vector<ControllerStateCallback> callbacksCopy;
-        {
-            std::lock_guard<std::mutex> lock(g_fo4vrToolsCallbacksMutex);
-            callbacksCopy = g_fo4vrToolsCallbacks;
-        }
-        for (auto& callback : callbacksCopy) {
-            uint64_t mask = callback(isLeft, pOutputControllerState);
-            pOutputControllerState->ulButtonPressed &= mask;
-            pOutputControllerState->ulButtonTouched &= mask;
+
+        controller_bridge::ControllerRole role = controller_bridge::kRoleUnknown;
+        if (unControllerDeviceIndex == left) {
+            role = controller_bridge::kRoleLeft;
+        } else if (unControllerDeviceIndex == right) {
+            role = controller_bridge::kRoleRight;
         }
 
-        // THUMB-TWITCH FIX (Jul 19): FRIK maps all three thumb bones to the thumbstick's
-        // capacitive TOUCH bit (k_EButton_SteamVR_Touchpad in setHandPose) — any stick
-        // edge-graze bends the thumb mid-grab. Strip the touch bit only; presses and axis
-        // values (locomotion, Pip-Boy) are untouched.
-        if (g_config.suppressThumbstickTouch) {
-            pOutputControllerState->ulButtonTouched &= ~vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Touchpad);
+        // FO4VRTools is a fallback only. Once the vtable path is active, that path
+        // already applied the pipeline and running it here would double-advance
+        // edge/hold state.
+        auto& hook = OpenVRHook::GetSingleton();
+        if (role != controller_bridge::kRoleUnknown && !hook.IsVtableHooked()) {
+            hook.ApplyCallbacksToState(
+                role, pOutputControllerState, controller_bridge::kConsumerGame);
         }
 
         return true;  // Continue processing
@@ -154,14 +355,24 @@ namespace heisenberg
         m_rightControllerIndex = m_realSystem->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
     }
 
-    bool VRSystemWrapper::IsLeftController(vr::TrackedDeviceIndex_t index)
+    controller_bridge::ControllerRole VRSystemWrapper::GetControllerRole(vr::TrackedDeviceIndex_t index)
     {
-        // Refresh indices periodically (controllers can change)
-        if (m_leftControllerIndex == vr::k_unTrackedDeviceIndexInvalid || 
-            m_rightControllerIndex == vr::k_unTrackedDeviceIndexInvalid) {
+        auto left = m_leftControllerIndex.load(std::memory_order_acquire);
+        auto right = m_rightControllerIndex.load(std::memory_order_acquire);
+        if (left == vr::k_unTrackedDeviceIndexInvalid ||
+            right == vr::k_unTrackedDeviceIndexInvalid ||
+            (index != left && index != right)) {
             UpdateControllerIndices();
+            left = m_leftControllerIndex.load(std::memory_order_acquire);
+            right = m_rightControllerIndex.load(std::memory_order_acquire);
         }
-        return index == m_leftControllerIndex;
+        if (index == left) {
+            return controller_bridge::kRoleLeft;
+        }
+        if (index == right) {
+            return controller_bridge::kRoleRight;
+        }
+        return controller_bridge::kRoleUnknown;
     }
 
     // ============================================================
@@ -189,8 +400,11 @@ namespace heisenberg
             // m_callbacks is empty whenever the vtable hook succeeded (registration is skipped
             // then), and populated only in the vtable-hook-failed fallback — but every callback
             // is ALSO in OpenVRHook::m_callbacks, so the shared list is correct in both cases.
-            bool isLeft = IsLeftController(unControllerDeviceIndex);
-            OpenVRHook::GetSingleton().ApplyCallbacksToState(isLeft, pControllerState);
+            const auto role = GetControllerRole(unControllerDeviceIndex);
+            if (role != controller_bridge::kRoleUnknown) {
+                OpenVRHook::GetSingleton().ApplyCallbacksToState(
+                    role, pControllerState, controller_bridge::kConsumerGame);
+            }
         }
 
         return result;
@@ -211,8 +425,11 @@ namespace heisenberg
         if (result && pControllerState && !IsCallerInOwnModule(callerRa)) {
             // Apply the SHARED OpenVRHook callback list (audit rank 1 fix — see the
             // GetControllerState twin above for the full rationale).
-            bool isLeft = IsLeftController(unControllerDeviceIndex);
-            OpenVRHook::GetSingleton().ApplyCallbacksToState(isLeft, pControllerState);
+            const auto role = GetControllerRole(unControllerDeviceIndex);
+            if (role != controller_bridge::kRoleUnknown) {
+                OpenVRHook::GetSingleton().ApplyCallbacksToState(
+                    role, pControllerState, controller_bridge::kConsumerGame);
+            }
         }
 
         return result;
@@ -418,11 +635,17 @@ namespace heisenberg
         // Call original function
         using VR_GetGenericInterface_t = void* (*)(const char*, vr::EVRInitError*);
         auto originalFunc = reinterpret_cast<VR_GetGenericInterface_t>(s_originalGetGenericInterface);
+        if (!originalFunc) {
+            if (peError) {
+                *peError = vr::VRInitError_Init_InterfaceNotFound;
+            }
+            return nullptr;
+        }
         void* result = originalFunc(pchInterfaceVersion, peError);
 
         if (result && pchInterfaceVersion) {
-            // Check if this is a request for IVRSystem
-            if (strstr(pchInterfaceVersion, "IVRSystem") != nullptr) {
+            // The hard-coded vtable indices below are valid only for IVRSystem_019.
+            if (std::strcmp(pchInterfaceVersion, "IVRSystem_019") == 0) {
                 spdlog::info("[OpenVRHook] Intercepted IVRSystem request: {}", pchInterfaceVersion);
                 
                 auto& hook = GetSingleton();
@@ -462,14 +685,12 @@ namespace heisenberg
             return false;
         }
 
-        // Get the real VR_GetGenericInterface address
-        s_originalGetGenericInterface = GetProcAddress(openvrModule, "VR_GetGenericInterface");
-        if (!s_originalGetGenericInterface) {
+        // Verify that the export exists, but chain through the function currently in
+        // Fallout's IAT slot. It may already be another mod's compatible hook.
+        if (!GetProcAddress(openvrModule, "VR_GetGenericInterface")) {
             spdlog::error("[OpenVRHook] Failed to find VR_GetGenericInterface in openvr_api.dll");
             return false;
         }
-
-        spdlog::info("[OpenVRHook] Found VR_GetGenericInterface at {:p}", s_originalGetGenericInterface);
 
         // Parse the PE headers to find the IAT
         PIMAGE_DOS_HEADER dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(gameModule);
@@ -507,8 +728,14 @@ namespace heisenberg
                         if (strcmp(importByName->Name, "VR_GetGenericInterface") == 0) {
                             spdlog::info("[OpenVRHook] Found VR_GetGenericInterface in IAT");
 
-                            // Save original address
-                            m_originalIATEntry = reinterpret_cast<void*>(thunk->u1.Function);
+                            m_iatSlot = reinterpret_cast<void**>(&thunk->u1.Function);
+                            m_originalIATEntry = *m_iatSlot;
+                            if (m_originalIATEntry == reinterpret_cast<void*>(&HookedVR_GetGenericInterface)) {
+                                m_iatHooked.store(true, std::memory_order_release);
+                                m_isHooked.store(true, std::memory_order_release);
+                                return true;
+                            }
+                            s_originalGetGenericInterface = m_originalIATEntry;
 
                             // Make the page writable
                             DWORD oldProtect;
@@ -518,13 +745,14 @@ namespace heisenberg
                             }
 
                             // Replace with our hook
-                            thunk->u1.Function = reinterpret_cast<ULONGLONG>(HookedVR_GetGenericInterface);
+                            *m_iatSlot = reinterpret_cast<void*>(&HookedVR_GetGenericInterface);
 
                             // Restore protection
                             VirtualProtect(&thunk->u1.Function, sizeof(void*), oldProtect, &oldProtect);
 
                             spdlog::info("[OpenVRHook] IAT patch successful!");
-                            m_isHooked = true;
+                            m_iatHooked.store(true, std::memory_order_release);
+                            m_isHooked.store(true, std::memory_order_release);
                             return true;
                         }
                     }
@@ -543,42 +771,72 @@ namespace heisenberg
 
     bool OpenVRHook::RestoreIAT()
     {
-        if (!m_isHooked || !m_originalIATEntry) {
+        if (!m_iatHooked.load(std::memory_order_acquire) || !m_originalIATEntry) {
             return true;
         }
+        if (!m_iatSlot) {
+            return false;
+        }
 
-        // We would need to re-locate the IAT entry to restore it
-        // For simplicity, we just mark as not hooked - the game will exit anyway
-        m_isHooked = false;
-        return true;
+        DWORD oldProtect = 0;
+        if (!VirtualProtect(m_iatSlot, sizeof(void*), PAGE_READWRITE, &oldProtect)) {
+            spdlog::error("[OpenVRHook] Failed to make IAT writable during shutdown: {}", GetLastError());
+            return false;
+        }
+
+        const bool owned =
+            *m_iatSlot ==
+            reinterpret_cast<void*>(&HookedVR_GetGenericInterface);
+        if (owned) {
+            *m_iatSlot = m_originalIATEntry;
+        } else {
+            spdlog::warn("[OpenVRHook] IAT ownership changed; preserving the newer hook");
+        }
+        DWORD ignored = 0;
+        const bool protectionRestored =
+            VirtualProtect(
+                m_iatSlot,
+                sizeof(void*),
+                oldProtect,
+                &ignored) != FALSE;
+        if (!protectionRestored) {
+            spdlog::error(
+                "[OpenVRHook] Failed to restore IAT page protection during "
+                "shutdown: {}",
+                GetLastError());
+        }
+
+        if (owned) {
+            m_iatHooked.store(false, std::memory_order_release);
+        }
+        // Keep the slot and predecessor pointers for process life. A newer
+        // hook may have captured our thunk, and a thread can also enter a
+        // thunk after fetching the old IAT entry immediately before restore.
+        return owned && protectionRestored;
     }
 
     bool OpenVRHook::Initialize()
     {
         spdlog::info("[OpenVRHook] Initializing OpenVR hook...");
 
-        if (m_isHooked) {
+        if (m_isHooked.load(std::memory_order_acquire)) {
             spdlog::warn("[OpenVRHook] Already hooked");
             return true;
         }
+        m_shuttingDown.store(false, std::memory_order_release);
 
-        // FIRST: Check if FO4VRTools.dll is loaded AT ALL
-        // If it is, we should NOT do IAT patching - we'll use their API later
         HMODULE fo4vrToolsModule = GetModuleHandleA("FO4VRTools.dll");
         if (fo4vrToolsModule != nullptr) {
-            // FO4VRTools is loaded - don't do IAT patching, we'll use their API lazily
-            spdlog::info("[OpenVRHook] FO4VRTools.dll detected - skipping IAT hook to avoid conflicts");
-            spdlog::info("[OpenVRHook] Will use FO4VRTools API for OpenVR access");
-            
-            m_isHooked = true;  // Mark as "hooked" so we don't try again
-            m_usingFO4VRTools = true;  // Will get API lazily when needed
-            return true;
+            m_usingFO4VRTools.store(true, std::memory_order_release);
+            spdlog::info("[OpenVRHook] FO4VRTools.dll detected; probing backend health");
+            if (TryActivateFO4VRToolsBackend()) {
+                m_isHooked.store(true, std::memory_order_release);
+                return true;
+            }
+            spdlog::warn(
+                "[OpenVRHook] FO4VRTools is present but not operational yet; installing chained IAT fallback");
         }
         
-        // FO4VRTools not loaded - use our own IAT hook
-        spdlog::info("[OpenVRHook] FO4VRTools not detected - using our own IAT hook");
-
-        // Try to patch the IAT
         if (!PatchIAT()) {
             spdlog::error("[OpenVRHook] Failed to patch IAT");
             return false;
@@ -591,90 +849,75 @@ namespace heisenberg
     void OpenVRHook::Shutdown()
     {
         spdlog::info("[OpenVRHook] Shutting down OpenVR hook");
+        m_shuttingDown.store(true, std::memory_order_release);
+        bridge_detail::DisableAndDrainAll();
         
-        if (m_usingFO4VRTools && g_fo4vrToolsAPI) {
-            // Unregister our bridge callback from FO4VRTools
+        if (m_fo4vrToolsCallbackRegistered.exchange(false, std::memory_order_acq_rel) &&
+            g_fo4vrToolsAPI) {
             g_fo4vrToolsAPI->UnregisterControllerStateCB(FO4VRToolsControllerStateCallback);
-            // g_fo4vrToolsCallbacks is documented as "protected by g_fo4vrToolsCallbacksMutex
-            // (same pattern)" (see the header contract) - unregistering does not synchronize
-            // with an in-flight callback already inside FO4VRToolsControllerStateCallback's
-            // own lock_guard-protected copy of this vector, so an unlocked clear() here could
-            // free the vector's storage mid-copy on another thread.
-            {
-                std::lock_guard<std::mutex> lock(g_fo4vrToolsCallbacksMutex);
-                g_fo4vrToolsCallbacks.clear();
-            }
             spdlog::info("[OpenVRHook] Unregistered from FO4VRTools");
-        } else {
-            RestoreIAT();
         }
+        RestoreIAT();
         
-        // Unhook vtable if we hooked it
         UnhookRealVRSystemVtable();
+        WaitForHookCallsToDrain();
         
         {
             std::lock_guard<std::mutex> lock(m_callbackMutex);
             m_callbacks.clear();
         }
 
-        m_vrSystemWrapper.reset();
+        // The game or another plugin may have cached the wrapper returned by
+        // HookedVR_GetGenericInterface. Keep it as a disabled forwarding proxy
+        // for process life instead of creating a shutdown-time use-after-free.
+        m_isHooked.store(false, std::memory_order_release);
     }
     
-    // Helper to lazily get FO4VRTools API (called when needed, not at init time)
-    static OpenVRHookManagerAPI* EnsureFO4VRToolsAPI()
+    bool OpenVRHook::TryActivateFO4VRToolsBackend()
     {
-        if (g_fo4vrToolsAPI) {
-            return g_fo4vrToolsAPI;
+        if (m_shuttingDown.load(std::memory_order_acquire)) {
+            return false;
         }
-        
-        // Try to get the API now
-        g_fo4vrToolsAPI = RequestFO4VRToolsAPI();
-        if (g_fo4vrToolsAPI) {
-            spdlog::info("[OpenVRHook] Lazily acquired FO4VRTools API");
-            
-            // Register our bridge callback (still useful for game's own calls)
+        std::lock_guard<std::mutex> apiLock(g_fo4vrToolsApiMutex);
+        if (!g_fo4vrToolsAPI || !g_fo4vrToolsAPI->IsInitialized()) {
+            g_fo4vrToolsAPI = RequestFO4VRToolsAPI();
+        }
+        if (!g_fo4vrToolsAPI || !g_fo4vrToolsAPI->IsInitialized()) {
+            return false;
+        }
+
+        m_usingFO4VRTools.store(true, std::memory_order_release);
+        if (!m_fo4vrToolsCallbackRegistered.exchange(true, std::memory_order_acq_rel)) {
             g_fo4vrToolsAPI->RegisterControllerStateCB(FO4VRToolsControllerStateCallback);
-            
-            // CRITICAL: Also hook the REAL IVRSystem's vtable
-            // This catches calls from mods that use GetVRSystem()->GetControllerState()
-            // (like Virtual Holsters) which bypass the FO4VRTools callback system
-            vr::IVRSystem* realSystem = g_fo4vrToolsAPI->GetVRSystem();
-            if (realSystem) {
-                const bool vtableHooked = OpenVRHook::GetSingleton().HookRealVRSystemVtable(realSystem);
-                // A callback registered while the vtable hook wasn't up yet (FO4VRTools
-                // loaded but not fully initialized) falls back into g_fo4vrToolsCallbacks
-                // (see RegisterControllerStateCallback's own comment on why the two paths
-                // must never both be live). If THIS lazy Ensure call is what finally makes
-                // the vtable hook succeed, those fallback entries are now redundant AND
-                // dangerous: every controller poll would run the callback twice (vtable
-                // hook, then the bridge on the already-modified state), advancing per-hand
-                // edge-tracking statics twice per poll and misrouting native buttons. Clear
-                // them now that the vtable hook - the intended, non-double-executing path -
-                // is confirmed up.
-                if (vtableHooked) {
-                    std::lock_guard<std::mutex> lock(g_fo4vrToolsCallbacksMutex);
-                    if (!g_fo4vrToolsCallbacks.empty()) {
-                        spdlog::info("[OpenVRHook] Vtable hook succeeded on lazy Ensure - clearing {} stale FO4VRTools bridge fallback callback(s)",
-                            g_fo4vrToolsCallbacks.size());
-                        g_fo4vrToolsCallbacks.clear();
-                    }
-                }
-            }
+            spdlog::info("[OpenVRHook] Registered FO4VRTools fallback callback");
         }
-        
-        return g_fo4vrToolsAPI;
+
+        if (auto* realSystem = g_fo4vrToolsAPI->GetVRSystem()) {
+            HookRealVRSystemVtable(realSystem);
+        }
+        const bool operational =
+            m_vtableHooked.load(std::memory_order_acquire) ||
+            m_fo4vrToolsCallbackRegistered.load(std::memory_order_acquire);
+        if (operational) {
+            m_isHooked.store(true, std::memory_order_release);
+        }
+        return operational;
     }
     
     vr::IVRSystem* OpenVRHook::GetRealVRSystem() const
     {
-        if (m_usingFO4VRTools) {
-            auto* api = EnsureFO4VRToolsAPI();
-            if (api) {
-                return api->GetVRSystem();
+        if (m_usingFO4VRTools.load(std::memory_order_acquire) ||
+            GetModuleHandleA("FO4VRTools.dll")) {
+            auto* self = const_cast<OpenVRHook*>(this);
+            self->m_usingFO4VRTools.store(true, std::memory_order_release);
+            self->TryActivateFO4VRToolsBackend();
+            std::lock_guard<std::mutex> apiLock(g_fo4vrToolsApiMutex);
+            if (g_fo4vrToolsAPI && g_fo4vrToolsAPI->IsInitialized()) {
+                return g_fo4vrToolsAPI->GetVRSystem();
             }
-            return nullptr;
         }
-        return m_vrSystemWrapper ? m_vrSystemWrapper->GetRealSystem() : nullptr;
+        return m_realVRSystem ? m_realVRSystem :
+            (m_vrSystemWrapper ? m_vrSystemWrapper->GetRealSystem() : nullptr);
     }
     
     bool OpenVRHook::GetControllerStateUnfiltered(vr::TrackedDeviceIndex_t deviceIndex,
@@ -696,6 +939,9 @@ namespace heisenberg
 
     void OpenVRHook::RegisterControllerStateCallback(ControllerStateCallback callback)
     {
+        if (!callback || m_shuttingDown.load(std::memory_order_acquire)) {
+            return;
+        }
         // Always add to our internal callback list (used by vtable hook)
         {
             std::lock_guard<std::mutex> lock(m_callbackMutex);
@@ -709,22 +955,15 @@ namespace heisenberg
         // cause double-execution: vtable hook modifies state (strips A, injects grip),
         // then bridge/wrapper applies the same callback on the modified state, seeing
         // stripped A as "released" and corrupting hold-timing logic.
-        if (m_usingFO4VRTools) {
-            // Ensure API is available and hook vtable
-            EnsureFO4VRToolsAPI();
-            
-            // After EnsureFO4VRToolsAPI, vtable should be hooked. Only add to bridge
-            // as fallback if vtable hook failed.
-            if (!m_vtableHooked) {
-                spdlog::warn("[OpenVRHook] Vtable hook failed - using FO4VRTools bridge as fallback");
-                std::lock_guard<std::mutex> lock(g_fo4vrToolsCallbacksMutex);
-                g_fo4vrToolsCallbacks.push_back(callback);
-            } else {
-                spdlog::info("[OpenVRHook] Vtable hooked - skipping bridge (prevents double-execution)");
-            }
+        if (m_usingFO4VRTools.load(std::memory_order_acquire) ||
+            GetModuleHandleA("FO4VRTools.dll")) {
+            m_usingFO4VRTools.store(true, std::memory_order_release);
+            // Retry every time another consumer registers. FO4VRTools may have been
+            // loaded at process start but initialized only after F4SE plugin load.
+            TryActivateFO4VRToolsBackend();
         } else if (m_vrSystemWrapper) {
             // Wrapper mode - vtable hook handles everything, no need for wrapper callbacks
-            if (!m_vtableHooked) {
+            if (!m_vtableHooked.load(std::memory_order_acquire)) {
                 m_vrSystemWrapper->RegisterControllerStateCallback(callback);
             } else {
                 spdlog::info("[OpenVRHook] Vtable hooked - skipping wrapper callback (prevents double-execution)");
@@ -732,9 +971,32 @@ namespace heisenberg
         }
     }
     
-    void OpenVRHook::ApplyCallbacksToState(bool isLeft, vr::VRControllerState_t* state)
+    void OpenVRHook::ApplyCallbacksToState(
+        controller_bridge::ControllerRole role,
+        vr::VRControllerState_t* state,
+        std::uint32_t consumer)
     {
-        if (!state) return;
+        if (!state || role == controller_bridge::kRoleUnknown ||
+            m_shuttingDown.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        const auto deviceIndex = role == controller_bridge::kRoleLeft
+            ? m_leftControllerIndex.load(std::memory_order_acquire)
+            : m_rightControllerIndex.load(std::memory_order_acquire);
+        vr::VRControllerState_t heisenbergState = *state;
+
+        // External remappers run first for game input, so virtual Grip/button
+        // outputs can be directed either to Fallout (`state`) or exclusively to
+        // Heisenberg (`heisenbergState`).
+        bridge_detail::Dispatch(
+            role,
+            deviceIndex,
+            state,
+            &heisenbergState,
+            controller_bridge::kPreHeisenberg,
+            consumer,
+            nullptr);
 
         // Copy-under-lock: snapshot callbacks to avoid holding mutex during execution
         std::vector<ControllerStateCallback> callbacksCopy;
@@ -743,7 +1005,32 @@ namespace heisenberg
             callbacksCopy = m_callbacks;
         }
         for (auto& callback : callbacksCopy) {
-            uint64_t mask = callback(isLeft, state);
+            const auto before = heisenbergState;
+            uint64_t mask = callback(
+                role == controller_bridge::kRoleLeft, &heisenbergState);
+            heisenbergState.ulButtonPressed &= mask;
+            heisenbergState.ulButtonTouched &= mask;
+
+            // Merge only changes made by Heisenberg itself. Bits injected solely
+            // into the private interaction state by a bridge callback remain
+            // private when Heisenberg leaves them unchanged.
+            const auto pressedChanges =
+                before.ulButtonPressed ^ heisenbergState.ulButtonPressed;
+            const auto touchedChanges =
+                before.ulButtonTouched ^ heisenbergState.ulButtonTouched;
+            state->ulButtonPressed =
+                (state->ulButtonPressed & ~pressedChanges) |
+                (heisenbergState.ulButtonPressed & pressedChanges);
+            state->ulButtonTouched =
+                (state->ulButtonTouched & ~touchedChanges) |
+                (heisenbergState.ulButtonTouched & touchedChanges);
+
+            for (std::size_t axis = 0; axis < std::size(state->rAxis); ++axis) {
+                if (before.rAxis[axis].x != heisenbergState.rAxis[axis].x ||
+                    before.rAxis[axis].y != heisenbergState.rAxis[axis].y) {
+                    state->rAxis[axis] = heisenbergState.rAxis[axis];
+                }
+            }
             state->ulButtonPressed &= mask;
             state->ulButtonTouched &= mask;
         }
@@ -752,18 +1039,128 @@ namespace heisenberg
         if (g_config.suppressThumbstickTouch) {
             state->ulButtonTouched &= ~vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Touchpad);
         }
+
+        bridge_detail::Dispatch(
+            role,
+            deviceIndex,
+            state,
+            &heisenbergState,
+            controller_bridge::kPostHeisenberg,
+            consumer,
+            nullptr);
+    }
+
+    bool OpenVRHook::ApplyInteractionCallbacks(
+        controller_bridge::ControllerRole role,
+        vr::TrackedDeviceIndex_t deviceIndex,
+        const vr::VRControllerState_t& rawState,
+        vr::VRControllerState_t& interactionState)
+    {
+        interactionState = rawState;
+        if (role == controller_bridge::kRoleUnknown ||
+            m_shuttingDown.load(std::memory_order_acquire)) {
+            return false;
+        }
+
+        auto gameFacingCopy = rawState;
+        std::uint64_t resultFlags =
+            controller_bridge::kResultNone;
+        bridge_detail::Dispatch(
+            role,
+            deviceIndex,
+            &gameFacingCopy,
+            &interactionState,
+            controller_bridge::kPreHeisenberg,
+            controller_bridge::kConsumerHeisenberg,
+            &resultFlags);
+        bridge_detail::Dispatch(
+            role,
+            deviceIndex,
+            &gameFacingCopy,
+            &interactionState,
+            controller_bridge::kPostHeisenberg,
+            controller_bridge::kConsumerHeisenberg,
+            &resultFlags);
+        return (resultFlags &
+                controller_bridge::kResultOwnsHeisenbergGrip) != 0;
     }
     
     void OpenVRHook::UpdateControllerIndices(vr::IVRSystem* vrSystem)
     {
         if (!vrSystem) return;
-        m_leftControllerIndex = vrSystem->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_LeftHand);
-        m_rightControllerIndex = vrSystem->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
+        const auto left =
+            vrSystem->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_LeftHand);
+        const auto right =
+            vrSystem->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
+        m_leftControllerIndex.store(left, std::memory_order_release);
+        m_rightControllerIndex.store(right, std::memory_order_release);
+        g_leftControllerIndex.store(left, std::memory_order_release);
+        g_rightControllerIndex.store(right, std::memory_order_release);
     }
     
-    bool OpenVRHook::IsLeftController(vr::TrackedDeviceIndex_t deviceIndex)
+    controller_bridge::ControllerRole OpenVRHook::GetControllerRole(
+        vr::TrackedDeviceIndex_t deviceIndex) const
     {
-        return deviceIndex == m_leftControllerIndex;
+        const auto left = m_leftControllerIndex.load(std::memory_order_acquire);
+        const auto right = m_rightControllerIndex.load(std::memory_order_acquire);
+        if (deviceIndex == left) {
+            return controller_bridge::kRoleLeft;
+        }
+        if (deviceIndex == right) {
+            return controller_bridge::kRoleRight;
+        }
+        return controller_bridge::kRoleUnknown;
+    }
+
+    std::uint32_t OpenVRHook::GetBackendStatusFlags() const
+    {
+        std::uint32_t flags = controller_bridge::kBackendNone;
+        if (m_iatHooked.load(std::memory_order_acquire)) {
+            flags |= controller_bridge::kBackendIATInstalled;
+        }
+        if (m_usingFO4VRTools.load(std::memory_order_acquire)) {
+            flags |= controller_bridge::kBackendFO4VRToolsAvailable;
+        }
+        if (m_fo4vrToolsCallbackRegistered.load(std::memory_order_acquire)) {
+            flags |= controller_bridge::kBackendFO4VRToolsCallback;
+        }
+        if (m_vtableHooked.load(std::memory_order_acquire)) {
+            flags |= controller_bridge::kBackendVtableInstalled;
+        }
+        if ((flags & (controller_bridge::kBackendIATInstalled |
+                      controller_bridge::kBackendFO4VRToolsCallback |
+                      controller_bridge::kBackendVtableInstalled)) != 0) {
+            flags |= controller_bridge::kBackendOperational;
+        }
+        if (m_shuttingDown.load(std::memory_order_acquire)) {
+            flags |= controller_bridge::kBackendShuttingDown;
+        }
+        flags |= controller_bridge::kBackendInteractionStateConsumed;
+        return flags;
+    }
+
+    void OpenVRHook::BeginHookCall()
+    {
+        m_activeHookCalls.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    void OpenVRHook::EndHookCall()
+    {
+        if (m_activeHookCalls.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            m_drainCondition.notify_all();
+        }
+    }
+
+    void OpenVRHook::WaitForHookCallsToDrain()
+    {
+        std::unique_lock<std::mutex> lock(m_drainMutex);
+        if (!m_drainCondition.wait_for(lock, std::chrono::milliseconds(500), [this] {
+                return m_activeHookCalls.load(std::memory_order_acquire) == 0;
+            })) {
+            spdlog::warn(
+                "[OpenVRHook] Timed out waiting for {} in-flight OpenVR call(s); preserving process-lifetime state",
+                m_activeHookCalls.load(std::memory_order_acquire));
+        }
     }
     
     // ============================================================
@@ -772,7 +1169,7 @@ namespace heisenberg
     // ============================================================
     
     // Global pointer to OpenVRHook for the hook functions
-    static OpenVRHook* g_openVRHookInstance = nullptr;
+    static std::atomic<OpenVRHook*> g_openVRHookInstance{nullptr};
 
     // FAITHFULNESS FIX (2026-07-05 audit rank 1): per-consumer input routing. The embedded
     // ROCK engine's framework polls GetControllerState(WithPose) through this SAME patched
@@ -806,20 +1203,70 @@ namespace heisenberg
         const auto ra = reinterpret_cast<uintptr_t>(returnAddress);
         return s_base != 0 && ra >= s_base && ra < s_base + s_size;
     }
+
+    static std::uint32_t ClassifyConsumer(const void* returnAddress)
+    {
+        if (IsCallerInOwnModule(returnAddress)) {
+            return controller_bridge::kConsumerHeisenberg;
+        }
+        HMODULE callerModule = nullptr;
+        if (GetModuleHandleExA(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCSTR>(returnAddress),
+                &callerModule) &&
+            callerModule) {
+            if (callerModule == GetModuleHandle(nullptr) ||
+                callerModule == GetModuleHandleA("FO4VRTools.dll")) {
+                // FO4VRTools can be the immediate caller while proxying Fallout's
+                // cached IVRSystem. Mods using its exposed real system still enter
+                // from their own DLL and remain third-party consumers.
+                return controller_bridge::kConsumerGame;
+            }
+        }
+        return controller_bridge::kConsumerThirdParty;
+    }
+
+    static bool ReplacePointerSlot(void** slot, void* expected, void* replacement)
+    {
+        if (!slot || !expected || !replacement) {
+            return false;
+        }
+        DWORD oldProtect = 0;
+        if (!VirtualProtect(slot, sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            return false;
+        }
+        const auto observed = InterlockedCompareExchangePointer(
+            reinterpret_cast<void* volatile*>(slot), replacement, expected);
+        DWORD ignored = 0;
+        const bool protectionRestored =
+            VirtualProtect(slot, sizeof(void*), oldProtect, &ignored) != FALSE;
+        if (!protectionRestored) {
+            spdlog::error("[OpenVRHook] Failed to restore vtable page protection: {}", GetLastError());
+        }
+        return observed == expected && protectionRestored;
+    }
     
     // Our hooked GetControllerState - called instead of the real one
-    static bool __fastcall Hooked_GetControllerState(vr::IVRSystem* thisPtr,
+    bool __fastcall Hooked_GetControllerState(vr::IVRSystem* thisPtr,
                                                       vr::TrackedDeviceIndex_t unControllerDeviceIndex,
                                                       vr::VRControllerState_t* pControllerState,
                                                       uint32_t unControllerStateSize)
     {
         const void* callerRa = _ReturnAddress();
-        if (!g_openVRHookInstance || !g_openVRHookInstance->m_originalGetControllerState) {
+        auto* hook = g_openVRHookInstance.load(std::memory_order_acquire);
+        if (!hook) {
+            return false;
+        }
+        hook->BeginHookCall();
+        const auto original = hook->m_originalGetControllerState;
+        if (!original) {
+            hook->EndHookCall();
             return false;
         }
 
         // Call the original function
-        bool result = g_openVRHookInstance->m_originalGetControllerState(
+        bool result = original(
             thisPtr, unControllerDeviceIndex, pControllerState, unControllerStateSize);
 
         if (result && pControllerState) {
@@ -830,25 +1277,28 @@ namespace heisenberg
             // NEITHER cached slot. Without this, the real left controller (say) polls as
             // IsLeftController()==false forever after a reconnect, and ApplyCallbacksToState
             // below misroutes the A+Grip strip/inject to the wrong physical hand.
-            if (g_openVRHookInstance->m_leftControllerIndex == vr::k_unTrackedDeviceIndexInvalid ||
-                (unControllerDeviceIndex != g_openVRHookInstance->m_leftControllerIndex &&
-                 unControllerDeviceIndex != g_openVRHookInstance->m_rightControllerIndex)) {
-                g_openVRHookInstance->UpdateControllerIndices(thisPtr);
+            const auto left = hook->m_leftControllerIndex.load(std::memory_order_acquire);
+            const auto right = hook->m_rightControllerIndex.load(std::memory_order_acquire);
+            if (left == vr::k_unTrackedDeviceIndexInvalid ||
+                right == vr::k_unTrackedDeviceIndexInvalid ||
+                (unControllerDeviceIndex != left && unControllerDeviceIndex != right)) {
+                hook->UpdateControllerIndices(thisPtr);
             }
 
-            // Determine hand and apply callbacks — but NOT for our own module's reads
-            // (embedded ROCK must see raw hardware grip, like standalone; audit rank 1).
-            if (!IsCallerInOwnModule(callerRa)) {
-                bool isLeft = g_openVRHookInstance->IsLeftController(unControllerDeviceIndex);
-                g_openVRHookInstance->ApplyCallbacksToState(isLeft, pControllerState);
+            const auto consumer = ClassifyConsumer(callerRa);
+            const auto role = hook->GetControllerRole(unControllerDeviceIndex);
+            if (consumer != controller_bridge::kConsumerHeisenberg &&
+                role != controller_bridge::kRoleUnknown) {
+                hook->ApplyCallbacksToState(role, pControllerState, consumer);
             }
         }
 
+        hook->EndHookCall();
         return result;
     }
 
     // Our hooked GetControllerStateWithPose
-    static bool __fastcall Hooked_GetControllerStateWithPose(vr::IVRSystem* thisPtr,
+    bool __fastcall Hooked_GetControllerStateWithPose(vr::IVRSystem* thisPtr,
                                                               vr::ETrackingUniverseOrigin eOrigin,
                                                               vr::TrackedDeviceIndex_t unControllerDeviceIndex,
                                                               vr::VRControllerState_t* pControllerState,
@@ -856,73 +1306,114 @@ namespace heisenberg
                                                               vr::TrackedDevicePose_t* pTrackedDevicePose)
     {
         const void* callerRa = _ReturnAddress();
-        if (!g_openVRHookInstance || !g_openVRHookInstance->m_originalGetControllerStateWithPose) {
+        auto* hook = g_openVRHookInstance.load(std::memory_order_acquire);
+        if (!hook) {
+            return false;
+        }
+        hook->BeginHookCall();
+        const auto original = hook->m_originalGetControllerStateWithPose;
+        if (!original) {
+            hook->EndHookCall();
             return false;
         }
 
         // Call the original function
-        bool result = g_openVRHookInstance->m_originalGetControllerStateWithPose(
+        bool result = original(
             thisPtr, eOrigin, unControllerDeviceIndex, pControllerState, unControllerStateSize, pTrackedDevicePose);
         
         if (result && pControllerState) {
             // Update controller indices if needed (see the identical comment in
             // Hooked_GetControllerState above - same mid-session reconnect fix).
-            if (g_openVRHookInstance->m_leftControllerIndex == vr::k_unTrackedDeviceIndexInvalid ||
-                (unControllerDeviceIndex != g_openVRHookInstance->m_leftControllerIndex &&
-                 unControllerDeviceIndex != g_openVRHookInstance->m_rightControllerIndex)) {
-                g_openVRHookInstance->UpdateControllerIndices(thisPtr);
+            const auto left = hook->m_leftControllerIndex.load(std::memory_order_acquire);
+            const auto right = hook->m_rightControllerIndex.load(std::memory_order_acquire);
+            if (left == vr::k_unTrackedDeviceIndexInvalid ||
+                right == vr::k_unTrackedDeviceIndexInvalid ||
+                (unControllerDeviceIndex != left && unControllerDeviceIndex != right)) {
+                hook->UpdateControllerIndices(thisPtr);
             }
 
-            // Determine hand and apply callbacks — but NOT for our own module's reads
-            // (embedded ROCK must see raw hardware grip, like standalone; audit rank 1).
-            if (!IsCallerInOwnModule(callerRa)) {
-                bool isLeft = g_openVRHookInstance->IsLeftController(unControllerDeviceIndex);
-                g_openVRHookInstance->ApplyCallbacksToState(isLeft, pControllerState);
+            const auto consumer = ClassifyConsumer(callerRa);
+            const auto role = hook->GetControllerRole(unControllerDeviceIndex);
+            if (consumer != controller_bridge::kConsumerHeisenberg &&
+                role != controller_bridge::kRoleUnknown) {
+                hook->ApplyCallbacksToState(role, pControllerState, consumer);
             }
         }
 
+        hook->EndHookCall();
         return result;
     }
 
     bool OpenVRHook::HookRealVRSystemVtable(vr::IVRSystem* realSystem)
     {
-        if (m_vtableHooked || !realSystem) {
-            return m_vtableHooked;
+        if (!realSystem || m_shuttingDown.load(std::memory_order_acquire)) {
+            return false;
+        }
+        std::lock_guard<std::mutex> installLock(m_installMutex);
+        if (m_vtableHooked.load(std::memory_order_acquire)) {
+            return m_realVRSystem == realSystem;
         }
         
-        // Store instance pointer for hook functions
-        g_openVRHookInstance = this;
-        m_realVRSystem = realSystem;
-        
-        // Get the vtable pointer (first sizeof(void*) bytes of the object)
         void** vtable = *reinterpret_cast<void***>(realSystem);
-        
-        // Store original function pointers
-        m_originalGetControllerState = reinterpret_cast<GetControllerState_t>(vtable[kVtableIndex_GetControllerState]);
-        m_originalGetControllerStateWithPose = reinterpret_cast<GetControllerStateWithPose_t>(vtable[kVtableIndex_GetControllerStateWithPose]);
-        
-        // Make vtable writable
-        DWORD oldProtect;
-        void* vtableEntry1 = &vtable[kVtableIndex_GetControllerState];
-        void* vtableEntry2 = &vtable[kVtableIndex_GetControllerStateWithPose];
-        
-        // Patch GetControllerState
-        if (!VirtualProtect(vtableEntry1, sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
-            spdlog::error("[OpenVRHook] Failed to change vtable protection for GetControllerState");
+        if (!vtable) {
             return false;
         }
-        vtable[kVtableIndex_GetControllerState] = reinterpret_cast<void*>(&Hooked_GetControllerState);
-        VirtualProtect(vtableEntry1, sizeof(void*), oldProtect, &oldProtect);
-        
-        // Patch GetControllerStateWithPose
-        if (!VirtualProtect(vtableEntry2, sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
-            spdlog::error("[OpenVRHook] Failed to change vtable protection for GetControllerStateWithPose");
+
+        const auto originalState =
+            reinterpret_cast<GetControllerState_t>(vtable[kVtableIndex_GetControllerState]);
+        const auto originalPose =
+            reinterpret_cast<GetControllerStateWithPose_t>(
+                vtable[kVtableIndex_GetControllerStateWithPose]);
+        if (!originalState || !originalPose ||
+            reinterpret_cast<void*>(originalState) == reinterpret_cast<void*>(&Hooked_GetControllerState) ||
+            reinterpret_cast<void*>(originalPose) == reinterpret_cast<void*>(&Hooked_GetControllerStateWithPose)) {
+            spdlog::error("[OpenVRHook] Refusing invalid or recursive IVRSystem vtable chain");
             return false;
         }
-        vtable[kVtableIndex_GetControllerStateWithPose] = reinterpret_cast<void*>(&Hooked_GetControllerStateWithPose);
-        VirtualProtect(vtableEntry2, sizeof(void*), oldProtect, &oldProtect);
-        
-        m_vtableHooked = true;
+
+        m_realVRSystem = realSystem;
+        m_originalGetControllerState = originalState;
+        m_originalGetControllerStateWithPose = originalPose;
+        g_openVRHookInstance.store(this, std::memory_order_release);
+
+        void** stateSlot = &vtable[kVtableIndex_GetControllerState];
+        void** poseSlot = &vtable[kVtableIndex_GetControllerStateWithPose];
+        if (!ReplacePointerSlot(
+                stateSlot,
+                reinterpret_cast<void*>(originalState),
+                reinterpret_cast<void*>(&Hooked_GetControllerState))) {
+            spdlog::error("[OpenVRHook] Transaction failed while patching GetControllerState");
+            g_openVRHookInstance.store(nullptr, std::memory_order_release);
+            m_realVRSystem = nullptr;
+            m_originalGetControllerState = nullptr;
+            m_originalGetControllerStateWithPose = nullptr;
+            return false;
+        }
+        if (!ReplacePointerSlot(
+                poseSlot,
+                reinterpret_cast<void*>(originalPose),
+                reinterpret_cast<void*>(&Hooked_GetControllerStateWithPose))) {
+            spdlog::error(
+                "[OpenVRHook] Transaction failed while patching GetControllerStateWithPose; rolling back");
+            if (!ReplacePointerSlot(
+                    stateSlot,
+                    reinterpret_cast<void*>(&Hooked_GetControllerState),
+                    reinterpret_cast<void*>(originalState))) {
+                // We lost ownership between the two operations. Keep the chain state
+                // alive because a newer hook may now call through our function.
+                spdlog::critical(
+                    "[OpenVRHook] Vtable rollback lost ownership; preserving process-lifetime predecessor state");
+                return false;
+            }
+            g_openVRHookInstance.store(nullptr, std::memory_order_release);
+            m_realVRSystem = nullptr;
+            m_originalGetControllerState = nullptr;
+            m_originalGetControllerStateWithPose = nullptr;
+            return false;
+        }
+
+        m_vtableHooked.store(true, std::memory_order_release);
+        m_isHooked.store(true, std::memory_order_release);
         spdlog::info("[OpenVRHook] Hooked IVRSystem vtable for button filtering");
         
         // Update controller indices
@@ -933,7 +1424,8 @@ namespace heisenberg
     
     void OpenVRHook::UnhookRealVRSystemVtable()
     {
-        if (!m_vtableHooked || !m_realVRSystem) {
+        std::lock_guard<std::mutex> installLock(m_installMutex);
+        if (!m_vtableHooked.load(std::memory_order_acquire) || !m_realVRSystem) {
             return;
         }
         
@@ -942,32 +1434,211 @@ namespace heisenberg
         // Get the vtable pointer
         void** vtable = *reinterpret_cast<void***>(m_realVRSystem);
         
-        // Restore original function pointers
-        DWORD oldProtect;
-        
-        if (m_originalGetControllerState) {
-            void* vtableEntry1 = &vtable[kVtableIndex_GetControllerState];
-            if (VirtualProtect(vtableEntry1, sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
-                vtable[kVtableIndex_GetControllerState] = reinterpret_cast<void*>(m_originalGetControllerState);
-                VirtualProtect(vtableEntry1, sizeof(void*), oldProtect, &oldProtect);
-            }
+        const bool stateOwned =
+            vtable[kVtableIndex_GetControllerState] == reinterpret_cast<void*>(&Hooked_GetControllerState);
+        const bool poseOwned =
+            vtable[kVtableIndex_GetControllerStateWithPose] ==
+                reinterpret_cast<void*>(&Hooked_GetControllerStateWithPose);
+
+        bool stateRestored = !stateOwned;
+        bool poseRestored = !poseOwned;
+        if (stateOwned && m_originalGetControllerState) {
+            stateRestored = ReplacePointerSlot(
+                &vtable[kVtableIndex_GetControllerState],
+                reinterpret_cast<void*>(&Hooked_GetControllerState),
+                reinterpret_cast<void*>(m_originalGetControllerState));
         }
-        
-        if (m_originalGetControllerStateWithPose) {
-            void* vtableEntry2 = &vtable[kVtableIndex_GetControllerStateWithPose];
-            if (VirtualProtect(vtableEntry2, sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
-                vtable[kVtableIndex_GetControllerStateWithPose] = reinterpret_cast<void*>(m_originalGetControllerStateWithPose);
-                VirtualProtect(vtableEntry2, sizeof(void*), oldProtect, &oldProtect);
-            }
+        if (poseOwned && m_originalGetControllerStateWithPose) {
+            poseRestored = ReplacePointerSlot(
+                &vtable[kVtableIndex_GetControllerStateWithPose],
+                reinterpret_cast<void*>(&Hooked_GetControllerStateWithPose),
+                reinterpret_cast<void*>(m_originalGetControllerStateWithPose));
         }
-        
-        m_vtableHooked = false;
-        m_originalGetControllerState = nullptr;
-        m_originalGetControllerStateWithPose = nullptr;
-        m_realVRSystem = nullptr;
-        g_openVRHookInstance = nullptr;
+
+        if (!stateOwned || !poseOwned) {
+            // A newer hook owns at least one slot and may have captured our function
+            // as its predecessor. Clearing the function pointers would break that
+            // chain. F4SE plugins are process-lifetime modules, so leave a disabled
+            // passthrough predecessor in place.
+            spdlog::warn(
+                "[OpenVRHook] Newer vtable owner detected; preserving process-lifetime passthrough chain");
+            return;
+        }
+        if (!stateRestored || !poseRestored) {
+            spdlog::error("[OpenVRHook] Could not safely restore every owned vtable slot");
+            return;
+        }
+
+        m_vtableHooked.store(false, std::memory_order_release);
+        WaitForHookCallsToDrain();
+        // Keep predecessor pointers and the singleton address for the remainder of
+        // the process. A call that fetched our vtable entry immediately before the
+        // restore can still arrive after the drain observation; process-lifetime
+        // storage lets that late call safely pass through.
         
         spdlog::info("[OpenVRHook] Vtable restored");
     }
 
 } // namespace heisenberg
+
+// Versioned cross-plugin controller-state broker. The legacy exports below are
+// retained for Controls Config releases that predate the C ABI.
+using HeisenbergExternalControllerStateCallback =
+    uint64_t(*)(bool isLeft, vr::VRControllerState_t* state);
+namespace
+{
+    bool __cdecl BridgeRegister(
+        const heisenberg::controller_bridge::Registration* registration,
+        std::uint64_t* handle)
+    {
+        if ((heisenberg::OpenVRHook::GetSingleton().GetBackendStatusFlags() &
+             heisenberg::controller_bridge::kBackendShuttingDown) != 0) {
+            return false;
+        }
+        return heisenberg::bridge_detail::Register(registration, handle);
+    }
+
+    bool __cdecl BridgeUnregister(std::uint64_t handle, bool drainInFlight)
+    {
+        return heisenberg::bridge_detail::Unregister(handle, drainInFlight);
+    }
+
+    bool __cdecl BridgeGetBackendStatus(heisenberg::controller_bridge::BackendStatus* status)
+    {
+        if (!status ||
+            status->structSize < sizeof(heisenberg::controller_bridge::BackendStatus)) {
+            return false;
+        }
+        status->abiVersion = heisenberg::controller_bridge::kAbiVersion;
+        status->flags = heisenberg::OpenVRHook::GetSingleton().GetBackendStatusFlags();
+        status->registeredCallbacks = heisenberg::bridge_detail::Count();
+        return true;
+    }
+
+    const heisenberg::controller_bridge::API g_bridgeAPI{
+        sizeof(heisenberg::controller_bridge::API),
+        heisenberg::controller_bridge::kAbiVersion,
+        &BridgeRegister,
+        &BridgeUnregister,
+        &BridgeGetBackendStatus,
+    };
+
+    struct LegacyAdapter
+    {
+        HeisenbergExternalControllerStateCallback callback = nullptr;
+    };
+
+    struct LegacyRegistration
+    {
+        std::uint64_t handle = 0;
+        std::unique_ptr<LegacyAdapter> adapter;
+    };
+
+    std::mutex g_legacyBridgeMutex;
+    std::unordered_map<HeisenbergExternalControllerStateCallback, LegacyRegistration>
+        g_legacyBridgeRegistrations;
+
+    std::uint64_t __cdecl LegacyDispatch(
+        const heisenberg::controller_bridge::CallbackContext* context,
+        vr::VRControllerState_t* state,
+        void* userData)
+    {
+        auto* adapter = static_cast<LegacyAdapter*>(userData);
+        if (!context || !state || !adapter || !adapter->callback ||
+            context->controllerRole == heisenberg::controller_bridge::kRoleUnknown) {
+            return ~std::uint64_t{0};
+        }
+        const auto before = *state;
+        const auto mask = adapter->callback(
+            context->controllerRole == heisenberg::controller_bridge::kRoleLeft,
+            state);
+        // Legacy callbacks had one state view. Mirror their delta into the
+        // interaction copy to preserve old behavior; versioned clients should
+        // write interaction-only Grip directly to context->heisenbergState.
+        if (context->heisenbergState) {
+            const auto pressedChanges = before.ulButtonPressed ^ state->ulButtonPressed;
+            const auto touchedChanges = before.ulButtonTouched ^ state->ulButtonTouched;
+            context->heisenbergState->ulButtonPressed =
+                (context->heisenbergState->ulButtonPressed & ~pressedChanges) |
+                (state->ulButtonPressed & pressedChanges);
+            context->heisenbergState->ulButtonTouched =
+                (context->heisenbergState->ulButtonTouched & ~touchedChanges) |
+                (state->ulButtonTouched & touchedChanges);
+            for (std::size_t axis = 0;
+                 axis < std::size(context->heisenbergState->rAxis);
+                 ++axis) {
+                if (before.rAxis[axis].x != state->rAxis[axis].x ||
+                    before.rAxis[axis].y != state->rAxis[axis].y) {
+                    context->heisenbergState->rAxis[axis] = state->rAxis[axis];
+                }
+            }
+            context->heisenbergState->ulButtonPressed &= mask;
+            context->heisenbergState->ulButtonTouched &= mask;
+        }
+        return mask;
+    }
+}
+
+extern "C" __declspec(dllexport)
+const heisenberg::controller_bridge::API* __cdecl
+Heisenberg_GetControllerStateBridgeAPI(std::uint32_t requestedAbiVersion)
+{
+    return requestedAbiVersion == heisenberg::controller_bridge::kAbiVersion
+        ? &g_bridgeAPI
+        : nullptr;
+}
+
+extern "C" __declspec(dllexport) bool Heisenberg_RegisterControllerStateCallback(
+    HeisenbergExternalControllerStateCallback callback)
+{
+    if (!callback) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(g_legacyBridgeMutex);
+    if (g_legacyBridgeRegistrations.find(callback) != g_legacyBridgeRegistrations.end()) {
+        return true;
+    }
+
+    auto adapter = std::make_unique<LegacyAdapter>();
+    adapter->callback = callback;
+    heisenberg::controller_bridge::Registration descriptor{
+        sizeof(heisenberg::controller_bridge::Registration),
+        heisenberg::controller_bridge::kAbiVersion,
+        heisenberg::controller_bridge::kPreHeisenberg,
+        heisenberg::controller_bridge::kConsumerGame,
+        0,
+        0,
+        &LegacyDispatch,
+        adapter.get(),
+        "legacy-controls-remapper",
+    };
+    std::uint64_t handle = 0;
+    if (!BridgeRegister(&descriptor, &handle)) {
+        return false;
+    }
+    g_legacyBridgeRegistrations.emplace(
+        callback, LegacyRegistration{handle, std::move(adapter)});
+    spdlog::info(
+        "[OpenVRHook] Registered legacy game-only controller-state callback in pre-Heisenberg phase");
+    return true;
+}
+
+extern "C" __declspec(dllexport) bool Heisenberg_UnregisterControllerStateCallback(
+    HeisenbergExternalControllerStateCallback callback)
+{
+    std::unique_lock<std::mutex> lock(g_legacyBridgeMutex);
+    const auto it = g_legacyBridgeRegistrations.find(callback);
+    if (it == g_legacyBridgeRegistrations.end()) {
+        return false;
+    }
+    auto registration = std::move(it->second);
+    g_legacyBridgeRegistrations.erase(it);
+    lock.unlock();
+
+    const bool removed = BridgeUnregister(registration.handle, true);
+    if (removed) {
+        spdlog::info("[OpenVRHook] Unregistered legacy controller-state callback");
+    }
+    return removed;
+}

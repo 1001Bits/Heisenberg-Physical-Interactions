@@ -97,6 +97,15 @@ namespace heisenberg
     inline REL::Relocation<_BSFadeNode_MergeWorldBounds> BSFadeNode_MergeWorldBounds{ REL::Offset(0x27a9930) };
 
     /**
+     * BSFadeNode::UpdateGeomArray - refreshes flattened/skinned geometry after
+     * late bone writes. FRIK calls this in its final world update together with
+     * MergeWorldBounds and BSFlattenedBoneTree::UpdateBoneArray.
+     * VR offset: 0x27a9690 - verified by FRIK's F4VRCommonFramework.
+     */
+    using _BSFadeNode_UpdateGeomArray = void*(*)(RE::NiNode* node, int somevar);
+    inline REL::Relocation<_BSFadeNode_UpdateGeomArray> BSFadeNode_UpdateGeomArray{ REL::Offset(0x27a9690) };
+
+    /**
      * Activate a reference (pick up items, open doors, etc.)
      * This is the native function that handles item pickup, door opening, etc.
      * VR offset: 0x3f4a60 - Status 4 (Verified) from fo4_database.csv

@@ -80,6 +80,12 @@ namespace rock::provider
     inline constexpr std::uint32_t ROCK_PROVIDER_MAX_WEAPON_PART_DRIVE_LEASE_FRAMES_V1 =
         ROCK_PROVIDER_WEAPON_PART_DRIVE_LEASE_UNTIL_CLEARED_V1 - 1u;
     inline constexpr std::uint32_t ROCK_PROVIDER_MAX_WEAPON_PART_MOTION_CONSTRAINTS_V1 = 64;
+    inline constexpr std::uint32_t ROCK_PROVIDER_MAX_WEAPON_PART_INTERACTION_ZONES_V1 = 64;
+    inline constexpr std::uint32_t ROCK_PROVIDER_MAX_LEARNED_WEAPON_PART_PROFILES_V1 = 32;
+    inline constexpr std::uint32_t ROCK_PROVIDER_MAX_PLUGIN_NAME_V1 = 64;
+    inline constexpr std::uint32_t ROCK_PROVIDER_MAX_WEAPON_NODE_PATH_V1 = 192;
+    inline constexpr std::uint32_t ROCK_PROVIDER_WEAPON_PART_KIND_ANY_V1 = 0xFFFF'FFFFu;
+    inline constexpr std::uint32_t ROCK_PROVIDER_WEAPON_ACTION_ROLE_ANY_V1 = 0xFFFF'FFFFu;
 
     enum class RockProviderHand : std::uint32_t
     {
@@ -249,6 +255,8 @@ namespace rock::provider
         ObjectAlreadyOwned = 14,
         RequestQueued = 15,
         RequestNotFound = 16,
+        ProfileUnavailable = 17,
+        ProfileAmbiguous = 18,
     };
 
     enum class RockProviderConsumerCapabilityV1 : std::uint32_t
@@ -262,6 +270,7 @@ namespace rock::provider
         HandInputSuppression = 1u << 5,
         WeaponPartInteraction = 1u << 6,
         WeaponPartMotionConstraint = 1u << 7,
+        LearnedWeaponPartProfiles = 1u << 8,
     };
 
     enum class RockProviderFeatureBitV1 : std::uint32_t
@@ -288,6 +297,35 @@ namespace rock::provider
         PipboyInputSuppression = 1u << 20,
         WeaponPartMotionConstraint = 1u << 21,
         WeaponPartDrivePersistentLease = 1u << 22,
+        // Exclusive weapon-part targets require collision with a matching
+        // generated body. ROCK accepts the native contact callback or an
+        // exact reconstruction from the live hand-collider hull samples and
+        // that matched body's mesh triangles. The ordinary whole-weapon
+        // palm/AABB proximity probe is never used.
+        WeaponPartExclusiveExactContact = 1u << 23,
+        /*
+         * Drive targets and motion constraints may select a collision source
+         * with their normal matcher while writing a separate, related scene
+         * node through controlledRoot. This is required when the generated
+         * collision leaf and the consumer's authored bolt/slide node are not
+         * the same NiAVObject (and therefore do not share a parent-local
+         * transform or even the same immediate scene-graph branch).
+         */
+        WeaponPartControlledRoot = 1u << 24,
+        /*
+         * Consumer-authored, exact-body interaction zones. A zone makes a
+         * small part easy to acquire without allowing the provider target to
+         * fall through to nearby barrel/receiver geometry. The zone still
+         * names one live body + weapon generation and therefore cannot select
+         * a different part.
+         */
+        WeaponPartInteractionZone = 1u << 25,
+        /*
+         * Provider-owned profiles learned from a bounded vanilla reload
+         * animation. Stable authored identities and transforms are persisted;
+         * transient body IDs/pointers are resolved again on activation.
+         */
+        LearnedWeaponPartProfiles = 1u << 26,
     };
 
     enum class RockProviderInteractionCommandKindV1 : std::uint32_t
@@ -388,7 +426,10 @@ namespace rock::provider
          * grants its grab mode on match without activating whitelist gating,
          * so unmatched parts keep their normal grip behavior. Omit the flag
          * for reload-session semantics where every unmatched part grip is
-         * rejected while the whitelist is active.
+         * rejected while the whitelist is active. Providers advertising
+         * WeaponPartExclusiveExactContact additionally require the live hand
+         * colliders to touch the matched generated body; nearby geometry
+         * cannot satisfy the target through the normal palm probe.
          */
         NonExclusive = 1u << 8,
     };
@@ -396,7 +437,12 @@ namespace rock::provider
     enum class RockProviderWeaponPartDriveSpaceV1 : std::uint32_t
     {
         WeaponRootLocal = 0,
-        SourceParentLocal = 1,
+        /*
+         * Parent-local space of controlledRoot when one is supplied; otherwise
+         * parent-local space of the collision source selected by the matcher.
+         */
+        ControlledRootParentLocal = 1,
+        SourceParentLocal = ControlledRootParentLocal,
     };
 
     /*
@@ -414,6 +460,93 @@ namespace rock::provider
         None = 0,
         Linear = 1,
         Rotational = 2,
+    };
+
+    enum class RockProviderWeaponPartInteractionZoneShapeV1 : std::uint32_t
+    {
+        Box = 0,
+        Sphere = 1,
+    };
+
+    enum class RockProviderWeaponPartInteractionZoneSpaceV1 : std::uint32_t
+    {
+        WeaponRootLocal = 0,
+        SourceRootLocal = 1,
+        ControlledRootLocal = 2,
+    };
+
+    /*
+     * ClosestTargetMeshSurface is the responsive default: entering the larger
+     * authored zone makes the exact target body eligible, then ROCK seats the
+     * hand on that body's nearest real mesh surface. AnchorPosition preserves
+     * the tracked hand orientation and translates its palm to snapAnchor.
+     * FullHandTransform uses the handed transform supplied below verbatim.
+     */
+    enum class RockProviderWeaponPartInteractionZoneSnapModeV1 : std::uint32_t
+    {
+        ClosestTargetMeshSurface = 0,
+        AnchorPosition = 1,
+        FullHandTransform = 2,
+    };
+
+    enum class RockProviderWeaponPartInteractionZoneFlagV1 : std::uint32_t
+    {
+        None = 0,
+        SnapAnchorValid = 1u << 0,
+        RightHandTransformValid = 1u << 1,
+        LeftHandTransformValid = 1u << 2,
+    };
+
+    enum class RockProviderLearnedWeaponPartProfilePoseV1 : std::uint32_t
+    {
+        Current = 0,
+        Closed = 1,
+        Open = 2,
+        SyntheticDryFire = 3,
+    };
+
+    enum class RockProviderLearnedWeaponPartDryFireSourceV1 : std::uint32_t
+    {
+        Unknown = 0,
+        InferredReloadHold = 1,
+        GeneratedFromOpenEndpoint = 2,
+        ConsumerOverride = 3,
+    };
+
+    enum class RockProviderLearnedWeaponPartProfileFlagV1 : std::uint32_t
+    {
+        None = 0,
+        ClosedPoseObserved = 1u << 0,
+        OpenPoseObserved = 1u << 1,
+        DryFirePoseSynthetic = 1u << 2,
+        DryFireFromReloadHold = 1u << 3,
+        DryFireFromOpenEndpoint = 1u << 4,
+        ControlledNodeLearned = 1u << 5,
+        ExactEvidenceRequired = 1u << 6,
+        GeneratedInteractionZone = 1u << 7,
+        NeedsReview = 1u << 8,
+        LiveEvidenceAvailable = 1u << 16,
+        LiveControlledNodeAvailable = 1u << 17,
+        Activatable = 1u << 18,
+    };
+
+    enum class RockProviderLearnedWeaponPartActivationFlagV1 : std::uint32_t
+    {
+        None = 0,
+        InstallGrabTarget = 1u << 0,
+        InstallMotionConstraint = 1u << 1,
+        HoldInitialPose = 1u << 2,
+        InstallInteractionZone = 1u << 3,
+        OverrideInitialValue = 1u << 8,
+        OverrideZone = 1u << 9,
+        OverrideSnapAnchor = 1u << 10,
+        OverrideRightHandTransform = 1u << 11,
+        OverrideLeftHandTransform = 1u << 12,
+        Default =
+            static_cast<std::uint32_t>(InstallGrabTarget) |
+            static_cast<std::uint32_t>(InstallMotionConstraint) |
+            static_cast<std::uint32_t>(HoldInitialPose) |
+            static_cast<std::uint32_t>(InstallInteractionZone),
     };
 
     /*
@@ -539,6 +672,20 @@ namespace rock::provider
     [[nodiscard]] inline constexpr bool hasWeaponPartTargetFlagV1(
         std::uint32_t flags,
         RockProviderWeaponPartTargetFlagV1 flag)
+    {
+        return (flags & static_cast<std::uint32_t>(flag)) != 0;
+    }
+
+    [[nodiscard]] inline constexpr bool hasWeaponPartInteractionZoneFlagV1(
+        std::uint32_t flags,
+        RockProviderWeaponPartInteractionZoneFlagV1 flag)
+    {
+        return (flags & static_cast<std::uint32_t>(flag)) != 0;
+    }
+
+    [[nodiscard]] inline constexpr bool hasLearnedWeaponPartActivationFlagV1(
+        std::uint32_t flags,
+        RockProviderLearnedWeaponPartActivationFlagV1 flag)
     {
         return (flags & static_cast<std::uint32_t>(flag)) != 0;
     }
@@ -777,7 +924,17 @@ namespace rock::provider
         std::uint32_t leaseFrames{ 1 };
         RockProviderTransform targetTransform{};
         char sourceName[ROCK_PROVIDER_MAX_EVIDENCE_NAME]{};
-        std::uint32_t reserved[7]{};
+        /*
+         * Optional NiAVObject to write after the matcher has selected the
+         * collision source. It must be inside the current weapon tree. The
+         * consumer explicitly defines its semantic association with the
+         * selected body; no scene-graph ancestry is assumed. Zero preserves the
+         * legacy behavior of writing the matched collision source itself.
+         *
+         * Feature bit: WeaponPartControlledRoot.
+         */
+        std::uintptr_t controlledRoot{ 0 };
+        std::uint32_t reserved[4]{};
     };
 
     /*
@@ -810,15 +967,29 @@ namespace rock::provider
         std::uint32_t socketRole{ 0 };
         std::uint32_t actionRole{ 0 };
         std::uint32_t priority{ 0 };
-        // Pivot (Rotational) or path start point (Linear), in axisSpace, game units.
+        // Pivot for Rotational constraints, in axisSpace/game units. Linear
+        // travel is relative to the part transform captured at grab time, so
+        // axisOrigin is ignored for Linear constraints.
         float axisOrigin[3]{};
         // Unit vector in axisSpace: slide direction (Linear) or hinge axis (Rotational).
         float axisDirection[3]{};
-        // Linear: game units of travel from axisOrigin. Rotational: degrees swept around axisDirection.
+        // Linear: game units relative to the at-grab transform. Rotational:
+        // degrees swept around axisDirection through axisOrigin. Zero must be
+        // inside [minValue, maxValue] so capture cannot move the part before
+        // the hand itself moves.
         float minValue{ 0.0f };
         float maxValue{ 0.0f };
         char sourceName[ROCK_PROVIDER_MAX_EVIDENCE_NAME]{};
-        std::uint32_t reserved[6]{};
+        /*
+         * Optional NiAVObject moved by the constraint. Matching still uses the
+         * contacted collision source/body; this field only selects the related
+         * authored node whose transform ROCK writes. See the identically named
+         * drive-target field above.
+         *
+         * Feature bit: WeaponPartControlledRoot.
+         */
+        std::uintptr_t controlledRoot{ 0 };
+        std::uint32_t reserved[4]{};
     };
 
     // Resolved against the same RockProviderWeaponPartTargetQueryV1 shape used by
@@ -835,6 +1006,165 @@ namespace rock::provider
         float minValue{ 0.0f };
         float maxValue{ 0.0f };
         std::uint64_t ownerToken{ 0 };
+        std::uintptr_t controlledRoot{ 0 };
+    };
+
+    /*
+     * Gameplay-friendly acquisition volume for one exact live weapon body.
+     * Unlike a broad part-kind/proximity fallback, the pair
+     * (weaponGenerationKey, bodyId) is mandatory. A hand inside the zone may
+     * acquire only that body, and the normal target whitelist must resolve to
+     * the same owner/group before capture is accepted.
+     *
+     * zoneCenter/zoneHalfExtents use zoneSpace. snapAnchor and handed
+     * transforms are local to controlledRoot when supplied, otherwise the
+     * exact evidence source root. For Sphere, zoneHalfExtents[0] is radius.
+     */
+    struct RockProviderWeaponPartInteractionZoneV1
+    {
+        std::uint32_t size{ sizeof(RockProviderWeaponPartInteractionZoneV1) };
+        std::uint32_t version{ ROCK_PROVIDER_API_VERSION };
+        std::uint64_t weaponGenerationKey{ 0 };
+        std::uint32_t bodyId{ 0x7FFF'FFFF };
+        std::uint32_t groupId{ 0 };
+        std::uint32_t priority{ 0 };
+        std::uint32_t flags{ 0 };
+        RockProviderWeaponPartInteractionZoneShapeV1 shape{
+            RockProviderWeaponPartInteractionZoneShapeV1::Box
+        };
+        RockProviderWeaponPartInteractionZoneSpaceV1 zoneSpace{
+            RockProviderWeaponPartInteractionZoneSpaceV1::ControlledRootLocal
+        };
+        RockProviderWeaponPartInteractionZoneSnapModeV1 snapMode{
+            RockProviderWeaponPartInteractionZoneSnapModeV1::ClosestTargetMeshSurface
+        };
+        std::uintptr_t sourceRoot{ 0 };
+        std::uintptr_t controlledRoot{ 0 };
+        float zoneCenter[3]{};
+        float zoneHalfExtents[3]{};
+        float snapAnchor[3]{};
+        RockProviderTransform rightHandPartLocal{};
+        RockProviderTransform leftHandPartLocal{};
+        char sourceName[ROCK_PROVIDER_MAX_EVIDENCE_NAME]{};
+        std::uint32_t reserved[8]{};
+    };
+
+    /*
+     * One provider-generated stable profile for the currently equipped weapon.
+     * closed/open transforms and rail/hinge values are observed during a
+     * vanilla reload boundary. syntheticDryFireTransform/value are explicitly
+     * generated policy: Fallout does not author a persistent "dry fire" state.
+     *
+     * No persisted body ID or scene pointer appears here. current* fields are
+     * live conveniences populated only while the matching weapon generation is
+     * equipped; activation re-resolves them and fails closed if either identity
+     * is unavailable or ambiguous.
+     */
+    struct RockProviderLearnedWeaponPartProfileV1
+    {
+        std::uint32_t size{ sizeof(RockProviderLearnedWeaponPartProfileV1) };
+        std::uint32_t version{ ROCK_PROVIDER_API_VERSION };
+        std::uint64_t profileId{ 0 };
+        std::uint32_t weaponFormId{ 0 };
+        std::uint32_t partKind{ ROCK_PROVIDER_WEAPON_PART_KIND_ANY_V1 };
+        std::uint32_t actionRole{ ROCK_PROVIDER_WEAPON_ACTION_ROLE_ANY_V1 };
+        RockProviderWeaponPartMotionKindV1 motionKind{ RockProviderWeaponPartMotionKindV1::None };
+        RockProviderWeaponPartDriveSpaceV1 axisSpace{
+            RockProviderWeaponPartDriveSpaceV1::ControlledRootParentLocal
+        };
+        std::uint32_t flags{ 0 };
+        RockProviderLearnedWeaponPartDryFireSourceV1 dryFireSource{
+            RockProviderLearnedWeaponPartDryFireSourceV1::Unknown
+        };
+        float confidence{ 0.0f };
+        float axisOrigin[3]{};
+        float axisDirection[3]{};
+        // Absolute profile coordinate relative to the learned closed pose.
+        float minValue{ 0.0f };
+        float maxValue{ 0.0f };
+        float openValue{ 0.0f };
+        float syntheticDryFireValue{ 0.0f };
+        float generatedZoneCenter[3]{};
+        float generatedZoneHalfExtents[3]{};
+        float generatedSnapAnchor[3]{};
+        RockProviderTransform closedTransform{};
+        RockProviderTransform openTransform{};
+        RockProviderTransform syntheticDryFireTransform{};
+        std::uint32_t omodFormId{ 0 };
+        std::uint32_t attachPointFormId{ 0 };
+        std::uint32_t captureFrameCount{ 0 };
+        std::uint32_t captureSampleCount{ 0 };
+        std::uint32_t currentMatchingBodyCount{ 0 };
+        std::uint32_t reserved0{ 0 };
+        std::uint64_t currentWeaponGenerationKey{ 0 };
+        std::uintptr_t currentControlledRoot{ 0 };
+        char weaponPlugin[ROCK_PROVIDER_MAX_PLUGIN_NAME_V1]{};
+        char sourceName[ROCK_PROVIDER_MAX_EVIDENCE_NAME]{};
+        char controlledNodeName[ROCK_PROVIDER_MAX_EVIDENCE_NAME]{};
+        char controlledNodePath[ROCK_PROVIDER_MAX_WEAPON_NODE_PATH_V1]{};
+        std::uint32_t reserved[8]{};
+    };
+
+    /*
+     * High-level activation request. profileId is the unambiguous path. When it
+     * is zero, ROCK filters current profiles by partKind/actionRole/sourceName
+     * and returns ProfileAmbiguous instead of guessing if more than one remains.
+     *
+     * min/max constraints are rebuilt relative to whichever initial pose/value
+     * is selected, so zero is always legal on the capture frame: squeezing grip
+     * alone can never move the part. Interaction-zone overrides and snap data
+     * are in the learned controlled-root local space.
+     */
+    struct RockProviderLearnedWeaponPartActivationRequestV1
+    {
+        std::uint32_t size{ sizeof(RockProviderLearnedWeaponPartActivationRequestV1) };
+        std::uint32_t version{ ROCK_PROVIDER_API_VERSION };
+        std::uint64_t profileId{ 0 };
+        std::uint32_t partKind{ ROCK_PROVIDER_WEAPON_PART_KIND_ANY_V1 };
+        std::uint32_t actionRole{ ROCK_PROVIDER_WEAPON_ACTION_ROLE_ANY_V1 };
+        RockProviderWeaponPartGrabModeV1 grabMode{ RockProviderWeaponPartGrabModeV1::AttachOnly };
+        RockProviderLearnedWeaponPartProfilePoseV1 initialPose{
+            RockProviderLearnedWeaponPartProfilePoseV1::SyntheticDryFire
+        };
+        std::uint32_t flags{
+            static_cast<std::uint32_t>(RockProviderLearnedWeaponPartActivationFlagV1::Default)
+        };
+        std::uint32_t groupId{ 0 };
+        std::uint32_t priority{ 100 };
+        RockProviderWeaponPartInteractionZoneSnapModeV1 snapMode{
+            RockProviderWeaponPartInteractionZoneSnapModeV1::ClosestTargetMeshSurface
+        };
+        float initialValueOverride{ 0.0f };
+        float zoneCenterOverride[3]{};
+        float zoneHalfExtentsOverride[3]{};
+        float snapAnchorOverride[3]{};
+        RockProviderTransform rightHandPartLocalOverride{};
+        RockProviderTransform leftHandPartLocalOverride{};
+        char sourceName[ROCK_PROVIDER_MAX_EVIDENCE_NAME]{};
+        std::uint32_t reserved[8]{};
+    };
+
+    struct RockProviderLearnedWeaponPartActivationResultV1
+    {
+        std::uint32_t size{ sizeof(RockProviderLearnedWeaponPartActivationResultV1) };
+        std::uint32_t version{ ROCK_PROVIDER_API_VERSION };
+        std::uint64_t profileId{ 0 };
+        std::uint64_t weaponGenerationKey{ 0 };
+        std::uint32_t weaponFormId{ 0 };
+        std::uint32_t partKind{ ROCK_PROVIDER_WEAPON_PART_KIND_ANY_V1 };
+        std::uint32_t matchingBodyCount{ 0 };
+        std::uint32_t installedTargetCount{ 0 };
+        std::uint32_t installedConstraintCount{ 0 };
+        std::uint32_t installedZoneCount{ 0 };
+        std::uint32_t installedDriveCount{ 0 };
+        RockProviderLearnedWeaponPartProfilePoseV1 initialPose{
+            RockProviderLearnedWeaponPartProfilePoseV1::Current
+        };
+        float initialValue{ 0.0f };
+        float constraintMinValue{ 0.0f };
+        float constraintMaxValue{ 0.0f };
+        std::uintptr_t controlledRoot{ 0 };
+        std::uint32_t reserved[8]{};
     };
 
     enum class RockProviderWeaponPartGripLocalSpaceV1 : std::uint32_t
@@ -1247,6 +1577,27 @@ namespace rock::provider
          * or toggle the flashlight.
          */
         bool(ROCK_PROVIDER_CALL* isNativePipboyInputSuppressedV1)();
+        RockProviderResultV1(ROCK_PROVIDER_CALL* setWeaponPartInteractionZonesV1)(
+            std::uint64_t ownerToken,
+            const RockProviderWeaponPartInteractionZoneV1* zones,
+            std::uint32_t zoneCount);
+        RockProviderResultV1(ROCK_PROVIDER_CALL* clearWeaponPartInteractionZonesV1)(
+            std::uint64_t ownerToken);
+        std::uint32_t(ROCK_PROVIDER_CALL* getLearnedWeaponPartProfileCountV1)();
+        std::uint32_t(ROCK_PROVIDER_CALL* copyLearnedWeaponPartProfilesV1)(
+            RockProviderLearnedWeaponPartProfileV1* outProfiles,
+            std::uint32_t maxProfiles);
+        RockProviderResultV1(ROCK_PROVIDER_CALL* activateLearnedWeaponPartProfileV1)(
+            std::uint64_t ownerToken,
+            const RockProviderLearnedWeaponPartActivationRequestV1* request,
+            RockProviderLearnedWeaponPartActivationResultV1* outResult);
+        /*
+         * Clears only the high-level learned activation (its generated target,
+         * drive, constraint, and zone). Manual V1 sets owned by the same token
+         * remain intact.
+         */
+        RockProviderResultV1(ROCK_PROVIDER_CALL* clearLearnedWeaponPartProfileV1)(
+            std::uint64_t ownerToken);
 
         [[nodiscard]] static int initialize(
             const std::uint32_t minVersion = ROCK_PROVIDER_API_VERSION,
@@ -1348,6 +1699,10 @@ namespace rock::provider
         offsetof(RockProviderApi, getRawWandButtonStateV1) + sizeof(std::declval<RockProviderApi>().getRawWandButtonStateV1));
     inline constexpr std::uint32_t ROCK_PROVIDER_API_V1_PIPBOY_INPUT_SUPPRESSION_TABLE_BYTES = static_cast<std::uint32_t>(
         offsetof(RockProviderApi, isNativePipboyInputSuppressedV1) + sizeof(std::declval<RockProviderApi>().isNativePipboyInputSuppressedV1));
+    inline constexpr std::uint32_t ROCK_PROVIDER_API_V1_WEAPON_PART_INTERACTION_ZONE_TABLE_BYTES = static_cast<std::uint32_t>(
+        offsetof(RockProviderApi, clearWeaponPartInteractionZonesV1) + sizeof(std::declval<RockProviderApi>().clearWeaponPartInteractionZonesV1));
+    inline constexpr std::uint32_t ROCK_PROVIDER_API_V1_LEARNED_WEAPON_PART_PROFILE_TABLE_BYTES = static_cast<std::uint32_t>(
+        offsetof(RockProviderApi, clearLearnedWeaponPartProfileV1) + sizeof(std::declval<RockProviderApi>().clearLearnedWeaponPartProfileV1));
 
     [[nodiscard]] inline bool queryProviderLimitsV1(RockProviderLimitsV1& outLimits)
     {
@@ -1443,6 +1798,54 @@ namespace rock::provider
     {
         RockProviderLimitsV1 limits{};
         return queryProviderLimitsV1(limits) && supportsWeaponPartDrivePersistentLeaseV1(limits);
+    }
+
+    [[nodiscard]] inline bool supportsWeaponPartExclusiveExactContactV1(const RockProviderLimitsV1& limits)
+    {
+        return supportsWeaponPartInteractionV1(limits) &&
+               hasFeatureBitV1(limits.featureBits, RockProviderFeatureBitV1::WeaponPartExclusiveExactContact);
+    }
+
+    [[nodiscard]] inline bool supportsWeaponPartExclusiveExactContactV1()
+    {
+        RockProviderLimitsV1 limits{};
+        return queryProviderLimitsV1(limits) && supportsWeaponPartExclusiveExactContactV1(limits);
+    }
+
+    [[nodiscard]] inline bool supportsWeaponPartControlledRootV1(const RockProviderLimitsV1& limits)
+    {
+        return supportsWeaponPartInteractionV1(limits) &&
+               hasFeatureBitV1(limits.featureBits, RockProviderFeatureBitV1::WeaponPartControlledRoot);
+    }
+
+    [[nodiscard]] inline bool supportsWeaponPartControlledRootV1()
+    {
+        RockProviderLimitsV1 limits{};
+        return queryProviderLimitsV1(limits) && supportsWeaponPartControlledRootV1(limits);
+    }
+
+    [[nodiscard]] inline bool supportsWeaponPartInteractionZoneV1(const RockProviderLimitsV1& limits)
+    {
+        return providerApiTableSupportsV1(limits, ROCK_PROVIDER_API_V1_WEAPON_PART_INTERACTION_ZONE_TABLE_BYTES) &&
+               hasFeatureBitV1(limits.featureBits, RockProviderFeatureBitV1::WeaponPartInteractionZone);
+    }
+
+    [[nodiscard]] inline bool supportsWeaponPartInteractionZoneV1()
+    {
+        RockProviderLimitsV1 limits{};
+        return queryProviderLimitsV1(limits) && supportsWeaponPartInteractionZoneV1(limits);
+    }
+
+    [[nodiscard]] inline bool supportsLearnedWeaponPartProfilesV1(const RockProviderLimitsV1& limits)
+    {
+        return providerApiTableSupportsV1(limits, ROCK_PROVIDER_API_V1_LEARNED_WEAPON_PART_PROFILE_TABLE_BYTES) &&
+               hasFeatureBitV1(limits.featureBits, RockProviderFeatureBitV1::LearnedWeaponPartProfiles);
+    }
+
+    [[nodiscard]] inline bool supportsLearnedWeaponPartProfilesV1()
+    {
+        RockProviderLimitsV1 limits{};
+        return queryProviderLimitsV1(limits) && supportsLearnedWeaponPartProfilesV1(limits);
     }
 
     [[nodiscard]] inline bool supportsWeaponPartGripStateV1(const RockProviderLimitsV1& limits)
@@ -1549,16 +1952,26 @@ namespace rock::provider
     static_assert(sizeof(RockProviderTransform) == 52);
     static_assert(sizeof(RockProviderWeaponPartDriveTargetV1) == 192);
     static_assert(alignof(RockProviderWeaponPartDriveTargetV1) == 8);
+    static_assert(offsetof(RockProviderWeaponPartDriveTargetV1, controlledRoot) == 168);
     static_assert(std::is_standard_layout_v<RockProviderWeaponPartDriveTargetV1>);
     static_assert(std::is_trivially_copyable_v<RockProviderWeaponPartDriveTargetV1>);
     static_assert(sizeof(RockProviderWeaponPartMotionConstraintV1) == 192);
     static_assert(alignof(RockProviderWeaponPartMotionConstraintV1) == 8);
+    static_assert(offsetof(RockProviderWeaponPartMotionConstraintV1, controlledRoot) == 168);
     static_assert(std::is_standard_layout_v<RockProviderWeaponPartMotionConstraintV1>);
     static_assert(std::is_trivially_copyable_v<RockProviderWeaponPartMotionConstraintV1>);
-    static_assert(sizeof(RockProviderWeaponPartMotionConstraintResolutionV1) == 56);
+    static_assert(sizeof(RockProviderWeaponPartMotionConstraintResolutionV1) == 64);
     static_assert(alignof(RockProviderWeaponPartMotionConstraintResolutionV1) == 8);
     static_assert(std::is_standard_layout_v<RockProviderWeaponPartMotionConstraintResolutionV1>);
     static_assert(std::is_trivially_copyable_v<RockProviderWeaponPartMotionConstraintResolutionV1>);
+    static_assert(std::is_standard_layout_v<RockProviderWeaponPartInteractionZoneV1>);
+    static_assert(std::is_trivially_copyable_v<RockProviderWeaponPartInteractionZoneV1>);
+    static_assert(std::is_standard_layout_v<RockProviderLearnedWeaponPartProfileV1>);
+    static_assert(std::is_trivially_copyable_v<RockProviderLearnedWeaponPartProfileV1>);
+    static_assert(std::is_standard_layout_v<RockProviderLearnedWeaponPartActivationRequestV1>);
+    static_assert(std::is_trivially_copyable_v<RockProviderLearnedWeaponPartActivationRequestV1>);
+    static_assert(std::is_standard_layout_v<RockProviderLearnedWeaponPartActivationResultV1>);
+    static_assert(std::is_trivially_copyable_v<RockProviderLearnedWeaponPartActivationResultV1>);
     static_assert(sizeof(RockProviderWeaponPartTargetQueryV1) == 104);
     static_assert(alignof(RockProviderWeaponPartTargetQueryV1) == 8);
     static_assert(std::is_standard_layout_v<RockProviderWeaponPartTargetQueryV1>);
@@ -1618,6 +2031,10 @@ namespace rock::provider
     std::uint32_t copyWeaponPartDriveTargetsV1(
         RockProviderWeaponPartDriveTargetV1* outTargets,
         std::uint32_t maxTargets);
+    std::uint32_t copyWeaponPartInteractionZonesV1(
+        RockProviderWeaponPartInteractionZoneV1* outZones,
+        std::uint64_t* outOwnerTokens,
+        std::uint32_t maxZones);
     bool resolveWeaponPartMotionConstraintV1(
         const RockProviderWeaponPartTargetQueryV1& query,
         RockProviderWeaponPartMotionConstraintResolutionV1& outResolution);

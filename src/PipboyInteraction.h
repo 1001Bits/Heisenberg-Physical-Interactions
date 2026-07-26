@@ -13,6 +13,7 @@
 //   EjectButton_mesh:0  - Button mesh, translates Z based on finger proximity
 
 #include "RE/Fallout.h"
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <string>
@@ -52,17 +53,13 @@ namespace heisenberg
         bool IsIntroSWFActive() const { return _introSWFActive; }
         bool IsProgramSWFActive() const { return _programSWFActive; }
         float GetFrikPipboyScale();
-        // True if FRIK's holo Pip-Boy is enabled ([Fallout4VRBody] HoloPipBoyEnabled in
-        // FRIK.ini). Holo mode requires a staged projected->wrist transition because FRIK
-        // replaces the Pip-Boy root on the following frame. Cached until cell/game load.
+        // True when stock FRIK 77.12 is configured for its Holo Pip-Boy.
         bool IsFrikHoloPipboyEnabled();
 
-        // Writes FRIK.ini's HoloPipBoyEnabled directly and updates our own cached read of
-        // it. FRIK has a live file-watcher on this exact file (thomasmonkman-filewatch)
-        // that reloads on external changes, so this affects FRIK's live in-memory value
-        // too - see BeginPipboyBootSequence's use of this for the boot-sequence's holo
-        // workaround. Returns false (and changes nothing) if the file couldn't be read/written.
-        bool SetFrikHoloPipboyEnabled(bool enabled);
+        // Installs/restores a temporary normal FRIK/PipboyVR.nif scene root without
+        // modifying stock FRIK 77.12's DLL, API, or INI preference.
+        bool BeginTemporaryNormalPipboyModel();
+        bool EndTemporaryNormalPipboyModel();
         void SetTapREFVisible(bool visible);
 
         // Inventory activation of the intro tape while it is physically loaded means
@@ -150,10 +147,19 @@ namespace heisenberg
         bool            _buttonOriginalZSet   = false;
         bool            _ejectContactLatched  = false;   // Sticky contact; resets outside release radius
         float           _holotapeGrabCooldown   = 0.0f;   // Insertion-only grace; prevents a removed/just-spawned tape re-entering the deck
-        float           _holotapeRemovalCooldown = 0.0f;  // Separate short post-insert guard; ejecting never has to wait on insertion grace
+        float           _holotapeRemovalCooldown = 0.0f;  // Short post-insert debounce in addition to the required Grip release
+        bool            _holotapeRemovalRequiresGripRelease = false; // Insertion's held Grip cannot immediately remove the same tape
+        float           _deckRemovalHandGuard    = 0.0f;  // Keeps the extracting hand from re-closing the deck before DropToHand owns the tape
         float           _closeAnimSpeed         = ANIM_SPEED; // Current close animation speed (variable for slam)
         float           _slamCooldown           = 0.0f;   // Prevent multiple slam detections
         float           _pushProgress           = 1.0f;   // Hand-driven progress during Pushing state (1=open, 0=closed)
+        bool            _deckPushStrokeValid       = false; // Fixed contact-frame stroke captured on first physical touch
+        bool            _deckPushStrokeUsesWeapon  = false; // Selects the stable hand or weapon anchor for the whole stroke
+        RE::NiPoint3    _deckPushStrokeOrigin{};
+        RE::NiPoint3    _deckPushStrokeDirection{};
+        float           _deckPushStrokeStartProgress = 1.0f;
+        float           _deckPushStrokeRequiredTravel = 3.0f;
+        float           _deckPushStrokeMaxTravel = 0.0f; // Deepest travel retained during one uninterrupted stroke
         float           _frikPipboyScale        = -1.0f;  // Cached FRIK PipboyScale (-1 = not yet read)
         int             _frikHoloPipboy         = -1;     // Cached FRIK HoloPipBoyEnabled (-1=unread, 0=false, 1=true)
         bool            _tapREFForceHidden      = false;  // Set by removal, cleared by insertion — overrides per-frame visibility
@@ -217,14 +223,50 @@ namespace heisenberg
         // ── Vanilla Pip-Boy boot sequence (auto-fired on first pickup) ──
         bool            _bootSequenceFired          = false; // One-way latch: never re-send the native event this game session
         bool            _bootWristOverrideOwned     = false; // True if the boot sequence itself started the projected->wrist override
-        // Temporary FRIK HoloPipBoyEnabled override so the boot sequence renders on the
-        // flat wrist model even when the player's real preference is Holo. Written to
-        // FRIK.ini directly, before FRIK's own Pip-Boy model is ever constructed this
-        // session (sidesteps needing FRIK's un-exported swapModel() sequence).
-        bool            _bootHoloIniHandled          = false; // One-way latch: decided whether to override, for this pickup
-        bool            _bootHoloIniOverrideActive   = false; // True from a successful false-write until restored back to true
-        float           _bootHoloIniWaitSeconds      = 0.0f;  // Countdown after writing false, before forcing the Pip-Boy open (lets FRIK's debounced file-watcher reload)
-        float           _bootHoloIniRestoreSeconds   = -1.0f; // Countdown after firing the boot event, before restoring true (-1 = not started)
+        // Temporary live FRIK Holo override so the boot sequence renders only on the
+        // normal wrist model. The event is gated on the actual PlayerNodes root:
+        // the old Holo root must be replaced, the new root must contain normal-only
+        // mesh markers, and the ScreenNode must belong to it for two stable frames.
+        bool            _bootHoloModeHandled             = false; // One-way latch: pickup transition was initialized
+        bool            _bootHoloOverrideActive          = false; // Player preferred Holo and the live false request succeeded
+        bool            _bootPipboyRootTransitionPending = false; // Waiting for a verified normal FRIK root
+        bool            _bootPipboyRootTransitionFailed  = false; // Fail closed: never fire boot against an unverified/Holo root
+        bool            _bootPipboyRootMustChange        = false; // True when the pre-switch root was Holo
+        RE::NiNode*     _bootPipboyPreSwitchRoot          = nullptr;
+        RE::NiNode*     _bootPipboyCandidateRoot          = nullptr;
+        int             _bootPipboyRootStableFrames      = 0;
+        float           _bootPipboyRootWaitSeconds       = 0.0f;  // Bounded wait for FRIK's live root replacement
+        float           _bootHoloRestoreSeconds          = -1.0f; // Countdown after boot closes before restoring Holo (-1 = not started)
+
+        // Temporary normal UI/screen model. FRIK/PipboyVR.nif supplies the
+        // native Screen render root assigned to PlayerNodes; the physical
+        // casing is supplied separately by equipped Pip-Boy armor 0x21B3B.
+        // Some skeletons expose that armor tree as a PipboyRoot_NIF_ONLY
+        // sibling. Its Screen must never replace the loaded UI model's native
+        // Screen. Strong references keep both roots and their parent alive.
+        bool            _temporaryNormalPipboyActive       = false;
+        bool            _temporaryNormalPipboyRootOwned     = false;
+        RE::NiNode*     _temporaryNormalPipboyRoot         = nullptr;
+        RE::NiNode*     _temporaryNormalPipboyScreen       = nullptr;
+        RE::NiNode*     _temporaryOriginalPipboyRoot       = nullptr;
+        RE::NiNode*     _temporaryOriginalPipboyScreen     = nullptr;
+        RE::NiNode*     _temporaryPipboyAttachParent       = nullptr;
+        RE::NiNode*     _temporaryPhysicalCasingRoot       = nullptr;
+        RE::NiPointer<RE::NiNode> _temporaryNormalPipboyRootHold{};
+        RE::NiPointer<RE::NiNode> _temporaryOriginalPipboyRootHold{};
+        RE::NiPointer<RE::NiNode> _temporaryPipboyAttachParentHold{};
+        RE::NiPointer<RE::NiNode> _temporaryPhysicalCasingRootHold{};
+        RE::NiAVObject* _temporaryArmHoloEmitter           = nullptr;
+        RE::NiAVObject* _temporaryArmPhysicalScreen        = nullptr;
+        float           _temporaryOriginalRootScale        = 1.0f;
+        std::uint64_t   _temporaryOriginalScreenFlags      = 0;
+        float           _temporaryNormalRootScale          = 1.0f;
+        RE::NiTransform _temporaryNormalScreenLocal{};
+        float           _temporaryPhysicalCasingRootScale  = 1.0f;
+        float           _temporaryHoloEmitterScale         = 1.0f;
+        std::uint64_t   _temporaryHoloEmitterFlags         = 0;
+        float           _temporaryArmPhysicalScreenScale   = 1.0f;
+        std::uint64_t   _temporaryArmPhysicalScreenFlags   = 0;
         // Jul 24 boot redesign: completion is detected from the game's own
         // PipboyOpeningSequenceMenu open->closed transition (the boot SWF drives its
         // own teardown); the Holo/projected restores hang off that, not fixed timers.
@@ -233,8 +275,18 @@ namespace heisenberg
         float           _bootMenuAppearWaitSeconds   = 0.0f;  // Ceiling for the menu to appear after firing before falling back
         bool            _bootScreenActivated         = false; // Wrist screen lit for the boot menu (ActivatePipboyScreen) — must be deactivated on completion/interruption
         bool            _bootPipboyMenuBlanked       = false; // PipboyMenu's Scaleform root hidden while the boot SWF owns the screen (restored on completion)
+        bool            _bootPipboyCursorOverridden  = false; // Hidden PipboyMenu cursor suppressed while boot SWF owns the render target
+        bool            _bootPipboyCursorWasEnabled  = false; // Original kUsesCursor state restored when normal tabs take over
         float           _bootContentOpenSeconds      = 0.0f;  // Post-boot countdown before opening PipboyMenu so normal content shows (vanilla shows STATS after boot)
+        bool            _bootContentOpenRequested    = false; // Native PipboyManager open requested; wait for real PipboyMenu creation
+        float           _bootContentOpenWaitSeconds  = 0.0f;  // Bounded wait for the native menu lifecycle to complete
+        bool            _bootContentMenuSeen         = false; // Normal post-boot PipboyMenu observed; screen activation can be released when it later closes
+        float           _bootContentCloseArmSeconds  = 0.0f;  // Distinguishes FRIK's immediate handoff race from a later intentional close
+        bool            _bootContentGripWasPressed   = false; // Synthetic boot open does not set FRIK's private _isOpen; track the normal offhand Grip explicitly
+        bool            _bootContentGripCloseRequested = false; // Prevent repeated ClosedownPipboy calls while the menu close is pending
+        float           _bootContentCloseRetrySeconds = 0.0f;   // Watchdog: re-arm grip close if ClosedownPipboy left the menu open
         bool            _bootSawPipboyAbsent         = false; // Armed only after observing the Pip-Boy NOT owned this session — boot fires on the 0->1 acquisition, never on loads
+        bool            _bootPipboyArmorEquipQueued  = false; // Physical wrist armor was queued immediately on the observed pickup transition
         // Intro ceremony always-on-wrist rule: FRIK Holo temporarily forced off (same
         // FRIK.ini override the boot sequence uses) while the intro plays on the wrist;
         // projected/HMD modes ride the existing projected->wrist override.
@@ -242,6 +294,7 @@ namespace heisenberg
         int             _introHoloWaitFrames         = 0;     // Settle frames (FRIK watcher debounce + root reinstall) before the deferred playback starts
         std::uint32_t   _introHoloWaitFormID         = 0;     // Intro tape whose playback is deferred behind the settle wait
         bool            _introHoloSawPipOpen         = false; // Display-ended tracking for the Holo restore (open observed, then closed)
+        bool            _introDisplayRestorePending  = false; // Narration completed; close the display fully before restoring the user's Holo/projected mode
         int             _savedLayerLock             = 0;     // Saved render layer singleton lock value (+0x374)
         int             _savedModeLock              = 0;     // Saved render mode singleton lock value (+0x374)
         int             _savedLayerValue            = -1;    // Saved render layer singleton value (+0x36c)

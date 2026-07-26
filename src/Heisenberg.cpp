@@ -3,6 +3,7 @@
 #include "FrikArmGoalHook.h"
 
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <SimpleIni.h>
@@ -17,6 +18,7 @@
 #include "Hand.h"
 #include "HeisenbergInterface001.h"
 #include "Highlight.h"
+#include "InputRecovery.h"
 #include "HandCollision.h"
 #include "FingerCurves.h"
 #include "WandNodeHelper.h"
@@ -220,8 +222,7 @@ namespace heisenberg
         // dormant engine (toggle off / HostLoad failed) is never driven.
         if (s_rockEngineHosted) {
             // Host-adapter isolation (integration audit §3.1 / C1): swallow+log any engine fault
-            // (e.g. RockConfig::load throwing when its embedded ROCK.ini resource is missing on a
-            // clean install) so it can't std::terminate the whole DLL.
+            // so it can't std::terminate the whole DLL.
             try {
                 rock::HostOnF4SEMessage(a_msg);
             } catch (const std::exception& e) {
@@ -447,6 +448,18 @@ namespace heisenberg
         } else {
             spdlog::warn("OpenVR hook failed to initialize - input blocking disabled");
         }
+        // F4SE plugins are process-lifetime in normal play, but the OpenVR
+        // bridge still owns IAT/vtable entries and callback registrations.
+        // Register after constructing the singleton so this runs before its
+        // own static destructor. Consumers must not assume a cross-DLL atexit
+        // order; process-exit cleanup in Controls Config avoids calling back
+        // through this DLL's bridge API.
+        static std::once_flag shutdownRegistration;
+        std::call_once(shutdownRegistration, [] {
+            std::atexit([] {
+                OpenVRHook::GetSingleton().Shutdown();
+            });
+        });
 
         // ─── SECOND ARCHITECTURE (embedded ROCK engine) ─────────────────────────────
         // Read ONLY the master toggle directly from the INI here. The full Config::Load()
@@ -473,13 +486,17 @@ namespace heisenberg
                     // iGrabMode=9 (Full Dynamic): cede grab+selection ownership to the embedded
                     // engine for the whole session (read from the boot ini — g_config loads later).
                     // The seam forces the embed's bGrabEnabled/bSelectionEnabled ON across every
-                    // ROCK.ini (re)load; Heisenberg's grip handlers stand down via GetEffectiveGrabMode.
+                    // shared Heisenberg INI reload; Heisenberg's grip handlers stand down via
+                    // GetEffectiveGrabMode.
                     const long bootGrabMode = bootIni.GetLongValue("ObjectPickup", "iGrabMode", 0);
-                    if (bootGrabMode == 9) {
-                        rock::HostSetGrabOwnership(true);
+                    const bool rockOwnsGrab = bootGrabMode == 9;
+                    rock::HostSetGrabOwnership(rockOwnsGrab);
+                    if (rockOwnsGrab) {
                         spdlog::info("[RockEngine] iGrabMode=9 — embedded ROCK owns grab+selection this session");
+                    } else {
+                        spdlog::info("[RockEngine] iGrabMode={} — Heisenberg owns grab+selection; embedded ROCK supplies collision", bootGrabMode);
                     }
-                    spdlog::info("[RockEngine] Embedded ROCK engine load OK — driven by ROCK.ini");
+                    spdlog::info("[RockEngine] Embedded ROCK engine load OK — settings share Heisenberg_F4VR.ini");
                 } else {
                     spdlog::error("[RockEngine] rock::HostLoad() FAILED — embedded ROCK engine disabled this session");
                 }
@@ -1262,6 +1279,10 @@ namespace heisenberg
         }
 
         // NOTE: kFighting toggle code removed - was causing issues
+
+        // Post-load input watchdog: dumps the engine's input-enable layers and re-asserts movement
+        // at a few checkpoints after a save load. Disarmed (single atomic load) the rest of the time.
+        InputRecovery::Tick();
 
         // Check for MCM settings changes (throttled internally to every 2 seconds)
         g_config.ReloadIfMCMChanged();

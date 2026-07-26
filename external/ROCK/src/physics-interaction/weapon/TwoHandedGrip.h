@@ -110,6 +110,13 @@ namespace rock
         std::uint32_t supportRole{ 0 };
         std::uint32_t socketRole{ 0 };
         std::uint32_t actionRole{ 0 };
+        /*
+         * Exact collision-source identity used to resolve provider matchers.
+         * This can differ from sourceRoot when an AttachOnly constraint moves
+         * a consumer-selected controlledRoot and the public glued-hand frame
+         * is therefore relative to that controlled node.
+         */
+        std::uintptr_t contactSourceRoot{ 0 };
         std::uintptr_t sourceRoot{ 0 };
         std::uint64_t providerOwnerToken{ 0 };
         std::uint32_t providerGroupId{ 0 };
@@ -138,7 +145,6 @@ namespace rock
             const WeaponInteractionRuntimeState& leftRuntimeState,
             const WeaponInteractionRuntimeState& rightRuntimeState,
             weapon_support_authority_policy::WeaponSupportAuthorityMode supportAuthorityMode,
-            bool sidearmHybridEligible,
             bool primaryDetachEnabled);
 
         void reset();
@@ -200,6 +206,24 @@ namespace rock
         // weapon transform from ROCK's update (pre-FRIK) — one frame stale — so during fast
         // gun motion the support hand visibly lags/slides off the grip. SEH-guarded.
         bool computeLiveGripHandWorld(bool isLeft, RE::NiTransform& out) const;
+
+        /*
+         * A provider motion constraint can match a generated collision leaf
+         * while moving a separate authored node through controlledRoot.
+         * Rebase the already-captured AttachOnly hand frame onto that node
+         * before it moves, preserving the current world pose without a snap.
+         */
+        bool rebindAttachOnlyGripToControlledRoot(
+            bool isLeft,
+            RE::NiNode* weaponNode,
+            RE::NiAVObject* controlledRoot);
+
+        /*
+         * Refresh the FRIK/host hand-authority writer after controlledRoot has
+         * moved. Motion constraints run after the normal two-handed update so
+         * the earlier writer otherwise contains the pre-motion hand target.
+         */
+        bool republishAttachOnlyHandAfterControlledRootMove(bool isLeft);
 
         TwoHandedState getState() const { return _state; }
 
@@ -294,6 +318,7 @@ namespace rock
              * exists when a consumer whitelist matched the part.
              */
             std::uint32_t contactBodyId{ 0x7FFF'FFFFu };
+            RE::NiAVObject* contactSourceRoot{ nullptr };
             WeaponReloadRole reloadRole{ WeaponReloadRole::None };
             WeaponSupportGripRole supportRole{ WeaponSupportGripRole::None };
             WeaponSocketRole socketRole{ WeaponSocketRole::None };
@@ -324,7 +349,6 @@ namespace rock
             const WeaponInteractionDecision& decision,
             const WeaponCollision& weaponCollision,
             weapon_support_authority_policy::WeaponSupportAuthorityMode supportAuthorityMode,
-            bool sidearmHybridEligible,
             const WeaponProviderPartAuthority& providerPartAuthority,
             // FIX A1 (trigger-finger clip through gun during two-handed steering): the
             // primary/firing hand's own weapon contact + runtime state, threaded in from
@@ -515,6 +539,12 @@ namespace rock
         RE::NiTransform _primaryHandWeaponLocal{};
 
         bool _hasFiringHandWeaponLocal{ false };
+
+        // Jul 25 (pistol grip fix B): firing palm normal in weapon-local space,
+        // captured at grip start — the solver's roll-about-aim-axis reference.
+        RE::NiPoint3 _primaryRollWeaponLocal{};
+
+        bool _hasPrimaryRollWeaponLocal{ false };
 
         LockedHandVisualLerpState _primaryHandVisualLerp{};
 

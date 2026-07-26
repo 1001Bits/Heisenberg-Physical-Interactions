@@ -31,6 +31,17 @@
 
 namespace heisenberg::Hooks
 {
+    // Controls Config marks only its synthetic semantic grenade lifecycle.
+    // Physical WandGrip events still pass through Heisenberg's normal grenade
+    // arbitration. Thread-local state preserves the engine call's p3/p4 ABI.
+    static thread_local bool g_externalSemanticGrenadeDispatch = false;
+
+    extern "C" __declspec(dllexport)
+    void __cdecl Heisenberg_SetExternalGrenadeDispatch(bool enabled)
+    {
+        g_externalSemanticGrenadeDispatch = enabled;
+    }
+
     // =========================================================================
     // Hook Strategy:
     // We use a single post-physics hook (0xd8405e) - called after physics step  
@@ -424,7 +435,10 @@ namespace heisenberg::Hooks
                 rock::HostSetHandDynamicPushAssistSuppressed(useEmbeddedBodylessProximity);
             }
 
-            if (rock.IsRunning() || (embeddedRockHosted && !useEmbeddedBodylessProximity)) {
+            const bool rockOwnsHandPhysics =
+                rock.IsRunning() ||
+                (embeddedRockHosted && !useEmbeddedBodylessProximity);
+            if (rockOwnsHandPhysics) {
                 static bool loggedRock = false;
                 if (!loggedRock) {
                     spdlog::info("[HOOKS] ROCK owns hand physics ({}) — built-in hand collision disabled.",
@@ -474,8 +488,8 @@ namespace heisenberg::Hooks
 
             // Two-scenario cleanup: Heisenberg no longer creates its own physics hand
             // bodies — real hand colliders come from the embedded ROCK engine (S1) or
-            // the external ROCK.dll (S2). Only the body-less proximity push remains,
-            // which runs post-physics.
+            // the external ROCK.dll (S2). The body-less push/contact work remains
+            // post-physics.
             if (phase == HandCollisionUpdatePhase::PrePhysics) {
                 return;
             }
@@ -1082,7 +1096,10 @@ namespace heisenberg::Hooks
         // is suppressed. We never strip grip from the OpenVR stream, so grip still reaches the
         // game / VirtualHolsters. Power attacks are AttackBlockHandler (own timer) — untouched.
         bool blockReady = false;
-        if (a_event && heisenberg::g_config.useGrenadeReadyHook && heisenberg::g_config.enableGrenadeHandling) {
+        if (a_event &&
+            !g_externalSemanticGrenadeDispatch &&
+            heisenberg::g_config.useGrenadeReadyHook &&
+            heisenberg::g_config.enableGrenadeHandling) {
             auto& mod = heisenberg::Heisenberg::GetSingleton();
             const bool primaryIsLeft = heisenberg::VRInput::GetSingleton().IsLeftHandedMode();
             const bool hasThrowable = PlayerHasThrowableEquipped();

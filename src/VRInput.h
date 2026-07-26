@@ -101,6 +101,13 @@ namespace heisenberg
          */
         float GetGripValue(bool isLeftHand) const;
 
+        // Private logical Grab state supplied by a compatible controls bridge.
+        // These accessors are used only by Hand object-grab input; all other
+        // Heisenberg features continue to read raw controller Grip.
+        bool HasLogicalGrab(bool isLeftHand) const;
+        bool IsLogicalGrabPressed(bool isLeftHand) const;
+        float GetLogicalGrabValue(bool isLeftHand) const;
+
         /**
          * Get the thumbstick X axis value (-1.0 to 1.0)
          * @param isLeftHand Which controller
@@ -197,6 +204,10 @@ namespace heisenberg
             bool valid = false;
             bool poseValid = false;
             bool hasAnalogGrip = false;  // True once we've seen gripValue > threshold
+            uint64_t logicalGrabCurrent = 0;
+            uint64_t logicalGrabPrevious = 0;
+            float logicalGrabValue = 0.0f;
+            bool logicalGrabOwned = false;
         };
         
         ButtonState _leftController;

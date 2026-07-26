@@ -23,7 +23,9 @@
 #include <RE/Bethesda/PipboyManager.h>
 #include <SimpleIni.h>
 #include <ShlObj.h>
+#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <array>
 #include <cmath>
 #include <algorithm>
 #include <string>
@@ -104,6 +106,61 @@ static bool PlayerHasReceivedPipboy()
     auto* pipboy = RE::TESForm::GetFormByID(0x00021B3B);
     if (!pipboy) return false;
     return player->GetInventoryObjectCount(static_cast<RE::TESBoundObject*>(pipboy)) > 0;
+}
+
+// The pickup quest adds the Pip-Boy armor to inventory before its ordinary
+// equip/model-attach work finishes.  The boot renderer can therefore become
+// visible several seconds before the physical PipboyLowPlayer armor does.
+// Complete the same verified VR equip operation immediately on the observed
+// inventory 0->1 transition. This helper runs from PipboyInteraction::Update on
+// the main thread, not from the inventory callback. A queued equip was not
+// processed until the 15-second boot menu closed, so the boot screen appeared
+// on an empty wrist.
+static bool QueuePhysicalPipboyArmorEquipForBoot()
+{
+    auto* player = RE::PlayerCharacter::GetSingleton();
+    auto* form = RE::TESForm::GetFormByID(0x00021B3B);
+    if (!player || !form ||
+        form->GetFormType() != RE::ENUM_FORM_ID::kARMO) {
+        return false;
+    }
+
+    RE::ActorEquipManager** equipManagerPtr =
+        heisenberg::g_ActorEquipManager.get();
+    if (!equipManagerPtr || !*equipManagerPtr) {
+        return false;
+    }
+
+    struct LocalObjectInstance
+    {
+        RE::TESForm* object{ nullptr };
+        RE::BSTSmartPointer<RE::TBO_InstanceData> instanceData;
+    };
+    static_assert(sizeof(LocalObjectInstance) == 0x10);
+
+    LocalObjectInstance instance{};
+    instance.object = form;
+    const bool queued =
+        heisenberg::ActorEquipManager_EquipObject(
+            *equipManagerPtr,
+            player,
+            reinterpret_cast<RE::BGSObjectInstance*>(&instance),
+            0,
+            1,
+            nullptr,
+            false,  // already on the main update thread; do not defer past boot
+            true,   // pickup armor must be present for the complete boot
+            false,  // vanilla pickup/boot owns its sounds
+            true,   // attach PipboyLowPlayer before the boot screen is shown
+            false);
+    spdlog::log(
+        queued ? spdlog::level::info : spdlog::level::warn,
+        "[PIPBOY] Physical Pip-Boy armor immediate equip {} at pickup transition",
+        queued ? "completed" : "returned false (vanilla equip may already own it)");
+    // A false return can mean the same armor is already in the vanilla equip
+    // queue.  The request reached a valid manager, so do not submit it every
+    // frame and race the pickup's own work.
+    return true;
 }
 
 static bool s_projOverrideActive   = false;
@@ -344,6 +401,12 @@ static bool EnableMenuInput(const RE::BSFixedString& menuName) {
 namespace heisenberg
 {
     static bool IsUsableWorldPoint(const RE::NiPoint3& point);
+    static RE::NiAVObject* SafeFindAVObject(RE::NiAVObject* root, const std::string& name);
+    static RE::NiAVObject* FindNamedNodeOutsideSubtree(
+        RE::NiAVObject* root,
+        const char* targetName,
+        RE::NiAVObject* excludedSubtree,
+        int remainingDepth);
 
     float PipboyInteraction::GetFrikPipboyScale()
     {
@@ -396,32 +459,379 @@ namespace heisenberg
         return _frikHoloPipboy != 0;
     }
 
-    bool PipboyInteraction::SetFrikHoloPipboyEnabled(bool enabled)
+    static bool LoadFrikNormalPipboyScreenOffset(
+        RE::NiTransform& outTransform)
     {
-        wchar_t* buffer = nullptr;
-        HRESULT hr = SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &buffer);
-        if (!SUCCEEDED(hr) || !buffer) {
-            if (buffer) CoTaskMemFree(buffer);
-            spdlog::warn("[PIPBOY] Could not resolve Documents folder, cannot write FRIK HoloPipBoyEnabled");
+        wchar_t* documentsBuffer = nullptr;
+        const HRESULT result = SHGetKnownFolderPath(
+            FOLDERID_Documents,
+            0,
+            nullptr,
+            &documentsBuffer);
+        if (FAILED(result) || !documentsBuffer) {
+            if (documentsBuffer) {
+                CoTaskMemFree(documentsBuffer);
+            }
             return false;
         }
-        std::filesystem::path frikPath(buffer);
-        CoTaskMemFree(buffer);
-        frikPath /= "My Games/Fallout4VR/FRIK_Config/FRIK.ini";
 
-        CSimpleIniA frikIni;
-        frikIni.SetUnicode();
-        if (frikIni.LoadFile(frikPath.string().c_str()) < 0) {
-            spdlog::warn("[PIPBOY] Could not load {} to write HoloPipBoyEnabled", frikPath.string());
+        std::filesystem::path offsetPath(documentsBuffer);
+        CoTaskMemFree(documentsBuffer);
+        offsetPath /=
+            "My Games/Fallout4VR/FRIK_Config/Pipboy_Offsets/"
+            "PipboyPosition_v2.json";
+
+        try {
+            std::ifstream stream(offsetPath);
+            if (!stream) {
+                spdlog::warn(
+                    "[PIPBOY] Normal FRIK screen offset not found at {}; "
+                    "using the NIF-authored transform",
+                    offsetPath.string());
+                return false;
+            }
+
+            nlohmann::json document;
+            stream >> document;
+            const auto& position = document.at("PipboyPosition");
+            const auto& rotation = position.at("rotation");
+            if (!rotation.is_array() || rotation.size() < 12) {
+                throw std::runtime_error(
+                    "PipboyPosition.rotation must contain 12 values");
+            }
+
+            RE::NiTransform parsed{};
+            parsed.translate.x = position.at("x").get<float>();
+            parsed.translate.y = position.at("y").get<float>();
+            parsed.translate.z = position.at("z").get<float>();
+            parsed.scale = position.at("scale").get<float>();
+            for (int row = 0; row < 3; ++row) {
+                for (int column = 0; column < 3; ++column) {
+                    parsed.rotate.entry[row][column] =
+                        rotation.at(row * 4 + column).get<float>();
+                }
+            }
+
+            const bool finite =
+                std::isfinite(parsed.translate.x) &&
+                std::isfinite(parsed.translate.y) &&
+                std::isfinite(parsed.translate.z) &&
+                std::isfinite(parsed.scale) &&
+                parsed.scale > 0.001f;
+            if (!finite) {
+                throw std::runtime_error(
+                    "PipboyPosition contains a non-finite/invalid transform");
+            }
+
+            outTransform = parsed;
+            spdlog::info(
+                "[PIPBOY] Loaded normal FRIK screen offset from {}: "
+                "pos=({:.3f},{:.3f},{:.3f}) scale={:.3f}",
+                offsetPath.string(),
+                parsed.translate.x,
+                parsed.translate.y,
+                parsed.translate.z,
+                parsed.scale);
+            return true;
+        } catch (const std::exception& error) {
+            spdlog::warn(
+                "[PIPBOY] Invalid normal FRIK screen offset {}: {}; "
+                "using the NIF-authored transform",
+                offsetPath.string(),
+                error.what());
             return false;
         }
-        frikIni.SetBoolValue("Fallout4VRBody", "HoloPipBoyEnabled", enabled);
-        if (frikIni.SaveFile(frikPath.string().c_str()) < 0) {
-            spdlog::warn("[PIPBOY] Failed to save {} (HoloPipBoyEnabled={})", frikPath.string(), enabled);
+    }
+
+    bool PipboyInteraction::BeginTemporaryNormalPipboyModel()
+    {
+        if (_temporaryNormalPipboyActive) {
+            return true;
+        }
+
+        auto* playerNodes = f4vr::getPlayerNodes();
+        if (!playerNodes ||
+            !playerNodes->PipboyRoot_nif_only_node ||
+            !playerNodes->ScreenNode) {
+            spdlog::debug(
+                "[PIPBOY] Cannot install temporary normal model: "
+                "stock FRIK PlayerNodes are not ready");
             return false;
         }
-        _frikHoloPipboy = enabled ? 1 : 0;
-        spdlog::info("[PIPBOY] Wrote FRIK HoloPipBoyEnabled={} to {}", enabled, frikPath.string());
+
+        auto* originalRoot = playerNodes->PipboyRoot_nif_only_node;
+        auto* originalScreen = playerNodes->ScreenNode;
+        auto* attachParent = originalRoot->parent;
+        if (!attachParent) {
+            spdlog::warn(
+                "[PIPBOY] Cannot install temporary normal model: "
+                "current FRIK root has no attach parent");
+            return false;
+        }
+
+        // FRIK/PipboyVR.nif is the normal UI/screen replacement.  The physical
+        // wrist casing is the equipped 0x21B3B Pip-Boy armor and can appear as
+        // a sibling in the actor tree after the queued pickup equip settles.
+        // It is useful compatibility state when present, but is not the screen
+        // root assigned to PlayerNodes.
+        auto* physicalCasingObject =
+            FindNamedNodeOutsideSubtree(
+                attachParent,
+                "PipboyRoot_NIF_ONLY",
+                originalRoot,
+                16);
+        auto* physicalCasingRoot =
+            physicalCasingObject
+                ? physicalCasingObject->IsNode()
+                : nullptr;
+        // The casing is OPTIONAL, and the whole rest of this function already treats it that way:
+        // every read of physicalCasingRoot below is null-guarded, EndTemporaryNormalPipboyModel
+        // restores only the pieces it captured, and the success log calls it "optional armor
+        // casing". This used to `return false` here instead, which permanently deferred the boot
+        // on any skeleton where the armor casing never appears as a separate PipboyRoot_NIF_ONLY
+        // sibling — confirmed live at the Vault 111 pickup, where it logged this same line 5213
+        // times in a row and the RobCo boot screen never played. The screen the boot renders
+        // through is FRIK's own loaded normal root, not the casing, so a missing casing costs only
+        // the cosmetic emitter/screen swap on the physical arm model.
+        if (!physicalCasingRoot) {
+            spdlog::debug(
+                "[PIPBOY] No separate armor-tree casing present; "
+                "booting through the FRIK normal root alone");
+        }
+
+        RE::NiNode* normalRoot = nullptr;
+        try {
+            normalRoot = f4vr::loadNifFromFile("FRIK/PipboyVR.nif");
+        } catch (const std::exception& error) {
+            spdlog::error(
+                "[PIPBOY] Failed to load FRIK/PipboyVR.nif: {}",
+                error.what());
+            return false;
+        }
+        if (!normalRoot) {
+            spdlog::error(
+                "[PIPBOY] Failed to load FRIK/PipboyVR.nif: null root");
+            return false;
+        }
+        RE::NiPointer<RE::NiNode> loadedNormalRootHold;
+        loadedNormalRootHold.reset(normalRoot);
+
+        auto* normalScreenObject =
+            SafeFindAVObject(normalRoot, "Screen");
+        auto* normalScreen =
+            normalScreenObject ? normalScreenObject->IsNode() : nullptr;
+        if (!normalScreen) {
+            spdlog::error(
+                "[PIPBOY] FRIK/PipboyVR.nif has no Screen node");
+            return false;
+        }
+
+        auto* armHoloEmitter = physicalCasingRoot
+            ? SafeFindAVObject(physicalCasingRoot, "HoloEmitter")
+            : nullptr;
+        auto* armPhysicalScreen = physicalCasingRoot
+            ? SafeFindAVObject(physicalCasingRoot, "Screen")
+            : nullptr;
+
+        _temporaryOriginalPipboyRoot = originalRoot;
+        _temporaryOriginalPipboyScreen = originalScreen;
+        _temporaryPipboyAttachParent = attachParent;
+        _temporaryPhysicalCasingRoot = physicalCasingRoot;
+        _temporaryNormalPipboyRootHold.reset(normalRoot);
+        _temporaryOriginalPipboyRootHold.reset(originalRoot);
+        _temporaryPipboyAttachParentHold.reset(attachParent);
+        if (physicalCasingRoot) {
+            _temporaryPhysicalCasingRootHold.reset(physicalCasingRoot);
+        }
+        _temporaryNormalPipboyRootOwned = true;
+        _temporaryNormalPipboyRoot = normalRoot;
+        _temporaryNormalPipboyScreen = normalScreen;
+        _temporaryArmHoloEmitter = armHoloEmitter;
+        _temporaryArmPhysicalScreen = armPhysicalScreen;
+        _temporaryOriginalRootScale = originalRoot->local.scale;
+        _temporaryOriginalScreenFlags = originalScreen->flags.flags;
+        _temporaryNormalRootScale = normalRoot->local.scale;
+        _temporaryNormalScreenLocal = normalScreen->local;
+        LoadFrikNormalPipboyScreenOffset(
+            _temporaryNormalScreenLocal);
+        // BOOT FRAMING (Jul 27, user: "the upper 5% of the screen is not visible during the
+        // startup animation"). The boot SWF renders to the full screen quad, but the temporary
+        // normal wrist model sits slightly high in the visible aperture, clipping the top band.
+        // Nudge the screen DOWN its own local -Z so the whole animation fits. Applied only to the
+        // temporary boot screen; FRIK's own offsets and the normal Pip-Boy are untouched, and the
+        // value is restored wholesale with the rest of the temporary state on teardown.
+        _temporaryNormalScreenLocal.translate.z -=
+            g_config.pipboyBootScreenDropGameUnits;
+        if (physicalCasingRoot) {
+            _temporaryPhysicalCasingRootScale =
+                physicalCasingRoot->local.scale;
+        }
+
+        if (armHoloEmitter) {
+            _temporaryHoloEmitterScale = armHoloEmitter->local.scale;
+            _temporaryHoloEmitterFlags = armHoloEmitter->flags.flags;
+        }
+        if (armPhysicalScreen) {
+            _temporaryArmPhysicalScreenScale =
+                armPhysicalScreen->local.scale;
+            _temporaryArmPhysicalScreenFlags =
+                armPhysicalScreen->flags.flags;
+        }
+
+        // Keep FRIK's owned Holo scene attached and intact, but make it
+        // impossible for its projector or screen to render during the boot.
+        originalRoot->local.scale = 0.0f;
+        originalScreen->flags.flags |= static_cast<std::uint64_t>(0x1);
+
+        // If this skeleton also has a separate armor casing, preserve the old
+        // compatibility behavior. PlayerNodes still points only at the loaded
+        // complete FRIK model and its native Screen render root.
+        if (physicalCasingRoot &&
+            !(physicalCasingRoot->local.scale > 0.0f)) {
+            physicalCasingRoot->local.scale = 1.0f;
+        }
+        if (armHoloEmitter) {
+            armHoloEmitter->local.scale = 0.0f;
+            armHoloEmitter->flags.flags |=
+                static_cast<std::uint64_t>(0x1);
+        }
+        if (armPhysicalScreen) {
+            if (!(armPhysicalScreen->local.scale > 0.0f)) {
+                armPhysicalScreen->local.scale = 1.0f;
+            }
+            armPhysicalScreen->flags.flags &=
+                ~static_cast<std::uint64_t>(0x1);
+        }
+
+        // The loaded normal FRIK root is the only root the game may render UI
+        // through. Apply FRIK's normal-screen offset rather than the currently
+        // selected Holo offset, which FRIK will otherwise write every frame.
+        if (!(normalRoot->local.scale > 0.0f)) {
+            normalRoot->local.scale = 1.0f;
+        }
+        normalScreen->local = _temporaryNormalScreenLocal;
+        normalScreen->flags.flags &=
+            ~static_cast<std::uint64_t>(0x1);
+        if (!(normalScreen->local.scale > 0.0f)) {
+            normalScreen->local.scale = 1.0f;
+        }
+        attachParent->AttachChild(normalRoot, false);
+        playerNodes->PipboyRoot_nif_only_node = normalRoot;
+        playerNodes->ScreenNode = normalScreen;
+        f4vr::updateTransformsDown(attachParent, true);
+
+        _temporaryNormalPipboyActive = true;
+        spdlog::info(
+            "[PIPBOY] Installed complete temporary FRIK normal wrist root {} "
+            "over Holo root {} (optional armor casing={} UI screen={} casing "
+            "screen={} emitter={} screenLocal=({:.2f},{:.2f},{:.2f}) "
+            "scale={:.3f})",
+            static_cast<const void*>(normalRoot),
+            static_cast<const void*>(originalRoot),
+            static_cast<const void*>(physicalCasingRoot),
+            static_cast<const void*>(normalScreen),
+            static_cast<const void*>(armPhysicalScreen),
+            static_cast<const void*>(armHoloEmitter),
+            normalScreen->local.translate.x,
+            normalScreen->local.translate.y,
+            normalScreen->local.translate.z,
+            normalScreen->local.scale);
+        return true;
+    }
+
+    bool PipboyInteraction::EndTemporaryNormalPipboyModel()
+    {
+        if (!_temporaryNormalPipboyActive) {
+            return true;
+        }
+
+        auto* playerNodes = f4vr::getPlayerNodes();
+        const bool stillOwnsCurrentRoot =
+            playerNodes &&
+            playerNodes->PipboyRoot_nif_only_node ==
+                _temporaryNormalPipboyRoot;
+
+        if (stillOwnsCurrentRoot) {
+            playerNodes->PipboyRoot_nif_only_node =
+                _temporaryOriginalPipboyRoot;
+            playerNodes->ScreenNode =
+                _temporaryOriginalPipboyScreen;
+            spdlog::info(
+                "[PIPBOY] Restored stock FRIK 77.12 Holo root {} and "
+                "detached temporary normal root",
+                static_cast<const void*>(
+                    _temporaryOriginalPipboyRoot));
+        } else {
+            // A FRIK skeleton rebuild invalidates the old tree and installs
+            // its own current pointers. Never dereference the stale saved
+            // nodes in that case; simply relinquish the temporary state.
+            spdlog::warn(
+                "[PIPBOY] Temporary normal root no longer owns PlayerNodes; "
+                "assuming stock FRIK rebuilt the Pip-Boy tree");
+        }
+
+        // The normal UI root is always ours. Detach it even if FRIK rebuilt
+        // PlayerNodes while it was active; otherwise its screen can remain
+        // visibly orphaned on the wrist.
+        if (_temporaryNormalPipboyRootOwned &&
+            _temporaryNormalPipboyRoot &&
+            _temporaryNormalPipboyRoot->parent ==
+                _temporaryPipboyAttachParent) {
+            _temporaryPipboyAttachParent->DetachChild(
+                _temporaryNormalPipboyRoot);
+        }
+
+        // Strong references make these restores safe even if an acquisition
+        // rebuild detached the old tree. Only PlayerNodes assignment is
+        // conditional: never overwrite a newer root installed by FRIK.
+        if (_temporaryOriginalPipboyRoot) {
+            _temporaryOriginalPipboyRoot->local.scale =
+                _temporaryOriginalRootScale;
+        }
+        if (_temporaryOriginalPipboyScreen) {
+            _temporaryOriginalPipboyScreen->flags.flags =
+                _temporaryOriginalScreenFlags;
+        }
+        if (_temporaryArmHoloEmitter) {
+            _temporaryArmHoloEmitter->local.scale =
+                _temporaryHoloEmitterScale;
+            _temporaryArmHoloEmitter->flags.flags =
+                _temporaryHoloEmitterFlags;
+        }
+        if (_temporaryArmPhysicalScreen) {
+            _temporaryArmPhysicalScreen->local.scale =
+                _temporaryArmPhysicalScreenScale;
+            _temporaryArmPhysicalScreen->flags.flags =
+                _temporaryArmPhysicalScreenFlags;
+        }
+        if (_temporaryPhysicalCasingRoot) {
+            _temporaryPhysicalCasingRoot->local.scale =
+                _temporaryPhysicalCasingRootScale;
+        }
+        if (_temporaryNormalPipboyRoot) {
+            _temporaryNormalPipboyRoot->local.scale =
+                _temporaryNormalRootScale;
+        }
+        if (_temporaryPipboyAttachParent) {
+            f4vr::updateTransformsDown(
+                _temporaryPipboyAttachParent,
+                true);
+        }
+
+        _temporaryNormalPipboyActive = false;
+        _temporaryNormalPipboyRootOwned = false;
+        _temporaryNormalPipboyRoot = nullptr;
+        _temporaryNormalPipboyScreen = nullptr;
+        _temporaryOriginalPipboyRoot = nullptr;
+        _temporaryOriginalPipboyScreen = nullptr;
+        _temporaryPipboyAttachParent = nullptr;
+        _temporaryPhysicalCasingRoot = nullptr;
+        _temporaryArmHoloEmitter = nullptr;
+        _temporaryArmPhysicalScreen = nullptr;
+        _temporaryNormalPipboyRootHold.reset();
+        _temporaryOriginalPipboyRootHold.reset();
+        _temporaryPipboyAttachParentHold.reset();
+        _temporaryPhysicalCasingRootHold.reset();
         return true;
     }
 
@@ -587,6 +997,105 @@ namespace heisenberg
             p = p->parent;
         }
         return false;
+    }
+
+    static RE::NiAVObject* FindNamedNodeOutsideSubtree(
+        RE::NiAVObject* root,
+        const char* targetName,
+        RE::NiAVObject* excludedSubtree,
+        int remainingDepth)
+    {
+        if (!root ||
+            !targetName ||
+            remainingDepth < 0 ||
+            root == excludedSubtree) {
+            return nullptr;
+        }
+
+        const char* currentName = root->name.c_str();
+        if (currentName &&
+            _stricmp(currentName, targetName) == 0) {
+            return root;
+        }
+
+        auto* node = root->IsNode();
+        if (!node) {
+            return nullptr;
+        }
+        for (const auto& child : node->children) {
+            if (!child) {
+                continue;
+            }
+            if (auto* match = FindNamedNodeOutsideSubtree(
+                    child.get(),
+                    targetName,
+                    excludedSubtree,
+                    remainingDepth - 1)) {
+                return match;
+            }
+        }
+        return nullptr;
+    }
+
+    struct PipboyRootInspection
+    {
+        RE::NiNode* root{ nullptr };
+        RE::NiNode* screen{ nullptr };
+        bool screenBelongsToRoot{ false };
+        bool hasHoloMarker{ false };
+        bool hasNormalMarker{ false };
+    };
+
+    static PipboyRootInspection InspectCurrentPipboyRoot()
+    {
+        PipboyRootInspection result{};
+        auto* playerNodes = f4vr::getPlayerNodes();
+        if (!playerNodes) {
+            return result;
+        }
+
+        result.root = playerNodes->PipboyRoot_nif_only_node;
+        result.screen = playerNodes->ScreenNode;
+        if (!result.root || !result.screen) {
+            return result;
+        }
+
+        result.screenBelongsToRoot =
+            result.screen == result.root ||
+            IsAncestorOf(result.root, result.screen);
+        result.hasHoloMarker =
+            SafeFindAVObject(result.root, "ScreenBlack01") != nullptr ||
+            SafeFindAVObject(result.root, "ScreenBlack02") != nullptr ||
+            SafeFindAVObject(result.root, "HoloScreen") != nullptr;
+        result.hasNormalMarker =
+            SafeFindAVObject(result.root, "ScreenGlowEffect01") != nullptr ||
+            SafeFindAVObject(result.root, "ScreenGlowEffect01:0") != nullptr ||
+            SafeFindAVObject(result.root, "ScreenDust:0") != nullptr;
+        return result;
+    }
+
+    static void HideCurrentPipboyRootDuringModelTransition(
+        const PipboyRootInspection& inspection)
+    {
+        if (inspection.root) {
+            inspection.root->local.scale = 0.0f;
+        }
+        if (inspection.screen) {
+            inspection.screen->flags.flags |= static_cast<std::uint64_t>(0x1);
+        }
+    }
+
+    static bool IsVerifiedNormalPipboyRoot(
+        const PipboyRootInspection& inspection,
+        RE::NiNode* preSwitchRoot,
+        bool rootMustChange)
+    {
+        return inspection.root != nullptr &&
+               inspection.screen != nullptr &&
+               inspection.screenBelongsToRoot &&
+               inspection.hasNormalMarker &&
+               !inspection.hasHoloMarker &&
+               (!rootMustChange || inspection.root != preSwitchRoot);
     }
 
     static void ForceAncestorScales(RE::NiAVObject* node) {
@@ -825,9 +1334,49 @@ namespace heisenberg
         return root.SetMember("visible", vis);
     }
 
+    // Enter through PipboyManager's real open lifecycle. A raw UI kShow creates
+    // the Scaleform menu but skips camera/manager initialization and can be
+    // closed by FRIK a frame later, leaving a lit but black render target.
+    static bool RequestNativePipboyContentOpen()
+    {
+        auto* manager = GetPipboyManagerVR();
+        if (!manager) {
+            return false;
+        }
+        static const RE::BSFixedString noAnim("");
+        manager->PlayPipboyGenericOpenAnim(
+            MenuPipboy(),
+            noAnim,
+            true);
+        return true;
+    }
+
     void PipboyInteraction::BeginPipboyBootSequence()
     {
         if (_bootSequenceFired) return;
+
+        const auto rootInspection = InspectCurrentPipboyRoot();
+        if (!IsVerifiedNormalPipboyRoot(
+                rootInspection,
+                _bootPipboyPreSwitchRoot,
+                _bootPipboyRootMustChange)) {
+            spdlog::error(
+                "[PIPBOY] Boot sequence blocked: current FRIK root is not the "
+                "verified normal wrist model (root={} screen={} belongs={} "
+                "normalMarker={} holoMarker={} mustChange={})",
+                static_cast<const void*>(rootInspection.root),
+                static_cast<const void*>(rootInspection.screen),
+                rootInspection.screenBelongsToRoot,
+                rootInspection.hasNormalMarker,
+                rootInspection.hasHoloMarker,
+                _bootPipboyRootMustChange);
+            return;
+        }
+
+        // The transition gate keeps the replacement hidden while its scene tree
+        // settles. Hand the verified normal root back to the native boot event;
+        // ScreenNode itself stays culled until the real opening menu is observed.
+        rootInspection.root->local.scale = 1.0f;
 
         if (IsProjectedPipboyNow()) {
             _bootWristOverrideOwned = BeginWristOverrideForHolotape();
@@ -845,10 +1394,18 @@ namespace heisenberg
         _bootMenuSeen = false;
         _bootMenuFinished = false;
         _bootMenuAppearWaitSeconds = 3.0f;  // if the boot menu never appears, fall through to the finish path
-        if (_bootHoloIniOverrideActive) {
+        _bootPipboyCursorOverridden = false;
+        _bootPipboyCursorWasEnabled = false;
+        _bootContentOpenRequested = false;
+        _bootContentOpenWaitSeconds = 0.0f;
+        _bootContentMenuSeen = false;
+        _bootContentCloseArmSeconds = 0.0f;
+        _bootContentGripWasPressed = false;
+        _bootContentGripCloseRequested = false;
+        if (_bootHoloOverrideActive) {
             // Holo restore is now driven by the boot menu CLOSING (see the completion
             // watcher in the update loop) — this stays -1 until then. Ceiling only.
-            _bootHoloIniRestoreSeconds = -1.0f;
+            _bootHoloRestoreSeconds = -1.0f;
         }
         spdlog::info("[PIPBOY] Boot sequence: fired PipboyOpeningSequenceMenu on the wrist Pip-Boy");
     }
@@ -910,21 +1467,20 @@ namespace heisenberg
         // plays on the wrist Pip-Boy no matter which display mode the player runs: Holo,
         // projected, and HMD-attached ("in front") are all temporarily overridden and
         // restored once the intro display ends.
-        //  * Holo uses the same FRIK.ini override the boot sequence uses (force
-        //    HoloPipBoyEnabled=false, wait out FRIK's file-watcher debounce + root swap,
-        //    restore afterwards) — replacing the old staged-Holo transition, which played
-        //    the intro ON the Holo display instead of moving it to the wrist.
+        //  * Holo uses the same temporary normal scene root as the boot
+        //    sequence. Stock FRIK's DLL and INI remain untouched.
         //  * Projected/HMD flip the game's live ini bools via the existing wrist override —
         //    unconditionally for the intro (the bHolotapeWristOverrideInProjected gate
         //    still governs ordinary holotapes only).
         if (IsFrikHoloPipboyEnabled() && !_introHoloIniOverrideActive) {
-            if (SetFrikHoloPipboyEnabled(false)) {
+            if (BeginTemporaryNormalPipboyModel()) {
                 _introHoloIniOverrideActive = true;
                 _introHoloSawPipOpen = false;
-                _introHoloWaitFrames = 80;  // ~0.9s at 90 Hz — FRIK watcher debounce (>=200ms) + wrist-root reinstall settle
+                _introDisplayRestorePending = false;
+                _introHoloWaitFrames = 2;
                 _introHoloWaitFormID = formID;
-                BeginWristOverrideForHolotape(true);  // also clear projected/HMD if set; safe — playback is deferred past the root swap
-                spdlog::info("[PIPBOY] Intro {:08X}: forced FRIK Holo off for wrist playback — deferring start {} frames",
+                BeginWristOverrideForHolotape(true);
+                spdlog::info("[PIPBOY] Intro {:08X}: temporary normal wrist root installed — deferring start {} frames",
                              formID, _introHoloWaitFrames);
                 return;  // UpdateIntroHoloOverride() queues playback once the wait expires
             }
@@ -936,11 +1492,9 @@ namespace heisenberg
         QueueProgramHolotapePlayback(formID);
     }
 
-    // Companion to the always-on-wrist intro rule above: runs the settle countdown after
-    // FRIK Holo was forced off (then starts the deferred playback), and restores the
-    // player's Holo preference once the intro display has ended (Pip-Boy observed open,
-    // then closed). Holo-only users never arm the projected-override restore path, so
-    // this tracks its own open/close transition.
+    // Settle the temporary normal root and keep it for the complete intro
+    // transaction: boot SWF plus spoken narration.  Restoring as soon as the
+    // SWF menu closes exposes/activates FRIK's Holo display behind the audio.
     void PipboyInteraction::UpdateIntroHoloOverride()
     {
         if (_introHoloWaitFrames > 0) {
@@ -948,12 +1502,12 @@ namespace heisenberg
                 const auto formID = _introHoloWaitFormID;
                 _introHoloWaitFormID = 0;
                 if (_holotapeLoaded && _loadedHolotapeFormID == formID && !Utils::IsPlayerInPowerArmor()) {
-                    spdlog::info("[PIPBOY] Intro {:08X}: Holo-off settle done — starting wrist playback", formID);
+                    spdlog::info("[PIPBOY] Intro {:08X}: normal-root settle done — starting wrist playback", formID);
                     QueueProgramHolotapePlayback(formID);
                 } else {
-                    spdlog::info("[PIPBOY] Intro {:08X}: cancelled during Holo-off settle — restoring modes", formID);
+                    spdlog::info("[PIPBOY] Intro {:08X}: cancelled during normal-root settle — restoring modes", formID);
                     if (_introHoloIniOverrideActive) {
-                        SetFrikHoloPipboyEnabled(true);
+                        EndTemporaryNormalPipboyModel();
                         _introHoloIniOverrideActive = false;
                     }
                     EndWristOverrideForHolotape();
@@ -963,15 +1517,50 @@ namespace heisenberg
             return;
         }
 
-        if (!_introHoloIniOverrideActive) return;
         const bool pipOpen = MenuChecker::GetSingleton().IsPipboyOpen();
-        if (pipOpen) {
-            _introHoloSawPipOpen = true;
-        } else if (_introHoloSawPipOpen) {
-            SetFrikHoloPipboyEnabled(true);
+
+        // Narration completion owns a strict close-before-restore handshake.
+        // Never restore the Holo/projected preference while PipboyMenu is
+        // still live: FRIK interprets that mode switch as a fresh open.
+        if (_introDisplayRestorePending) {
+            if (pipOpen) {
+                DeactivatePipboyScreen();
+                EnableMenuInput(MenuPipboy());
+                EnableMenuInput(MenuHolotape());
+                EnableMenuInput(MenuPipboyHolotape());
+                if (auto* pbm = GetPipboyManagerVR()) {
+                    pbm->ClosedownPipboy();
+                }
+                return;
+            }
+
+            DeactivatePipboyScreen();
+            if (_introHoloIniOverrideActive) {
+                EndTemporaryNormalPipboyModel();
+            }
+            EndWristOverrideForHolotape();
             _introHoloIniOverrideActive = false;
             _introHoloSawPipOpen = false;
-            spdlog::info("[PIPBOY] Intro display ended — restored FRIK HoloPipBoyEnabled=true");
+            _introDisplayRestorePending = false;
+            spdlog::info(
+                "[PIPBOY] Intro narration ended with display closed — "
+                "restored the user's Pip-Boy mode without reopening it");
+            return;
+        }
+
+        if (!_introHoloIniOverrideActive) return;
+        if (pipOpen) {
+            _introHoloSawPipOpen = true;
+        } else if (_introHoloSawPipOpen &&
+                   !_introSWFActive &&
+                   !_introPlaybackActive) {
+            EndTemporaryNormalPipboyModel();
+            EndWristOverrideForHolotape();
+            _introHoloIniOverrideActive = false;
+            _introHoloSawPipOpen = false;
+            spdlog::info(
+                "[PIPBOY] Intro display ended without narration — "
+                "restored stock FRIK Holo root");
         }
     }
 
@@ -1045,6 +1634,43 @@ namespace heisenberg
         auto* player = f4vr::getPlayer();
         if (!player || !f4vr::getCommonNode()) {
             return;
+        }
+
+        // FRIK refreshes PlayerNodes->ScreenNode->local every frame from the
+        // selected Holo offset profile. During the temporary normal handoff that
+        // would move the physical screen away from its authored casing position.
+        // Reassert only while PlayerNodes still explicitly belongs to our strongly
+        // held outer root. If FRIK installed a newer root, leave it untouched; the
+        // transition verifier will fail closed and EndTemporaryNormalPipboyModel
+        // will relinquish the old tree without replacing FRIK's newer pointers.
+        if (_temporaryNormalPipboyActive) {
+            auto* playerNodes = f4vr::getPlayerNodes();
+            const bool stillOwnsCurrentRoot =
+                playerNodes &&
+                playerNodes->PipboyRoot_nif_only_node ==
+                    _temporaryNormalPipboyRoot &&
+                playerNodes->ScreenNode ==
+                    _temporaryNormalPipboyScreen;
+            if (stillOwnsCurrentRoot) {
+                _temporaryNormalPipboyRoot->local.scale = 1.0f;
+                _temporaryNormalPipboyScreen->local =
+                    _temporaryNormalScreenLocal;
+                _temporaryNormalPipboyScreen->flags.flags &=
+                    ~static_cast<std::uint64_t>(0x1);
+                if (_temporaryPhysicalCasingRoot) {
+                    _temporaryPhysicalCasingRoot->local.scale = 1.0f;
+                }
+                if (_temporaryArmHoloEmitter) {
+                    _temporaryArmHoloEmitter->local.scale = 0.0f;
+                    _temporaryArmHoloEmitter->flags.flags |=
+                        static_cast<std::uint64_t>(0x1);
+                }
+                if (_temporaryArmPhysicalScreen) {
+                    _temporaryArmPhysicalScreen->local.scale = 1.0f;
+                    _temporaryArmPhysicalScreen->flags.flags &=
+                        ~static_cast<std::uint64_t>(0x1);
+                }
+            }
         }
 
         // ── Suppress game-opened menus when we redirected a holotape to hand ──
@@ -1181,14 +1807,11 @@ namespace heisenberg
         // physical wrist-Pipboy event; PA always uses projected, matching how the tape
         // deck/intro ceremony are gated above).
         if (!_bootSequenceFired && !inPowerArmor) {
-            // Phase 0: on first detecting the pickup, decide whether to temporarily
-            // force FRIK's own HoloPipBoyEnabled off via its ini, BEFORE touching the
-            // Pip-Boy any other way. Written this early (right at pickup, before FRIK
-            // ever constructs its first Pip-Boy model this session) so the vanilla
-            // boot sequence renders on the flat wrist model even if the player's real
-            // preference is Holo - see SetFrikHoloPipboyEnabled's doc comment for why
-            // this sidesteps needing FRIK's own un-exported model-swap sequence.
-            if (!_bootHoloIniHandled) {
+            // Phase 0: observe the real 0->1 inventory transition, then ask FRIK
+            // to perform its own live model-swap lifecycle when the player's
+            // preference is Holo. An INI write is insufficient here: it changes
+            // configuration but leaves the already-attached Holo NIF alive.
+            if (!_bootHoloModeHandled) {
                 const bool hasPipboy = PlayerHasReceivedPipboy();
                 // ACQUISITION GATE (Jul 24): fire only on the 0 -> 1 transition observed
                 // THIS session. Inventory count alone re-fired the boot on every save load
@@ -1197,30 +1820,124 @@ namespace heisenberg
                 if (!hasPipboy) {
                     _bootSawPipboyAbsent = true;
                 } else if (_bootSawPipboyAbsent) {
-                    _bootHoloIniHandled = true;
-                    if (IsFrikHoloPipboyEnabled() && SetFrikHoloPipboyEnabled(false)) {
-                        _bootHoloIniOverrideActive = true;
-                        // Watcher debounce (>=200ms) + FRIK's model rebuild need real time —
-                        // 0.6s produced a Holo-styled screen during the boot (user-reported).
-                        _bootHoloIniWaitSeconds = 1.5f;
-                        spdlog::info("[PIPBOY] Boot sequence: temporarily forced FRIK HoloPipBoyEnabled=false");
+                    // Inventory ownership is visible before the vanilla pickup
+                    // finishes equipping PipboyLowPlayer.nif.  Queue that armor
+                    // now, before installing/firing the boot screen, so the
+                    // physical wrist Pip-Boy and its boot image appear together.
+                    if (!_bootPipboyArmorEquipQueued) {
+                        _bootPipboyArmorEquipQueued =
+                            QueuePhysicalPipboyArmorEquipForBoot();
+                        if (!_bootPipboyArmorEquipQueued) {
+                            // The equip singleton/actor may still be settling
+                            // on the exact inventory transition frame.  Leave
+                            // the latch clear and retry next frame.
+                            spdlog::debug(
+                                "[PIPBOY] Boot deferred until physical "
+                                "Pip-Boy armor equip can be queued");
+                            return;
+                        }
+                    }
+
+                    const auto beforeSwitch = InspectCurrentPipboyRoot();
+                    const bool rootMustChange =
+                        IsFrikHoloPipboyEnabled();
+                    bool transitionInitialized = !rootMustChange;
+
+                    if (rootMustChange) {
+                        if (BeginTemporaryNormalPipboyModel()) {
+                            _bootHoloOverrideActive = true;
+                            transitionInitialized = true;
+                            spdlog::info(
+                                "[PIPBOY] Boot sequence: temporary normal root "
+                                "installed over stock FRIK Holo; validating");
+                        } else {
+                            // The inventory 0->1 event precedes FRIK attaching
+                            // the physical wrist casing by a few frames. This
+                            // is an expected acquisition race, not a terminal
+                            // failure: leave _bootHoloModeHandled false so the
+                            // next frame retries once the casing exists.
+                            // Throttled: this is a per-frame retry, and when it did stick it
+                            // produced 5213 identical lines (~2MB) in one session, burying the
+                            // rest of the log.
+                            static std::uint32_t s_bootDeferLog = 0;
+                            if ((s_bootDeferLog++ % 120) == 0) {
+                                spdlog::debug(
+                                    "[PIPBOY] Boot sequence deferred: temporary "
+                                    "normal wrist root is not ready yet (x{})",
+                                    s_bootDeferLog);
+                            }
+                        }
+                    }
+
+                    if (transitionInitialized) {
+                        _bootHoloModeHandled = true;
+                        _bootPipboyPreSwitchRoot = beforeSwitch.root;
+                        _bootPipboyRootMustChange = rootMustChange;
+                        _bootPipboyRootTransitionFailed = false;
+                        _bootPipboyRootTransitionPending = true;
+                        _bootPipboyCandidateRoot = nullptr;
+                        _bootPipboyRootStableFrames = 0;
+                        _bootPipboyRootWaitSeconds = 3.0f;
                     }
                 }
             }
 
-            if (_bootHoloIniHandled) {
-                bool readyToProceed = true;
-                if (_bootHoloIniOverrideActive && _bootHoloIniWaitSeconds > 0.0f) {
-                    _bootHoloIniWaitSeconds -= deltaTime;
-                    readyToProceed = _bootHoloIniWaitSeconds <= 0.0f;
+            if (_bootHoloModeHandled &&
+                !_bootPipboyRootTransitionFailed &&
+                _bootPipboyRootTransitionPending) {
+                const auto inspection = InspectCurrentPipboyRoot();
+
+                const bool runtimeIsNormal =
+                    !_bootPipboyRootMustChange ||
+                    _temporaryNormalPipboyActive;
+                const bool verifiedNormal = runtimeIsNormal &&
+                    IsVerifiedNormalPipboyRoot(
+                        inspection,
+                        _bootPipboyPreSwitchRoot,
+                        _bootPipboyRootMustChange);
+                if (!verifiedNormal) {
+                    HideCurrentPipboyRootDuringModelTransition(
+                        inspection);
                 }
 
-                if (readyToProceed) {
-                    // Jul 24 redesign: BeginPipboyBootSequence now fires the real boot menu
-                    // (PipboyOpeningSequenceMenu) directly — no pre-opened PipboyMenu, no
-                    // IsPipboyOpen settle wait, no screen-cull dance (holo is already forced
-                    // off by the ini override above before this point is ever reached).
+                if (verifiedNormal) {
+                    if (_bootPipboyCandidateRoot == inspection.root) {
+                        ++_bootPipboyRootStableFrames;
+                    } else {
+                        _bootPipboyCandidateRoot = inspection.root;
+                        _bootPipboyRootStableFrames = 1;
+                    }
+                } else {
+                    _bootPipboyCandidateRoot = nullptr;
+                    _bootPipboyRootStableFrames = 0;
+                }
+
+                _bootPipboyRootWaitSeconds -= deltaTime;
+                if (_bootPipboyRootStableFrames >= 2) {
+                    _bootPipboyRootTransitionPending = false;
+                    spdlog::info(
+                        "[PIPBOY] Boot sequence: verified normal FRIK root {} "
+                        "for {} stable frames",
+                        static_cast<const void*>(inspection.root),
+                        _bootPipboyRootStableFrames);
                     BeginPipboyBootSequence();
+                } else if (_bootPipboyRootWaitSeconds <= 0.0f) {
+                    _bootPipboyRootTransitionPending = false;
+                    _bootPipboyRootTransitionFailed = true;
+                    if (_bootHoloOverrideActive) {
+                        _bootHoloRestoreSeconds = 0.1f;
+                    }
+                    spdlog::error(
+                        "[PIPBOY] Boot sequence suppressed after root-validation "
+                        "timeout (root={} screen={} belongs={} normalMarker={} "
+                        "holoMarker={} runtimeHolo={} mustChange={})",
+                        static_cast<const void*>(inspection.root),
+                        static_cast<const void*>(inspection.screen),
+                        inspection.screenBelongsToRoot,
+                        inspection.hasNormalMarker,
+                        inspection.hasHoloMarker,
+                        !runtimeIsNormal,
+                        _bootPipboyRootMustChange);
                 }
             }
         }
@@ -1250,6 +1967,19 @@ namespace heisenberg
                     _bootPipboyMenuBlanked = true;
                     spdlog::info("[PIPBOY] Boot sequence: PipboyMenu movie blanked while boot SWF owns the screen");
                 }
+                // PipboyMenu is hidden, but its VR cursor/laser is rendered by
+                // the menu layer independently of root1.visible. Suppress that
+                // owner every frame so the boot screen has no white center dot.
+                if (auto* ui = RE::UI::GetSingleton()) {
+                    auto pipMenu = ui->GetMenu(MenuPipboy());
+                    if (pipMenu) {
+                        if (!_bootPipboyCursorOverridden) {
+                            _bootPipboyCursorWasEnabled = pipMenu->UsesCursor();
+                            _bootPipboyCursorOverridden = true;
+                        }
+                        pipMenu->menuFlags.reset(RE::UI_MENU_FLAGS::kUsesCursor);
+                    }
+                }
             } else if (_bootMenuSeen) {
                 _bootMenuFinished = true;
                 spdlog::info("[PIPBOY] Boot sequence: boot menu closed — sequence complete");
@@ -1257,48 +1987,223 @@ namespace heisenberg
                     SetPipboyMenuMovieVisible(true);
                     _bootPipboyMenuBlanked = false;
                 }
-                if (_bootScreenActivated) {
-                    DeactivatePipboyScreen();
-                    _bootScreenActivated = false;
-                }
-                if (_bootHoloIniOverrideActive) {
-                    _bootHoloIniRestoreSeconds = 0.5f;  // hand the display back to the player's Holo preference
+                // Keep the wrist render target lit through the display-mode
+                // restoration and normal-menu handoff. Deactivating it here
+                // produced the black interval that persisted until a manual
+                // close/reopen.
+                if (_bootHoloOverrideActive) {
+                    _bootHoloRestoreSeconds = 0.5f;  // hand the display back to the player's Holo preference
                 }
                 if (_bootWristOverrideOwned) {
                     EndWristOverrideForHolotape();
                     _bootWristOverrideOwned = false;
                 }
-                // Vanilla flat behavior after the boot: the Pip-Boy opens on the STATS
-                // tab. Match it — once the display-mode restores have had a moment to
-                // land (Holo model swap included), open the real Pip-Boy so the player
-                // sees normal content instead of an empty screen (user-reported).
-                _bootContentOpenSeconds = 1.2f;
+                // Vanilla flat behavior after the boot is that the Pip-Boy opens on the STATS
+                // tab, and bPipboyBootOpensContent reproduces that. It is OFF by default because
+                // that forced-open Pip-Boy could not be closed again (user-reported, log-confirmed
+                // 2026-07-27): the content is opened through PipboyManager's native path, which
+                // FRIK does not own, so a grip press does not close it. The fallback below then
+                // called ClosedownPipboy() directly, which blanked the screen WITHOUT closing the
+                // menu — leaving a black Pip-Boy stuck open (`pipOpen=true` for minutes after
+                // "close requested"). Ending the boot with the Pip-Boy CLOSED hands open/close
+                // back to FRIK, which works, and costs only the cosmetic auto-open.
+                if (g_config.pipboyBootOpensContent) {
+                    _bootContentOpenSeconds = 1.2f;
+                } else {
+                    if (auto* ui = RE::UI::GetSingleton()) {
+                        if (auto pipMenu = ui->GetMenu(MenuPipboy());
+                            pipMenu && _bootPipboyCursorOverridden) {
+                            if (_bootPipboyCursorWasEnabled) {
+                                pipMenu->menuFlags.set(RE::UI_MENU_FLAGS::kUsesCursor);
+                            }
+                        }
+                    }
+                    _bootPipboyCursorOverridden = false;
+                    _bootPipboyCursorWasEnabled = false;
+                    if (_bootScreenActivated) {
+                        DeactivatePipboyScreen();
+                        _bootScreenActivated = false;
+                    }
+                    spdlog::info(
+                        "[PIPBOY] Boot sequence: leaving Pip-Boy closed after boot "
+                        "(bPipboyBootOpensContent=false); FRIK owns open/close from here");
+                }
             } else {
                 _bootMenuAppearWaitSeconds -= deltaTime;
                 if (_bootMenuAppearWaitSeconds <= 0.0f) {
                     _bootMenuFinished = true;
                     spdlog::warn("[PIPBOY] Boot sequence: boot menu never appeared — restoring display modes");
-                    if (_bootHoloIniOverrideActive) {
-                        _bootHoloIniRestoreSeconds = 0.5f;
+                    if (_bootHoloOverrideActive) {
+                        _bootHoloRestoreSeconds = 0.5f;
                     }
                     if (_bootWristOverrideOwned) {
                         EndWristOverrideForHolotape();
                         _bootWristOverrideOwned = false;
                     }
+                    if (_bootPipboyMenuBlanked) {
+                        SetPipboyMenuMovieVisible(true);
+                        _bootPipboyMenuBlanked = false;
+                    }
+                    if (_bootPipboyCursorOverridden) {
+                        if (auto* ui = RE::UI::GetSingleton()) {
+                            auto pipMenu = ui->GetMenu(MenuPipboy());
+                            if (pipMenu && _bootPipboyCursorWasEnabled) {
+                                pipMenu->menuFlags.set(RE::UI_MENU_FLAGS::kUsesCursor);
+                            }
+                        }
+                        _bootPipboyCursorOverridden = false;
+                        _bootPipboyCursorWasEnabled = false;
+                    }
+                    if (_bootScreenActivated) {
+                        DeactivatePipboyScreen();
+                        _bootScreenActivated = false;
+                    }
                 }
             }
         }
 
-        // Post-boot content reveal: open PipboyMenu so the normal tabs show on whatever
-        // display the restores brought back (wrist or Holo). Externally opening
-        // PipboyMenu is an established pattern here (holotape playback does it); only
-        // CLOSING it externally is forbidden.
+        // Post-boot content reveal. Use PipboyManager's native no-animation
+        // open path, then wait for the actual menu object before handing over
+        // the screen/cursor. A raw kShow was the black-tabs lifecycle bug.
         if (_bootContentOpenSeconds > 0.0f) {
             _bootContentOpenSeconds -= deltaTime;
             if (_bootContentOpenSeconds <= 0.0f) {
-                if (auto* msgQueue = RE::UIMessageQueue::GetSingleton()) {
-                    msgQueue->AddMessage(MenuPipboy(), RE::UI_MESSAGE_TYPE::kShow);
-                    spdlog::info("[PIPBOY] Boot sequence: opening Pip-Boy content after boot");
+                auto* ui = RE::UI::GetSingleton();
+                const bool alreadyOpen =
+                    ui && ui->GetMenu(MenuPipboy()) != nullptr;
+                const bool requested =
+                    alreadyOpen || RequestNativePipboyContentOpen();
+                if (requested) {
+                    ActivatePipboyScreen();
+                    _bootScreenActivated = true;
+                    _bootContentOpenRequested = true;
+                    _bootContentOpenWaitSeconds = 2.0f;
+                    spdlog::info(
+                        "[PIPBOY] Boot sequence: {} normal Pip-Boy content via native lifecycle",
+                        alreadyOpen ? "adopting existing" : "opening");
+                } else {
+                    spdlog::warn(
+                        "[PIPBOY] Boot sequence: native normal-content open unavailable");
+                }
+            }
+        }
+
+        if (_bootContentOpenRequested) {
+            ActivatePipboyScreen();
+            auto* ui = RE::UI::GetSingleton();
+            auto pipMenu = ui ? ui->GetMenu(MenuPipboy()) : nullptr;
+            if (pipMenu) {
+                SetPipboyMenuMovieVisible(true);
+                if (_bootPipboyCursorOverridden) {
+                    if (_bootPipboyCursorWasEnabled) {
+                        pipMenu->menuFlags.set(RE::UI_MENU_FLAGS::kUsesCursor);
+                    }
+                    _bootPipboyCursorOverridden = false;
+                    _bootPipboyCursorWasEnabled = false;
+                }
+                _bootContentOpenRequested = false;
+                _bootContentMenuSeen = true;
+                _bootContentCloseArmSeconds = 0.5f;
+                _bootContentGripWasPressed = false;
+                _bootContentGripCloseRequested = false;
+                spdlog::info(
+                    "[PIPBOY] Boot sequence: normal Pip-Boy tabs confirmed visible");
+            } else {
+                _bootContentOpenWaitSeconds -= deltaTime;
+                if (_bootContentOpenWaitSeconds <= 0.0f) {
+                    _bootContentOpenRequested = false;
+                    if (_bootPipboyCursorOverridden) {
+                        _bootPipboyCursorOverridden = false;
+                        _bootPipboyCursorWasEnabled = false;
+                    }
+                    if (_bootScreenActivated) {
+                        DeactivatePipboyScreen();
+                        _bootScreenActivated = false;
+                    }
+                    spdlog::warn(
+                        "[PIPBOY] Boot sequence: native normal-content menu did not appear");
+                }
+            }
+        }
+
+        if (_bootContentMenuSeen && !_bootContentOpenRequested) {
+            auto* ui = RE::UI::GetSingleton();
+            const bool contentOpen =
+                ui && ui->GetMenu(MenuPipboy()) != nullptr;
+            const bool pipboyHandIsLeft =
+                !g_vrInput.IsLeftHandedMode();
+            const bool gripPressed =
+                g_vrInput.IsPressed(
+                    pipboyHandIsLeft,
+                    VRButton::Grip);
+            if (gripPressed) {
+                _bootContentGripWasPressed = true;
+            } else if (_bootContentGripWasPressed &&
+                       !_bootContentGripCloseRequested &&
+                       _bootContentCloseArmSeconds <= 0.0f &&
+                       contentOpen) {
+                _bootContentGripWasPressed = false;
+                if (auto* manager = GetPipboyManagerVR()) {
+                    EnableMenuInput(MenuPipboy());
+                    manager->ClosedownPipboy();
+                    _bootContentGripCloseRequested = true;
+                    // Watchdog: ClosedownPipboy() does not always actually close the menu (it can
+                    // blank the screen and leave the menu object alive). Without this the latch
+                    // above stayed set forever and EVERY later grip press was ignored, stranding
+                    // the player in front of a black Pip-Boy. Re-arm if the menu is still open.
+                    _bootContentCloseRetrySeconds = 1.0f;
+                    spdlog::info(
+                        "[PIPBOY] Post-boot Holo Pip-Boy close requested by "
+                        "{} grip release",
+                        pipboyHandIsLeft ? "left" : "right");
+                }
+            }
+            if (_bootContentGripCloseRequested &&
+                _bootContentCloseRetrySeconds > 0.0f) {
+                _bootContentCloseRetrySeconds -= deltaTime;
+                if (_bootContentCloseRetrySeconds <= 0.0f && contentOpen) {
+                    _bootContentGripCloseRequested = false;
+                    _bootContentGripWasPressed = false;
+                    spdlog::warn(
+                        "[PIPBOY] Post-boot close did not take (menu still open) — "
+                        "re-arming grip close");
+                }
+            }
+            if (_bootContentCloseArmSeconds > 0.0f) {
+                _bootContentCloseArmSeconds -= deltaTime;
+                if (!contentOpen) {
+                    // FRIK can close a menu during the immediate model handoff.
+                    // Treat that as a race and re-enter through PipboyManager;
+                    // a later close after this window is an intentional user close.
+                    _bootContentMenuSeen = false;
+                    _bootContentGripWasPressed = false;
+                    _bootContentGripCloseRequested = false;
+                    if (RequestNativePipboyContentOpen()) {
+                        ActivatePipboyScreen();
+                        _bootScreenActivated = true;
+                        _bootContentOpenRequested = true;
+                        _bootContentOpenWaitSeconds = 2.0f;
+                        spdlog::info(
+                            "[PIPBOY] Boot sequence: retried native content open after FRIK handoff close");
+                    }
+                }
+            } else if (!contentOpen) {
+                _bootContentMenuSeen = false;
+                _bootContentGripWasPressed = false;
+                _bootContentGripCloseRequested = false;
+                if (_bootScreenActivated) {
+                    DeactivatePipboyScreen();
+                    _bootScreenActivated = false;
+                }
+                if (auto* playerNodes = f4vr::getPlayerNodes()) {
+                    if (playerNodes->ScreenNode) {
+                        playerNodes->ScreenNode->flags.flags |=
+                            static_cast<std::uint64_t>(0x1);
+                    }
+                    if (playerNodes->PipboyRoot_nif_only_node) {
+                        playerNodes->PipboyRoot_nif_only_node->local.scale =
+                            0.0f;
+                    }
                 }
             }
         }
@@ -1306,12 +2211,19 @@ namespace heisenberg
         // Restore FRIK's real Holo preference once the boot menu has finished. Kept
         // outside the !_bootSequenceFired gate above since it needs to keep running
         // AFTER that flips true.
-        if (_bootHoloIniRestoreSeconds > 0.0f) {
-            _bootHoloIniRestoreSeconds -= deltaTime;
-            if (_bootHoloIniRestoreSeconds <= 0.0f) {
-                SetFrikHoloPipboyEnabled(true);
-                _bootHoloIniOverrideActive = false;
-                spdlog::info("[PIPBOY] Boot sequence: restored FRIK HoloPipBoyEnabled=true");
+        if (_bootHoloRestoreSeconds > 0.0f) {
+            _bootHoloRestoreSeconds -= deltaTime;
+            if (_bootHoloRestoreSeconds <= 0.0f) {
+                if (EndTemporaryNormalPipboyModel()) {
+                    _bootHoloOverrideActive = false;
+                    _bootHoloRestoreSeconds = -1.0f;
+                    spdlog::info(
+                        "[PIPBOY] Boot sequence: restored stock FRIK Holo root");
+                } else {
+                    _bootHoloRestoreSeconds = 0.5f;
+                    spdlog::warn(
+                        "[PIPBOY] Boot sequence: stock FRIK root restore failed; retrying");
+                }
             }
         }
 
@@ -2425,6 +3337,10 @@ namespace heisenberg
             _holotapeRemovalCooldown -= deltaTime;
         }
 
+        if (_deckRemovalHandGuard > 0.0f) {
+            _deckRemovalHandGuard -= deltaTime;
+        }
+
         if (_slamCooldown > 0.0f) {
             _slamCooldown -= deltaTime;
         }
@@ -2467,7 +3383,7 @@ namespace heisenberg
             }
 
             OperateEjectButton(deltaTime);
-            CheckHandPush();             // Swept fingertip contact against the real tray mesh
+            CheckHandPush();             // Actual hand/weapon collider hulls against the live tray mesh
             CheckHolotapeRemoval();
 
             // Prevent immediate re-insertion of freshly grabbed holotapes.
@@ -2591,6 +3507,86 @@ namespace heisenberg
         return PointDistance(point, start + segment * t);
     }
 
+    static RE::NiPoint3 PipboyCrossProduct(
+        const RE::NiPoint3& a,
+        const RE::NiPoint3& b)
+    {
+        return RE::NiPoint3(
+            a.y * b.z - a.z * b.y,
+            a.z * b.x - a.x * b.z,
+            a.x * b.y - a.y * b.x);
+    }
+
+    static float PipboyDotProduct(
+        const RE::NiPoint3& a,
+        const RE::NiPoint3& b)
+    {
+        return a.x * b.x + a.y * b.y + a.z * b.z;
+    }
+
+    // Exact double-sided segment/triangle test. Point sampling alone can step
+    // over a sub-unit button or tray during a fast controller movement.
+    static bool SegmentIntersectsTriangle(
+        const RE::NiPoint3& start,
+        const RE::NiPoint3& end,
+        const TriangleData& triangle,
+        float& intersectionT,
+        RE::NiPoint3& intersection)
+    {
+        constexpr float epsilon = 1.0e-6f;
+        const RE::NiPoint3 direction = end - start;
+        const RE::NiPoint3 edge1 = triangle.v1 - triangle.v0;
+        const RE::NiPoint3 edge2 = triangle.v2 - triangle.v0;
+        const RE::NiPoint3 p = PipboyCrossProduct(direction, edge2);
+        const float determinant = PipboyDotProduct(edge1, p);
+        if (std::fabs(determinant) <= epsilon) {
+            return false;
+        }
+
+        const float inverseDeterminant = 1.0f / determinant;
+        const RE::NiPoint3 fromVertex = start - triangle.v0;
+        const float u = PipboyDotProduct(fromVertex, p) * inverseDeterminant;
+        if (u < -epsilon || u > 1.0f + epsilon) {
+            return false;
+        }
+
+        const RE::NiPoint3 q = PipboyCrossProduct(fromVertex, edge1);
+        const float v = PipboyDotProduct(direction, q) * inverseDeterminant;
+        if (v < -epsilon || u + v > 1.0f + epsilon) {
+            return false;
+        }
+
+        const float t = PipboyDotProduct(edge2, q) * inverseDeterminant;
+        if (t < -epsilon || t > 1.0f + epsilon) {
+            return false;
+        }
+
+        intersectionT = (std::clamp)(t, 0.0f, 1.0f);
+        intersection = start + direction * intersectionT;
+        return true;
+    }
+
+    static bool FindFirstSegmentMeshIntersection(
+        const std::vector<TriangleData>& triangles,
+        const RE::NiPoint3& start,
+        const RE::NiPoint3& end,
+        RE::NiPoint3& intersection)
+    {
+        float firstT = (std::numeric_limits<float>::max)();
+        bool found = false;
+        for (const auto& triangle : triangles) {
+            float t = 0.0f;
+            RE::NiPoint3 candidate{};
+            if (SegmentIntersectsTriangle(start, end, triangle, t, candidate) &&
+                t < firstT) {
+                firstT = t;
+                intersection = candidate;
+                found = true;
+            }
+        }
+        return found;
+    }
+
     // Query the visible triangle surface at the node's current world transform. Sampling the
     // previous->current fingertip segment at <= half-radius spacing prevents a quick VR motion
     // from tunnelling through the thin deck/button between two 90 Hz updates.
@@ -2621,7 +3617,20 @@ namespace heisenberg
         if (!previousValid || !IsUsableWorldPoint(previous)) return result;
         const float travel = PointDistance(previous, current);
         // Treat a large tracking reacquisition/teleport as a discontinuity, not a physical sweep.
-        if (!std::isfinite(travel) || travel > 50.0f) return result;
+        // 120 game units is still far beyond a normal one-frame arm movement, but keeps
+        // low-frame-rate fast swipes usable instead of silently dropping their contact.
+        if (!std::isfinite(travel) || travel > 120.0f) return result;
+
+        // A true crossing is continuous and cannot be missed regardless of sample
+        // spacing. This is especially important for the eject button, whose fully
+        // depressed trigger depth is much smaller than the general hand-contact radius.
+        RE::NiPoint3 intersection{};
+        if (FindFirstSegmentMeshIntersection(
+                triangles, previous, current, intersection)) {
+            result.sweptDistance = 0.0f;
+            result.closestPoint = intersection;
+            return result;
+        }
 
         const int segments = pipboy_mesh_contact::SweepSegmentCount(travel, contactRadius);
         for (int i = 0; i < segments; ++i) {
@@ -2844,13 +3853,18 @@ namespace heisenberg
         RE::NiAVObject* ejectContactTarget = ejectButtonMesh ? ejectButtonMesh : ejectButton;
         if (!ejectContactTarget) return;
 
-        // Don't detect eject button when weapon is drawn or scoping — hand moves near
-        // Pipboy during aiming and causes false triggers
+        // Scope view remains an unsuitable interaction context.  A merely drawn
+        // weapon is not: the other hand can still physically press the wrist button,
+        // and returning here made that visibly depressed press do nothing.
         {
-            auto* vrPlayer = f4vr::getPlayer();
-            if (vrPlayer && vrPlayer->GetWeaponMagicDrawn()) return;
             auto& menuChecker = MenuChecker::GetSingleton();
-            if (menuChecker.IsScopeOpen()) return;
+            if (menuChecker.IsScopeOpen()) {
+                _ejectContactLatched = false;
+                if (animateNode && _buttonOriginalZSet) {
+                    animateNode->local.translate.z = _buttonOriginalZ;
+                }
+                return;
+            }
         }
 
         RE::NiPoint3 fingerPos;
@@ -2913,8 +3927,7 @@ namespace heisenberg
         // button. Model the real thing instead: the button starts moving exactly when the
         // fingertip SKIN reaches the mesh (tracked-point distance = EJECT_SKIN_RADIUS), rides
         // the finger 1:1 through the button's actual travel (|EJECT_Z_MIN|), and fires at full
-        // depression. Re-arm still requires retreating past the whole engage bubble
-        // (releaseRadius), so a resting finger can't re-fire.
+        // depression.
         // Fallback paths are exempt from the tight fire distance: the node fallback (GPU-only
         // replacement NIFs) measures to the node CENTER, and the intro-playback wand fallback
         // trails the visible fingertip by several gu — either would make the button
@@ -2924,12 +3937,23 @@ namespace heisenberg
         const float fireDistance = preciseTouch
             ? (std::max)(EJECT_SKIN_RADIUS + EJECT_Z_MIN, 0.05f)  // EJECT_Z_MIN is negative: skin contact minus full button travel
             : contactRadius;
+        // RE-ARM FIX (Jul 25, user: "pressed multiple times, it pressed in, deck didn't
+        // open"): the old release radius was the whole engage bubble + hysteresis pad — up
+        // to ~6 gu (~8.5 cm) of retreat before the latch re-armed. Meanwhile the press
+        // VISUAL below is purely distance-driven and kept animating, so repeat presses
+        // looked valid while the latch silently stayed armed and never re-fired
+        // (log-confirmed: whole test session recorded only 3 registered presses). On the
+        // precise path the finger only needs to lift just clear of the button skin to
+        // re-arm — one button-height above the engage point.
+        const float rearmDistance = preciseTouch
+            ? (EJECT_SKIN_RADIUS + 1.0f)
+            : releaseRadius;
         const auto latch = pipboy_mesh_contact::UpdateLatch(
             _ejectContactLatched,
             contact.currentDistance,
             contact.sweptDistance,
             fireDistance,
-            releaseRadius,
+            rearmDistance,
             _ejectCooldown <= 0.0f);
         _ejectContactLatched = latch.latched;
 
@@ -2947,11 +3971,16 @@ namespace heisenberg
 
         // Visual depression starts at skin contact (engageDistance) and reaches FULL travel
         // exactly at the fire distance, so the button moves only while the finger is really
-        // on it and the deck action lands the moment it looks fully pressed in.
+        // on it and the deck action lands the moment it looks fully pressed in. While the
+        // latch is armed (fired, finger not yet lifted clear) the button HOLDS fully
+        // depressed — a distance-driven visual here kept animating fresh-looking presses
+        // that could not fire, which is exactly what confused repeat presses.
         if (animateNode && _buttonOriginalZSet) {
             const float travelRange = (std::max)(engageDistance - fireDistance, 0.01f);
-            const float press = (std::clamp)(
-                (engageDistance - contact.currentDistance) / travelRange, 0.0f, 1.0f);
+            const float press = _ejectContactLatched
+                ? 1.0f
+                : (std::clamp)(
+                      (engageDistance - contact.currentDistance) / travelRange, 0.0f, 1.0f);
             animateNode->local.translate.z = _buttonOriginalZ + EJECT_Z_MIN * press;
         }
 
@@ -2981,6 +4010,7 @@ namespace heisenberg
                 _deckOpenedByEject = true;
                 _holotapeGrabCooldown = 0.5f;  // Prevent immediate insertion when deck opens
                 _holotapeRemovalCooldown = 0.0f; // Eject means the player may take the loaded tape immediately
+                _holotapeRemovalRequiresGripRelease = false; // This is a deliberate new removal cycle
 
                 // Cancel any pending delayed playback
                 if (_pendingPlaybackFormID != 0) {
@@ -3456,14 +4486,6 @@ namespace heisenberg
         if (!_holotapeLoaded) return;
         if (_tapeDeckState != TapeDeckState::Open && _tapeDeckState != TapeDeckState::Opening
             && _tapeDeckState != TapeDeckState::Pushing) return;
-        if (_holotapeRemovalCooldown > 0.0f) return;
-
-        RE::NiAVObject* arm = GetPipboyArmNode();
-        if (!arm) return;
-
-        RE::NiAVObject* tapeDeck = GetCachedTapeDeckNode();
-        if (!tapeDeck) return;
-
         // The grabbing hand is the non-pipboy hand. Pipboy is always on the left
         // wrist (doesn't swap in LH mode), so the grab hand is always the right hand.
         bool grabHandIsLeft = false;
@@ -3471,7 +4493,33 @@ namespace heisenberg
         // Check VR grip input directly (bypasses Hand state machine which may
         // have already consumed the grip press for a different grab this frame)
         bool gripPressed = VRInput::GetSingleton().IsPressed(grabHandIsLeft, VRButton::Grip);
+
+        // EndGrab during insertion does not release the physical controller button.
+        // A timer alone therefore let that same held Grip remove the tape again as
+        // soon as the timer expired. Require a real release before a later press can
+        // start removal; update this gate even while the short debounce is running.
+        const bool wasWaitingForRelease =
+            _holotapeRemovalRequiresGripRelease;
+        const auto releaseGate =
+            pipboy_mesh_contact::UpdateGripReleaseGate(
+                _holotapeRemovalRequiresGripRelease,
+                gripPressed);
+        _holotapeRemovalRequiresGripRelease =
+            releaseGate.requiresRelease;
+        if (wasWaitingForRelease &&
+            !_holotapeRemovalRequiresGripRelease) {
+            spdlog::debug(
+                "[PIPBOY] Insert grip released — holotape removal re-armed");
+        }
+        if (releaseGate.blocksAction) return;
+        if (_holotapeRemovalCooldown > 0.0f) return;
         if (!gripPressed) return;
+
+        RE::NiAVObject* arm = GetPipboyArmNode();
+        if (!arm) return;
+
+        RE::NiAVObject* tapeDeck = GetCachedTapeDeckNode();
+        if (!tapeDeck) return;
 
         // Keep the controller as a compatibility fallback, but use the visible fingertip
         // against the visible tape mesh as the primary grab test. The controller origin sits
@@ -3543,6 +4591,14 @@ namespace heisenberg
             _tapeDeckAnimProgress = 1.0f;
             _tapeDeckOpen = true;
         }
+        // CheckHandPush runs before this removal check. Discard any active
+        // physical push stroke and hold the tray open while QueueDropToHand
+        // transfers ownership to the extracting hand.  Otherwise _holotapeLoaded becomes
+        // false one frame before GrabManager reports the tape as held, so the same
+        // overlapping hand starts a fresh push and closes the tray.
+        _deckPushStrokeValid = false;
+        _deckPushStrokeMaxTravel = 0.0f;
+        _deckRemovalHandGuard = TAPE_GRAB_COOLDOWN;
         StopIntroPlayback();  // Cancel intro audio if playing
         RestoreIntroHolotapeType(_introHolotapeFormID);
         spdlog::debug("[PIPBOY] Player grabbing holotape out of deck! FormID={:08X} fingerDist={:.2f} controllerDist={:.1f} alreadyGrabbing={}",
@@ -3557,6 +4613,7 @@ namespace heisenberg
         _holotapeLoaded = false;
         _loadedHolotapeFormID = 0;
         _holotapeGrabCooldown = TAPE_GRAB_COOLDOWN;
+        _holotapeRemovalRequiresGripRelease = false;
         _tapREFForceHidden = true;   // Persistent flag — overrides per-frame visibility
         _insertionOpenHandActive = false;  // Player is now holding the holotape — let grab system handle curls
         SetTapREFVisible(false);
@@ -3675,7 +4732,8 @@ namespace heisenberg
             _tapREFForceHidden = false;  // Clear force-hide from previous removal
             _holotapeGrabCooldown = 0.5f;   // Insertion grace only
             _holotapeRemovalCooldown = 0.25f; // Prevent the still-held insertion grip from taking it straight back out
-            _slamCooldown = 0.15f;           // Consume insertion overlap, then allow a deliberate mesh re-touch quickly
+            _holotapeRemovalRequiresGripRelease = true; // The insertion press is consumed until Grip is physically released
+            _slamCooldown = 0.0f;            // Grip-release gate prevents accidental removal; do not discard a fast close sweep
             _ejectCooldown = 1.0f;  // Prevent eject button from immediately closing deck after insertion
             _deckOpenedByEject = false;  // Insertion — hand stays open for push-close
 
@@ -3873,40 +4931,28 @@ namespace heisenberg
 
     void PipboyInteraction::CheckHandPush()
     {
+        // Accept a fast closing swipe near the end of the opening animation, but
+        // not on the same frame as the eject-button press. Without this threshold
+        // the hand pressing the adjacent button could immediately reverse the tray.
+        const bool openingPushWindow =
+            _tapeDeckState == TapeDeckState::Opening &&
+            _tapeDeckAnimProgress >= 0.75f;
+        if (_tapeDeckState != TapeDeckState::Open &&
+            _tapeDeckState != TapeDeckState::Pushing &&
+            !openingPushWindow) {
+            return;
+        }
+
         RE::NiAVObject* arm = GetPipboyArmNode();
         if (!arm) return;
 
         RE::NiAVObject* tapeDeck = GetCachedTapeDeckNode();
         if (!tapeDeck) return;
 
-        if (!_interactionFingerValid) {
-            return;
-        }
-
         if (!_cachedTapeDeckMesh1 || !NodeStillInSubtree(tapeDeck, _cachedTapeDeckMesh1)) {
             _cachedTapeDeckMesh1 = SafeFindAVObject(tapeDeck, "TapeDeck01_mesh:1");
         }
         RE::NiAVObject* deckMesh = _cachedTapeDeckMesh1;
-
-        // The deployed fTapeDeckPushCloseRadius now means fingertip padding around the
-        // actual surface, not a sphere around the animation pivot.
-        const float contactRadius = (std::clamp)(g_config.tapeDeckPushCloseRadius, 0.3f, 8.0f);
-        const float releaseRadius = contactRadius + CONTACT_RELEASE_PAD;
-        SweptMeshContact contact = QuerySweptMeshContact(
-            deckMesh,
-            _interactionFingerPos,
-            _previousInteractionFingerPos,
-            _previousInteractionFingerValid,
-            contactRadius);
-        if (!contact.meshAvailable) {
-            contact.currentDistance = PointDistance(_interactionFingerPos, tapeDeck->world.translate);
-            contact.sweptDistance = _previousInteractionFingerValid
-                ? PointToSegmentDistance(
-                    tapeDeck->world.translate,
-                    _previousInteractionFingerPos,
-                    _interactionFingerPos)
-                : contact.currentDistance;
-        }
 
         // The pushing hand is the non-pipboy hand. Pipboy always on left wrist,
         // so push hand is always right.
@@ -3924,71 +4970,560 @@ namespace heisenberg
         // commit to Closing before removal gets a chance to fire.
         const bool removalIntent = _holotapeLoaded
             && VRInput::GetSingleton().IsPressed(pushHandIsLeft, VRButton::Grip);
+        const bool removalTransferInProgress = _deckRemovalHandGuard > 0.0f;
 
-        // ── PROPORTIONAL PUSH-CLOSE (Jul 24, user directive) ─────────────────────────
-        // No trigger, no latch, NO minimum speed: the tray FOLLOWS the finger. Push
-        // depth into the skin-contact envelope drives the close animation — push more,
-        // it closes more; stop, it stops; lift away before full travel and it springs
-        // back open. Commit (sound/state) happens only at full travel. This also removes
-        // the clip-through: the tray retreats from the finger instead of being passed
-        // through, because the contact query runs against the LIVE animated tray mesh —
-        // as the tray follows the finger down, the gap reopens and the follow rate
-        // self-regulates to track the finger. A side reach cannot drive it: the closest
-        // surface point must lie predominantly BELOW the fingertip (contact on TOP).
+        struct DeckHullContact
+        {
+            bool valid = false;
+            float distance = (std::numeric_limits<float>::max)();
+            float effectiveRadius = 0.0f;
+            float penetration = -(std::numeric_limits<float>::max)();
+            RE::NiPoint3 sample{};
+            RE::NiPoint3 closest{};
+            const char* source = "none";
+            bool swept = false;
+        };
+
+        /*
+         * TapeDeck01 is an animated visual mesh rather than an independently
+         * simulated rigid body, so native Havok cannot deliver a body/body
+         * contact callback for it. Sample the boundaries of ROCK's exact live
+         * generated collision hulls instead. This makes the deck react to the
+         * palm/finger boxes and to the equipped weapon collision, rather than
+         * to one hidden index-bone point.
+         */
+        std::vector<TriangleData> deckTriangles;
+        if (deckMesh) {
+            deckTriangles.reserve(256);
+            GetTriangles(deckMesh, deckTriangles, 2048);
+        }
+        const bool deckMeshAvailable = !deckTriangles.empty();
+        // Generated ROCK samples already carry the real collider radius.  Do not
+        // add the old proximity bubble here: with the deployed settings it expanded
+        // a 0.10-gu fingertip hull to 1.10 gu and closed the tray before visible
+        // contact.  The configured radius remains the compatibility fallback when
+        // generated hand collision is unavailable.
+        constexpr float surfacePadding = 0.0f;
+
+        RE::NiPoint3 handFrameDelta{};
+        bool handSweepValid = false;
+        if (_interactionFingerValid && _previousInteractionFingerValid) {
+            handFrameDelta =
+                _interactionFingerPos - _previousInteractionFingerPos;
+            const float handTravel =
+                PointDistance(
+                    _interactionFingerPos,
+                    _previousInteractionFingerPos);
+            handSweepValid =
+                std::isfinite(handTravel) &&
+                handTravel > 1.0e-3f &&
+                handTravel <= 120.0f;
+        }
+
+        auto evaluateSamples = [&](const RE::NiPoint3* points,
+                                   const float* radii,
+                                   std::uint32_t count,
+                                   const char* source,
+                                   bool sweepWithHand) {
+            DeckHullContact best{};
+            best.source = source;
+            if (!deckMeshAvailable) {
+                return best;
+            }
+
+            for (std::uint32_t i = 0; i < count; ++i) {
+                const auto& sample = points[i];
+                if (!IsUsableWorldPoint(sample)) {
+                    continue;
+                }
+                const float effectiveRadius =
+                    (std::max)(0.0f, radii[i]) + surfacePadding;
+
+                // Current-frame overlap remains the normal slow/steady contact path.
+                // Keep the broad phase local to this branch because a fast swept
+                // segment may cross the tray even when both endpoints are farther away.
+                if (PointDistance(sample, tapeDeck->world.translate) <= 24.0f) {
+                    RE::NiPoint3 closest{};
+                    float distance =
+                        (std::numeric_limits<float>::max)();
+                    if (GetClosestMeshPointToPoint(
+                            deckTriangles,
+                            sample,
+                            closest,
+                            distance)) {
+                        const RE::NiPoint3 toCollider =
+                            sample - closest;
+                        const float directionLength =
+                            PointDistance(sample, closest);
+                        // ADMISSION FIX (Jul 25, user: "can't reliably push it closed
+                        // slow"): the slow/steady path demanded near-vertical approach
+                        // (z > 0.45·len) while the fast sweep path only asked 0.15 — but
+                        // the OPEN tray is rotated ~20°, so a natural slow push meets it
+                        // at a shallow angle and was rejected while the identical fast
+                        // motion closed it. Use the same 0.15 dominance both ways; the
+                        // stroke mechanism below already disciplines direction (axial
+                        // travel along the captured closing direction, lateral release).
+                        const bool contactOnTop =
+                            directionLength > 1.0e-3f
+                                ? toCollider.z >
+                                      0.15f * directionLength
+                                : _tapeDeckState ==
+                                      TapeDeckState::Pushing;
+                        const float penetration =
+                            effectiveRadius - distance;
+                        if (contactOnTop &&
+                            (!best.valid ||
+                             penetration > best.penetration)) {
+                            best.valid = true;
+                            best.distance = distance;
+                            best.effectiveRadius =
+                                effectiveRadius;
+                            best.penetration = penetration;
+                            best.sample = sample;
+                            best.closest = closest;
+                            best.swept = false;
+                        }
+                    }
+                }
+
+                if (!sweepWithHand || !handSweepValid) {
+                    continue;
+                }
+
+                // The ROCK sample cloud is regenerated from the same hand hulls
+                // every frame. Translate each current boundary sample back by the
+                // tracked hand motion, then test its whole continuous path. This
+                // prevents a fast hand from appearing on opposite sides of the
+                // thin tray without ever producing a current-frame overlap.
+                const RE::NiPoint3 previousSample =
+                    sample - handFrameDelta;
+                if (!IsUsableWorldPoint(previousSample) ||
+                    PointToSegmentDistance(
+                        tapeDeck->world.translate,
+                        previousSample,
+                        sample) > 24.0f) {
+                    continue;
+                }
+
+                RE::NiPoint3 intersection{};
+                if (!FindFirstSegmentMeshIntersection(
+                        deckTriangles,
+                        previousSample,
+                        sample,
+                        intersection)) {
+                    continue;
+                }
+
+                const RE::NiPoint3 approach =
+                    previousSample - intersection;
+                const float approachLength =
+                    PointDistance(previousSample, intersection);
+                const bool sweptFromTop =
+                    approachLength <= 1.0e-3f ||
+                    (approach.z > 0.15f * approachLength &&
+                     sample.z < previousSample.z);
+                if (!sweptFromTop) {
+                    continue;
+                }
+
+                const float sweptPenetration =
+                    (std::max)(effectiveRadius, 0.01f);
+                if (!best.valid ||
+                    sweptPenetration > best.penetration) {
+                    best.valid = true;
+                    best.distance = 0.0f;
+                    best.effectiveRadius = effectiveRadius;
+                    best.penetration = sweptPenetration;
+                    best.sample = intersection;
+                    best.closest = intersection;
+                    best.source = "hand hull sweep";
+                    best.swept = true;
+                }
+            }
+            return best;
+        };
+
+        constexpr std::uint32_t kMaxHandSamples = 384;
+        constexpr std::uint32_t kMaxWeaponSamples = 512;
+        std::array<RE::NiPoint3, kMaxHandSamples> handPoints{};
+        std::array<float, kMaxHandSamples> handRadii{};
+        std::array<RE::NiPoint3, kMaxWeaponSamples> weaponPoints{};
+        std::array<float, kMaxWeaponSamples> weaponRadii{};
+        const std::uint32_t handSampleCount = rock::HostCopyHandCollisionSamples(
+            pushHandIsLeft,
+            handPoints.data(),
+            handRadii.data(),
+            kMaxHandSamples);
+        const std::uint32_t weaponSampleCount = rock::HostCopyWeaponCollisionSamples(
+            weaponPoints.data(),
+            weaponRadii.data(),
+            kMaxWeaponSamples);
+
+        auto sampleCentroid = [](const RE::NiPoint3* points,
+                                 std::uint32_t count,
+                                 RE::NiPoint3& out) {
+            out = {};
+            std::uint32_t validCount = 0;
+            for (std::uint32_t i = 0; i < count; ++i) {
+                if (!IsUsableWorldPoint(points[i])) {
+                    continue;
+                }
+                out = out + points[i];
+                ++validCount;
+            }
+            if (validCount == 0) {
+                return false;
+            }
+            out = out * (1.0f / static_cast<float>(validCount));
+            return IsUsableWorldPoint(out);
+        };
+
+        RE::NiPoint3 handHullCentroid{};
+        RE::NiPoint3 weaponHullCentroid{};
+        const bool handHullCentroidValid =
+            sampleCentroid(
+                handPoints.data(),
+                handSampleCount,
+                handHullCentroid);
+        const bool weaponHullCentroidValid =
+            sampleCentroid(
+                weaponPoints.data(),
+                weaponSampleCount,
+                weaponHullCentroid);
+
+        DeckHullContact handContact = evaluateSamples(
+            handPoints.data(),
+            handRadii.data(),
+            handSampleCount,
+            "hand hull",
+            true);
+        DeckHullContact weaponContact = evaluateSamples(
+            weaponPoints.data(),
+            weaponRadii.data(),
+            weaponSampleCount,
+            "weapon hull",
+            false);
+
+        // Compatibility fallback when generated hand collision is unavailable.
+        // Retain the original swept visible fingertip so old/fallback runtime
+        // configurations can still close the deck and fast hand motion cannot
+        // tunnel through the thin tray mesh.
+        if (handSampleCount == 0 && _interactionFingerValid) {
+            const float fingertipRadius =
+                (std::clamp)(g_config.tapeDeckPushCloseRadius, 0.3f, 8.0f);
+            const SweptMeshContact fallback = QuerySweptMeshContact(
+                deckMesh,
+                _interactionFingerPos,
+                _previousInteractionFingerPos,
+                _previousInteractionFingerValid,
+                fingertipRadius);
+            if (fallback.meshAvailable) {
+                const bool sweptCrossing =
+                    fallback.sweptDistance <= 1.0e-4f &&
+                    _previousInteractionFingerValid;
+                const RE::NiPoint3 contactSidePoint =
+                    sweptCrossing
+                        ? _previousInteractionFingerPos
+                        : _interactionFingerPos;
+                const RE::NiPoint3 toFinger =
+                    contactSidePoint - fallback.closestPoint;
+                const float length =
+                    PointDistance(
+                        contactSidePoint,
+                        fallback.closestPoint);
+                const bool onTop =
+                    length > 1.0e-3f
+                        ? toFinger.z >
+                              (sweptCrossing ? 0.15f : 0.45f) *
+                                  length
+                        : _tapeDeckState ==
+                              TapeDeckState::Pushing;
+                if (onTop) {
+                    handContact.valid = true;
+                    handContact.distance =
+                        (std::min)(fallback.currentDistance, fallback.sweptDistance);
+                    handContact.effectiveRadius = fingertipRadius;
+                    handContact.penetration =
+                        fingertipRadius - handContact.distance;
+                    handContact.sample = _interactionFingerPos;
+                    handContact.closest = fallback.closestPoint;
+                    handContact.source = sweptCrossing
+                        ? "fingertip sweep"
+                        : "fingertip fallback";
+                    handContact.swept = sweptCrossing;
+                }
+            }
+        }
+
         if (_tapeDeckState == TapeDeckState::Pushing && std::isnan(_pushProgress)) {
             _pushProgress = 1.0f;
             _tapeDeckState = TapeDeckState::Open;
+            _deckPushStrokeValid = false;
+            _deckPushStrokeMaxTravel = 0.0f;
         }
 
-        const bool blocked = _slamCooldown > 0.0f || handOccupied || removalIntent;
+        const bool globallyBlocked =
+            _slamCooldown > 0.0f || removalIntent || removalTransferInProgress;
+        const bool handPushingNow =
+            !globallyBlocked && !handOccupied &&
+            handContact.valid &&
+            (handContact.penetration > 0.0f ||
+             handContact.swept);
+        // An equipped weapon is not a GrabManager object. It remains a valid
+        // physical pusher even while the right hand is otherwise "occupied".
+        const bool weaponPushingNow =
+            !globallyBlocked &&
+            weaponContact.valid &&
+            weaponContact.penetration > 0.0f;
+        const bool pushingNow = handPushingNow || weaponPushingNow;
+        const bool activeUsesWeapon =
+            weaponPushingNow &&
+            (!handPushingNow ||
+             weaponContact.penetration > handContact.penetration);
+        const DeckHullContact& activeContact =
+            activeUsesWeapon
+                ? weaponContact
+                : handContact;
 
-        bool contactOnTop = false;
-        if (contact.meshAvailable) {
-            const RE::NiPoint3 toFinger = _interactionFingerPos - contact.closestPoint;
-            const float len = std::sqrt(toFinger.x * toFinger.x + toFinger.y * toFinger.y + toFinger.z * toFinger.z);
-            // Deeply buried fingertip (len ~ 0) has no meaningful direction — keep following
-            // rather than dropping the push mid-travel.
-            contactOnTop = len > 1e-3f ? (toFinger.z > 0.5f * len) : (_tapeDeckState == TapeDeckState::Pushing);
-        } else {
-            contactOnTop = _interactionFingerPos.z > tapeDeck->world.translate.z;
-        }
+        auto getStrokeAnchor = [&](bool useWeapon, RE::NiPoint3& out) {
+            if (useWeapon) {
+                if (!weaponHullCentroidValid) {
+                    return false;
+                }
+                out = weaponHullCentroid;
+                return true;
+            }
+            if (_interactionFingerValid) {
+                out = _interactionFingerPos;
+                return true;
+            }
+            if (handHullCentroidValid) {
+                out = handHullCentroid;
+                return true;
+            }
+            return false;
+        };
 
-        const float penetration = contactRadius - contact.currentDistance;  // >0 = pressing into the envelope
-        const bool pushingNow = !blocked && contactOnTop && penetration > 0.0f;
+        float strokeTravelForLog = 0.0f;
+        float strokeLateralForLog = 0.0f;
 
-        if (_tapeDeckState == TapeDeckState::Open && pushingNow) {
+        if ((_tapeDeckState == TapeDeckState::Open ||
+             openingPushWindow ||
+             (_tapeDeckState == TapeDeckState::Pushing &&
+              !_deckPushStrokeValid)) &&
+            pushingNow) {
+            RE::NiPoint3 anchor{};
+            if (!getStrokeAnchor(activeUsesWeapon, anchor)) {
+                anchor = activeContact.sample;
+            }
+
+            RE::NiPoint3 closingDirection =
+                activeContact.closest - activeContact.sample;
+            float directionLength =
+                PointDistance(activeContact.closest, activeContact.sample);
+            // STROKE-DIRECTION FIX (Jul 25, user: "gradually close relative to my hand"):
+            // sample→closest of the FIRST graze can point along the tray edge (a shallow
+            // first touch), making later straight-down hand motion produce near-zero
+            // axial travel — the tray stalled although the hand pushed correctly. When
+            // the hand's own motion is known and agrees with the contact side (not
+            // pulling away), use the HAND MOTION as the stroke axis: travel along it is
+            // then literally "how far my hand pushed".
+            if (!activeUsesWeapon && handSweepValid) {
+                const float handTravelLen = PointDistance({}, handFrameDelta);
+                if (handTravelLen > 1.0e-3f) {
+                    const float agreement = directionLength > 1.0e-3f
+                        ? PipboyDotProduct(handFrameDelta, closingDirection) /
+                              (handTravelLen * directionLength)
+                        : 1.0f;
+                    if (agreement > 0.0f) {
+                        closingDirection = handFrameDelta;
+                        directionLength = handTravelLen;
+                    }
+                }
+            }
+            if (directionLength <= 1.0e-3f &&
+                !activeUsesWeapon &&
+                handSweepValid) {
+                closingDirection = handFrameDelta;
+                directionLength = PointDistance({}, handFrameDelta);
+            }
+            if (directionLength <= 1.0e-3f ||
+                !std::isfinite(directionLength)) {
+                // Compatibility fallback for an exact swept intersection where
+                // closest==sample and visible fingertip tracking was unavailable.
+                // Contact admission already required the pusher to be above the
+                // tray, so downward world Z is the inward direction.
+                closingDirection = RE::NiPoint3(0.0f, 0.0f, -1.0f);
+                directionLength = 1.0f;
+            }
+            closingDirection =
+                closingDirection * (1.0f / directionLength);
+
             _tapeDeckState = TapeDeckState::Pushing;
             _pushProgress = _tapeDeckAnimProgress;
-            spdlog::debug("[PIPBOY] Deck push started (dist={:.2f})", contact.currentDistance);
+            _deckPushStrokeValid = true;
+            _deckPushStrokeUsesWeapon = activeUsesWeapon;
+            _deckPushStrokeOrigin =
+                activeContact.swept &&
+                        !activeUsesWeapon &&
+                        _previousInteractionFingerValid
+                    ? _previousInteractionFingerPos
+                    : anchor;
+            _deckPushStrokeDirection = closingDirection;
+            _deckPushStrokeStartProgress = _tapeDeckAnimProgress;
+            _deckPushStrokeMaxTravel = 0.0f;
+
+            const RE::NiPoint3 hinge =
+                deckMesh
+                    ? deckMesh->world.translate
+                    : tapeDeck->world.translate;
+            const float contactRadiusFromHinge =
+                PointDistance(activeContact.closest, hinge);
+            constexpr float openAngleRadians =
+                TAPE_DECK_OPEN_ANGLE *
+                3.14159265358979323846f / 180.0f;
+            _deckPushStrokeRequiredTravel =
+                pipboy_mesh_contact::TapeDeckStrokeDistance(
+                    contactRadiusFromHinge,
+                    _deckPushStrokeStartProgress,
+                    openAngleRadians);
+            spdlog::debug(
+                "[PIPBOY] Deck proportional push started by {} "
+                "(surfaceDist={:.2f}, hullRadius={:.2f}, "
+                "startProgress={:.2f}, requiredTravel={:.2f})",
+                activeContact.source,
+                activeContact.distance,
+                activeContact.effectiveRadius,
+                _deckPushStrokeStartProgress,
+                _deckPushStrokeRequiredTravel);
         }
 
         if (_tapeDeckState == TapeDeckState::Pushing) {
-            if (pushingNow) {
-                // Follow rate scales with burial depth: a firm push closes it in ~0.15s,
-                // a slow creep closes it just as surely, only slower — the tray always
-                // stays just under the fingertip.
-                const float drive = (std::clamp)(penetration / contactRadius, 0.0f, 1.0f);
-                _pushProgress -= 0.08f * drive;
-            } else {
-                // Finger lifted (or a guard engaged) before full travel — spring back open.
-                _pushProgress += 0.06f;
-                if (_pushProgress >= 1.0f) {
-                    _pushProgress = 1.0f;
-                    _tapeDeckState = TapeDeckState::Open;
-                    spdlog::debug("[PIPBOY] Deck push released — sprung back open");
+            RE::NiPoint3 anchor{};
+            const bool anchorValid =
+                _deckPushStrokeValid &&
+                getStrokeAnchor(_deckPushStrokeUsesWeapon, anchor);
+
+            float axialTravel = 0.0f;
+            float lateralTravel = 0.0f;
+            if (anchorValid) {
+                const RE::NiPoint3 delta =
+                    anchor - _deckPushStrokeOrigin;
+                axialTravel =
+                    PipboyDotProduct(
+                        delta,
+                        _deckPushStrokeDirection);
+                const RE::NiPoint3 lateralDelta =
+                    delta -
+                    _deckPushStrokeDirection * axialTravel;
+                lateralTravel = PointDistance({}, lateralDelta);
+            }
+            strokeTravelForLog = axialTravel;
+            strokeLateralForLog = lateralTravel;
+
+            /*
+             * The visual tray retreats as it rotates, so direct overlap naturally
+             * ends after first touch. Continue following the SAME stable hand or
+             * weapon anchor instead of advancing by elapsed frames. More travel
+             * along the captured inward direction means proportionally more
+             * closure; holding still means exactly zero further motion.
+             */
+            // DEPENETRATION DRIVE (Jul 27, user: "it should smoothly close when the hand touches
+            // it ... the hand is not allowed to penetrate the holotape deck and not close it").
+            //
+            // The old model integrated travel along a stroke axis captured at first touch, kept
+            // the deepest value via a ratchet, and abandoned the stroke on lateral drift. Every
+            // one of those could desynchronise the tray from the hand: a stroke captured along a
+            // shallow graze, or broken by drift, left the tray still while the hand kept going —
+            // i.e. the hand penetrated the deck without closing it.
+            //
+            // Replace it with the constraint the user actually described: the tray may never be
+            // inside the pusher. Each frame, rotate the tray away by exactly the angle that
+            // clears the CURRENT measured penetration (arc length -> angle at the contact's
+            // radius from the hinge). This is self-correcting rather than integrated, so it needs
+            // no anchor, no captured axis and no ratchet; it is inherently proportional to hand
+            // speed (a fast hand penetrates further per frame and so rotates the tray further),
+            // and it cannot be outrun, because any penetration is removed the frame it appears.
+            const bool strokeReleased = globallyBlocked || !pushingNow;
+
+            if (strokeReleased) {
+                _deckPushStrokeValid = false;
+                _deckPushStrokeMaxTravel = 0.0f;
+                // RECAPTURE FIX (Jul 25, user: close feels unreliable): a broken stroke
+                // (lateral drift past the tolerance, anchor loss) used to snap the tray
+                // back toward fully open, and a continuing push could not re-engage until
+                // the tray had re-opened past 75% — the deck visibly fought the player.
+                // If the pusher is STILL in valid contact, stay in Pushing with the stroke
+                // invalidated: the capture block above re-anchors a fresh stroke from the
+                // current hand position next frame, so the tray just keeps following the
+                // hand. Only spring back open when the contact is actually gone.
+                if (pushingNow) {
+                    _pushProgress = _tapeDeckAnimProgress;
+                    spdlog::debug(
+                        "[PIPBOY] Deck push stroke re-anchoring "
+                        "(travel={:.2f}, lateral={:.2f}) — contact persists",
+                        axialTravel,
+                        lateralTravel);
+                } else {
+                    _tapeDeckOpen = true;
+                    _tapeDeckState = TapeDeckState::Opening;
+                    _pushProgress = _tapeDeckAnimProgress;
+                    spdlog::debug(
+                        "[PIPBOY] Deck proportional push released "
+                        "(travel={:.2f}, lateral={:.2f}, blocked={}) — returning open",
+                        axialTravel,
+                        lateralTravel,
+                        globallyBlocked);
                 }
+            } else if (activeContact.penetration > 0.0f) {
+                const RE::NiPoint3 hingeNow =
+                    deckMesh
+                        ? deckMesh->world.translate
+                        : tapeDeck->world.translate;
+                const float contactRadius =
+                    PointDistance(activeContact.closest, hingeNow);
+                constexpr float openAngleRadiansNow =
+                    TAPE_DECK_OPEN_ANGLE *
+                    3.14159265358979323846f / 180.0f;
+                // Guard a degenerate radius (contact resolved essentially at the hinge): there the
+                // lever arm vanishes and penetration/radius explodes into a full-close snap.
+                if (contactRadius > 1.0f && openAngleRadiansNow > 1.0e-4f) {
+                    const float clearingAngle =
+                        activeContact.penetration / contactRadius;
+                    const float deltaProgress =
+                        clearingAngle / openAngleRadiansNow;
+                    // Cap per-frame motion so one bad depth sample cannot slam the tray shut; at
+                    // 90fps this still allows a full close in ~5 frames of hard pushing.
+                    constexpr float kMaxProgressPerFrame = 0.20f;
+                    _pushProgress = (std::clamp)(
+                        _pushProgress -
+                            (std::min)(deltaProgress, kMaxProgressPerFrame),
+                        0.0f,
+                        1.0f);
+                }
+                strokeTravelForLog = activeContact.penetration;
             }
 
-            if (_tapeDeckState == TapeDeckState::Pushing && _pushProgress <= 0.15f) {
+            if (_tapeDeckState == TapeDeckState::Pushing &&
+                pipboy_mesh_contact::TapeDeckReachedMechanicalLatch(
+                    _pushProgress)) {
                 _tapeDeckOpen = false;
                 _tapeDeckState = TapeDeckState::Closing;
-                _closeAnimSpeed = 0.15f;
+                _closeAnimSpeed = ANIM_SPEED;
                 _slamCooldown = SLAM_COOLDOWN_TIME;
+                _deckPushStrokeValid = false;
                 PlayWavSound("Slam close.wav");
                 VRInput::GetSingleton().TriggerHaptic(pushHandIsLeft, 5000);
-                spdlog::info("[PIPBOY] Tape deck pushed closed (proportional follow, {} contact, dist={:.2f})",
-                    contact.meshAvailable ? "tray mesh" : "node fallback",
-                    contact.currentDistance);
+                spdlog::info(
+                    "[PIPBOY] Tape deck physically pushed closed by {} "
+                    "(travel={:.2f}/{:.2f}, actual collider samples: "
+                    "hand={}, weapon={})",
+                    _deckPushStrokeUsesWeapon ? "weapon hull" : "hand hull",
+                    _deckPushStrokeMaxTravel,
+                    _deckPushStrokeRequiredTravel,
+                    handSampleCount,
+                    weaponSampleCount);
+                _deckPushStrokeMaxTravel = 0.0f;
             }
         }
 
@@ -3998,14 +5533,40 @@ namespace heisenberg
         // completely missed the pushes that failed to engage.
         {
             static std::uint32_t s_deckNearLog = 0;
-            const bool nearDeck = std::isfinite(contact.currentDistance) && contact.currentDistance < 8.0f;
+            const DeckHullContact* nearest = nullptr;
+            if (handContact.valid) nearest = &handContact;
+            if (weaponContact.valid &&
+                (!nearest || weaponContact.distance < nearest->distance)) {
+                nearest = &weaponContact;
+            }
+            const float nearestDistance = nearest
+                ? nearest->distance
+                : (std::numeric_limits<float>::max)();
+            const bool nearDeck =
+                std::isfinite(nearestDistance) && nearestDistance < 8.0f;
             const bool denseTick = nearDeck && (++s_deckNearLog % 6) == 0;
             if (denseTick || _logCooldown <= 0) {
                 if (_logCooldown <= 0) _logCooldown = 60;
-                spdlog::debug("[PIPBOY] Deck contact: mesh={} current={:.2f} radius={:.1f} pen={:.2f} state={} pushProg={:.2f} onTop={} blocked={}",
-                    contact.meshAvailable, contact.currentDistance, contactRadius,
-                    penetration,
-                    static_cast<int>(_tapeDeckState), _pushProgress, contactOnTop, blocked);
+                spdlog::debug(
+                    "[PIPBOY] Deck collider contact: mesh={} handSamples={} "
+                    "weaponSamples={} nearest={} dist={:.2f} pen={:.2f} "
+                    "state={} pushProg={:.2f} stroke={} source={} "
+                    "travel={:.2f}/{:.2f} lateral={:.2f} blocked={} occupied={}",
+                    deckMeshAvailable,
+                    handSampleCount,
+                    weaponSampleCount,
+                    nearest ? nearest->source : "none",
+                    nearestDistance,
+                    nearest ? nearest->penetration : 0.0f,
+                    static_cast<int>(_tapeDeckState),
+                    _pushProgress,
+                    _deckPushStrokeValid,
+                    _deckPushStrokeUsesWeapon ? "weapon" : "hand",
+                    strokeTravelForLog,
+                    _deckPushStrokeRequiredTravel,
+                    strokeLateralForLog,
+                    globallyBlocked,
+                    handOccupied);
             }
         }
     }
@@ -4096,6 +5657,10 @@ namespace heisenberg
         _loadedHolotapeFormID = 0;
         _tapREFForceHidden = true;
         _holotapeGrabCooldown = TAPE_GRAB_COOLDOWN;
+        _holotapeRemovalRequiresGripRelease = false;
+        _deckPushStrokeValid = false;
+        _deckPushStrokeMaxTravel = 0.0f;
+        _deckRemovalHandGuard = TAPE_GRAB_COOLDOWN;
         _insertionOpenHandActive = false;
         _deckOpenedByEject = false;
         SetTapREFVisible(false);
@@ -4131,7 +5696,9 @@ namespace heisenberg
     {
         spdlog::info("[PIPBOY] ClearState — resetting all tape deck state for load");
 
-        // Safety: never leave projected mode overridden across a load.
+        // Safety: never leave a temporary normal root or projected mode
+        // overridden across a load.
+        EndTemporaryNormalPipboyModel();
         EndWristOverrideForHolotape();
 
         _tapeDeckState          = TapeDeckState::Closed;
@@ -4148,9 +5715,18 @@ namespace heisenberg
         _ejectContactLatched    = false;
         _holotapeGrabCooldown   = 0.0f;
         _holotapeRemovalCooldown = 0.0f;
+        _holotapeRemovalRequiresGripRelease = false;
+        _deckRemovalHandGuard   = 0.0f;
         _closeAnimSpeed         = ANIM_SPEED;
         _slamCooldown           = 0.0f;
         _pushProgress           = 1.0f;
+        _deckPushStrokeValid       = false;
+        _deckPushStrokeUsesWeapon  = false;
+        _deckPushStrokeOrigin      = {};
+        _deckPushStrokeDirection   = {};
+        _deckPushStrokeStartProgress = 1.0f;
+        _deckPushStrokeRequiredTravel = 3.0f;
+        _deckPushStrokeMaxTravel   = 0.0f;
         _tapREFForceHidden      = false;
         _meshesInitialized      = false;   // Force re-init of mesh rotations on next frame
         // Invalidate persistent node caches (skeleton changes on load)
@@ -4214,15 +5790,14 @@ namespace heisenberg
         // Vanilla Pip-Boy boot sequence — same seeding rule as _pipboyOpenedSinceAcquire
         // (QueueIntroHolotapeDelivery seeds true for an established save; SetNewGame/here
         // leave false so a fresh pickup still fires the native event).
-        // Safety net: if a save/reload/quit interrupts the sequence while the Holo
-        // ini override is still active, restore it now rather than silently leaving
-        // the player's real FRIK preference overwritten on disk.
-        if (_bootHoloIniOverrideActive) {
-            SetFrikHoloPipboyEnabled(true);
+        // Safety net: if a save/load interrupts the sequence while the live Holo
+        // override is active, ask FRIK to restore the player's model now.
+        if (_bootHoloOverrideActive) {
+            EndTemporaryNormalPipboyModel();
         }
         // And for the intro ceremony's Holo override — same never-strand-the-preference rule.
         if (_introHoloIniOverrideActive) {
-            SetFrikHoloPipboyEnabled(true);
+            EndTemporaryNormalPipboyModel();
         }
         _introHoloIniOverrideActive = false;
         _introHoloWaitFrames        = 0;
@@ -4230,10 +5805,16 @@ namespace heisenberg
         _introHoloSawPipOpen        = false;
         _bootSequenceFired          = false;
         _bootWristOverrideOwned     = false;
-        _bootHoloIniHandled         = false;
-        _bootHoloIniOverrideActive  = false;
-        _bootHoloIniWaitSeconds     = 0.0f;
-        _bootHoloIniRestoreSeconds  = -1.0f;
+        _bootHoloModeHandled             = false;
+        _bootHoloOverrideActive          = false;
+        _bootPipboyRootTransitionPending = false;
+        _bootPipboyRootTransitionFailed  = false;
+        _bootPipboyRootMustChange        = false;
+        _bootPipboyPreSwitchRoot          = nullptr;
+        _bootPipboyCandidateRoot          = nullptr;
+        _bootPipboyRootStableFrames      = 0;
+        _bootPipboyRootWaitSeconds       = 0.0f;
+        _bootHoloRestoreSeconds          = -1.0f;
         _bootMenuSeen               = false;
         _bootMenuFinished           = false;
         _bootMenuAppearWaitSeconds  = 0.0f;
@@ -4247,8 +5828,18 @@ namespace heisenberg
             SetPipboyMenuMovieVisible(true);
         }
         _bootPipboyMenuBlanked      = false;
+        _bootPipboyCursorOverridden = false;
+        _bootPipboyCursorWasEnabled = false;
         _bootContentOpenSeconds     = 0.0f;
+        _bootContentOpenRequested   = false;
+        _bootContentOpenWaitSeconds = 0.0f;
+        _bootContentCloseRetrySeconds = 0.0f;
+        _bootContentMenuSeen        = false;
+        _bootContentCloseArmSeconds = 0.0f;
+        _bootContentGripWasPressed  = false;
+        _bootContentGripCloseRequested = false;
         _bootSawPipboyAbsent        = false;
+        _bootPipboyArmorEquipQueued = false;
         _terminalScreenNode         = nullptr;
         _savedDiffuseSRV            = 0;
         _savedRendererPtr           = nullptr;
@@ -4700,7 +6291,17 @@ namespace heisenberg
         _newGameExteriorReached = false;
         _pipboyOpenedSinceAcquire = false;
         _bootSequenceFired = false;
-        _bootHoloIniHandled = false;
+        _bootHoloModeHandled = false;
+        _bootHoloOverrideActive = false;
+        _bootPipboyRootTransitionPending = false;
+        _bootPipboyRootTransitionFailed = false;
+        _bootPipboyRootMustChange = false;
+        _bootPipboyPreSwitchRoot = nullptr;
+        _bootPipboyCandidateRoot = nullptr;
+        _bootPipboyRootStableFrames = 0;
+        _bootPipboyRootWaitSeconds = 0.0f;
+        _bootHoloRestoreSeconds = -1.0f;
+        _bootPipboyArmorEquipQueued = false;
         _introPostLoadBaselinePending = false;
         _hasReachedExterior = false;
         IntroCeremonyState::ResetForNewGame();
@@ -4809,8 +6410,16 @@ namespace heisenberg
             return;
         }
 
-        // Stop any previous playback
-        StopIntroPlayback();
+        // Transitioning from the intro SWF to narration is not an abort.  The
+        // old StopIntroPlayback() call restored the stock Holo root here,
+        // while the screen was closing, which visibly activated Holo during
+        // the narration.  Stop only a prior audio handle and retain display
+        // ownership until the final line completes.
+        if (_introPlaybackActive) {
+            StopNarrationWav();
+        }
+        heisenberg::HideSubtitle();
+        _introDisplayRestorePending = false;
 
         _introPlaybackActive = true;
         _introCurrentLine = -1;   // Will advance to 0 on first UpdateIntroPlayback fire
@@ -4861,6 +6470,7 @@ namespace heisenberg
                     spdlog::info("[INTRO] Playback complete");
                     _introPlaybackActive = false;
                     _introCurrentLine = -1;
+                    _introDisplayRestorePending = true;
                     // Mark intro as fully played — won't re-deliver on subsequent loads
                     if (!g_config.introHolotapePlayed) {
                         g_config.introHolotapePlayed = true;
@@ -4884,16 +6494,16 @@ namespace heisenberg
         }
         _introPlaybackActive = false;
         _introCurrentLine = -1;
+        _introDisplayRestorePending = false;
         heisenberg::HideSubtitle();
-        // The intro ceremony forced FRIK Holo off for wrist playback — an interrupted/
-        // ejected intro must hand the player's Holo preference back too, not just the
-        // natural pipboy-closed path in UpdateIntroHoloOverride.
+        // An interrupted/ejected intro must restore stock FRIK's Holo root too.
         if (_introHoloIniOverrideActive) {
-            SetFrikHoloPipboyEnabled(true);
+            EndTemporaryNormalPipboyModel();
             _introHoloIniOverrideActive = false;
             _introHoloSawPipOpen = false;
-            spdlog::info("[PIPBOY] Intro playback stopped — restored FRIK HoloPipBoyEnabled=true");
+            spdlog::info("[PIPBOY] Intro playback stopped — restored stock FRIK Holo root");
         }
+        EndWristOverrideForHolotape();
     }
 
     bool PipboyInteraction::IsIntroHolotape(std::uint32_t formID) const

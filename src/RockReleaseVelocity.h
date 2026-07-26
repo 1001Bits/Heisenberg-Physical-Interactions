@@ -14,7 +14,7 @@
  *   final  = clampMag( playerVelocity + throwMultiplier * clampMag(local, maxV), maxV )
  *   angular = clampMag( handAngular * angularScale, maxAngular )
  * All linear quantities in HAVOK meters/second; angular in radians/second.
- * Live tuning (Documents ROCK.ini == RockConfig defaults): multiplier 1.5, object
+ * Live tuning ([PhysicsInteraction] in Heisenberg_F4VR.ini == RockConfig defaults): multiplier 1.5, object
  * blend 0.35, tangential scale 1.0, maxVelocity 12.0 Havok m/s, angular scale 1.0,
  * maxAngular 18.0 rad/s, controller-derived enabled.
  */
