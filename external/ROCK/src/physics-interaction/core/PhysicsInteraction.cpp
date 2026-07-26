@@ -39,6 +39,7 @@
 #include "physics-interaction/grab/GrabTelemetry.h"
 #include "physics-interaction/grab/GrabHeldObject.h"
 #include "physics-interaction/grab/GrabMassPolicy.h"
+#include "physics-interaction/grab/MeshGrab.h"
 #include "physics-interaction/grab/GrabNodeInfoMath.h"
 #include "physics-interaction/grab/GrabPinchPocket.h"
 #include "physics-interaction/grab/GrabThreePhase.h"
@@ -51,12 +52,14 @@
 #include "physics-interaction/input/GrabInputIntentPolicy.h"
 #include "physics-interaction/object/ObjectDetection.h"
 #include "physics-interaction/object/ObjectPhysicsBodySet.h"
+#include "physics-interaction/object/PhysicsBodyClassifier.h"
 #include "physics-interaction/stash/ShoulderStashDetector.h"
 #include "physics-interaction/stash/ShoulderStashPolicy.h"
 #include "physics-interaction/stash/ShoulderStashTransfer.h"
 #include "physics-interaction/weapon/LooseWeaponGripZone.h"
 #include "physics-interaction/weapon/WeaponEquipTransfer.h"
 #include "physics-interaction/weapon/WeaponInteraction.h"
+#include "physics-interaction/weapon/WeaponPartContactAcquisitionPolicy.h"
 #include "physics-interaction/hand/HandFrame.h"
 #include "physics-interaction/core/PhysicsHooks.h"
 #include "physics-interaction/core/RockRuntimeState.h"
@@ -73,6 +76,7 @@
 #include "physics-interaction/PhysicsBodyFrame.h"
 #include "physics-interaction/TransformMath.h"
 
+#include "common/Quaternion.h"
 #include "RE/Bethesda/ActorValueInfo.h"
 #include "RE/Bethesda/BSHavok.h"
 #include "RE/Bethesda/Events.h"
@@ -1018,6 +1022,26 @@ namespace rock
             return nullptr;
         }
 
+        /*
+         * A provider may match a generated collision leaf but ask ROCK to
+         * write the consumer's authored bolt/slide node instead. Keep that
+         * indirection memory-safe: both pointers must be live in the current
+         * weapon tree. Do not require ancestry between them; some weapon NIFs
+         * place the animated controller and its collision geometry on sibling
+         * branches. Exact body matching remains the grab-safety boundary.
+         */
+        bool controlledWeaponPartRootIsLive(
+            RE::NiAVObject* weaponRoot,
+            RE::NiAVObject* collisionSource,
+            RE::NiAVObject* controlledRoot)
+        {
+            return weaponRoot &&
+                   collisionSource &&
+                   controlledRoot &&
+                   actor_equipment_grab::nodeContainsNode(weaponRoot, collisionSource, 64) &&
+                   actor_equipment_grab::nodeContainsNode(weaponRoot, controlledRoot, 64);
+        }
+
         std::uint32_t providerHandStateFlags(const Hand& hand, bool isLeft)
         {
             std::uint32_t flags = 0;
@@ -1078,7 +1102,9 @@ namespace rock
 
         WeaponProviderPartAuthority makeWeaponProviderPartAuthority(
             const ::rock::provider::RockProviderWeaponPartTargetQueryV1& query,
-            const ::rock::provider::RockProviderWeaponPartTargetResolutionV1& resolution)
+            const ::rock::provider::RockProviderWeaponPartTargetResolutionV1& resolution,
+            const ::rock::provider::RockProviderWeaponPartInteractionZoneV1* interactionZone = nullptr,
+            std::uint64_t interactionZoneOwner = 0)
         {
             WeaponProviderPartAuthority authority{};
             authority.active = resolution.matched != 0;
@@ -1096,7 +1122,124 @@ namespace rock
             static_assert(WeaponProviderPartAuthority{}.sourceName.size() == ::rock::provider::ROCK_PROVIDER_MAX_EVIDENCE_NAME);
             std::memcpy(authority.sourceName.data(), query.sourceName, authority.sourceName.size());
             authority.sourceName[authority.sourceName.size() - 1] = '\0';
+
+            /*
+             * Bind AttachOnly hand visuals to the same authored node that its
+             * motion constraint will move.  The exact contact identity remains
+             * query.sourceRoot/bodyId; controlledRoot is output authority only.
+             * This also makes controlledRoot work without requiring the newer
+             * interaction-zone API.
+             */
+            if (authority.active &&
+                resolution.grabMode == ::rock::provider::RockProviderWeaponPartGrabModeV1::AttachOnly) {
+                ::rock::provider::RockProviderWeaponPartMotionConstraintResolutionV1 motion{};
+                if (::rock::provider::resolveWeaponPartMotionConstraintV1(query, motion) &&
+                    motion.ownerToken == resolution.ownerToken) {
+                    authority.controlledRoot = motion.controlledRoot;
+                }
+            }
+
+            if (interactionZone &&
+                interactionZoneOwner == resolution.ownerToken &&
+                interactionZone->weaponGenerationKey == query.weaponGenerationKey &&
+                interactionZone->bodyId == query.bodyId &&
+                interactionZone->groupId == resolution.groupId) {
+                authority.interactionZoneActive = true;
+                authority.controlledRoot = interactionZone->controlledRoot ?
+                    interactionZone->controlledRoot :
+                    interactionZone->sourceRoot;
+                authority.interactionZoneFlags = interactionZone->flags;
+                authority.interactionZoneSnapMode = static_cast<std::uint32_t>(interactionZone->snapMode);
+                for (std::size_t i = 0; i < 3; ++i) {
+                    authority.interactionZoneSnapAnchor[i] = interactionZone->snapAnchor[i];
+                    authority.rightHandPartLocal.translate[i] = interactionZone->rightHandPartLocal.translate[i];
+                    authority.leftHandPartLocal.translate[i] = interactionZone->leftHandPartLocal.translate[i];
+                }
+                for (std::size_t i = 0; i < 9; ++i) {
+                    authority.rightHandPartLocal.rotate[i] = interactionZone->rightHandPartLocal.rotate[i];
+                    authority.leftHandPartLocal.rotate[i] = interactionZone->leftHandPartLocal.rotate[i];
+                }
+                authority.rightHandPartLocal.scale = interactionZone->rightHandPartLocal.scale;
+                authority.leftHandPartLocal.scale = interactionZone->leftHandPartLocal.scale;
+            }
             return authority;
+        }
+
+        bool pointerIsInLiveWeaponTree(
+            const RE::NiAVObject* target,
+            RE::NiAVObject* root,
+            int depth = 0)
+        {
+            if (!target || !root || depth > 32) {
+                return false;
+            }
+            if (target == root) {
+                return true;
+            }
+            if (auto* node = root->IsNode()) {
+                for (const auto& child : node->children) {
+                    if (child && pointerIsInLiveWeaponTree(target, child.get(), depth + 1)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        bool providerInteractionZoneContainsHand(
+            const ::rock::provider::RockProviderWeaponPartInteractionZoneV1& zone,
+            RE::NiNode* weaponNode,
+            const RE::NiPoint3& handPointWorld,
+            float& outNormalizedDistance)
+        {
+            outNormalizedDistance = (std::numeric_limits<float>::max)();
+            if (!weaponNode) {
+                return false;
+            }
+
+            RE::NiAVObject* zoneRoot = weaponNode;
+            switch (zone.zoneSpace) {
+            case ::rock::provider::RockProviderWeaponPartInteractionZoneSpaceV1::SourceRootLocal:
+                zoneRoot = reinterpret_cast<RE::NiAVObject*>(zone.sourceRoot);
+                break;
+            case ::rock::provider::RockProviderWeaponPartInteractionZoneSpaceV1::ControlledRootLocal:
+                zoneRoot = reinterpret_cast<RE::NiAVObject*>(
+                    zone.controlledRoot ? zone.controlledRoot : zone.sourceRoot);
+                break;
+            case ::rock::provider::RockProviderWeaponPartInteractionZoneSpaceV1::WeaponRootLocal:
+            default:
+                break;
+            }
+            // Never dereference a consumer pointer until the raw address has
+            // been found in the live equipped-weapon tree.
+            if (!pointerIsInLiveWeaponTree(zoneRoot, weaponNode)) {
+                return false;
+            }
+
+            const RE::NiPoint3 local = transform_math::worldPointToLocal(zoneRoot->world, handPointWorld);
+            const float dx = local.x - zone.zoneCenter[0];
+            const float dy = local.y - zone.zoneCenter[1];
+            const float dz = local.z - zone.zoneCenter[2];
+            if (zone.shape == ::rock::provider::RockProviderWeaponPartInteractionZoneShapeV1::Sphere) {
+                const float radius = zone.zoneHalfExtents[0];
+                if (!(radius > 0.0f)) {
+                    return false;
+                }
+                outNormalizedDistance = std::sqrt(dx * dx + dy * dy + dz * dz) / radius;
+                return std::isfinite(outNormalizedDistance) && outNormalizedDistance <= 1.0f;
+            }
+
+            if (!(zone.zoneHalfExtents[0] > 0.0f) ||
+                !(zone.zoneHalfExtents[1] > 0.0f) ||
+                !(zone.zoneHalfExtents[2] > 0.0f)) {
+                return false;
+            }
+            outNormalizedDistance = (std::max)({
+                std::abs(dx) / zone.zoneHalfExtents[0],
+                std::abs(dy) / zone.zoneHalfExtents[1],
+                std::abs(dz) / zone.zoneHalfExtents[2],
+            });
+            return std::isfinite(outNormalizedDistance) && outNormalizedDistance <= 1.0f;
         }
 
         ::rock::provider::RockProviderPoint3 makeProviderPoint(const WeaponEvidencePoint3& point)
@@ -1319,17 +1462,13 @@ namespace rock
         {
             using namespace weapon_support_authority_policy;
 
-            if (!g_rockConfig.rockVisualOnlySidearmSupportGripEnabled) {
-                return WeaponSupportAuthorityMode::FullTwoHandedSolver;
-            }
-
             if (!weaponNode) {
                 return WeaponSupportAuthorityMode::FullTwoHandedSolver;
             }
 
             const auto identity = makeEquippedWeaponSupportIdentity(weaponNode);
             const auto weaponClass = classifyEquippedWeaponForSupportGrip(identity);
-            const auto authorityMode = resolveSupportAuthorityMode(true, weaponClass);
+            const auto authorityMode = resolveSupportAuthorityMode(weaponClass);
             ROCK_LOG_SAMPLE_DEBUG(
                 Weapon,
                 g_rockConfig.rockLogSampleMilliseconds,
@@ -1442,6 +1581,142 @@ namespace rock
             f4vr::updateTransformsDown(muzzle->fireNode, true);
         }
 
+        struct FinalWeaponScopeCameraBaseline
+        {
+            RE::NiPoint3 weaponLocalTranslate{};
+            RE::NiPoint3 scopeCameraLocalTranslate{};
+            bool valid{ false };
+        };
+
+        [[nodiscard]] bool vanillaScopeMenuOpen()
+        {
+            auto* ui = RE::UI::GetSingleton();
+            static const RE::BSFixedString scopeMenuName{ "ScopeMenu" };
+            return ui && ui->GetMenuOpen(scopeMenuName);
+        }
+
+        [[nodiscard]] bool finitePoint(const RE::NiPoint3& point)
+        {
+            return std::isfinite(point.x) &&
+                   std::isfinite(point.y) &&
+                   std::isfinite(point.z);
+        }
+
+        [[nodiscard]] FinalWeaponScopeCameraBaseline captureFinalWeaponScopeCameraBaseline(
+            const RE::NiNode* weaponNode)
+        {
+            FinalWeaponScopeCameraBaseline baseline{};
+            const auto* playerNodes = f4vr::getPlayerNodes();
+            const auto* scopeCamera = playerNodes ? playerNodes->primaryWeaponScopeCamera : nullptr;
+            if (!weaponNode || !scopeCamera || !vanillaScopeMenuOpen()) {
+                return baseline;
+            }
+
+            baseline.weaponLocalTranslate = weaponNode->local.translate;
+            baseline.scopeCameraLocalTranslate = scopeCamera->local.translate;
+            baseline.valid =
+                finitePoint(baseline.weaponLocalTranslate) &&
+                finitePoint(baseline.scopeCameraLocalTranslate);
+            return baseline;
+        }
+
+        [[nodiscard]] RE::NiMatrix3 vanillaScopeCameraBaseMatrix()
+        {
+            /*
+             * Fallout VR's optical-scope camera uses X-forward while the weapon
+             * node uses Y-forward.  This is the same basis remap used by FRIK's
+             * WeaponPositionAdjuster.
+             */
+            RE::NiMatrix3 base{};
+            for (auto& row : base.entry) {
+                row[0] = 0.0f;
+                row[1] = 0.0f;
+                row[2] = 0.0f;
+            }
+            base.entry[2][0] = 1.0f;  // scope X <- weapon Z
+            base.entry[0][1] = 1.0f;  // scope Y <- weapon X
+            base.entry[1][2] = 1.0f;  // scope Z <- weapon Y
+            return base;
+        }
+
+        void applyFinalWeaponScopeCameraAuthority(
+            RE::NiNode* weaponNode,
+            const FinalWeaponScopeCameraBaseline* baseline)
+        {
+            /*
+             * FRIK updates primaryWeaponScopeCamera before ROCK's post-FRIK
+             * two-hand solve.  With FRIK offhand gripping disabled, ROCK then
+             * rotates the visible weapon and projectile node while the vanilla
+             * optical camera keeps FRIK's earlier one-handed direction.  The
+             * result is exactly the reported split: the shot follows the moved
+             * gun, but the image shown in ScopeMenu does not.
+             *
+             * Re-run FRIK's proven scope-camera mapping from ROCK's final
+             * weapon transform.  Translation is applied as an incremental
+             * correction over the same-frame pre-ROCK camera baseline, so
+             * weapon-specific FRIK offsets/calibration remain intact.
+             */
+            if (!weaponNode || !vanillaScopeMenuOpen()) {
+                return;
+            }
+
+            auto* playerNodes = f4vr::getPlayerNodes();
+            auto* scopeCamera = playerNodes ? playerNodes->primaryWeaponScopeCamera : nullptr;
+            if (!scopeCamera || !finitePoint(weaponNode->local.translate)) {
+                return;
+            }
+
+            if (baseline && baseline->valid) {
+                const RE::NiPoint3 weaponPosDiff =
+                    weaponNode->local.translate - baseline->weaponLocalTranslate;
+                RE::NiPoint3 scopeTranslate =
+                    baseline->scopeCameraLocalTranslate +
+                    RE::NiPoint3{ weaponPosDiff.y, weaponPosDiff.x, -weaponPosDiff.z };
+
+                // Preserve FRIK's empirical cross-axis drift correction, but
+                // apply it only to ROCK's incremental translation this frame.
+                scopeTranslate.z +=
+                    (weaponPosDiff.y > 0.0f ? 0.12f : 0.04f) * weaponPosDiff.y +
+                    (weaponPosDiff.x > 0.0f ? 0.14f : 0.04f) * weaponPosDiff.x;
+                scopeTranslate.x +=
+                    (weaponPosDiff.x > 0.0f ? -0.10f : -0.11f) * weaponPosDiff.x +
+                    (weaponPosDiff.z > 0.0f ? 0.05f : 0.06f) * weaponPosDiff.z;
+                if (finitePoint(scopeTranslate)) {
+                    scopeCamera->local.translate = scopeTranslate;
+                }
+            }
+
+            const RE::NiMatrix3 scopeBase = vanillaScopeCameraBaseMatrix();
+            scopeCamera->local.rotate = scopeBase;
+            f4vr::updateTransforms(scopeCamera);
+
+            const RE::NiPoint3 weaponForward{
+                weaponNode->world.rotate.entry[1][0],
+                weaponNode->world.rotate.entry[1][1],
+                weaponNode->world.rotate.entry[1][2],
+            };
+            const float scopeScale = scopeCamera->world.scale;
+            if (!finitePoint(weaponForward) ||
+                !std::isfinite(scopeScale) ||
+                std::abs(scopeScale) <= 1.0e-5f) {
+                return;
+            }
+
+            const RE::NiPoint3 weaponForwardInScope =
+                scopeCamera->world.rotate * (weaponForward / scopeScale);
+            if (!finitePoint(weaponForwardInScope) ||
+                weaponForwardInScope.Length() <= 1.0e-5f) {
+                return;
+            }
+
+            f4cf::common::Quaternion rotationAdjustment;
+            rotationAdjustment.vec2Vec(
+                weaponForwardInScope,
+                RE::NiPoint3{ 1.0f, 0.0f, 0.0f });
+            scopeCamera->local.rotate = rotationAdjustment.getMatrix() * scopeBase;
+            f4vr::updateTransformsDown(scopeCamera, true);
+        }
+
         RE::NiNode* resolveEquippedWeaponInteractionNodeDirect()
         {
             auto* firstPersonSkeleton = f4vr::getFirstPersonSkeleton();
@@ -1536,6 +1811,60 @@ namespace rock
 
         outTransform = _handBoneCache.getWorldTransform(isLeft);
         return true;
+    }
+
+    std::uint32_t PhysicsInteraction::hostCopyHandCollisionSamples(
+        bool isLeft,
+        RE::NiPoint3* outWorldPoints,
+        float* outRadiiGame,
+        std::uint32_t maxSamples) const
+    {
+        if (!_initialized.load(std::memory_order_acquire)) {
+            return 0;
+        }
+        const auto& hand = isLeft ? _leftHand : _rightHand;
+        return hand.copyHandCollisionSamples(
+            outWorldPoints,
+            outRadiiGame,
+            maxSamples);
+    }
+
+    std::uint32_t PhysicsInteraction::hostCopyWeaponCollisionSamples(
+        RE::NiPoint3* outWorldPoints,
+        float* outRadiiGame,
+        std::uint32_t maxSamples) const
+    {
+        if (!_initialized.load(std::memory_order_acquire)) {
+            return 0;
+        }
+        return _weaponCollision.copyInteractionCollisionSamples(
+            resolveEquippedWeaponInteractionNode(),
+            outWorldPoints,
+            outRadiiGame,
+            maxSamples);
+    }
+
+    void PhysicsInteraction::hostNotifyExternalRelease(
+        bool isLeft,
+        RE::TESObjectREFR* releasedRef)
+    {
+        const std::size_t handIndex = isLeft ? 1u : 0u;
+        if (!releasedRef || releasedRef->IsDeleted()) {
+            _hostRecentReleaseFrames[handIndex].store(0, std::memory_order_release);
+            _hostRecentReleaseFormId[handIndex].store(0, std::memory_order_release);
+            return;
+        }
+
+        // About 0.4 seconds at 90 Hz. This covers the host's delayed collision
+        // restoration/contact-cache rebuild without making the object feel
+        // non-interactive: native Havok collision remains enabled throughout.
+        constexpr std::uint32_t kRecentReleaseGuardFrames = 36;
+        _hostRecentReleaseFormId[handIndex].store(
+            releasedRef->GetFormID(),
+            std::memory_order_release);
+        _hostRecentReleaseFrames[handIndex].store(
+            kRecentReleaseGuardFrames,
+            std::memory_order_release);
     }
 
     void PhysicsInteraction::noteSkeletonLifecycle(std::uint32_t skeletonGeneration, ::rock::provider::RockProviderLifecycleReason reason)
@@ -2076,8 +2405,20 @@ namespace rock
         _softContactRuntime.reset();
         _nativeContactEvidence.reset();
         _bodyContactRuntime.reset();
+        {
+            std::scoped_lock lock(
+                _contactPenetrationDiagnosticMutex);
+            _contactPenetrationDiagnosticRecords = {};
+            _nextContactPenetrationDiagnosticSlot = 0;
+            _contactPenetrationDiagnosticSequence = 0;
+        }
+        _contactPenetrationDiagnosticCooldownUntil.clear();
         _dynamicPushElapsedSeconds = 0.0f;
         _dynamicPushCooldownUntil.clear();
+        for (std::size_t handIndex = 0; handIndex < 2; ++handIndex) {
+            _hostRecentReleaseFrames[handIndex].store(0, std::memory_order_release);
+            _hostRecentReleaseFormId[handIndex].store(0, std::memory_order_release);
+        }
         _heldImpactHapticCooldownUntil.clear();
         _grabEventFrameCounter = 0;
         _shoulderStashStates = {};
@@ -2125,6 +2466,332 @@ namespace rock
         // scene graph and the projectile/fire-node seam need final publication here.
         if (f4vr::isNodeVisible(weaponNode)) {
             applyFinalWeaponMuzzleAuthority();
+            if (_twoHandedGrip.getState() == TwoHandedState::Gripping) {
+                // Hand/arm authority can move the firing-hand parent after the
+                // first publication.  Reassert orientation from the final weapon;
+                // translation was already corrected from the pre-ROCK baseline
+                // during update() and must not be accumulated here.
+                applyFinalWeaponScopeCameraAuthority(weaponNode, nullptr);
+            }
+        }
+    }
+
+    void PhysicsInteraction::logContactPenetrationDiagnostics(
+        const PhysicsFrameContext& frame)
+    {
+        std::array<
+            ContactPenetrationDiagnosticRecord,
+            kMaxContactPenetrationDiagnosticRecords>
+            pending{};
+        {
+            std::scoped_lock lock(
+                _contactPenetrationDiagnosticMutex);
+            pending = _contactPenetrationDiagnosticRecords;
+            _contactPenetrationDiagnosticRecords = {};
+        }
+
+        if (!frame.bhkWorld || !frame.hknpWorld) {
+            return;
+        }
+
+        // Keep the deepest/newest manifold for each body pair. A physics step
+        // can publish several updates for the same pair, and extracting the
+        // visible target mesh for each duplicate would be both noisy and
+        // unnecessarily expensive.
+        std::unordered_map<
+            std::uint64_t,
+            ContactPenetrationDiagnosticRecord>
+            strongestByPair;
+        for (const auto& record : pending) {
+            if (!record.valid) {
+                continue;
+            }
+            const std::uint64_t key =
+                (static_cast<std::uint64_t>(
+                     record.sourceBodyId)
+                 << 32) |
+                record.targetBodyId;
+            const auto found = strongestByPair.find(key);
+            if (found == strongestByPair.end() ||
+                (record.hasRawManifoldPoint &&
+                 !found->second.hasRawManifoldPoint) ||
+                (record.hasRawManifoldPoint ==
+                     found->second.hasRawManifoldPoint &&
+                 (record.minimumSignedSeparationGame <
+                      found->second.minimumSignedSeparationGame ||
+                  (record.minimumSignedSeparationGame ==
+                       found->second.minimumSignedSeparationGame &&
+                   record.sequence > found->second.sequence)))) {
+                strongestByPair[key] = record;
+            }
+        }
+
+        struct TargetVisibleMesh
+        {
+            RE::TESObjectREFR* ref = nullptr;
+            std::vector<TriangleData> triangles;
+            MeshExtractionStats stats{};
+            RE::NiPoint3 visibleCenterGame{};
+            float visibleRadiusGame = 0.0f;
+        };
+        std::unordered_map<std::uint32_t, TargetVisibleMesh>
+            visibleMeshes;
+
+        auto nearestVisibleMeshDistance = [](
+                                              const RE::NiPoint3& point,
+                                              const std::vector<TriangleData>&
+                                                  triangles,
+                                              RE::NiPoint3* outNearestPoint =
+                                                  nullptr) {
+            float bestSquared =
+                (std::numeric_limits<float>::max)();
+            for (const auto& triangle : triangles) {
+                float distanceSquared = 0.0f;
+                const auto candidate =
+                    closestPointOnTriangleToPoint(
+                    point,
+                    triangle,
+                    distanceSquared);
+                if (std::isfinite(distanceSquared) &&
+                    distanceSquared < bestSquared) {
+                    bestSquared = distanceSquared;
+                    if (outNearestPoint) {
+                        *outNearestPoint = candidate;
+                    }
+                }
+            }
+            return bestSquared <
+                           (std::numeric_limits<float>::max)()
+                       ? std::sqrt(
+                             (std::max)(0.0f, bestSquared))
+                       : -1.0f;
+        };
+
+        for (const auto& [pairKey, record] : strongestByPair) {
+            const auto cooldown =
+                _contactPenetrationDiagnosticCooldownUntil.find(
+                    pairKey);
+            const bool emitDiagnostic =
+                cooldown ==
+                    _contactPenetrationDiagnosticCooldownUntil.end() ||
+                cooldown->second <= _dynamicPushElapsedSeconds;
+            if (emitDiagnostic) {
+                _contactPenetrationDiagnosticCooldownUntil[pairKey] =
+                    _dynamicPushElapsedSeconds + 0.25f;
+            }
+
+            auto meshIt = visibleMeshes.find(record.targetBodyId);
+            if (meshIt == visibleMeshes.end()) {
+                TargetVisibleMesh target{};
+                target.ref = resolveBodyToRef(
+                    frame.bhkWorld,
+                    frame.hknpWorld,
+                    RE::hknpBodyId{ record.targetBodyId });
+                if (target.ref &&
+                    !target.ref->IsDeleted() &&
+                    !target.ref->IsDisabled()) {
+                    if (auto* root = target.ref->Get3D()) {
+                        target.visibleCenterGame =
+                            root->worldBound.center;
+                        target.visibleRadiusGame =
+                            root->worldBound.fRadius;
+                        // This visible-envelope pass is diagnostic only. Direct
+                        // body-transform corrections made thin props jitter at
+                        // rest and could separate their Havok body from the
+                        // rendered scene graph.
+                        if (emitDiagnostic) {
+                            extractAllTriangles(
+                                root,
+                                target.triangles,
+                                12,
+                                &target.stats);
+                        }
+                    }
+                }
+                meshIt = visibleMeshes
+                             .emplace(
+                                 record.targetBodyId,
+                                 std::move(target))
+                             .first;
+            }
+            const auto& target = meshIt->second;
+
+            const float contactToVisibleMesh =
+                record.hasRawManifoldPoint &&
+                        !target.triangles.empty()
+                    ? nearestVisibleMeshDistance(
+                          record.contactPointGame,
+                          target.triangles)
+                    : -1.0f;
+
+            const Hand& hand =
+                record.isLeft ? _leftHand : _rightHand;
+            HandColliderFrameSnapshot colliderFrame{};
+            const bool haveColliderFrame =
+                hand.tryGetHandColliderFrame(
+                    record.sourceBodyId,
+                    colliderFrame);
+
+            float renderedFingerEnvelopeClearance = -1.0f;
+            float estimatedVisibleIntersectionDepth = 0.0f;
+            bool estimatedVisibleIntersection = false;
+            if (haveColliderFrame &&
+                !target.triangles.empty() &&
+                colliderFrame.lengthGameUnits > 0.0f &&
+                colliderFrame.radiusGameUnits > 0.0f) {
+                constexpr int kCenterlineSamples = 9;
+                const float halfLength =
+                    colliderFrame.lengthGameUnits * 0.5f;
+                float nearestCenterlineDistance =
+                    (std::numeric_limits<float>::max)();
+                RE::NiPoint3 nearestCenterlinePoint{};
+                RE::NiPoint3 nearestVisibleSurfacePoint{};
+                for (int sample = 0;
+                     sample < kCenterlineSamples;
+                     ++sample) {
+                    const float fraction =
+                        static_cast<float>(sample) /
+                        static_cast<float>(
+                            kCenterlineSamples - 1);
+                    const float localX =
+                        -halfLength +
+                        colliderFrame.lengthGameUnits *
+                            fraction;
+                    const auto centerlinePoint =
+                        transform_math::localPointToWorld(
+                            colliderFrame.transform,
+                            RE::NiPoint3{
+                                localX,
+                                0.0f,
+                                0.0f });
+                    RE::NiPoint3 visibleSurfacePoint{};
+                    const float distance =
+                        nearestVisibleMeshDistance(
+                            centerlinePoint,
+                            target.triangles,
+                            &visibleSurfacePoint);
+                    if (distance >= 0.0f &&
+                        distance <
+                            nearestCenterlineDistance) {
+                        nearestCenterlineDistance = distance;
+                        nearestCenterlinePoint =
+                            centerlinePoint;
+                        nearestVisibleSurfacePoint =
+                            visibleSurfacePoint;
+                    }
+                }
+                if (nearestCenterlineDistance <
+                    (std::numeric_limits<float>::max)()) {
+                    const float renderedEnvelopeRadius =
+                        colliderFrame.radiusGameUnits +
+                        colliderFrame.convexRadiusGameUnits;
+                    renderedFingerEnvelopeClearance =
+                        nearestCenterlineDistance -
+                        renderedEnvelopeRadius;
+                    estimatedVisibleIntersection =
+                        renderedFingerEnvelopeClearance < 0.0f;
+                    estimatedVisibleIntersectionDepth =
+                        (std::max)(
+                            0.0f,
+                            -renderedFingerEnvelopeClearance);
+
+                }
+            }
+
+            const float nativePenetration =
+                record.hasRawManifoldPoint
+                    ? (std::max)(
+                          0.0f,
+                          -record.minimumSignedSeparationGame)
+                    : 0.0f;
+            const char* objectName =
+                target.ref
+                    ? target.ref->GetDisplayFullName()
+                    : nullptr;
+            const bool noteworthy =
+                nativePenetration > 0.01f ||
+                estimatedVisibleIntersectionDepth > 0.05f ||
+                record.sourceSpeedGamePerSecond > 15.0f ||
+                record.targetSpeedGamePerSecond > 15.0f;
+
+            if (emitDiagnostic && noteworthy) {
+                ROCK_LOG_INFO(
+                    Hand,
+                    "[CONTACT-PENETRATION] seq={} hand={} role={} "
+                    "sourceBody={} targetBody={} formID={:08X} name='{}' "
+                    "rawManifold={} extractFail={} rawCount={} rawNormalFinite={} "
+                    "manifoldPoints={}/{} signedAvg={:.4f}gu "
+                    "signedMin={:.4f}gu signedMax={:.4f}gu "
+                    "nativePenetration={:.4f}gu sourceSpeed={:.2f}gu/s "
+                    "targetSpeed={:.2f}gu/s contactToVisibleMesh={:.4f}gu "
+                    "renderedFingerEnvelopeClearance={:.4f}gu "
+                    "estimatedVisibleIntersection={} estimatedDepth={:.4f}gu "
+                    "triangles={} shapes={} frameAvailable={}",
+                    record.sequence,
+                    record.isLeft ? "Left" : "Right",
+                    hand_collider_semantics::roleName(
+                        record.role),
+                    record.sourceBodyId,
+                    record.targetBodyId,
+                    target.ref
+                        ? target.ref->GetFormID()
+                        : 0,
+                    objectName ? objectName : "",
+                    record.hasRawManifoldPoint ? "yes" : "no",
+                    havok_runtime::contactSignalFailStageName(record.extractFailStage),
+                    record.rawInlineCount,
+                    record.rawNormalFinite ? "yes" : "no",
+                    record.validContactPointCount,
+                    record.manifoldContactCount,
+                    record.averageSignedSeparationGame,
+                    record.minimumSignedSeparationGame,
+                    record.maximumSignedSeparationGame,
+                    nativePenetration,
+                    record.sourceSpeedGamePerSecond,
+                    record.targetSpeedGamePerSecond,
+                    contactToVisibleMesh,
+                    renderedFingerEnvelopeClearance,
+                    estimatedVisibleIntersection
+                        ? "yes"
+                        : "no",
+                    estimatedVisibleIntersectionDepth,
+                    target.triangles.size(),
+                    target.stats.visitedShapes,
+                    haveColliderFrame ? "yes" : "no");
+            } else if (emitDiagnostic) {
+                ROCK_LOG_SAMPLE_DEBUG(
+                    Hand,
+                    g_rockConfig.rockLogSampleMilliseconds,
+                    "[CONTACT-PENETRATION] quiet contact hand={} role={} "
+                    "sourceBody={} targetBody={} rawManifold={} signedMin={:.4f}gu "
+                    "contactToVisibleMesh={:.4f}gu envelopeClearance={:.4f}gu",
+                    record.isLeft ? "Left" : "Right",
+                    hand_collider_semantics::roleName(
+                        record.role),
+                    record.sourceBodyId,
+                    record.targetBodyId,
+                    record.hasRawManifoldPoint ? "yes" : "no",
+                    record.minimumSignedSeparationGame,
+                    contactToVisibleMesh,
+                    renderedFingerEnvelopeClearance);
+            }
+        }
+
+        if (_contactPenetrationDiagnosticCooldownUntil.size() >
+            512) {
+            for (auto it =
+                     _contactPenetrationDiagnosticCooldownUntil.begin();
+                 it !=
+                 _contactPenetrationDiagnosticCooldownUntil.end();) {
+                if (it->second <=
+                    _dynamicPushElapsedSeconds) {
+                    it =
+                        _contactPenetrationDiagnosticCooldownUntil.erase(
+                            it);
+                } else {
+                    ++it;
+                }
+            }
         }
     }
 
@@ -2152,6 +2819,21 @@ namespace rock
         enforceNativeMeleeRuntimeSuppression();
         enforceNativeGrabHapticRuntimeSuppression();
         _dynamicPushElapsedSeconds += _deltaTime;
+        for (std::size_t handIndex = 0; handIndex < 2; ++handIndex) {
+            const auto frames =
+                _hostRecentReleaseFrames[handIndex].load(std::memory_order_acquire);
+            if (frames == 0) {
+                continue;
+            }
+            _hostRecentReleaseFrames[handIndex].store(
+                frames - 1,
+                std::memory_order_release);
+            if (frames == 1) {
+                _hostRecentReleaseFormId[handIndex].store(
+                    0,
+                    std::memory_order_release);
+            }
+        }
         if (_dynamicPushCooldownUntil.size() > 512) {
             for (auto it = _dynamicPushCooldownUntil.begin(); it != _dynamicPushCooldownUntil.end();) {
                 if (it->second <= _dynamicPushElapsedSeconds) {
@@ -2496,6 +3178,14 @@ namespace rock
 
         RE::NiNode* weaponNode = resolveEquippedWeaponInteractionNode();
         /*
+         * Capture FRIK's same-frame weapon/scope result before any ROCK weapon
+         * authority is republished.  If a two-hand solve moves the weapon later
+         * in this update, the vanilla optical camera receives only that ROCK
+         * delta and retains all weapon-specific FRIK calibration.
+         */
+        const FinalWeaponScopeCameraBaseline finalScopeCameraBaseline =
+            captureFinalWeaponScopeCameraBaseline(weaponNode);
+        /*
          * FRIK re-attaches the weapon node to the firing hand every frame
          * before ROCK runs, even in part-carry. Republish ROCK's solved carry
          * transform first so weapon-part probes, firing-grip zone checks, and
@@ -2646,7 +3336,38 @@ namespace rock
             WeaponInteractionContact rightWeaponContact{};
             auto leftWeaponContactSource = weapon_debug_notification_policy::WeaponContactSource::None;
 
-            auto publishWeaponProbeContact = [&](bool isLeft, WeaponInteractionContact& contact) {
+            const std::uint64_t currentWeaponGenerationKey = _weaponCollision.getCurrentWeaponGenerationKey();
+            ::rock::provider::RockProviderWeaponPartTargetQueryV1 weaponPartScopeQuery{};
+            weaponPartScopeQuery.weaponGenerationKey = currentWeaponGenerationKey;
+            ::rock::provider::RockProviderWeaponPartTargetResolutionV1 weaponPartScopeResolution{};
+            const bool weaponPartScopeResolved =
+                currentWeaponGenerationKey != 0 &&
+                ::rock::provider::resolveWeaponPartTargetV1(weaponPartScopeQuery, weaponPartScopeResolution);
+            const bool exclusiveWeaponPartWhitelistActive =
+                weaponPartScopeResolved && weaponPartScopeResolution.whitelistActive != 0;
+            const auto weaponPartAcquisitionMode =
+                weapon_part_contact_acquisition_policy::selectMode(exclusiveWeaponPartWhitelistActive);
+            const auto weaponBodySnapshot = _weaponCollision.getWeaponBodySnapshotAtomic();
+            std::array<::rock::provider::RockProviderWeaponPartInteractionZoneV1,
+                ::rock::provider::ROCK_PROVIDER_MAX_WEAPON_PART_INTERACTION_ZONES_V1> providerInteractionZones{};
+            std::array<std::uint64_t,
+                ::rock::provider::ROCK_PROVIDER_MAX_WEAPON_PART_INTERACTION_ZONES_V1> providerInteractionZoneOwners{};
+            const std::uint32_t providerInteractionZoneCount =
+                ::rock::provider::copyWeaponPartInteractionZonesV1(
+                    providerInteractionZones.data(),
+                    providerInteractionZoneOwners.data(),
+                    static_cast<std::uint32_t>(providerInteractionZones.size()));
+
+            struct SelectedProviderInteractionZone
+            {
+                bool valid{ false };
+                std::uint64_t ownerToken{ 0 };
+                ::rock::provider::RockProviderWeaponPartInteractionZoneV1 zone{};
+            };
+            SelectedProviderInteractionZone leftSelectedProviderZone{};
+            SelectedProviderInteractionZone rightSelectedProviderZone{};
+
+            auto publishResolvedWeaponContact = [&](bool isLeft, WeaponInteractionContact& contact) {
                 auto& partKind = isLeft ? _leftWeaponContactPartKind : _rightWeaponContactPartKind;
                 auto& reloadRole = isLeft ? _leftWeaponContactReloadRole : _rightWeaponContactReloadRole;
                 auto& supportRole = isLeft ? _leftWeaponContactSupportRole : _rightWeaponContactSupportRole;
@@ -2678,9 +3399,274 @@ namespace rock
                 auto& bodyIdAtomic = isLeft ? _leftWeaponContactBodyId : _rightWeaponContactBodyId;
                 auto& missedFrames = isLeft ? _leftWeaponContactMissedFrames : _rightWeaponContactMissedFrames;
                 auto& sequence = isLeft ? _leftWeaponContactSequence : _rightWeaponContactSequence;
+                auto& selectedProviderZone = isLeft ? leftSelectedProviderZone : rightSelectedProviderZone;
+                selectedProviderZone = {};
                 auto source = weapon_debug_notification_policy::WeaponContactSource::None;
 
                 const std::uint32_t weaponBodyId = bodyIdAtomic.exchange(INVALID_CONTACT_BODY_ID, std::memory_order_acquire);
+
+                /*
+                 * Gameplay-authored interaction zones reproduce the old
+                 * Heisenberg clone/keyframed grab's forgiving acquisition:
+                 * entering the volume nominates one exact body, then normal
+                 * provider target resolution proves the same owner/group.
+                 * There is deliberately no semantic or nearest-part fallback.
+                 */
+                if (weaponNode && currentWeaponGenerationKey != 0 && providerInteractionZoneCount != 0) {
+                    bool foundZone = false;
+                    std::uint32_t bestPriority = 0;
+                    float bestNormalizedDistance = (std::numeric_limits<float>::max)();
+                    WeaponInteractionContact bestContact{};
+                    SelectedProviderInteractionZone bestZone{};
+
+                    for (std::uint32_t i = 0; i < providerInteractionZoneCount; ++i) {
+                        const auto& zone = providerInteractionZones[i];
+                        const auto zoneOwner = providerInteractionZoneOwners[i];
+                        if (zone.weaponGenerationKey != currentWeaponGenerationKey ||
+                            zone.bodyId == INVALID_CONTACT_BODY_ID ||
+                            zoneOwner == 0) {
+                            continue;
+                        }
+
+                        WeaponInteractionContact candidate{};
+                        if (!_weaponCollision.tryGetWeaponContactAtomic(zone.bodyId, candidate) ||
+                            !candidate.valid ||
+                            candidate.weaponGenerationKey != currentWeaponGenerationKey) {
+                            continue;
+                        }
+                        const auto candidateQuery = makeProviderWeaponPartTargetQuery(candidate, _weaponCollision);
+                        if ((zone.sourceRoot != 0 && zone.sourceRoot != candidateQuery.sourceRoot) ||
+                            (zone.sourceName[0] != '\0' &&
+                                std::strncmp(zone.sourceName, candidateQuery.sourceName, sizeof(zone.sourceName)) != 0)) {
+                            continue;
+                        }
+
+                        ::rock::provider::RockProviderWeaponPartTargetResolutionV1 candidateResolution{};
+                        if (!::rock::provider::resolveWeaponPartTargetV1(candidateQuery, candidateResolution) ||
+                            candidateResolution.matched == 0 ||
+                            candidateResolution.ownerToken != zoneOwner ||
+                            candidateResolution.groupId != zone.groupId) {
+                            continue;
+                        }
+                        if ((zone.sourceRoot != 0 &&
+                                !pointerIsInLiveWeaponTree(
+                                    reinterpret_cast<RE::NiAVObject*>(zone.sourceRoot),
+                                    weaponNode)) ||
+                            (zone.controlledRoot != 0 &&
+                                !pointerIsInLiveWeaponTree(
+                                    reinterpret_cast<RE::NiAVObject*>(zone.controlledRoot),
+                                    weaponNode))) {
+                            continue;
+                        }
+
+                        float normalizedDistance = 0.0f;
+                        if (!providerInteractionZoneContainsHand(
+                                zone,
+                                weaponNode,
+                                handInput.grabAnchorWorld,
+                                normalizedDistance)) {
+                            continue;
+                        }
+                        if (!foundZone ||
+                            zone.priority > bestPriority ||
+                            (zone.priority == bestPriority && normalizedDistance < bestNormalizedDistance)) {
+                            foundZone = true;
+                            bestPriority = zone.priority;
+                            bestNormalizedDistance = normalizedDistance;
+                            bestContact = candidate;
+                            bestZone.valid = true;
+                            bestZone.ownerToken = zoneOwner;
+                            bestZone.zone = zone;
+                        }
+                    }
+
+                    if (foundZone) {
+                        outContact = bestContact;
+                        selectedProviderZone = bestZone;
+                        publishResolvedWeaponContact(isLeft, outContact);
+                        source = weapon_debug_notification_policy::WeaponContactSource::Probe;
+                        ROCK_LOG_SAMPLE_DEBUG(Weapon,
+                            g_rockConfig.rockLogSampleMilliseconds,
+                            "Provider exact-part interaction zone acquired: hand={} bodyId={} partKind={} owner={} priority={} normalizedDistance={:.3f}",
+                            isLeft ? "left" : "right",
+                            outContact.bodyId,
+                            static_cast<int>(outContact.partKind),
+                            bestZone.ownerToken,
+                            bestPriority,
+                            bestNormalizedDistance);
+                        return source;
+                    }
+                }
+
+                /*
+                 * An exclusive provider target is a fail-closed physical
+                 * whitelist. Resolve only bodies that this hand actually
+                 * contacted and that match the target set; never let the
+                 * forgiving palm/AABB probe turn a barrel touch into a nearby
+                 * bolt grip. The direct callback body handles the zero-latency
+                 * case, while ContactActivityTracker preserves simultaneous
+                 * body pairs so "last contact wins" cannot hide the bolt.
+                 */
+                if (!weapon_part_contact_acquisition_policy::mayUseRankedPalmProbe(weaponPartAcquisitionMode)) {
+                    auto trySelectExactProviderBody = [&](std::uint32_t candidateBodyId) {
+                        if (candidateBodyId == INVALID_CONTACT_BODY_ID) {
+                            return false;
+                        }
+
+                        WeaponInteractionContact candidate{};
+                        if (!_weaponCollision.tryGetWeaponContactAtomic(candidateBodyId, candidate) ||
+                            candidate.weaponGenerationKey != currentWeaponGenerationKey) {
+                            return false;
+                        }
+
+                        const auto candidateQuery = makeProviderWeaponPartTargetQuery(candidate, _weaponCollision);
+                        ::rock::provider::RockProviderWeaponPartTargetResolutionV1 candidateResolution{};
+                        const bool candidateResolved =
+                            ::rock::provider::resolveWeaponPartTargetV1(candidateQuery, candidateResolution);
+                        const bool candidateMatched =
+                            candidateResolved &&
+                            candidateResolution.whitelistActive != 0 &&
+                            candidateResolution.matched != 0;
+                        if (!weapon_part_contact_acquisition_policy::mayAcceptExactPhysicalContact(
+                                weaponPartAcquisitionMode,
+                                candidateMatched)) {
+                            return false;
+                        }
+
+                        outContact = candidate;
+                        publishResolvedWeaponContact(isLeft, outContact);
+                        source = weapon_debug_notification_policy::WeaponContactSource::Contact;
+                        return true;
+                    };
+
+                    auto tryRecoverExactProviderMeshContact = [&]() {
+                        /*
+                         * Native callbacks are authoritative when present.
+                         * Havok can omit a begin-contact event for a tiny,
+                         * keyframed bolt when the hand arrives between physics
+                         * steps, so reconstruct only that same collision test:
+                         * live generated hand-hull samples against mesh
+                         * triangles of bodies that already match the provider
+                         * whitelist. This never invokes the broad 12-unit
+                         * whole-weapon palm probe and cannot fall through to a
+                         * barrel or receiver.
+                         */
+                        constexpr std::size_t kMaxExactContactHandSamples = 256;
+                        std::array<RE::NiPoint3, kMaxExactContactHandSamples> samplePoints{};
+                        std::array<float, kMaxExactContactHandSamples> sampleRadii{};
+                        const Hand& interactionHand = isLeft ? _leftHand : _rightHand;
+                        const std::uint32_t sampleCount = interactionHand.copyHandCollisionSamples(
+                            samplePoints.data(),
+                            sampleRadii.data(),
+                            static_cast<std::uint32_t>(samplePoints.size()));
+                        if (sampleCount == 0 ||
+                            weaponBodySnapshot.generationKey != currentWeaponGenerationKey) {
+                            return false;
+                        }
+
+                        WeaponInteractionContact bestContact{};
+                        float bestDistance = (std::numeric_limits<float>::max)();
+                        for (std::uint32_t i = 0;
+                             i < weaponBodySnapshot.count && i < weaponBodySnapshot.bodyIds.size();
+                             ++i) {
+                            const std::uint32_t candidateBodyId = weaponBodySnapshot.bodyIds[i];
+                            WeaponInteractionContact candidate{};
+                            if (!_weaponCollision.tryGetWeaponContactAtomic(candidateBodyId, candidate) ||
+                                candidate.weaponGenerationKey != currentWeaponGenerationKey) {
+                                continue;
+                            }
+
+                            const auto candidateQuery = makeProviderWeaponPartTargetQuery(candidate, _weaponCollision);
+                            ::rock::provider::RockProviderWeaponPartTargetResolutionV1 candidateResolution{};
+                            const bool targetMatched =
+                                ::rock::provider::resolveWeaponPartTargetV1(candidateQuery, candidateResolution) &&
+                                candidateResolution.whitelistActive != 0 &&
+                                candidateResolution.matched != 0;
+                            if (!targetMatched) {
+                                continue;
+                            }
+
+                            WeaponInteractionContact overlapContact{};
+                            const bool overlaps = _weaponCollision.tryFindInteractionContactOverlappingSamples(
+                                weaponNode,
+                                candidateBodyId,
+                                samplePoints.data(),
+                                sampleRadii.data(),
+                                sampleCount,
+                                g_rockConfig.rockWeaponPartExactContactToleranceGameUnits,
+                                overlapContact);
+                            if (!weapon_part_contact_acquisition_policy::mayRecoverExactTargetMeshContact(
+                                    weaponPartAcquisitionMode,
+                                    targetMatched,
+                                    overlaps)) {
+                                continue;
+                            }
+                            if (!bestContact.valid ||
+                                overlapContact.probeDistanceGame < bestDistance) {
+                                bestContact = overlapContact;
+                                bestDistance = overlapContact.probeDistanceGame;
+                            }
+                        }
+
+                        if (!bestContact.valid) {
+                            return false;
+                        }
+
+                        outContact = bestContact;
+                        publishResolvedWeaponContact(isLeft, outContact);
+                        source = weapon_debug_notification_policy::WeaponContactSource::Contact;
+                        ROCK_LOG_SAMPLE_DEBUG(Weapon,
+                            g_rockConfig.rockLogSampleMilliseconds,
+                            "Exclusive weapon-part mesh contact recovered: hand={} bodyId={} partKind={} surfaceDistance={:.3f} tolerance={:.3f}",
+                            isLeft ? "left" : "right",
+                            outContact.bodyId,
+                            static_cast<int>(outContact.partKind),
+                            outContact.probeDistanceGame,
+                            g_rockConfig.rockWeaponPartExactContactToleranceGameUnits);
+                        return true;
+                    };
+
+                    bool selected = trySelectExactProviderBody(weaponBodyId);
+                    if (!selected && weaponBodySnapshot.generationKey == currentWeaponGenerationKey) {
+                        for (std::uint32_t i = 0; i < weaponBodySnapshot.count && i < weaponBodySnapshot.bodyIds.size(); ++i) {
+                            const std::uint32_t candidateBodyId = weaponBodySnapshot.bodyIds[i];
+                            if (candidateBodyId == weaponBodyId ||
+                                !_handContactActivity.hasFreshHandContactWithTarget(
+                                    isLeft,
+                                    candidateBodyId,
+                                    PROVIDER_EXACT_WEAPON_CONTACT_MAX_AGE_FRAMES)) {
+                                continue;
+                            }
+                            if (trySelectExactProviderBody(candidateBodyId)) {
+                                selected = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!selected) {
+                        selected = tryRecoverExactProviderMeshContact();
+                    }
+
+                    if (selected) {
+                        missedFrames.store(0, std::memory_order_release);
+                    } else {
+                        outContact = {};
+                        const auto missed = missedFrames.fetch_add(1, std::memory_order_acq_rel) + 1;
+                        if (missed > WEAPON_CONTACT_TIMEOUT_FRAMES) {
+                            clearWeaponContactForHand(isLeft);
+                        }
+                        if (weaponBodyId != INVALID_CONTACT_BODY_ID) {
+                            ROCK_LOG_SAMPLE_DEBUG(Weapon,
+                                g_rockConfig.rockLogSampleMilliseconds,
+                                "Exclusive weapon-part contact rejected: hand={} contactedBody={} generation={:016X} (no exact whitelist match)",
+                                isLeft ? "left" : "right",
+                                weaponBodyId,
+                                currentWeaponGenerationKey);
+                        }
+                    }
+                    return source;
+                }
+
                 if (weaponBodyId != INVALID_CONTACT_BODY_ID) {
                     missedFrames.store(0, std::memory_order_release);
                     /*
@@ -2695,7 +3681,7 @@ namespace rock
                     if (weaponNode &&
                         _weaponCollision.tryFindInteractionContactNearPoint(
                             weaponNode, handInput.grabAnchorWorld, g_rockConfig.rockWeaponInteractionProbeRadius, outContact)) {
-                        publishWeaponProbeContact(isLeft, outContact);
+                        publishResolvedWeaponContact(isLeft, outContact);
                         source = weapon_debug_notification_policy::WeaponContactSource::Contact;
                     } else if (!_weaponCollision.tryGetWeaponContactAtomic(weaponBodyId, outContact)) {
                         clearWeaponContactForHand(isLeft);
@@ -2708,7 +3694,7 @@ namespace rock
                 } else if (weaponNode && probeAllowed) {
                     const RE::NiPoint3 probePoint = handInput.grabAnchorWorld;
                     if (_weaponCollision.tryFindInteractionContactNearPoint(weaponNode, probePoint, g_rockConfig.rockWeaponInteractionProbeRadius, outContact)) {
-                        publishWeaponProbeContact(isLeft, outContact);
+                        publishResolvedWeaponContact(isLeft, outContact);
                         source = weapon_debug_notification_policy::WeaponContactSource::Probe;
                         if (g_rockConfig.rockDebugVerboseLogging && ++_weaponInteractionProbeLogCounter >= 90) {
                             _weaponInteractionProbeLogCounter = 0;
@@ -2758,12 +3744,18 @@ namespace rock
             const auto weaponPartQuery = makeProviderWeaponPartTargetQuery(leftWeaponContact, _weaponCollision);
             const bool weaponPartResolved = leftWeaponContact.valid &&
                 ::rock::provider::resolveWeaponPartTargetV1(weaponPartQuery, weaponPartResolution);
-            const bool weaponPartWhitelistActive = weaponPartResolved && weaponPartResolution.whitelistActive != 0;
+            const bool weaponPartWhitelistActive =
+                exclusiveWeaponPartWhitelistActive ||
+                (weaponPartResolved && weaponPartResolution.whitelistActive != 0);
             const bool weaponPartMatched = weaponPartResolved && weaponPartResolution.matched != 0;
             if (weaponPartWhitelistActive && !weaponPartMatched) {
                 providerInteractionState.supportGripAllowed = false;
             } else if (weaponPartMatched) {
-                providerInteractionState.providerPartAuthority = makeWeaponProviderPartAuthority(weaponPartQuery, weaponPartResolution);
+                providerInteractionState.providerPartAuthority = makeWeaponProviderPartAuthority(
+                    weaponPartQuery,
+                    weaponPartResolution,
+                    leftSelectedProviderZone.valid ? &leftSelectedProviderZone.zone : nullptr,
+                    leftSelectedProviderZone.ownerToken);
             }
 
             /*
@@ -2777,16 +3769,21 @@ namespace rock
             const auto rightWeaponPartQuery = makeProviderWeaponPartTargetQuery(rightWeaponContact, _weaponCollision);
             const bool rightWeaponPartResolved = rightWeaponContact.valid &&
                 ::rock::provider::resolveWeaponPartTargetV1(rightWeaponPartQuery, rightWeaponPartResolution);
-            const bool rightWeaponPartWhitelistActive = rightWeaponPartResolved && rightWeaponPartResolution.whitelistActive != 0;
+            const bool rightWeaponPartWhitelistActive =
+                exclusiveWeaponPartWhitelistActive ||
+                (rightWeaponPartResolved && rightWeaponPartResolution.whitelistActive != 0);
             const bool rightWeaponPartMatched = rightWeaponPartResolved && rightWeaponPartResolution.matched != 0;
             if (rightWeaponPartWhitelistActive && !rightWeaponPartMatched) {
                 rightHandInteractionState.supportGripAllowed = false;
             } else if (rightWeaponPartMatched) {
-                rightHandInteractionState.providerPartAuthority = makeWeaponProviderPartAuthority(rightWeaponPartQuery, rightWeaponPartResolution);
+                rightHandInteractionState.providerPartAuthority = makeWeaponProviderPartAuthority(
+                    rightWeaponPartQuery,
+                    rightWeaponPartResolution,
+                    rightSelectedProviderZone.valid ? &rightSelectedProviderZone.zone : nullptr,
+                    rightSelectedProviderZone.ownerToken);
             }
 
             const WeaponInteractionDecision leftWeaponDecision = routeWeaponInteraction(leftWeaponContact, providerInteractionState);
-            const std::uint64_t currentWeaponGenerationKey = _weaponCollision.getCurrentWeaponGenerationKey();
             const auto weaponNotificationKey = weapon_debug_notification_policy::makeWeaponNotificationKey(
                 leftWeaponContact,
                 leftWeaponDecision,
@@ -2794,19 +3791,13 @@ namespace rock
 
             const bool leftHandHoldingObject = _leftHand.isHolding();
             auto supportAuthorityMode = resolveEquippedWeaponSupportAuthorityMode(weaponNode);
-            bool supportAuthorityProviderOverride = false;
             if (weaponPartMatched) {
                 if (weaponPartResolution.grabMode == ::rock::provider::RockProviderWeaponPartGrabModeV1::FullTwoHandAuthority) {
                     supportAuthorityMode = weapon_support_authority_policy::WeaponSupportAuthorityMode::FullTwoHandedSolver;
-                    supportAuthorityProviderOverride = true;
                 } else if (weaponPartResolution.grabMode == ::rock::provider::RockProviderWeaponPartGrabModeV1::AttachOnly) {
                     supportAuthorityMode = weapon_support_authority_policy::WeaponSupportAuthorityMode::VisualOnlySupport;
-                    supportAuthorityProviderOverride = true;
                 }
             }
-            const bool sidearmHybridEligible = weapon_support_authority_policy::canApplySidearmHybridAuthority(
-                supportAuthorityMode,
-                supportAuthorityProviderOverride);
             EquippedWeaponPrimaryGripInput primaryGripInput{};
             GrabButtonState primaryGrabState{};
             bool primaryGrabStateRead = false;
@@ -2998,7 +3989,6 @@ namespace rock
                 providerInteractionState,
                 rightHandInteractionState,
                 supportAuthorityMode,
-                sidearmHybridEligible,
                 primaryDetachFeatureAvailable);
             /*
              * Must run after _twoHandedGrip.update() above so getHandGripReport()
@@ -3251,6 +4241,12 @@ namespace rock
             }
             if (f4vr::isNodeVisible(weaponNode)) {
                 applyFinalWeaponMuzzleAuthority();
+                if (_twoHandedGrip.getState() == TwoHandedState::Gripping &&
+                    _twoHandedGrip.ownsWeaponTransform()) {
+                    applyFinalWeaponScopeCameraAuthority(
+                        weaponNode,
+                        &finalScopeCameraBaseline);
+                }
             }
         }
         refreshGeneratedBodyContactRegistry();
@@ -3291,6 +4287,7 @@ namespace rock
          */
         contact_evidence::NativeContactEvidenceSnapshot nativeContactEvidence{};
         _nativeContactEvidence.snapshot(nativeContactEvidence, _handContactActivity.currentFrame());
+        logContactPenetrationDiagnostics(frame);
         _softContactRuntime.update(
             frame,
             _rightHand,
@@ -3965,6 +4962,10 @@ namespace rock
         _runtimeScaleLogged = false;
         _rawHandParityStates = {};
         _dynamicPushCooldownUntil.clear();
+        for (std::size_t handIndex = 0; handIndex < 2; ++handIndex) {
+            _hostRecentReleaseFrames[handIndex].store(0, std::memory_order_release);
+            _hostRecentReleaseFormId[handIndex].store(0, std::memory_order_release);
+        }
         _heldImpactHapticCooldownUntil.clear();
         _grabEventFrameCounter = 0;
         _mouthConsumeStates = {};
@@ -3983,6 +4984,14 @@ namespace rock
         _handContactActivity.reset();
         _nativeContactEvidence.reset();
         _bodyContactRuntime.reset();
+        {
+            std::scoped_lock lock(
+                _contactPenetrationDiagnosticMutex);
+            _contactPenetrationDiagnosticRecords = {};
+            _nextContactPenetrationDiagnosticSlot = 0;
+            _contactPenetrationDiagnosticSequence = 0;
+        }
+        _contactPenetrationDiagnosticCooldownUntil.clear();
         hand_collision_suppression_math::clear(_rightDominantWeaponCollisionSuppression);
         hand_collision_suppression_math::clear(_leftWeaponSupportCollisionSuppression);
         hand_collision_suppression_math::clear(_rightWeaponSupportCollisionSuppression);
@@ -6251,7 +7260,20 @@ namespace rock
                 }
             }
 
-            return candidate;
+            if (!candidate || drive.controlledRoot == 0) {
+                return candidate;
+            }
+
+            auto* controlledRoot = reinterpret_cast<RE::NiAVObject*>(drive.controlledRoot);
+            if (!controlledWeaponPartRootIsLive(weaponNode, candidate, controlledRoot)) {
+                ROCK_LOG_SAMPLE_WARN(Weapon,
+                    g_rockConfig.rockLogSampleMilliseconds,
+                    "Provider weapon-part drive rejected: controlledRoot=0x{:X} or collision source=0x{:X} is not live in the current weapon tree",
+                    static_cast<std::uint64_t>(drive.controlledRoot),
+                    static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(candidate)));
+                return nullptr;
+            }
+            return controlledRoot;
         };
 
         auto shouldApplyPriority = [&](RE::NiAVObject* node, std::uint32_t priority) {
@@ -6415,13 +7437,17 @@ namespace rock
             // FullTwoHandAuthority grip already steers the whole weapon and has
             // no single part path to constrain against (see
             // RockProviderWeaponPartMotionConstraintV1's doc comment).
-            if (!report.active || !report.attachOnly || report.weaponGenerationKey != currentWeaponGenerationKey || report.sourceRoot == 0) {
+            if (!report.active || !report.attachOnly ||
+                report.weaponGenerationKey != currentWeaponGenerationKey ||
+                report.contactSourceRoot == 0) {
                 releaseWeaponPartMotionConstraint(handIndex, weaponNode, currentWeaponGenerationKey);
                 continue;
             }
 
-            auto* sourceNode = reinterpret_cast<RE::NiAVObject*>(report.sourceRoot);
-            if (!sourceNode || !sourceNode->parent || !actor_equipment_grab::nodeContainsNode(weaponNode, sourceNode, 64)) {
+            auto* collisionSourceNode =
+                reinterpret_cast<RE::NiAVObject*>(report.contactSourceRoot);
+            if (!collisionSourceNode ||
+                !actor_equipment_grab::nodeContainsNode(weaponNode, collisionSourceNode, 64)) {
                 releaseWeaponPartMotionConstraint(handIndex, weaponNode, currentWeaponGenerationKey);
                 continue;
             }
@@ -6434,7 +7460,7 @@ namespace rock
             query.supportRole = report.supportRole;
             query.socketRole = report.socketRole;
             query.actionRole = report.actionRole;
-            query.sourceRoot = report.sourceRoot;
+            query.sourceRoot = report.contactSourceRoot;
             const auto sourceNameLength = (std::min)(report.sourceName.size(), static_cast<std::size_t>(::rock::provider::ROCK_PROVIDER_MAX_EVIDENCE_NAME - 1));
             std::memcpy(query.sourceName, report.sourceName.data(), sourceNameLength);
             query.sourceName[sourceNameLength] = '\0';
@@ -6447,42 +7473,211 @@ namespace rock
                 continue;
             }
 
-            const bool axisIsSourceParentLocal = resolution.axisSpace == ::rock::provider::RockProviderWeaponPartDriveSpaceV1::SourceParentLocal;
-            const RE::NiTransform& axisSpaceWorld = axisIsSourceParentLocal ? sourceNode->parent->world : weaponNode->world;
+            RE::NiAVObject* controlledRoot = collisionSourceNode;
+            if (resolution.controlledRoot != 0) {
+                auto* requestedControlledRoot = reinterpret_cast<RE::NiAVObject*>(resolution.controlledRoot);
+                /*
+                 * AttachOnly must never write the equipped weapon root.  A
+                 * consumer can hold a pointer from another first-person clone
+                 * or accidentally pass its weapon root; the old implementation
+                 * either rejected the constraint (part never moved) or drove
+                 * the entire gun with the offhand.  The exact contacted source
+                 * is already generation/body-validated, so it is the safe,
+                 * deterministic fallback in both cases and cannot select a
+                 * barrel/receiver/other body.
+                 */
+                if (requestedControlledRoot == weaponNode ||
+                    !controlledWeaponPartRootIsLive(weaponNode, collisionSourceNode, requestedControlledRoot)) {
+                    ROCK_LOG_SAMPLE_WARN(Weapon,
+                        g_rockConfig.rockLogSampleMilliseconds,
+                        "Provider weapon-part constraint controlledRoot fallback: requested=0x{:X} contactedSource=0x{:X} bodyId={} reason={}; using exact contacted source",
+                        static_cast<std::uint64_t>(resolution.controlledRoot),
+                        static_cast<std::uint64_t>(report.contactSourceRoot),
+                        report.bodyId,
+                        requestedControlledRoot == weaponNode ? "weapon-root" : "not-live");
+                } else {
+                    controlledRoot = requestedControlledRoot;
+                }
+            }
+            if (!controlledRoot->parent) {
+                releaseWeaponPartMotionConstraint(handIndex, weaponNode, currentWeaponGenerationKey);
+                continue;
+            }
 
-            const bool freshGrab = !state.active || state.gripSequence != report.gripSequence || state.node != sourceNode;
+            /*
+             * Matching and output identity are intentionally separate: the
+             * hand touches collisionSourceNode, while controlledRoot can be a
+             * sibling authored bolt/slide node. Bind the captured AttachOnly
+             * hand frame to the output node before moving it. If that cannot
+             * be done safely, fail closed for this frame; moving the part
+             * without its glued hand is worse than holding both in place.
+             */
+            if (!_twoHandedGrip.rebindAttachOnlyGripToControlledRoot(
+                    isLeft,
+                    weaponNode,
+                    controlledRoot)) {
+                ROCK_LOG_SAMPLE_WARN(Weapon,
+                    g_rockConfig.rockLogSampleMilliseconds,
+                    "Provider weapon-part constraint held: AttachOnly hand "
+                    "could not bind controlledRoot hand={} bodyId={} "
+                    "contactedSource=0x{:X} controlledRoot=0x{:X}",
+                    isLeft ? "left" : "right",
+                    report.bodyId,
+                    static_cast<std::uint64_t>(report.contactSourceRoot),
+                    reinterpret_cast<std::uintptr_t>(controlledRoot));
+                continue;
+            }
+
+            const bool freshGrab =
+                !state.active ||
+                state.gripSequence != report.gripSequence ||
+                state.node != controlledRoot;
+            const auto resolvedKind =
+                resolution.kind ==
+                        ::rock::provider::
+                            RockProviderWeaponPartMotionKindV1::Rotational ?
+                    weapon_part_motion_constraint_policy::ConstraintKind::
+                        Rotational :
+                    weapon_part_motion_constraint_policy::ConstraintKind::
+                        Linear;
+            const bool basisChangedDuringGrip =
+                !freshGrab &&
+                (state.kind != resolvedKind ||
+                    state.axisSpace != resolution.axisSpace ||
+                    std::abs(
+                        state.axis.origin.x - resolution.axisOrigin[0]) >
+                        0.00001f ||
+                    std::abs(
+                        state.axis.origin.y - resolution.axisOrigin[1]) >
+                        0.00001f ||
+                    std::abs(
+                        state.axis.origin.z - resolution.axisOrigin[2]) >
+                        0.00001f ||
+                    std::abs(
+                        state.axis.direction.x -
+                        resolution.axisDirection[0]) > 0.00001f ||
+                    std::abs(
+                        state.axis.direction.y -
+                        resolution.axisDirection[1]) > 0.00001f ||
+                    std::abs(
+                        state.axis.direction.z -
+                        resolution.axisDirection[2]) > 0.00001f);
+            if (basisChangedDuringGrip) {
+                ROCK_LOG_SAMPLE_WARN(Weapon,
+                    g_rockConfig.rockLogSampleMilliseconds,
+                    "Provider weapon-part constraint basis changed during "
+                    "grip hand={} bodyId={}; retaining the captured "
+                    "kind/space/axis until re-grab while accepting live range "
+                    "updates",
+                    isLeft ? "left" : "right",
+                    report.bodyId);
+            }
+
+            const auto effectiveAxisSpace =
+                freshGrab ? resolution.axisSpace : state.axisSpace;
+            const bool axisIsSourceParentLocal =
+                effectiveAxisSpace ==
+                ::rock::provider::RockProviderWeaponPartDriveSpaceV1::
+                    SourceParentLocal;
+            const RE::NiTransform& axisSpaceWorld = axisIsSourceParentLocal ? controlledRoot->parent->world : weaponNode->world;
+
+            /*
+             * Constraint input must remain independent from constraint output.
+             * An AttachOnly grip intentionally places the visible hand from the
+             * moving part every frame. frame.grabAnchorWorld may come from that
+             * authority-written hand or its generated Havok proxy, so using it
+             * here makes an initial part move drag the input hand with it and
+             * integrate immediately to maxValue. Heisenberg publishes FRIK's
+             * clean pass-1 hand before any authority write; use only that
+             * controller truth. If it is unavailable, hold this frame instead
+             * of falling back to a contaminated visual/proxy transform.
+             */
+            RE::NiTransform preAuthorityHandWorld{};
+            if (!rock::HostGetPreAuthorityHandWorld(isLeft, preAuthorityHandWorld) ||
+                !finiteNiTransform(preAuthorityHandWorld)) {
+                ROCK_LOG_SAMPLE_WARN(Weapon,
+                    g_rockConfig.rockLogSampleMilliseconds,
+                    "Provider weapon-part constraint held: clean pre-authority hand unavailable hand={} bodyId={}",
+                    isLeft ? "left" : "right",
+                    report.bodyId);
+                continue;
+            }
+
+            const RE::NiPoint3 trackedPalmWorld =
+                computeGrabLegacyPalmPivotAWorldFromHandBasis(
+                    preAuthorityHandWorld,
+                    isLeft);
+            if (!std::isfinite(trackedPalmWorld.x) ||
+                !std::isfinite(trackedPalmWorld.y) ||
+                !std::isfinite(trackedPalmWorld.z)) {
+                continue;
+            }
+            const RE::NiPoint3 trackedPalmLocal =
+                transform_math::worldPointToLocal(axisSpaceWorld, trackedPalmWorld);
+
             if (freshGrab) {
                 // A previous grab on a DIFFERENT node is still active for this
                 // hand (rare: two constrained parts grabbed in immediate
                 // succession without an intervening non-matching frame) -
                 // restore it before starting the new one.
-                if (state.active && state.node != sourceNode) {
+                if (state.active && state.node != controlledRoot) {
                     releaseWeaponPartMotionConstraint(handIndex, weaponNode, currentWeaponGenerationKey);
                 }
 
                 state.active = true;
                 state.gripSequence = report.gripSequence;
-                state.node = sourceNode;
-                state.baselineLocal = sourceNode->local;
-                state.kind = (resolution.kind == ::rock::provider::RockProviderWeaponPartMotionKindV1::Rotational)
-                    ? weapon_part_motion_constraint_policy::ConstraintKind::Rotational
-                    : weapon_part_motion_constraint_policy::ConstraintKind::Linear;
+                state.node = controlledRoot;
+                state.baselineLocal = controlledRoot->local;
+                state.kind = resolvedKind;
                 state.axisSpace = resolution.axisSpace;
                 state.axis.origin = RE::NiPoint3{ resolution.axisOrigin[0], resolution.axisOrigin[1], resolution.axisOrigin[2] };
                 state.axis.direction = RE::NiPoint3{ resolution.axisDirection[0], resolution.axisDirection[1], resolution.axisDirection[2] };
                 state.axis.minValue = resolution.minValue;
                 state.axis.maxValue = resolution.maxValue;
-                state.reference.partLocalAtGrab = sourceNode->local;
-
-                const RE::NiPoint3& handWorldAtGrab = isLeft ? frame.left.grabAnchorWorld : frame.right.grabAnchorWorld;
-                state.reference.handPositionAtGrab = transform_math::worldPointToLocal(axisSpaceWorld, handWorldAtGrab);
+                state.reference.partLocalAtGrab = axisIsSourceParentLocal
+                    ? controlledRoot->local
+                    : transform_math::composeTransforms(transform_math::invertTransform(weaponNode->world), controlledRoot->world);
+                // Capture and evaluate the identical clean point this frame:
+                // a grab press by itself is definitionally zero travel.
+                state.reference.handPositionAtGrab = trackedPalmLocal;
+            } else {
+                /*
+                 * Consumers may resubmit the same exact-body constraint while
+                 * the hand remains attached. Refresh the legal interval
+                 * without replacing the at-grab node/hand reference: this is
+                 * what lets a dry-fire slide use [0, pullTravel] until it is
+                 * cocked, then extend minValue below zero so the same physical
+                 * grip can push it forward to the closed/rest position.
+                 *
+                 * Axis/kind changes intentionally require the next fresh
+                 * grab; reinterpreting an existing hand displacement in a
+                 * different basis would make the part snap.
+                 */
+                const bool rangeChanged =
+                    std::abs(state.axis.minValue - resolution.minValue) >
+                        0.00001f ||
+                    std::abs(state.axis.maxValue - resolution.maxValue) >
+                        0.00001f;
+                if (rangeChanged) {
+                    const float previousMin = state.axis.minValue;
+                    const float previousMax = state.axis.maxValue;
+                    state.axis.minValue = resolution.minValue;
+                    state.axis.maxValue = resolution.maxValue;
+                    ROCK_LOG_INFO(Weapon,
+                        "Provider weapon-part constraint range refreshed "
+                        "during grip hand={} bodyId={} [{:.3f},{:.3f}] -> "
+                        "[{:.3f},{:.3f}] (at-grab reference preserved)",
+                        isLeft ? "left" : "right",
+                        report.bodyId,
+                        previousMin,
+                        previousMax,
+                        state.axis.minValue,
+                        state.axis.maxValue);
+                }
             }
 
-            const RE::NiPoint3& handWorldCurrent = isLeft ? frame.left.grabAnchorWorld : frame.right.grabAnchorWorld;
-            const RE::NiPoint3 handLocalCurrent = transform_math::worldPointToLocal(axisSpaceWorld, handWorldCurrent);
-
             const RE::NiTransform projectedLocal = weapon_part_motion_constraint_policy::projectHandOntoConstraint(
-                state.kind, state.axis, state.reference, handLocalCurrent);
+                state.kind, state.axis, state.reference, trackedPalmLocal);
             if (!finiteNiTransform(projectedLocal)) {
                 continue;
             }
@@ -6491,13 +7686,51 @@ namespace rock
             if (!finiteNiTransform(desiredWorld)) {
                 continue;
             }
-            const RE::NiTransform requestedNodeLocal = transform_math::composeTransforms(transform_math::invertTransform(sourceNode->parent->world), desiredWorld);
+            const RE::NiTransform requestedNodeLocal = transform_math::composeTransforms(transform_math::invertTransform(controlledRoot->parent->world), desiredWorld);
             if (!finiteNiTransform(requestedNodeLocal)) {
                 continue;
             }
 
-            sourceNode->local = requestedNodeLocal;
-            f4vr::updateTransformsDown(sourceNode, true);
+            const RE::NiTransform previousNodeLocal = controlledRoot->local;
+            controlledRoot->local = requestedNodeLocal;
+            f4vr::updateTransformsDown(controlledRoot, true);
+
+            /*
+             * updateVisualOnlySupportGrip() ran before this constraint and
+             * published a hand target composed from the node's old transform.
+             * Replace that writer now, after the authored node has moved, so
+             * FRIK/HandAuthority consumes one coherent node+hand transaction
+             * later in this same frame.
+             */
+            if (!_twoHandedGrip.republishAttachOnlyHandAfterControlledRootMove(
+                    isLeft)) {
+                controlledRoot->local = previousNodeLocal;
+                f4vr::updateTransformsDown(controlledRoot, true);
+                ROCK_LOG_SAMPLE_WARN(Weapon,
+                    g_rockConfig.rockLogSampleMilliseconds,
+                    "Provider weapon-part constraint rolled back: post-motion "
+                    "AttachOnly hand target failed hand={} bodyId={} "
+                    "controlledRoot=0x{:X}",
+                    isLeft ? "left" : "right",
+                    report.bodyId,
+                    reinterpret_cast<std::uintptr_t>(controlledRoot));
+                continue;
+            }
+
+            ROCK_LOG_SAMPLE_DEBUG(Weapon,
+                g_rockConfig.rockLogSampleMilliseconds,
+                "Provider weapon-part constraint coherent update hand={} "
+                "bodyId={} controlledRoot=0x{:X} nodeLocal=({:.3f},{:.3f},{:.3f}) "
+                "trackedPalmLocal=({:.3f},{:.3f},{:.3f})",
+                isLeft ? "left" : "right",
+                report.bodyId,
+                reinterpret_cast<std::uintptr_t>(controlledRoot),
+                controlledRoot->local.translate.x,
+                controlledRoot->local.translate.y,
+                controlledRoot->local.translate.z,
+                trackedPalmLocal.x,
+                trackedPalmLocal.y,
+                trackedPalmLocal.z);
         }
     }
 

@@ -354,7 +354,7 @@ namespace
         // `!rockEnabled` branch above. The host's OWN gate for calling ApplyWinners
         // (Hooks.cpp) is the session-static IsRockEngineHosted() flag, NOT a per-frame
         // "did ROCK run its tail callback" check - so a session with
-        // bUseRockEngineArchitecture=1 that sets ROCK.ini bEnabled=false at runtime (hot
+        // bUseRockEngineArchitecture=1 that sets [PhysicsInteraction] bEnabled=false at runtime (hot
         // reload) silently killed EVERY hand-authority writer (wall pushback, etc.) with
         // no log hint, because NEITHER side ever called ApplyWinners once rockEnabled
         // went false. Now runs every frame this hook fires, regardless of rockEnabled.
@@ -637,6 +637,15 @@ namespace rock
         }
     }
 
+    void HostNotifyExternalRelease(bool a_isLeft, RE::TESObjectREFR* a_releasedRef)
+    {
+        if (s_physicsInteraction && s_physicsInteraction->isInitialized()) {
+            s_physicsInteraction->hostNotifyExternalRelease(
+                a_isLeft,
+                a_releasedRef);
+        }
+    }
+
     // Plugin-side hand-authority seam (see ROCKMain.h). The bridge uses these when FRIK lacks v5.
     void HostSetHandAuthority(const HostHandAuthority* a_cbs) { s_hostHandAuthority = a_cbs; }
     const HostHandAuthority* getHostHandAuthority() { return s_hostHandAuthority; }
@@ -705,7 +714,7 @@ namespace rock
                 // shared file sink anyway, silently defeating "host sink stays authoritative"
                 // the moment kGameLoaded's g_rockConfig.load() ran. Seed the in-memory pattern
                 // to ROCK's own default so that near-certain first load is a true no-op; a
-                // genuine user sLogPattern= override in ROCK.ini still differs from this and
+                // genuine user sLogPattern= override in Heisenberg_F4VR.ini still differs and
                 // still applies normally.
                 logger::internal::_logPattern = logging_policy::DefaultLogPattern;
                 logger::info("ROCK(host): engine log merged into HeisenbergF4VR.log (single-log mode)");
@@ -763,12 +772,11 @@ namespace rock
 
     void HostSetGrabOwnership(bool a_rockOwnsGrab)
     {
+        g_rockConfig.rockHostGrabOwnershipConfigured = true;
         g_rockConfig.rockHostGrabOwnershipForced = a_rockOwnsGrab;
-        if (a_rockOwnsGrab) {
-            g_rockConfig.rockGrabEnabled = true;
-            g_rockConfig.rockSelectionEnabled = true;
-        }
-        logger::info("ROCK(host): grab+selection ownership {} (iGrabMode=9 host seam)",
+        g_rockConfig.rockGrabEnabled = a_rockOwnsGrab;
+        g_rockConfig.rockSelectionEnabled = a_rockOwnsGrab;
+        logger::info("ROCK(host): grab+selection ownership {} (Heisenberg iGrabMode host seam)",
             a_rockOwnsGrab ? "ceded to embedded ROCK" : "retained by host");
     }
 
@@ -848,6 +856,73 @@ namespace rock
     RE::TESObjectREFR* HostGetHandTouchedRef(bool a_isLeft)
     {
         return s_physicsInteraction ? s_physicsInteraction->hostGetHandTouchedRef(a_isLeft) : nullptr;
+    }
+
+    bool HostGetHandTouchEvidence(
+        bool a_isLeft,
+        std::uint32_t a_maxAgeFrames,
+        RE::TESObjectREFR** a_outRef,
+        std::uint32_t* a_outBodyId,
+        std::uint32_t* a_outAgeFrames,
+        RE::NiPoint3* a_outContactPointWorld,
+        bool* a_outHasContactPoint)
+    {
+        if (a_outRef) {
+            *a_outRef = nullptr;
+        }
+        if (a_outBodyId) {
+            *a_outBodyId = 0x7FFF'FFFFu;
+        }
+        if (a_outAgeFrames) {
+            *a_outAgeFrames = 0xFFFF'FFFFu;
+        }
+        if (a_outContactPointWorld) {
+            *a_outContactPointWorld = {};
+        }
+        if (a_outHasContactPoint) {
+            *a_outHasContactPoint = false;
+        }
+        if (!s_physicsInteraction || !a_outRef || !a_outBodyId ||
+            !a_outAgeFrames || !a_outContactPointWorld ||
+            !a_outHasContactPoint) {
+            return false;
+        }
+        return s_physicsInteraction->hostGetHandTouchEvidence(
+            a_isLeft,
+            a_maxAgeFrames,
+            *a_outRef,
+            *a_outBodyId,
+            *a_outAgeFrames,
+            *a_outContactPointWorld,
+            *a_outHasContactPoint);
+    }
+
+    std::uint32_t HostCopyHandCollisionSamples(
+        bool a_isLeft,
+        RE::NiPoint3* a_outWorldPoints,
+        float* a_outRadiiGame,
+        std::uint32_t a_maxSamples)
+    {
+        return s_physicsInteraction
+            ? s_physicsInteraction->hostCopyHandCollisionSamples(
+                  a_isLeft,
+                  a_outWorldPoints,
+                  a_outRadiiGame,
+                  a_maxSamples)
+            : 0;
+    }
+
+    std::uint32_t HostCopyWeaponCollisionSamples(
+        RE::NiPoint3* a_outWorldPoints,
+        float* a_outRadiiGame,
+        std::uint32_t a_maxSamples)
+    {
+        return s_physicsInteraction
+            ? s_physicsInteraction->hostCopyWeaponCollisionSamples(
+                  a_outWorldPoints,
+                  a_outRadiiGame,
+                  a_maxSamples)
+            : 0;
     }
 
     void HostSetHandColliderRadiusPadding(float a_padding)

@@ -127,10 +127,18 @@ namespace heisenberg
             // not drop held items. Passively track grip state so there is no stale
             // transition when the menu closes.
             if (grabState.active) {
-                VRButton grabBtn = _isLeft ? (g_config.useXForLeftGrab  ? VRButton::X : VRButton::Grip)
-                                           : (g_config.useAForRightGrab ? VRButton::A : VRButton::Grip);
+                const bool logicalGrab =
+                    g_vrInput.HasLogicalGrab(_isLeft);
+                VRButton grabBtn = logicalGrab ? VRButton::Grip :
+                    (_isLeft ?
+                        (g_config.useXForLeftGrab ?
+                            VRButton::X : VRButton::Grip) :
+                        (g_config.useAForRightGrab ?
+                            VRButton::A : VRButton::Grip));
                 const bool wasPressed = _grabPressed;
-                _grabPressed = g_vrInput.IsPressed(_isLeft, grabBtn);
+                _grabPressed = logicalGrab ?
+                    g_vrInput.IsLogicalGrabPressed(_isLeft) :
+                    g_vrInput.IsPressed(_isLeft, grabBtn);
                 // A/X hold-to-grab: UpdateInput's hold-confirmation branch computes the
                 // held duration from _axGrabPressTime, which is only written on a press
                 // edge THERE - but that code doesn't run while blocked, so a press that
@@ -207,19 +215,29 @@ namespace heisenberg
     void Hand::UpdateInput()
     {
         // Determine which button this hand uses for grabbing
-        VRButton grabButton = _isLeft ? (g_config.useXForLeftGrab  ? VRButton::X : VRButton::Grip)
-                                      : (g_config.useAForRightGrab ? VRButton::A : VRButton::Grip);
+        const bool logicalGrab =
+            g_vrInput.HasLogicalGrab(_isLeft);
+        VRButton grabButton = logicalGrab ? VRButton::Grip :
+            (_isLeft ?
+                (g_config.useXForLeftGrab ?
+                    VRButton::X : VRButton::Grip) :
+                (g_config.useAForRightGrab ?
+                    VRButton::A : VRButton::Grip));
 
         // Hysteresis on the analog Grip axis: Valve Index Knuckles and similar controllers
         // can have the grip value fluctuate around 0.5 mid-hold, causing spurious releases.
         // Only applies when using Grip — A/X are digital and don't need it.
-        float gripValue = g_vrInput.GetGripValue(_isLeft);
+        float gripValue = logicalGrab ?
+            g_vrInput.GetLogicalGrabValue(_isLeft) :
+            g_vrInput.GetGripValue(_isLeft);
         bool gripPressed;
         if (grabButton == VRButton::Grip && _grabPressed) {
             // Already holding with Grip — stay held until clearly released (0.3 threshold)
             gripPressed = (gripValue > 0.3f);
         } else {
-            gripPressed = g_vrInput.IsPressed(_isLeft, grabButton);
+            gripPressed = logicalGrab ?
+                g_vrInput.IsLogicalGrabPressed(_isLeft) :
+                g_vrInput.IsPressed(_isLeft, grabButton);
         }
 
         // DEBUG: Per-hand grip/button diagnostics.
@@ -299,7 +317,8 @@ namespace heisenberg
         // Hold (>200ms) = Heisenberg grab.
         // For Grip buttons, grab starts immediately as before.
         // =========================================================================
-        bool useHoldToGrab = (grabButton != VRButton::Grip);
+        bool useHoldToGrab =
+            !logicalGrab && grabButton != VRButton::Grip;
 
         if (useHoldToGrab) {
             if (gripPressed && !_grabPressed) {
@@ -919,15 +938,55 @@ namespace heisenberg
 
         // TOUCH-PRIORITY SELECTION (Jul 24, user-reported): gripping while physically
         // TOUCHING an object must grab THAT object, regardless of what the viewcaster
-        // holds selected. ROCK's contact evidence knows the exact touched ref. No
-        // distance sanity gate here: distance is computed from _position, and the
-        // 148cm repro suggests _position itself can lie — the physical touch evidence
-        // (at most a few frames old) outranks any distance derived from it.
+        // holds selected. Native hknp contact events are edge-like and may not repeat
+        // while a finger remains resting on the same body, so the old five-frame
+        // timeout routinely expired during the natural touch->squeeze delay. Keep
+        // active contact authoritative over any pick, and allow a longer recent
+        // contact ONLY when it names the same ref that is still selected. That
+        // guarded fallback cannot hijack a different object the player moved to.
         if (heisenberg::IsRockEngineHosted()) {
-            if (auto* touched = rock::HostGetHandTouchedRef(_isLeft)) {
-                RE::TESObjectREFR* selRefr = _selection.IsValid() ? _selection.GetRefr() : nullptr;
-                if (touched != selRefr && !touched->IsDeleted() && !touched->IsDisabled()
-                    && Physics::IsGrabbable(touched)) {
+            constexpr std::uint32_t kActiveTouchMaxAgeFrames = 4;
+            // Roughly two seconds at the headset's usual 90 Hz. This covers a
+            // deliberate touch-then-squeeze without allowing the evidence to
+            // select anything except the still-current same reference.
+            constexpr std::uint32_t kRecentSameRefMaxAgeFrames = 180;
+
+            RE::TESObjectREFR* selRefr =
+                _selection.IsValid() ? _selection.GetRefr() : nullptr;
+            RE::TESObjectREFR* touched = nullptr;
+            std::uint32_t touchedBodyId = 0x7FFF'FFFFu;
+            std::uint32_t touchAgeFrames = 0xFFFF'FFFFu;
+            RE::NiPoint3 contactPointWorld{};
+            bool hasContactPoint = false;
+            bool activeTouch = rock::HostGetHandTouchEvidence(
+                _isLeft,
+                kActiveTouchMaxAgeFrames,
+                &touched,
+                &touchedBodyId,
+                &touchAgeFrames,
+                &contactPointWorld,
+                &hasContactPoint);
+
+            bool recentSameRef = false;
+            if (!activeTouch && selRefr) {
+                RE::TESObjectREFR* recentTouched = nullptr;
+                if (rock::HostGetHandTouchEvidence(
+                        _isLeft,
+                        kRecentSameRefMaxAgeFrames,
+                        &recentTouched,
+                        &touchedBodyId,
+                        &touchAgeFrames,
+                        &contactPointWorld,
+                        &hasContactPoint) &&
+                    recentTouched == selRefr) {
+                    touched = recentTouched;
+                    recentSameRef = true;
+                }
+            }
+
+            if (touched) {
+                if (!touched->IsDeleted() && !touched->IsDisabled() &&
+                    Physics::IsGrabbable(touched)) {
                     if (auto* touchedNode = touched->Get3D()) {
                         const RE::NiPoint3 objPos = touchedNode->world.translate;
                         const float dx = objPos.x - _position.x;
@@ -936,17 +995,37 @@ namespace heisenberg
                         const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
                         Selection touchSelection;
                         touchSelection.SetRefr(touched);
-                        touchSelection.hitPoint = objPos;
+                        touchSelection.node.reset(touchedNode);
+                        touchSelection.hitPoint =
+                            hasContactPoint ? contactPointWorld : objPos;
                         touchSelection.hitNormal = RE::NiPoint3(0, 0, 1);
                         // Report the touch as at-hand: the hand is ON the object per
                         // contact evidence, whatever the (possibly stale) node math says.
                         touchSelection.distance = (std::min)(distance, 5.0f);
                         touchSelection.isClose = true;
+                        touchSelection.isPhysicalTouch = true;
+                        touchSelection.physicalTouchBodyId = touchedBodyId;
+                        touchSelection.physicalTouchAgeFrames = touchAgeFrames;
+                        touchSelection.hasPhysicalTouchPoint = hasContactPoint;
                         _selection = touchSelection;
                         _state = State::SelectedClose;
-                        spdlog::info("[GRAB] {} hand: touch-priority selection — grabbing touched {:08X} (nodeDist={:.1f}) over viewcaster pick {:08X}",
-                                     _isLeft ? "Left" : "Right", touched->formID, distance,
-                                     selRefr ? selRefr->formID : 0);
+                        spdlog::info(
+                            "[GRAB] {} hand: touch-priority {} — grabbing touched {:08X} "
+                            "body={} age={}f point={} "
+                            "(controllerNodeDist={:.1f}, reportedDist={:.1f}) over viewcaster pick {:08X}",
+                            _isLeft ? "Left" : "Right",
+                            recentSameRef
+                                ? "recent-same-ref"
+                                : (touched == selRefr
+                                    ? "active-same-ref"
+                                    : "active-replacement"),
+                            touched->formID,
+                            touchedBodyId,
+                            touchAgeFrames,
+                            hasContactPoint ? "contact" : "body-only",
+                            distance,
+                            touchSelection.distance,
+                            selRefr ? selRefr->formID : 0);
                     }
                 }
             }

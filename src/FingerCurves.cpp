@@ -15,6 +15,7 @@
 #include "FRIKInterface.h"
 #include "Config.h"
 #include "Utils.h"
+#include "physics-interaction/hand/HandSkeleton.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
 #include <cmath>
@@ -224,6 +225,28 @@ namespace heisenberg
         RE::NiPoint3 stagedZeroAngleVecs[5]{};
         RE::NiPoint3 stagedNormals[5]{};
 
+        // FRIK renders from a BSFlattenedBoneTree.  In that structure only the first
+        // bone of each finger is guaranteed to be exposed as an NiAVObject child;
+        // Finger12/13 (and their siblings) commonly exist only in the flattened
+        // transform array.  Walking NiNode::children therefore produced the live
+        // 0/5 calibration failure seen in the log and left every digit on unrelated
+        // Skyrim/HIGGS defaults.  ROCK already owns a validated reader for this exact
+        // live tree, so use its compact world-space finger snapshot first and retain
+        // the NiAVObject walk only as a compatibility fallback.
+        rock::root_flattened_finger_skeleton_runtime::Snapshot flattenedSnapshot{};
+        std::string flattenedMissingBone;
+        const bool haveFlattenedSnapshot =
+            rock::root_flattened_finger_skeleton_runtime::resolveLiveFingerSkeletonSnapshot(
+                isLeft,
+                flattenedSnapshot,
+                &flattenedMissingBone);
+        if (!haveFlattenedSnapshot) {
+            spdlog::warn(
+                "[FINGER-CAL] {} root-flattened snapshot unavailable (missing='{}'); using NiAVObject fallback",
+                isLeft ? "LEFT" : "RIGHT",
+                flattenedMissingBone);
+        }
+
         int foundCount = 0;
         for (int fi = 0; fi < 5; ++fi) {
             const int fingerDigit = fi + 1;  // 1=thumb..5=pinky in FRIK naming
@@ -232,18 +255,45 @@ namespace heisenberg
             std::snprintf(n2, sizeof(n2), "%s%d2", prefix, fingerDigit);
             std::snprintf(n3, sizeof(n3), "%s%d3", prefix, fingerDigit);
 
-            RE::NiAVObject* b1 = FindNodeDirect(handNode, n1, 6);
-            RE::NiAVObject* b2 = FindNodeDirect(handNode, n2, 6);
-            RE::NiAVObject* b3 = FindNodeDirect(handNode, n3, 6);
-            if (!b1 || !b2 || !b3) {
-                spdlog::warn("[FINGER-CAL] {} hand: missing bones for finger {} ({}/{}/{})",
-                             isLeft ? "LEFT" : "RIGHT", fi, n1, n2, n3);
+            RE::NiPoint3 p1World{};
+            RE::NiPoint3 p2World{};
+            RE::NiPoint3 p3World{};
+            bool haveChain = false;
+
+            if (haveFlattenedSnapshot &&
+                flattenedSnapshot.valid &&
+                flattenedSnapshot.fingers[static_cast<std::size_t>(fi)].valid) {
+                const auto& points =
+                    flattenedSnapshot.fingers[static_cast<std::size_t>(fi)].points;
+                p1World = points[0];
+                p2World = points[1];
+                p3World = points[2];
+                haveChain = true;
+            } else {
+                RE::NiAVObject* b1 = FindNodeDirect(handNode, n1, 6);
+                RE::NiAVObject* b2 = FindNodeDirect(handNode, n2, 6);
+                RE::NiAVObject* b3 = FindNodeDirect(handNode, n3, 6);
+                if (b1 && b2 && b3) {
+                    p1World = b1->world.translate;
+                    p2World = b2->world.translate;
+                    p3World = b3->world.translate;
+                    haveChain = true;
+                }
+            }
+            if (!haveChain) {
+                spdlog::warn(
+                    "[FINGER-CAL] {} hand: missing bones for finger {} ({}/{}/{})",
+                    isLeft ? "LEFT" : "RIGHT",
+                    fi,
+                    n1,
+                    n2,
+                    n3);
                 continue;
             }
 
-            const RE::NiPoint3 p1 = TransformPoint(handInv, b1->world.translate);
-            const RE::NiPoint3 p2 = TransformPoint(handInv, b2->world.translate);
-            const RE::NiPoint3 p3 = TransformPoint(handInv, b3->world.translate);
+            const RE::NiPoint3 p1 = TransformPoint(handInv, p1World);
+            const RE::NiPoint3 p2 = TransformPoint(handInv, p2World);
+            const RE::NiPoint3 p3 = TransformPoint(handInv, p3World);
 
             // zeroAngle = direction of the PROXIMAL segment (p1→p2), not the
             // full knuckle→tip vector. FRIK's idle pose has the medial/distal
@@ -272,7 +322,15 @@ namespace heisenberg
             const float v23Len = VectorLength(v23);
             if (v23Len > 0.1f) {
                 const float straightnessDot = DotProduct(v12 * (1.0f / proxLen), v23 * (1.0f / v23Len));
-                if (straightnessDot < 0.4f) {
+                // FRIK 77.12's neutral index can legitimately sit around
+                // dot=0.30-0.35 even with every input released (confirmed by
+                // the current deployment log). The old 0.40 cutoff therefore
+                // rejected that same neutral finger forever, retried every
+                // frame, and left the whole hand on unrelated HIGGS defaults.
+                // A firm grip is substantially tighter; keep a conservative
+                // 0.20 floor while relying on TryCalibrateFingerDataIfIdle's
+                // input/grab gates for the first line of defence.
+                if (straightnessDot < 0.20f) {
                     spdlog::debug("[FINGER-CAL] {} hand: finger {} too curled to calibrate (dot={:.2f}) - skipping this attempt",
                                  isLeft ? "LEFT" : "RIGHT", fi, straightnessDot);
                     continue;
@@ -1463,11 +1521,15 @@ namespace heisenberg
         InitializeHandFingerDataDefaults();
         const int handIdx = isLeft ? 1 : 0;
 
-        // Calculate curl for each finger — HIGGS default 0.0 (closed). On
-        // intersection miss the finger is "just closed completely"
-        // (hand.cpp:1494-1495). After the loop we clamp to min 0.2 so the
-        // finger doesn't over-curl.
-        float fingerCurls[5] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+        // A mesh miss must fail OPEN.  HIGGS's original "miss = fully closed"
+        // fallback is unsafe for arbitrary Fallout clutter: a missed clipboard
+        // edge made the thumb/fingers close through the visible mesh.  Valid
+        // first-surface hits receive a small open-value margin (1=open, 0=closed)
+        // so the skinned fingertip stops just before the triangle instead of
+        // numerically touching and then penetrating because of skin thickness.
+        constexpr float kMeshClearanceOpenValue = 0.04f;
+        float fingerCurls[5] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
+        bool fingerHit[5] = { false, false, false, false, false };
         bool foundAnyIntersection = false;
         bool useAltThumb = false;
 
@@ -1489,21 +1551,22 @@ namespace heisenberg
 
             if (found) {
                 foundAnyIntersection = true;
+                fingerHit[i] = true;
                 // intersection.angle carries the max-across-curves curl value.
                 // HIGGS only rejects strictly negative angles (→ open hand);
                 // positive values pass through unclamped. We match that below
                 // in the min-0.2 clamp pass.
                 fingerCurls[i] = intersection.angle;
             }
-            // On miss: leave fingerCurls[i] at 0.0 (closed). HIGGS hand.cpp:1495
-            // "No finger intersection, so just close it completely" (return 0).
+            // On miss: leave the digit open.  Closing without a verified first
+            // surface is precisely the mesh-penetration failure we must avoid.
 
             // HIGGS thumb alternate curve (hand.cpp:1508-1518): if the standard
             // sideways thumb missed (curveVal <= 0), try the alternate curve.
             // Prefer the alt result only if it intersects at a non-negative
             // angle, or if both missed — otherwise keep the (negative) standard
             // result which the post-loop pass converts to "open hand".
-            if (i == 0 && fingerCurls[i] <= 0.0f) {
+            if (i == 0 && (!fingerHit[i] || fingerCurls[i] <= 0.0f)) {
                 RE::NiPoint3 altZeroAngle = g_handFingerZeroAngleVecs[handIdx][FINGER_THUMB_ALT];
                 RE::NiPoint3 altNormal = g_handFingerNormals[handIdx][FINGER_THUMB_ALT];
                 RE::NiPoint3 altStart = g_handFingerStartPositions[handIdx][FINGER_THUMB_ALT];
@@ -1513,29 +1576,34 @@ namespace heisenberg
                 RE::NiPoint3 altCenterWorld = TransformPoint(handTransform, altStart) + palmToPoint;
 
                 Intersection altIntersection;
-                float altCurl = 0.0f;  // miss → closed (HIGGS FingerCheck returns 0)
+                float altCurl = 1.0f;  // miss remains fail-open
                 bool altFound = GetFingerIntersections(nearbyTriangles, FINGER_THUMB_ALT, handScale,
                     altCenterWorld, altNormalWorld, altZeroAngleWorld, altIntersection);
                 if (altFound) altCurl = altIntersection.angle;
 
-                // HIGGS rule: take alt if it's non-negative, or if both missed.
-                if (altCurl > 0.0f || (altCurl == 0.0f && fingerCurls[0] == 0.0f)) {
+                // Prefer an alternate first-surface hit.  Never replace a safe
+                // miss/open result with an unverified closed thumb pose.
+                if (altFound && altCurl >= 0.0f) {
                     fingerCurls[0] = altCurl;
+                    fingerHit[0] = true;
                     useAltThumb = true;
-                    if (altFound) foundAnyIntersection = true;
+                    foundAnyIntersection = true;
                 }
             }
         }
 
-        // HIGGS post-pass (hand.cpp:1521-1532):
-        //   - negative angle → hand stays open (1.0)
-        //   - positive angle → use curve value
-        //   - clamp min 0.2 so the finger doesn't over-curl
+        // Convert verified curve contacts into a skin-safe pose.  Negative
+        // intersections and misses stay fully open; a valid hit is opened by
+        // the clearance margin and then clamped to the FRIK scalar range.
         for (int i = 0; i < 5; i++) {
-            if (fingerCurls[i] < 0.0f) {
+            if (!fingerHit[i] || fingerCurls[i] < 0.0f) {
                 fingerCurls[i] = 1.0f;  // open
+            } else {
+                fingerCurls[i] = (std::clamp)(
+                    fingerCurls[i] + kMeshClearanceOpenValue,
+                    0.2f,
+                    1.0f);
             }
-            fingerCurls[i] = (std::max)(0.2f, fingerCurls[i]);
         }
 
         if (!foundAnyIntersection) {

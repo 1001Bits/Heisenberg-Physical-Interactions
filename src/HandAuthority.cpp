@@ -8,7 +8,9 @@
 
 #include "Utils.h"                 // GetLocalTransformForWorldTransform
 #include "Config.h"
+#include "F4VROffsets.h"
 #include "Heisenberg.h"   // IsRockEngineHosted
+#include "MenuChecker.h"
 #include "f4vr/PlayerNodes.h"      // f4cf::f4vr::getCommonNode / getPlayer
 #include "f4vr/F4VRUtils.h"        // f4cf::f4vr::findNode / updateTransformsDown
 
@@ -117,16 +119,8 @@ namespace heisenberg
             return out.upperArm && out.foreArm && out.hand;
         }
 
-        constexpr float kArmReachSafetyMargin = 0.15f;
-
-        // [PA-JITTER FIX] Width (game units) of the blend zone below reachableHsLen over
-        // which the arm-reach clamp in solveArmFrik() eases in, instead of snapping the
-        // whole hand/arm target instantly the moment requestedHsLen crosses the boundary.
-        // Ordinary walk/turn sway repeatedly nudges the support-grip point across a razor
-        // -thin (0.15gu) threshold near full extension, which is common in power armor
-        // (see naturalArmReach's PA-topology branch) - see solveArmFrik for the smoothed
-        // application.
-        constexpr float kArmReachSoftBlend = 3.0f;
+        constexpr float kArmReachSafetyMargin =
+            rock::two_handed_weapon_policy::kSupportArmReachSafetyMargin;
 
         // Cubic (Hermite) smoothstep on [edge0, edge1]: 0 at/below edge0, 1 at/above edge1,
         // continuous first derivative in between. Used to blend hard numeric discontinuities
@@ -301,6 +295,28 @@ namespace heisenberg
             return sehWriteNodeLocal(node, local);
         }
 
+        // FRIK performs this exact three-call finalization after its own arm
+        // solve. A hosted authority solve runs later, at ROCK's frame tail, so
+        // power-armor skin attachments otherwise keep FRIK's earlier flattened
+        // bone array while the arm nodes already contain our final pose. Refresh
+        // the same renderer data once after the late support-arm write.
+        bool refreshPlayerSkinnedGeometryAfterAuthority()
+        {
+            RE::NiNode* worldRoot = f4cf::f4vr::getWorldRootNode();
+            RE::NiNode* flattenedRoot = f4cf::f4vr::getRootNode();
+            if (!worldRoot || !flattenedRoot) {
+                return false;
+            }
+            __try {
+                BSFadeNode_MergeWorldBounds(worldRoot);
+                BSFlattenedBoneTree_UpdateBoneArray(flattenedRoot);
+                BSFadeNode_UpdateGeomArray(worldRoot, 1);
+                return true;
+            } __except(EXCEPTION_EXECUTE_HANDLER) {
+                return false;
+            }
+        }
+
         // Analytic 2-bone IK: aim upperArm+foreArm so the wrist reaches worldT.translate, bending in
         // FRIK's current elbow plane. Then place the hand at the full worldT for wrist orientation.
         // ==================================================================================
@@ -383,12 +399,13 @@ namespace heisenberg
                 return false;
             }
 
-            // FRIK defaults: g_config.armLength = 36.74 -> adjustedArmLength = 1.0.
-            // A weapon support grip gets one small, bounded extension so a physically
-            // straight offhand can remain seated without translating the gun or primary
-            // grip. No other hand-authority writer receives stretched anatomy.
+            // FRIK defaults: g_config.armLength = 36.74 -> scale 1.0. For a
+            // weapon support grip this input is the maximum visual-only scale,
+            // not an unconditional extension. The exact scale is chosen from
+            // live target/native-reach geometry below, making the solve
+            // independent of the user's fVrScale and calibrated skeleton size.
             constexpr float kArmLength = 36.74f;
-            const float adjustedArmLength = std::clamp(
+            const float maximumArmLengthScale = std::clamp(
                 std::isfinite(requestedArmLengthScale) ? requestedArmLengthScale : 1.0f,
                 1.0f,
                 rock::two_handed_weapon_policy::kSupportArmLengthScale);
@@ -411,7 +428,16 @@ namespace heisenberg
 
             // ---- shoulder IK (verbatim) ----
             RE::NiPoint3 shoulderToHand = handPos - arm.upperArm->world.translate;
-            const float armLength = kArmLength * adjustedArmLength;
+            const float measuredPreShoulderReach = naturalArmReach(arm);
+            const float preShoulderNativeReach = measuredPreShoulderReach > 0.0f ?
+                measuredPreShoulderReach + kArmReachSafetyMargin :
+                kArmLength;
+            const float shoulderArmLengthScale =
+                rock::two_handed_weapon_policy::adaptiveArmLengthScale(
+                    MU::vec3Len(shoulderToHand),
+                    preShoulderNativeReach,
+                    maximumArmLengthScale);
+            const float armLength = kArmLength * shoulderArmLengthScale;
             const float adjustAmount = (std::clamp)(MU::vec3Len(shoulderToHand) - armLength * 0.5f, 0.0f, armLength * 0.85f) / (armLength * 0.85f);
             const RE::NiPoint3 shoulderOffset = MU::vec3Norm(shoulderToHand) * (adjustAmount * armLength * 0.08f);
 
@@ -441,13 +467,19 @@ namespace heisenberg
             if (!std::isfinite(chainWorldScale) || chainWorldScale < 0.01f) {
                 chainWorldScale = 1.0f;
             }
-            float upperLen = originalUpperLen * adjustedArmLength * chainWorldScale;
-            float forearmLen = originalForearmLen * adjustedArmLength * chainWorldScale;
-
             const RE::NiPoint3 Uwp = arm.upperArm->world.translate;
-            const float armReach = upperLen + forearmLen;
             RE::NiPoint3 shoulderToRequestedHand = handPos - Uwp;
             const float requestedHsLen = (std::max)(MU::vec3Len(shoulderToRequestedHand), 0.1f);
+            const float nativeArmReach =
+                (originalUpperLen + originalForearmLen) * chainWorldScale;
+            const float adjustedArmLength =
+                rock::two_handed_weapon_policy::adaptiveArmLengthScale(
+                    requestedHsLen,
+                    nativeArmReach,
+                    maximumArmLengthScale);
+            float upperLen = originalUpperLen * adjustedArmLength * chainWorldScale;
+            float forearmLen = originalForearmLen * adjustedArmLength * chainWorldScale;
+            const float armReach = upperLen + forearmLen;
 
             if (requestedHsLen > armReach * 2.25f) {
                 static std::uint32_t s_r2 = 0;
@@ -456,38 +488,18 @@ namespace heisenberg
             }
             g_frikDiag[isLeft ? 1 : 0] = { requestedHsLen, armReach, requestedHsLen > armReach };
 
-            // Unlike FRIK's unbounded reach extension, adjustedArmLength is capped at 1.08
-            // and is support-grip-only. Targets beyond that modest allowance are still
-            // projected onto the visual wrist sphere; weapon aim stays untouched.
-            //
-            // [PA-JITTER FIX] This used to be a hard if/else: the instant requestedHsLen
-            // crossed reachableHsLen, the target snapped from "as requested" to "fully
-            // projected onto the wrist sphere" with no blending. solveArmFrik is the last
-            // writer of the visible skinned arm every frame during two-handed support grip
-            // (see needsSameFrameSupportPin below), so that pop was directly visible as
-            // off-hand jitter whenever ordinary walk/turn sway nudged the target back and
-            // forth across the boundary - which happens often in power armor because of the
-            // PA-topology reach difference above. Ease the projection in over
-            // kArmReachSoftBlend game units instead: reachBlendT is 0 well inside reach
-            // (steady state unchanged - target used exactly "as requested") and 1 at/beyond
-            // reachableHsLen (steady state unchanged - target fully projected onto the wrist
-            // sphere, identical to the old hard clamp); only the transition zone is smoothed.
-            //
-            // REVIEW FIX v2 (Jul 24): two prior shapes were both wrong. The original lerp
-            // LENGTHENED sub-reach targets (steady-state palm-past-the-grip bias); the min()
-            // hotfix restored "never lengthen" but algebraically collapsed the blend back
-            // into the exact hard clamp the PA-jitter fix was written to remove (for
-            // requested <= reachable the min always picks requested; beyond it always picks
-            // the boundary — a C0 kink at the crossing). This shape does both jobs: targets
-            // INSIDE reach are honored exactly, and OVERSHOOT beyond the boundary is eased
-            // into the clamp over kArmReachSoftBlend gu (C1 at the crossing — near-zero
-            // overshoot still tracks the target ~1:1 before the clamp takes over), so
-            // walk-sway across the boundary no longer pops.
-            const float reachableHsLen = (std::max)(armReach - kArmReachSafetyMargin, 0.1f);
-            if (requestedHsLen > reachableHsLen) {
-                const float overshoot = requestedHsLen - reachableHsLen;
-                const float t = smoothstep(0.0f, kArmReachSoftBlend, overshoot);
-                const float effectiveHsLen = reachableHsLen + overshoot * (1.0f - t);
+            // Match FRIK's normal behavior by extending the support arm only as
+            // much as the live grip requires, with a modest support-only cap.
+            // If an extreme target exceeds that cap, project monotonically onto
+            // the final sphere. The previous "soft clamp" was non-monotonic: as
+            // overshoot grew it first moved the wrist outward and then pulled it
+            // backward, so walking around its boundary produced visible wobble.
+            const float effectiveHsLen =
+                rock::two_handed_weapon_policy::projectedArmTargetDistance(
+                    requestedHsLen,
+                    nativeArmReach,
+                    adjustedArmLength);
+            if (effectiveHsLen + 1e-4f < requestedHsLen) {
                 shoulderToRequestedHand = MU::vec3Norm(shoulderToRequestedHand) * effectiveHsLen;
                 handPos = Uwp + shoulderToRequestedHand;
             }
@@ -563,13 +575,25 @@ namespace heisenberg
             constexpr float kWristAngleDomainBlend = 0.08f;
             const float wristAngleBlendT = smoothstep(1.0f - kWristAngleDomainBlend, 1.0f, std::abs(lawOfCosinesArg));
             if (wristAngleBlendT > 0.0f) {
-                const float avgLen = (originalUpperLen + originalForearmLen) / 2.0f * adjustedArmLength;
+                // originalUpperLen/originalForearmLen are LOCAL-space lengths.  The
+                // primary path above converts them to world units with
+                // chainWorldScale, but this near-extension fallback previously omitted
+                // that conversion.  In power armor (skeleton scale ~= 0.665) it therefore
+                // blended 26gu world-space segments toward ~39gu local-space segments.
+                // The resulting wrist miss is the ~20gu post-solve error/flicker visible
+                // in the live PA two-hand log.  Keep every branch in the same world-unit
+                // space.
+                const float avgLen =
+                    (originalUpperLen + originalForearmLen) * 0.5f *
+                    adjustedArmLength * chainWorldScale;
                 forearmLen = std::lerp(forearmLen, avgLen, wristAngleBlendT);
                 upperLen = std::lerp(upperLen, avgLen, wristAngleBlendT);
             }
             float wristAngle = std::acos((forearmLen * forearmLen + hsLen * hsLen - upperLen * upperLen) / (2.0f * forearmLen * hsLen));
             if (std::isnan(wristAngle) || std::isinf(wristAngle)) {
-                forearmLen = upperLen = (originalUpperLen + originalForearmLen) / 2.0f * adjustedArmLength;
+                forearmLen = upperLen =
+                    (originalUpperLen + originalForearmLen) * 0.5f *
+                    adjustedArmLength * chainWorldScale;
                 wristAngle = std::acos((forearmLen * forearmLen + hsLen * hsLen - upperLen * upperLen) / (2.0f * forearmLen * hsLen));
             }
             const float xDist = std::cos(wristAngle) * forearmLen;
@@ -936,6 +960,19 @@ namespace heisenberg
                 slot.latchedReachLimitedRigid = reachLimitedRigidWeaponWinner;
                 slot.latchedPlayerPositionValid = slot.latchedTracksPlayer &&
                     getPlayerWorldPosition(slot.latchedPlayerPosition);
+
+                // FRIK deliberately calls hideHands() after its arm pass while
+                // the native ScopeMenu is open (it scales/moves the rendered
+                // skeleton root out of view).  A late scene-graph arm solve
+                // fights that scope state: the tester log shows 17-27gu writer
+                // disagreement and 15-18gu wrist error only between ScopeMenu
+                // OPENED/CLOSED.  Keep publishing the latch so FRIK consumes
+                // the requested grip in its own pass, but never overwrite the
+                // intentional post-pass scope hide.
+                if (MenuChecker::GetSingleton().IsScopeOpen()) {
+                    continue;
+                }
+
                 const std::uint32_t sinceConsume = frame - g_lastConsumeFrame[i];
                 // The FRIK seam consumes this latch on the NEXT frame. That remains useful
                 // for carrying the arm through FRIK, but it cannot be the final rendered
@@ -944,7 +981,8 @@ namespace heisenberg
                 // more from the final live gun. (Never do this for the primary hand: the
                 // weapon is its child and moving that chain would feed back into the gun.)
                 const bool needsSameFrameSupportPin =
-                    rigidSupportGripWinner && heisenberg::IsRockEngineHosted();
+                    rigidSupportGripWinner &&
+                    heisenberg::IsRockEngineHosted();
                 if (sinceConsume <= 5 && !needsSameFrameSupportPin) {
                     continue;
                 }
@@ -953,6 +991,12 @@ namespace heisenberg
                 slot.latchedTracksPlayer = false;
                 slot.latchedReachLimitedRigid = false;
                 slot.latchedPlayerPositionValid = false;
+                // With no goal seam there is still no useful visible hand to
+                // pin in the native optical-scope overlay.  Respect FRIK's
+                // intentional hidden-hand state instead of resurrecting it.
+                if (MenuChecker::GetSingleton().IsScopeOpen()) {
+                    continue;
+                }
             }
 
             ArmChain arm;
@@ -975,8 +1019,9 @@ namespace heisenberg
 
             // Rigid weapon hands are solved below as complete arm chains. Never project
             // only their requested hand transform here: that would break the captured
-            // hand-to-gun relation. The support chain receives a bounded 1.08x visual
-            // allowance; the weapon and trigger-hand pivot remain untouched.
+            // hand-to-gun relation. The support chain receives only the adaptive,
+            // bounded visual allowance needed for the live target; the weapon and
+            // trigger-hand pivot remain untouched.
             if (!rigidWeaponWinner) {
                 float requestedDistance = 0.0f;
                 float maxReach = 0.0f;
@@ -1043,8 +1088,25 @@ namespace heisenberg
                 // Always solve the full arm chain; never place the hand alone.
                 // The emergency chain-incomplete fallback keeps the native bone lengths.
                 // Extending locals without a complete episode baseline would compound on
-                // consecutive frames; the normal full-chain path above owns the 1.08x reach.
+                // consecutive frames; the normal full-chain path above owns the
+                // adaptive support-only reach allowance.
                 solveArmIK(arm, liveTarget);
+            }
+
+            if (rigidSupportGripWinner &&
+                heisenberg::IsRockEngineHosted() &&
+                Utils::IsPlayerInPowerArmor()) {
+                const bool refreshed =
+                    refreshPlayerSkinnedGeometryAfterAuthority();
+                static bool s_loggedPaFinalRefresh = false;
+                if (!s_loggedPaFinalRefresh || !refreshed) {
+                    spdlog::log(
+                        refreshed ? spdlog::level::info : spdlog::level::warn,
+                        "[PA-AUTH] Same-frame support pin + final flattened "
+                        "bone/geometry refresh {}",
+                        refreshed ? "active" : "FAILED");
+                    s_loggedPaFinalRefresh = refreshed;
+                }
             }
             slot.lastApplied = liveTarget;
             slot.overriding = true;

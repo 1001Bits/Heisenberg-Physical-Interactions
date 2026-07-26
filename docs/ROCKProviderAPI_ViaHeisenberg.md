@@ -1,296 +1,456 @@
-## Background: what you're connecting to
+# ROCK provider API through Heisenberg
 
-Heisenberg embeds the full ROCK physics/grab engine directly inside `Heisenberg_F4VR.dll` — there
-is no separate `ROCK.dll` on disk or loaded in the process. ROCK ships a "provider API"
-specifically meant for other mods to consume: weapon-part classification (which node is the
-magazine, the bolt, the charging handle...), a whitelist mechanism to make specific parts
-grabbable, live grip-state reporting, and the ability to drive a part's transform yourself. It's
-built for exactly the "reload mod grabs the real weapon part" use case.
+Heisenberg embeds ROCK in `Heisenberg_F4VR.dll`; a separate `ROCK.dll` and a
+Virtual Reloads helper header are not required. Include the matching
+`ROCKProviderApi.h`, call the API directly, and check every returned
+`RockProviderResultV1`.
 
-## Step 1 — Get the header
+## What the three structures do
 
-You need one file: `ROCKProviderApi.h`. Pull it from this project's
-`external/ROCK/src/api/ROCKProviderApi.h` — it's vendored unmodified from upstream ROCK, so it's
-the same file you'd get from a standalone ROCK.dll build. Copy it into your own project's include
-path; you don't need any other ROCK source files, just this one header (it's self-contained aside
-from standard headers).
+- `RockProviderWeaponPartTargetV1` selects the exact collision body the hand
+  is allowed to grab.
+- `RockProviderWeaponPartMotionConstraintV1` defines how a grabbed part may
+  move.
+- `RockProviderWeaponPartDriveTargetV1` writes an explicit pose without hand
+  movement.
 
-## Step 2 — Find the API at runtime
+`motion` and `partConstraint` are only local variable names. Both examples
+refer to the same `RockProviderWeaponPartMotionConstraintV1` type.
 
-As of 2026-07-21 the header itself does the module lookup for you —
-`rock::provider::RockProviderApi::initialize()` tries `ROCK.dll` first, then falls back to
-`Heisenberg_F4VR.dll`, so the same call works whether the player has standalone ROCK or Heisenberg
-with ROCK embedded:
+There are also two node identities:
+
+- The evidence `bodyId` identifies the physical mesh the hand must touch.
+- `controlledRoot` identifies the authored scene node ROCK must move.
+
+For Cylon's current code, the controlled node value is:
+
+```cpp
+reinterpret_cast<std::uintptr_t>(weap->primaryNode01)
+```
+
+It is **not** `CurrentWeapon::primaryNode01`. `controlledRoot` does not make a
+part grabbable; the exact evidence target does that.
+
+## Connect once
 
 ```cpp
 #include "ROCKProviderApi.h"
 
-bool AcquireRockProviderApi()
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <vector>
+
+const rock::provider::RockProviderApi* g_rockApi = nullptr;
+std::uint64_t g_rockOwnerToken = 0;
+
+bool connectToRock()
 {
     using namespace rock::provider;
-    const int status = RockProviderApi::initialize(); // 0 == success
-    return status == 0; // RockProviderApi::inst now points at the live table
-}
 
-// ... later ...
-const rock::provider::RockProviderApi* api = rock::provider::RockProviderApi::inst;
-```
-
-Call this after your plugin receives F4SE's `kGameLoaded` message — the host DLL needs to have
-finished its own init first. A non-zero status isn't a hard error (host not installed yet, or an
-older build below the version/table-size you asked for) — retry later or disable the integration
-for this session. If you'd rather do the module/proc lookup yourself (e.g. to log which module
-answered), `GetProcAddress(module, "ROCKAPI_GetProviderApi")` against either module name still
-works exactly as before — `initialize()` is just that same lookup, done for you.
-
-## Step 3 — Register as a consumer
-
-Most of the interesting functions (anything that lets you change state, like declaring grabbable
-parts) require an `ownerToken`, which you get by registering:
-
-```cpp
-using namespace rock::provider;
-
-const RockProviderApi* g_rockApi = nullptr;
-std::uint64_t g_rockOwnerToken = 0;
-std::uint32_t g_rockGrantedCapabilities = 0;
-
-bool ConnectToRock()
-{
-    g_rockApi = AcquireRockProviderApi();
-    if (!g_rockApi || !g_rockApi->isProviderReady())
+    if (RockProviderApi::initialize(
+            ROCK_PROVIDER_API_VERSION,
+            ROCK_PROVIDER_API_V1_WEAPON_PART_MOTION_CONSTRAINT_TABLE_BYTES) != 0) {
         return false;
+    }
+
+    g_rockApi = RockProviderApi::inst;
+    if (!g_rockApi || !g_rockApi->isProviderReady()) {
+        return false;
+    }
+
+    RockProviderLimitsV1 limits{};
+    if (!g_rockApi->getProviderLimitsV1(&limits) ||
+        !supportsWeaponPartInteractionV1(limits) ||
+        !supportsWeaponPartMotionConstraintV1(limits) ||
+        !supportsWeaponPartExclusiveExactContactV1(limits) ||
+        !supportsWeaponPartControlledRootV1(limits)) {
+        return false;
+    }
 
     RockProviderConsumerRegistrationV1 registration{};
-    std::snprintf(registration.modName, sizeof(registration.modName), "VirtualReloads");
+    std::snprintf(
+        registration.modName,
+        sizeof(registration.modName),
+        "%s",
+        "CylonVirtualReloads");
     registration.requestedCapabilities =
-        static_cast<std::uint32_t>(RockProviderConsumerCapabilityV1::WeaponPartInteraction);
+        static_cast<std::uint32_t>(
+            RockProviderConsumerCapabilityV1::WeaponPartInteraction) |
+        static_cast<std::uint32_t>(
+            RockProviderConsumerCapabilityV1::WeaponPartMotionConstraint);
 
     RockProviderConsumerHandleV1 handle{};
-    if (g_rockApi->registerConsumerV1(&registration, &handle) != RockProviderResultV1::Ok)
+    if (g_rockApi->registerConsumerV1(&registration, &handle) !=
+        RockProviderResultV1::Ok) {
+        g_rockApi = nullptr;
         return false;
+    }
+
+    const auto required = registration.requestedCapabilities;
+    if ((handle.grantedCapabilities & required) != required) {
+        g_rockApi->unregisterConsumerV1(handle.ownerToken);
+        g_rockApi = nullptr;
+        return false;
+    }
 
     g_rockOwnerToken = handle.ownerToken;
-    g_rockGrantedCapabilities = handle.grantedCapabilities;
+    return true;
+}
+```
 
-    // Confirm the parts of the table you need actually exist at this ABI size before calling
-    // into them — a running host may be an older build with a smaller struct.
-    RockProviderLimitsV1 limits{};
-    if (!g_rockApi->getProviderLimitsV1(&limits) || !supportsWeaponPartInteractionV1(limits))
+Retry connection on a later game tick if ROCK is not ready yet.
+
+## Cylon's exact dry-fire slide setup
+
+The lifecycle supplied by Cylon is:
+
+1. `dryPositionSlide` runs when ammunition reaches zero and moves the bolt to
+   `reloadSlidePos`.
+2. The player presses reload, which calls `slideReloadSetup`.
+3. `slideReloadSetup` calls `setupSlideConstraint` only while the bolt is
+   already in the dry-fire position.
+
+Therefore the position captured at the instant of the grab is rail coordinate
+zero. Pressing grip without moving the controller must not move the bolt.
+Moving the controller along local negative Y pulls it from `reloadSlidePos`
+toward `maxBoltPosition`, and moving the controller back returns it toward
+the dry-fire position.
+
+This is a complete raw-API setup with every local defined:
+
+```cpp
+bool setupSlideConstraint(CurrentWeapon* weap)
+{
+    using namespace rock::provider;
+
+    if (!g_rockApi || !g_rockOwnerToken ||
+        !weap || !weap->primaryNode01) {
         return false;
+    }
+
+    const char* wantedSource =
+        weap->primaryNode01->m_name.c_str();
+    if (!wantedSource || !wantedSource[0]) {
+        return false;
+    }
+
+    const std::uint32_t requestedCount =
+        g_rockApi->getWeaponEvidenceDetailCountV1();
+    if (requestedCount == 0 ||
+        requestedCount > ROCK_PROVIDER_MAX_WEAPON_BODIES) {
+        return false;
+    }
+
+    std::vector<RockProviderWeaponEvidenceDetailV1> details(
+        requestedCount);
+    const std::uint32_t copiedCount =
+        g_rockApi->copyWeaponEvidenceDetailsV1(
+            details.data(),
+            requestedCount);
+    details.resize(copiedCount);
+
+    // One authored source can have multiple generated collision hulls. Select
+    // every body for exactly primaryNode01 and no other source/part.
+    std::vector<RockProviderWeaponEvidenceDetailV1> boltBodies;
+    for (const auto& detail : details) {
+        const bool exactSource =
+            std::strcmp(detail.sourceName, wantedSource) == 0;
+        const bool isBolt =
+            detail.partKind ==
+            static_cast<std::uint32_t>(
+                RockProviderWeaponPartKindV1::Bolt);
+
+        if (exactSource && isBolt) {
+            boltBodies.push_back(detail);
+        }
+    }
+
+    if (boltBodies.empty()) {
+        // Log the evidence list here. Do not fall back to MatchPartKind,
+        // barrel, receiver, proximity, or the legacy whole-weapon grab.
+        return false;
+    }
+
+    const float travel =
+        weap->reloadSlidePos - weap->maxBoltPosition;
+    if (!std::isfinite(travel) || travel <= 0.0f) {
+        return false;
+    }
+
+    std::vector<RockProviderWeaponPartTargetV1> targets;
+    std::vector<RockProviderWeaponPartMotionConstraintV1> constraints;
+    targets.reserve(boltBodies.size());
+    constraints.reserve(boltBodies.size());
+
+    for (const auto& boltEvidence : boltBodies) {
+        RockProviderWeaponPartTargetV1 target{};
+        target.flags = static_cast<std::uint32_t>(
+            RockProviderWeaponPartTargetFlagV1::MatchBodyId);
+        target.grabMode =
+            RockProviderWeaponPartGrabModeV1::AttachOnly;
+        target.weaponGenerationKey =
+            boltEvidence.weaponGenerationKey;
+        target.bodyId = boltEvidence.bodyId;
+        targets.push_back(target);
+
+        RockProviderWeaponPartMotionConstraintV1 motion{};
+        motion.flags = static_cast<std::uint32_t>(
+            RockProviderWeaponPartTargetFlagV1::MatchBodyId);
+        motion.kind =
+            RockProviderWeaponPartMotionKindV1::Linear;
+        motion.axisSpace =
+            RockProviderWeaponPartDriveSpaceV1::
+                ControlledRootParentLocal;
+        motion.weaponGenerationKey =
+            boltEvidence.weaponGenerationKey;
+        motion.bodyId = boltEvidence.bodyId;
+        motion.axisDirection[0] = 0.0f;
+        motion.axisDirection[1] = -1.0f;
+        motion.axisDirection[2] = 0.0f;
+        motion.minValue = 0.0f;
+        motion.maxValue = travel;
+        motion.controlledRoot =
+            reinterpret_cast<std::uintptr_t>(
+                weap->primaryNode01);
+        constraints.push_back(motion);
+    }
+
+    const auto targetResult =
+        g_rockApi->setWeaponPartTargetsV1(
+            g_rockOwnerToken,
+            targets.data(),
+            static_cast<std::uint32_t>(targets.size()));
+    if (targetResult != RockProviderResultV1::Ok) {
+        return false;
+    }
+
+    const auto constraintResult =
+        g_rockApi->setWeaponPartMotionConstraintsV1(
+            g_rockOwnerToken,
+            constraints.data(),
+            static_cast<std::uint32_t>(constraints.size()));
+    if (constraintResult != RockProviderResultV1::Ok) {
+        g_rockApi->clearWeaponPartTargetsV1(
+            g_rockOwnerToken);
+        return false;
+    }
 
     return true;
 }
 ```
 
-Keep `g_rockOwnerToken` — every weapon-part call below takes it as the first argument, and it's
-how ROCK knows which whitelist/drive entries belong to you versus another consumer.
+The example intentionally does not set `axisOrigin`: ROCK linear constraints
+measure hand displacement relative to the part and clean tracked hand pose
+captured on the grab frame. `axisOrigin` is used for rotational constraints.
 
-## Step 4 — The actual reload flow
+`axisDirection = (0,-1,0)` defines the increasing rail coordinate; it is not
+a one-way input lock. With `minValue = 0` and `maxValue = travel`, the player
+can pull back and push forward anywhere inside that interval.
 
-This is the part that gets you "the same parts a reload animation would reference, with full
-collision":
+`weaponGenerationKey` comes from the same evidence record as `bodyId`. It
+prevents a numeric body ID from accidentally selecting a different weapon
+after an equip or collision rebuild.
 
-**4a. Find the real parts.** When the player has a weapon equipped and you're about to start a
-reload, enumerate its parts:
+## Detecting when the bolt reaches maximum travel
+
+`RockProviderWeaponPartGripStateV1::handPartLocal` is the hand-to-part
+transform captured when the grip starts. It does not change as the constrained
+part moves and therefore cannot be used as the bolt's current rail coordinate.
+
+Because the example uses `ControlledRootParentLocal`, ROCK writes
+`weap->primaryNode01->m_localTransform`. Save that node's local position on the
+first grabbed frame, then project its live displacement onto the same normalized
+axis supplied to the constraint:
 
 ```cpp
-std::uint32_t count = g_rockApi->getWeaponEvidenceDetailCountV1();
-std::vector<RockProviderWeaponEvidenceDetailV1> details(count);
-g_rockApi->copyWeaponEvidenceDetailsV1(details.data(), count);
+NiPoint3 boltLocalPositionAtGrab{};
+bool haveBoltGrabPosition = false;
 
-for (const auto& part : details)
+void updateBoltTravel(CurrentWeapon* weap, bool isGrabbing)
 {
-    // part.partKind: Magazine, Bolt, Slide, ChargingHandle, Cylinder, ...
-    // part.reloadRole / part.actionRole: which reload step this part belongs to
-    // part.omodFormId: the ACTUAL installed magazine/mod occupying this slot (0 if vanilla) —
-    // this is what makes it "the same part the reload animation references" rather than a
-    // guess from the NIF name.
+    if (!weap || !weap->primaryNode01) {
+        haveBoltGrabPosition = false;
+        return;
+    }
+
+    const NiPoint3 current =
+        weap->primaryNode01->m_localTransform.pos;
+
+    if (!isGrabbing) {
+        haveBoltGrabPosition = false;
+        return;
+    }
+
+    if (!haveBoltGrabPosition) {
+        boltLocalPositionAtGrab = current;
+        haveBoltGrabPosition = true;
+    }
+
+    // axisDirection is (0,-1,0), so dot(current - start, axis)
+    // simplifies to start.y - current.y.
+    const float currentTravel =
+        boltLocalPositionAtGrab.y - current.y;
+    const float maximumTravel =
+        weap->reloadSlidePos - weap->maxBoltPosition;
+    constexpr float endpointTolerance = 0.02f;
+
+    if (currentTravel >= maximumTravel - endpointTolerance) {
+        weap->maxBoltReached = true;
+    }
 }
 ```
 
-**4b. Make the right part grabbable for this reload step.** When your reload state machine
-reaches "player should grab the magazine," whitelist just that part:
+If `primaryNode01->m_localTransform` does not change, first verify that the
+submitted constraint sets:
 
 ```cpp
-RockProviderWeaponPartTargetV1 target{};
-target.flags = static_cast<std::uint32_t>(RockProviderWeaponPartTargetFlagV1::MatchPartKind);
-target.grabMode = RockProviderWeaponPartGrabModeV1::FullTwoHandAuthority; // or AttachOnly
-target.partKind = static_cast<std::uint32_t>(RockProviderWeaponPartKindV1::Magazine);
-
-g_rockApi->setWeaponPartTargetsV1(g_rockOwnerToken, &target, 1);
+motion.axisSpace =
+    RockProviderWeaponPartDriveSpaceV1::ControlledRootParentLocal;
+motion.controlledRoot =
+    reinterpret_cast<std::uintptr_t>(weap->primaryNode01);
 ```
 
-While this whitelist is active, only parts matching your target(s) grab normally — everything
-else behaves as it would without your mod involved.
+Without `controlledRoot`, ROCK moves the exact matched collision source. That
+source may be a generated mesh leaf rather than the authored
+`primaryNode01` that Virtual Reloads polls.
 
-**4c. Know when the player grabs it.** Poll every frame (or on your own tick):
+## Extending the rail to the closed position while still gripping
+
+The consumer may call `setWeaponPartMotionConstraintsV1` again with the same
+exact body matcher while the grip remains active. Heisenberg refreshes
+`minValue` and `maxValue` in place while preserving the original at-grab
+reference, so this does not require an API change, a release, or a re-grab.
+
+For Cylon's negative-Y rail, the initial dry-fire-to-cocked interval is:
 
 ```cpp
-RockProviderWeaponPartGripStateV1 state{};
-if (g_rockApi->getWeaponPartGripStateV1(RockProviderHand::Right, &state) && state.active)
+motion.minValue = 0.0f;
+motion.maxValue =
+    weap->reloadSlidePos - weap->maxBoltPosition;
+```
+
+After the bolt reaches the cocked endpoint, resubmit every exact-body
+constraint with:
+
+```cpp
+motion.minValue =
+    weap->reloadSlidePos - weap->originalBoltPosition;
+motion.maxValue =
+    weap->reloadSlidePos - weap->maxBoltPosition;
+```
+
+The new minimum is negative when the closed/rest Y position is forward of the
+dry-fire Y position. The same held hand can then push the bolt through
+coordinate zero to the closed endpoint. Only the legal range is updated
+mid-grip; changing the motion kind, axis space, or axis direction takes effect
+on the next fresh grab to avoid reinterpreting the existing hand displacement
+and snapping the part.
+
+## Holding the dry-fire pose
+
+If Virtual Reloads wants a set-and-forget drive, use the persistent lease
+constant and target the same authored node:
+
+```cpp
+bool holdDryPos(CurrentWeapon* weap)
 {
-    // state.partKind / state.reloadRole tell you what got grabbed;
-    // state.gripSequence increments on every fresh grab, so compare it to the last value you
-    // saw to detect a new attach without needing a callback.
+    using namespace rock::provider;
+
+    if (!g_rockApi || !g_rockOwnerToken ||
+        !weap || !weap->primaryNode01) {
+        return false;
+    }
+
+    RockProviderWeaponPartDriveTargetV1 drive{};
+    drive.flags = static_cast<std::uint32_t>(
+        RockProviderWeaponPartTargetFlagV1::MatchSourceName);
+    drive.driveSpace =
+        RockProviderWeaponPartDriveSpaceV1::
+            ControlledRootParentLocal;
+    std::snprintf(
+        drive.sourceName,
+        sizeof(drive.sourceName),
+        "%s",
+        weap->primaryNode01->m_name.c_str());
+
+    drive.targetTransform =
+        weap->primaryNode01->m_localTransform;
+    drive.targetTransform.translate[1] =
+        weap->reloadSlidePos;
+    drive.controlledRoot =
+        reinterpret_cast<std::uintptr_t>(
+            weap->primaryNode01);
+    drive.leaseFrames =
+        ROCK_PROVIDER_WEAPON_PART_DRIVE_LEASE_UNTIL_CLEARED_V1;
+
+    return g_rockApi->setWeaponPartDriveTargetsV1(
+               g_rockOwnerToken,
+               &drive,
+               1) == RockProviderResultV1::Ok;
 }
 ```
 
-This is real Havok contact — the player is physically touching and holding the actual part body,
-not a scripted proxy, so it collides with the rest of the world normally while held.
+`drive.targetTransform = node->m_localTransform;` is supported directly by
+the header adapter; manual copying of the matrix, position, and scale is not
+required.
 
-**4d. Optional — drive the part yourself.** If part of your reload sequence should animate
-before or independent of the player's hand (e.g. the mag auto-ejecting partway before the player
-takes it), you can write the part's transform directly while ROCK keeps the grabbing hand glued
-to it:
+ROCK applies a matching hand constraint after a drive in the same frame, so
+the dry-fire hold keeps the part open before it is grabbed while the
+constraint has authority during the grab.
 
-```cpp
-RockProviderWeaponPartDriveTargetV1 drive{};
-drive.bodyId = /* from the evidence detail you found in 4a */;
-drive.driveSpace = RockProviderWeaponPartDriveSpaceV1::WeaponRootLocal;
-drive.targetTransform = /* your animated transform */;
-drive.leaseFrames = 1; // short finite lease; re-send while this animation advances
-
-g_rockApi->setWeaponPartDriveTargetsV1(g_rockOwnerToken, &drive, 1);
-```
-
-**4e. Clean up.** When your reload finishes (or the player cancels), clear both:
+## Cleanup
 
 ```cpp
-g_rockApi->clearWeaponPartTargetsV1(g_rockOwnerToken);
-g_rockApi->clearWeaponPartDriveTargetsV1(g_rockOwnerToken);
-```
-
-## Step 5 — Your own node-name mapping, with real collision and correct constrained motion
-
-If you already have your own curated per-archetype node-name maps (built from real-world testing —
-"a slide lives in one of these 4 specific nodes for this archetype," break-actions use the barrel
-node instead of P-Mag, etc.), you don't need ROCK's own classification heuristics at all. Target
-the exact node by name (`MatchSourceName` is an exact, case-sensitive match against the live NIF
-node's real name — no fuzzy matching, so whatever string is in your map is what to send):
-
-```cpp
-RockProviderWeaponPartTargetV1 target{};
-target.flags = static_cast<std::uint32_t>(RockProviderWeaponPartTargetFlagV1::MatchSourceName);
-target.grabMode = RockProviderWeaponPartGrabModeV1::AttachOnly; // required for a motion constraint - see below
-std::snprintf(target.sourceName, sizeof(target.sourceName), "%s", yourMappedNodeName.c_str());
-
-g_rockApi->setWeaponPartTargetsV1(g_rockOwnerToken, &target, 1);
-```
-
-`AttachOnly` grabs give the player real Havok collision on the part (it's a normal generated body,
-same as any other ROCK weapon-part hull) but the hand only glues to wherever the part's node
-currently sits — nothing makes the part itself move correctly along a slide rail or a hinge on its
-own. That's what a **motion constraint** is for: it tells ROCK to project the grabbing hand's
-motion onto an axis you define, instead of letting the part follow the hand freely in 3D.
-
-Check support once (this feature may not exist on an older host build), then set a constraint for
-the same part you just whitelisted — match it by the same identity fields (exact node name here
-again is the simplest and most reliable), before or the same frame the player is expected to grab
-it:
-
-```cpp
-RockProviderLimitsV1 limits{};
-const bool haveMotionConstraints = g_rockApi->getProviderLimitsV1(&limits) &&
-    supportsWeaponPartMotionConstraintV1(limits);
-
-if (haveMotionConstraints)
+void clearSlideConstraint()
 {
-    RockProviderWeaponPartMotionConstraintV1 constraint{};
-    constraint.kind = RockProviderWeaponPartMotionKindV1::Linear;      // or Rotational
-    constraint.axisSpace = RockProviderWeaponPartDriveSpaceV1::WeaponRootLocal;
-    std::snprintf(constraint.sourceName, sizeof(constraint.sourceName), "%s", yourMappedNodeName.c_str());
+    using namespace rock::provider;
+    if (!g_rockApi || !g_rockOwnerToken) {
+        return;
+    }
 
-    // Linear: axisOrigin is the path start point, axisDirection is the slide direction (unit
-    // vector), min/maxValue are game units of travel from axisOrigin.
-    // Rotational: axisOrigin is the hinge pivot, axisDirection is the hinge axis (unit vector),
-    // min/maxValue are degrees swept around it.
-    constraint.axisOrigin[0] = 0.0f;  constraint.axisOrigin[1] = 0.0f;  constraint.axisOrigin[2] = 0.0f;
-    constraint.axisDirection[0] = 0.0f; constraint.axisDirection[1] = 0.0f; constraint.axisDirection[2] = 1.0f;
-    constraint.minValue = 0.0f;
-    constraint.maxValue = 3.2f; // e.g. slide travel in game units - these are entirely yours to set,
-                                // per weapon/archetype, from whatever you measure or author
+    (void)g_rockApi->clearWeaponPartTargetsV1(
+        g_rockOwnerToken);
+    (void)g_rockApi->clearWeaponPartMotionConstraintsV1(
+        g_rockOwnerToken);
+}
 
-    g_rockApi->setWeaponPartMotionConstraintsV1(g_rockOwnerToken, &constraint, 1);
+void clearDryPose()
+{
+    if (g_rockApi && g_rockOwnerToken) {
+        (void)g_rockApi->clearWeaponPartDriveTargetsV1(
+            g_rockOwnerToken);
+    }
+}
+
+void disconnectFromRock()
+{
+    if (g_rockApi && g_rockOwnerToken) {
+        clearSlideConstraint();
+        clearDryPose();
+        (void)g_rockApi->unregisterConsumerV1(
+            g_rockOwnerToken);
+    }
+    g_rockOwnerToken = 0;
+    g_rockApi = nullptr;
 }
 ```
 
-Once both are set: the player grabs the real part with real collision (identified by your own
-mapping, not ROCK's), and as their hand moves, the part slides or swings exactly along the axis you
-specified — clamped to your min/max — instead of following the hand's raw 3D position. The part's
-rotation stays fixed for a Linear constraint (pure translation, correct for a slide/detach path);
-for Rotational, the part's translation sweeps through the same arc as its rotation around
-`axisOrigin`, so a part whose own origin isn't exactly at the pivot still swings through a real arc
-rather than spinning in place.
+Clear the target, constraint, and drive on success, cancellation, holster,
+weapon change, and plugin shutdown.
 
-Clear it alongside the target when your reload step ends:
+## Exact contact behavior in this build
 
-```cpp
-g_rockApi->clearWeaponPartMotionConstraintsV1(g_rockOwnerToken);
-g_rockApi->clearWeaponPartTargetsV1(g_rockOwnerToken);
-```
+Exclusive targets never fall back to another weapon part or the legacy
+whole-weapon selector. A target attaches only when a generated hand collider
+actually overlaps the selected body's mesh; ROCK can reconstruct that exact
+mesh contact when Havok omits the callback for a tiny keyframed part.
 
-A constraint only ever applies to an `AttachOnly` grip — `FullTwoHandAuthority` already steers the
-whole weapon and has no single part to constrain independently, so setting one for a
-`FullTwoHandAuthority` target is simply ignored (no error, `getWeaponPartGripStateV1` just won't
-show constrained motion for it).
+The stock 10 mm `Pistol10mmBoltRelease:0` is no longer classified as a Bolt,
+so `MatchPartKind::Bolt` cannot accidentally select the release button.
+Exact `MatchBodyId` remains the recommended selector.
 
-## Step 6 — Positioning a part WITHOUT a grab (dry-fire slide lock, bolt hold-open, hammer states)
-
-`setWeaponPartDriveTargetsV1` is not just for mid-grab animation — it is the general "set this
-node's transform" call, and it works with **no whitelist, no grip, and no collision body** on the
-part. Verified against the engine implementation (`PhysicsInteraction::applyProviderWeaponPartDrives`):
-
-- **Node resolution**: `MatchSourceName` matches the exact NIF node name first against collision
-  evidence, then **falls back to a live search of the equipped weapon's node tree** — so a slide
-  that was never whitelisted or touched still resolves.
-- **What it writes**: the node's actual `local` transform (then `updateTransformsDown`), re-applied
-  every frame while the drive is alive — it survives the game/FRIK re-posing the tree each frame.
-- **Spaces**: `SourceParentLocal` = the transform you supply IS the node's new local transform
-  relative to its own parent (what you want for "slide at rest, translated back 2.4 units along
-  its rail"). `WeaponRootLocal` = relative to the weapon root node instead.
-- **Automatic restore**: the engine snapshots the node's original local on first drive and
-  **restores it automatically** when the drive lease expires, when you call
-  `clearWeaponPartDriveTargetsV1`, or when the weapon regenerates (holster/re-equip). You never
-  have to put the slide back yourself.
-
-Dry-fire example — hold the slide locked back until the state ends:
-
-```cpp
-RockProviderWeaponPartDriveTargetV1 drive{};
-drive.flags = static_cast<std::uint32_t>(RockProviderWeaponPartTargetFlagV1::MatchSourceName);
-drive.driveSpace = RockProviderWeaponPartDriveSpaceV1::SourceParentLocal;
-std::snprintf(drive.sourceName, sizeof(drive.sourceName), "%s", slideNodeName.c_str());
-drive.targetTransform = slideNode->m_localTransform;          // legacy F4SE NiTransform converts directly
-drive.targetTransform.translate[Y] -= slideLockBackTravel;    // ...offset along the rail axis
-drive.leaseFrames = ROCK_PROVIDER_WEAPON_PART_DRIVE_LEASE_UNTIL_CLEARED_V1;
-g_rockApi->setWeaponPartDriveTargetsV1(g_rockOwnerToken, &drive, 1);
-
-// chamber a round / reload complete:
-g_rockApi->clearWeaponPartDriveTargetsV1(g_rockOwnerToken);   // slide snaps home automatically
-```
-
-The published `0xFFFFFF` value is the persistent sentinel, so existing consumers using that
-literal remain source- and behavior-compatible; the named constant makes the intent explicit.
-Persistent drives are still removed by `clearWeaponPartDriveTargetsV1`, owner unregister, or
-provider lifecycle loss. New consumers that also support older ROCK hosts can query
-`supportsWeaponPartDrivePersistentLeaseV1()` and fall back to refreshing a short lease when it
-returns false. A small `leaseFrames` value remains useful for fail-safe, continuously updated
-animation.
-
-Notes: the direct assignment adapter accepts the legacy F4SE `NiTransform` layout used by
-`m_localTransform` (`rot.data`, `pos`, and `scale`) without exposing that engine type in ROCK's ABI.
-If two drives target the same node, the higher `priority` wins. Set `weaponGenerationKey` from the
-frame snapshot when the drive must be restricted to the currently equipped weapon generation;
-leaving it zero intentionally permits the matcher to resolve on later generations too. The drive
-requires an equipped weapon with a live generation key (i.e. ROCK's weapon collision has seen the
-weapon — always true in normal play with the embed).
-
-## Export stability
-
-`ROCKAPI_GetProviderApi` is a documented, intentional public export as of 2026-07-21 (see the
-comment on its declaration in `ROCKProviderApi.h` and its definition in `ROCKProviderApi.cpp`) —
-not an accident of a leftover build flag. It's expected to stay put; the API widens by bumping
-`ROCK_PROVIDER_API_VERSION` and appending new function-table members (check
-`getProviderLimitsV1`/`supportsXV1` before calling anything new, same as today), never by changing
-this entry point's signature.
+`ROCKAPI_GetProviderApi` is the stable export. `RockProviderApi::initialize`
+checks standalone `ROCK.dll` first for compatibility, then the embedded
+`Heisenberg_F4VR.dll`.

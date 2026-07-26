@@ -1,5 +1,6 @@
 #include "MenuChecker.h"
 #include "DropToHand.h"
+#include "InputRecovery.h"
 #include "Utils.h"
 #include "f4vr/F4VRUtils.h"
 
@@ -187,6 +188,12 @@ namespace heisenberg
                 if (auto* player = RE::PlayerCharacter::GetSingleton()) {
                     f4cf::f4vr::SetActorRestrained(player, false);
                 }
+
+                // The one-shot above fires the instant LoadingMenu closes, which can still be
+                // before the engine finishes restoring save state, and it only covers the actor
+                // RESTRAINED flag. Arm the watchdog so the engine's input-enable layers are dumped
+                // and movement re-asserted at several checkpoints after the load settles.
+                InputRecovery::OnLoadComplete();
             }
         }
         else if (strcmp(menuName, "PauseMenu") == 0) {

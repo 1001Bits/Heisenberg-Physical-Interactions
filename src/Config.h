@@ -107,7 +107,7 @@ namespace heisenberg
         // second hand acts as an aim/stabilize hand (object swings to point along the line
         // between the two hands). Default OFF. When off, a second-hand grab transfers the
         // object hand-to-hand as before.
-        bool enableTwoHandedGrab = false;
+        bool enableTwoHandedGrab = true;
         // Limb grab: when grabbing an actor (requires bEnableGrabActors), constrain to the
         // specific ragdoll limb (bone body) nearest the hand instead of the actor root.
         // Default OFF. Grabbing NPC ragdoll bodies is CTD-prone — opt-in only.
@@ -167,7 +167,7 @@ namespace heisenberg
         float palmPositionZ = -2.4f;
         bool enablePalmSnap = true;  // Snap objects to palm center on grab (for mid-range grabs)
         bool enableAutomaticHandPlacement = false;  // HIGGS-style geometry placement; off uses saved item offsets
-        bool enableAutomaticFingerCurls = false;   // Geometry-based finger curls; off uses saved finger curl offsets
+        bool enableAutomaticFingerCurls = true;    // Geometry-based finger curls; fail-open when no trustworthy mesh stop exists
         bool saveNaturalGrabAsOffset = false;  // Save natural grab positions as item offsets (default off)
 
         // Grip inference (Task #3). When enabled, prefers a palm-ray cast into
@@ -416,6 +416,24 @@ namespace heisenberg
                                                  // controller state (FRIK bends the thumb on any
                                                  // stick edge-touch -> twitch during grabs);
                                                  // presses and axis values pass through
+        float pipboyBootScreenDropGameUnits = 0.18f;  // shift the temporary boot screen DOWN by this
+                                                 // many game units so the top of the RobCo startup
+                                                 // animation is not clipped by the wrist aperture.
+                                                 // 0.35 uncovered the top but sat too low overall
+                                                 // (user, Jul 27) — halved. Raise to move the screen
+                                                 // DOWN, lower it (toward 0) to move the screen UP.
+        bool  pipboyBootOpensContent = false;    // after the Vault 111 RobCo boot sequence, auto-open
+                                                 // the Pip-Boy on STATS like vanilla flat does.
+                                                 // OFF: that forced-open Pip-Boy is opened through a
+                                                 // native path FRIK does not own, so grip could not
+                                                 // close it (black screen, stuck open). Closed hand-off
+                                                 // to FRIK is reliable; only the auto-open is lost.
+        bool  postLoadInputRecovery = true;      // after a save load, dump the engine's input-enable
+                                                 // layers ([INPUT-DIAG]) and re-assert un-restrained
+                                                 // + force-enabled movement at several checkpoints.
+                                                 // Fixes saves that carry a stale control-disable
+                                                 // layer (symptom: cannot move or jump, CAN turn).
+                                                 // Never heals while a control-owning menu is open.
         int   twoHandedFingerPoseMode = 1;       // support-hand fingers during ROCK two-handed
                                                  // grip: 0=off (FRIK grip fist), 1=ROCK's
                                                  // mesh-solved grip pose via base FRIK API,
@@ -429,10 +447,10 @@ namespace heisenberg
         // ─── SECOND ARCHITECTURE: embedded full ROCK engine (rock_engine static lib) ───
         // When ON, Heisenberg hosts ROCK's *complete* vendored engine in-process via
         // rock::HostLoad() — ROCK's own PhysicsInteraction/grab/hand/weapon pipeline runs
-        // exactly as the standalone ROCK.dll, driven by ROCK.ini (deployed alongside this
-        // plugin). Per-subsystem ownership (Heisenberg vs ROCK) is then chosen purely via
-        // the two INIs. Default OFF — when off the engine is linked but completely dormant
-        // (no hook installed, no listener registered), so behaviour is identical to today.
+        // from [PhysicsInteraction] in Heisenberg_F4VR.ini. Missing ROCK keys use compiled
+        // defaults, so there is no standalone ROCK.ini or ROCK_Config folder. Default OFF
+        // — when off the engine is linked but completely dormant (no hook installed, no
+        // listener registered), so behaviour is identical to today.
         // Read EARLY (during F4SEPlugin_Load) so ROCK registers its lifecycle listener
         // before kGameLoaded fires — see Heisenberg::OnF4SELoad.
         bool  useRockEngineArchitecture = false;

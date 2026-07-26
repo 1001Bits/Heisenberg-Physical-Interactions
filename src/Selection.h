@@ -25,6 +25,15 @@ namespace heisenberg
         RE::NiPoint3 hitNormal;
         float distance = 0.0f;
         bool isClose = false;
+        // Set only from ROCK's native contact evidence. A selected ref can be
+        // physically under the rendered hand even when the controller/viewcast
+        // frame is stale or belongs to a different skeleton space. Carry this
+        // provenance into StartGrab so a real touch can never become a remote
+        // pull merely because the node/controller distance is wrong.
+        bool isPhysicalTouch = false;
+        std::uint32_t physicalTouchBodyId = 0x7FFF'FFFFu;
+        std::uint32_t physicalTouchAgeFrames = 0xFFFF'FFFFu;
+        bool hasPhysicalTouchPoint = false;
 
         void Clear()
         {
@@ -34,6 +43,10 @@ namespace heisenberg
             hitNormal = RE::NiPoint3();
             distance = 0.0f;
             isClose = false;
+            isPhysicalTouch = false;
+            physicalTouchBodyId = 0x7FFF'FFFFu;
+            physicalTouchAgeFrames = 0xFFFF'FFFFu;
+            hasPhysicalTouchPoint = false;
         }
 
         /**

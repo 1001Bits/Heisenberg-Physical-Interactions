@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <string_view>
 
 #include "physics-interaction/object/ExternalBodyRegistry.h"
@@ -117,7 +118,8 @@ namespace
         static_cast<std::uint32_t>(RockProviderConsumerCapabilityV1::InteractionCommands) |
         static_cast<std::uint32_t>(RockProviderConsumerCapabilityV1::HandInputSuppression) |
         static_cast<std::uint32_t>(RockProviderConsumerCapabilityV1::WeaponPartInteraction) |
-        static_cast<std::uint32_t>(RockProviderConsumerCapabilityV1::WeaponPartMotionConstraint);
+        static_cast<std::uint32_t>(RockProviderConsumerCapabilityV1::WeaponPartMotionConstraint) |
+        static_cast<std::uint32_t>(RockProviderConsumerCapabilityV1::LearnedWeaponPartProfiles);
     constexpr std::uint32_t kProviderFeatureBitsV1 =
         static_cast<std::uint32_t>(RockProviderFeatureBitV1::FrameCallbacks) |
         static_cast<std::uint32_t>(RockProviderFeatureBitV1::LifecycleFields) |
@@ -139,7 +141,11 @@ namespace
         static_cast<std::uint32_t>(RockProviderFeatureBitV1::RawWandButtonState) |
         static_cast<std::uint32_t>(RockProviderFeatureBitV1::PipboyInputSuppression) |
         static_cast<std::uint32_t>(RockProviderFeatureBitV1::WeaponPartMotionConstraint) |
-        static_cast<std::uint32_t>(RockProviderFeatureBitV1::WeaponPartDrivePersistentLease);
+        static_cast<std::uint32_t>(RockProviderFeatureBitV1::WeaponPartDrivePersistentLease) |
+        static_cast<std::uint32_t>(RockProviderFeatureBitV1::WeaponPartExclusiveExactContact) |
+        static_cast<std::uint32_t>(RockProviderFeatureBitV1::WeaponPartControlledRoot) |
+        static_cast<std::uint32_t>(RockProviderFeatureBitV1::WeaponPartInteractionZone) |
+        static_cast<std::uint32_t>(RockProviderFeatureBitV1::LearnedWeaponPartProfiles);
     constexpr std::uint32_t kImplementedForceGrabFlagsV1 =
         static_cast<std::uint32_t>(RockProviderForceGrabFlagV1::UsePreferredGrabPointGame);
     constexpr std::uint32_t kImplementedForceReleaseFlagsV1 =
@@ -213,10 +219,17 @@ namespace
     std::mutex s_handInputSuppressionMutex;
     std::array<HandInputSuppressionSlot, ROCK_PROVIDER_MAX_HAND_INPUT_SUPPRESSIONS_V1> s_handInputSuppressions{};
 
+    enum class WeaponPartSlotOrigin : std::uint8_t
+    {
+        Manual = 0,
+        LearnedProfile = 1,
+    };
+
     struct WeaponPartTargetSlot
     {
         bool active{ false };
         std::uint64_t ownerToken{ 0 };
+        WeaponPartSlotOrigin origin{ WeaponPartSlotOrigin::Manual };
         RockProviderWeaponPartTargetV1 target{};
     };
 
@@ -224,6 +237,7 @@ namespace
     {
         bool active{ false };
         std::uint64_t ownerToken{ 0 };
+        WeaponPartSlotOrigin origin{ WeaponPartSlotOrigin::Manual };
         std::uint64_t expiresAfterFrame{ 0 };
         RockProviderWeaponPartDriveTargetV1 target{};
     };
@@ -232,13 +246,23 @@ namespace
     {
         bool active{ false };
         std::uint64_t ownerToken{ 0 };
+        WeaponPartSlotOrigin origin{ WeaponPartSlotOrigin::Manual };
         RockProviderWeaponPartMotionConstraintV1 constraint{};
+    };
+
+    struct WeaponPartInteractionZoneSlot
+    {
+        bool active{ false };
+        std::uint64_t ownerToken{ 0 };
+        WeaponPartSlotOrigin origin{ WeaponPartSlotOrigin::Manual };
+        RockProviderWeaponPartInteractionZoneV1 zone{};
     };
 
     std::mutex s_weaponPartMutex;
     std::array<WeaponPartTargetSlot, ROCK_PROVIDER_MAX_WEAPON_PART_TARGETS_V1> s_weaponPartTargets{};
     std::array<WeaponPartDriveSlot, ROCK_PROVIDER_MAX_WEAPON_PART_DRIVES_V1> s_weaponPartDrives{};
     std::array<WeaponPartMotionConstraintSlot, ROCK_PROVIDER_MAX_WEAPON_PART_MOTION_CONSTRAINTS_V1> s_weaponPartMotionConstraints{};
+    std::array<WeaponPartInteractionZoneSlot, ROCK_PROVIDER_MAX_WEAPON_PART_INTERACTION_ZONES_V1> s_weaponPartInteractionZones{};
 
     std::uint32_t ROCK_PROVIDER_CALL apiGetVersion() { return ROCK_PROVIDER_API_VERSION; }
 
@@ -485,28 +509,52 @@ namespace
         }
     }
 
-    void clearWeaponPartTargetsForOwnerLocked(std::uint64_t ownerToken)
+    bool slotOriginMatches(
+        WeaponPartSlotOrigin actual,
+        const std::optional<WeaponPartSlotOrigin>& requested)
+    {
+        return !requested.has_value() || actual == *requested;
+    }
+
+    void clearWeaponPartTargetsForOwnerLocked(
+        std::uint64_t ownerToken,
+        std::optional<WeaponPartSlotOrigin> origin = std::nullopt)
     {
         for (auto& slot : s_weaponPartTargets) {
-            if (slot.active && slot.ownerToken == ownerToken) {
+            if (slot.active && slot.ownerToken == ownerToken && slotOriginMatches(slot.origin, origin)) {
                 slot = {};
             }
         }
     }
 
-    void clearWeaponPartDrivesForOwnerLocked(std::uint64_t ownerToken)
+    void clearWeaponPartDrivesForOwnerLocked(
+        std::uint64_t ownerToken,
+        std::optional<WeaponPartSlotOrigin> origin = std::nullopt)
     {
         for (auto& slot : s_weaponPartDrives) {
-            if (slot.active && slot.ownerToken == ownerToken) {
+            if (slot.active && slot.ownerToken == ownerToken && slotOriginMatches(slot.origin, origin)) {
                 slot = {};
             }
         }
     }
 
-    void clearWeaponPartMotionConstraintsForOwnerLocked(std::uint64_t ownerToken)
+    void clearWeaponPartMotionConstraintsForOwnerLocked(
+        std::uint64_t ownerToken,
+        std::optional<WeaponPartSlotOrigin> origin = std::nullopt)
     {
         for (auto& slot : s_weaponPartMotionConstraints) {
-            if (slot.active && slot.ownerToken == ownerToken) {
+            if (slot.active && slot.ownerToken == ownerToken && slotOriginMatches(slot.origin, origin)) {
+                slot = {};
+            }
+        }
+    }
+
+    void clearWeaponPartInteractionZonesForOwnerLocked(
+        std::uint64_t ownerToken,
+        std::optional<WeaponPartSlotOrigin> origin = std::nullopt)
+    {
+        for (auto& slot : s_weaponPartInteractionZones) {
+            if (slot.active && slot.ownerToken == ownerToken && slotOriginMatches(slot.origin, origin)) {
                 slot = {};
             }
         }
@@ -643,33 +691,52 @@ namespace
         return true;
     }
 
-    std::size_t availableWeaponPartTargetSlotsForOwnerLocked(std::uint64_t ownerToken)
+    std::size_t availableWeaponPartTargetSlotsForOwnerLocked(
+        std::uint64_t ownerToken,
+        WeaponPartSlotOrigin origin)
     {
         std::size_t available = 0;
         for (const auto& slot : s_weaponPartTargets) {
-            if (!slot.active || slot.ownerToken == ownerToken) {
+            if (!slot.active || (slot.ownerToken == ownerToken && slot.origin == origin)) {
                 ++available;
             }
         }
         return available;
     }
 
-    std::size_t availableWeaponPartDriveSlotsForOwnerLocked(std::uint64_t ownerToken)
+    std::size_t availableWeaponPartDriveSlotsForOwnerLocked(
+        std::uint64_t ownerToken,
+        WeaponPartSlotOrigin origin)
     {
         std::size_t available = 0;
         for (const auto& slot : s_weaponPartDrives) {
-            if (!slot.active || slot.ownerToken == ownerToken) {
+            if (!slot.active || (slot.ownerToken == ownerToken && slot.origin == origin)) {
                 ++available;
             }
         }
         return available;
     }
 
-    std::size_t availableWeaponPartMotionConstraintSlotsForOwnerLocked(std::uint64_t ownerToken)
+    std::size_t availableWeaponPartMotionConstraintSlotsForOwnerLocked(
+        std::uint64_t ownerToken,
+        WeaponPartSlotOrigin origin)
     {
         std::size_t available = 0;
         for (const auto& slot : s_weaponPartMotionConstraints) {
-            if (!slot.active || slot.ownerToken == ownerToken) {
+            if (!slot.active || (slot.ownerToken == ownerToken && slot.origin == origin)) {
+                ++available;
+            }
+        }
+        return available;
+    }
+
+    std::size_t availableWeaponPartInteractionZoneSlotsForOwnerLocked(
+        std::uint64_t ownerToken,
+        WeaponPartSlotOrigin origin)
+    {
+        std::size_t available = 0;
+        for (const auto& slot : s_weaponPartInteractionZones) {
+            if (!slot.active || (slot.ownerToken == ownerToken && slot.origin == origin)) {
                 ++available;
             }
         }
@@ -708,6 +775,78 @@ namespace
                std::abs(transform.scale) > 0.0001f;
     }
 
+    bool isFinitePoint3(const float (&point)[3])
+    {
+        return std::isfinite(point[0]) &&
+               std::isfinite(point[1]) &&
+               std::isfinite(point[2]);
+    }
+
+    bool isValidWeaponPartInteractionZone(const RockProviderWeaponPartInteractionZoneV1& zone)
+    {
+        constexpr std::uint32_t kKnownFlags =
+            static_cast<std::uint32_t>(RockProviderWeaponPartInteractionZoneFlagV1::SnapAnchorValid) |
+            static_cast<std::uint32_t>(RockProviderWeaponPartInteractionZoneFlagV1::RightHandTransformValid) |
+            static_cast<std::uint32_t>(RockProviderWeaponPartInteractionZoneFlagV1::LeftHandTransformValid);
+        if ((zone.flags & ~kKnownFlags) != 0 ||
+            zone.weaponGenerationKey == 0 ||
+            zone.bodyId == kProviderInvalidBodyId ||
+            !isFinitePoint3(zone.zoneCenter) ||
+            !isFinitePoint3(zone.zoneHalfExtents) ||
+            !isFinitePoint3(zone.snapAnchor)) {
+            return false;
+        }
+        if (zone.shape != RockProviderWeaponPartInteractionZoneShapeV1::Box &&
+            zone.shape != RockProviderWeaponPartInteractionZoneShapeV1::Sphere) {
+            return false;
+        }
+        if (zone.zoneSpace != RockProviderWeaponPartInteractionZoneSpaceV1::WeaponRootLocal &&
+            zone.zoneSpace != RockProviderWeaponPartInteractionZoneSpaceV1::SourceRootLocal &&
+            zone.zoneSpace != RockProviderWeaponPartInteractionZoneSpaceV1::ControlledRootLocal) {
+            return false;
+        }
+        if (zone.snapMode != RockProviderWeaponPartInteractionZoneSnapModeV1::ClosestTargetMeshSurface &&
+            zone.snapMode != RockProviderWeaponPartInteractionZoneSnapModeV1::AnchorPosition &&
+            zone.snapMode != RockProviderWeaponPartInteractionZoneSnapModeV1::FullHandTransform) {
+            return false;
+        }
+        if (zone.shape == RockProviderWeaponPartInteractionZoneShapeV1::Sphere) {
+            if (!(zone.zoneHalfExtents[0] > 0.0f)) {
+                return false;
+            }
+        } else if (!(zone.zoneHalfExtents[0] > 0.0f) ||
+                   !(zone.zoneHalfExtents[1] > 0.0f) ||
+                   !(zone.zoneHalfExtents[2] > 0.0f)) {
+            return false;
+        }
+        if (zone.zoneSpace == RockProviderWeaponPartInteractionZoneSpaceV1::SourceRootLocal &&
+            zone.sourceRoot == 0) {
+            return false;
+        }
+        if (zone.zoneSpace == RockProviderWeaponPartInteractionZoneSpaceV1::ControlledRootLocal &&
+            zone.controlledRoot == 0 && zone.sourceRoot == 0) {
+            return false;
+        }
+        if (zone.snapMode == RockProviderWeaponPartInteractionZoneSnapModeV1::AnchorPosition &&
+            !hasWeaponPartInteractionZoneFlagV1(zone.flags, RockProviderWeaponPartInteractionZoneFlagV1::SnapAnchorValid)) {
+            return false;
+        }
+        if (hasWeaponPartInteractionZoneFlagV1(zone.flags, RockProviderWeaponPartInteractionZoneFlagV1::RightHandTransformValid) &&
+            !isFiniteProviderTransform(zone.rightHandPartLocal)) {
+            return false;
+        }
+        if (hasWeaponPartInteractionZoneFlagV1(zone.flags, RockProviderWeaponPartInteractionZoneFlagV1::LeftHandTransformValid) &&
+            !isFiniteProviderTransform(zone.leftHandPartLocal)) {
+            return false;
+        }
+        if (zone.snapMode == RockProviderWeaponPartInteractionZoneSnapModeV1::FullHandTransform &&
+            !hasWeaponPartInteractionZoneFlagV1(zone.flags, RockProviderWeaponPartInteractionZoneFlagV1::RightHandTransformValid) &&
+            !hasWeaponPartInteractionZoneFlagV1(zone.flags, RockProviderWeaponPartInteractionZoneFlagV1::LeftHandTransformValid)) {
+            return false;
+        }
+        return true;
+    }
+
     bool isFiniteWeaponPartMotionConstraintAxes(const RockProviderWeaponPartMotionConstraintV1& constraint)
     {
         for (float value : constraint.axisOrigin) {
@@ -728,7 +867,18 @@ namespace
         if (directionLengthSq < 0.0001f) {
             return false;
         }
-        return std::isfinite(constraint.minValue) && std::isfinite(constraint.maxValue) && constraint.minValue <= constraint.maxValue;
+        /*
+         * Motion is defined relative to the transform captured at grab time.
+         * Zero must therefore be legal; otherwise the first constrained frame
+         * necessarily snaps the part to minValue/maxValue even though the hand
+         * has not moved. Consumers that need a different starting pose should
+         * drive the node there before the grab.
+         */
+        return std::isfinite(constraint.minValue) &&
+               std::isfinite(constraint.maxValue) &&
+               constraint.minValue <= 0.0f &&
+               constraint.maxValue >= 0.0f &&
+               constraint.minValue <= constraint.maxValue;
     }
 
     weapon_part_runtime::GrabMode toRuntimeGrabMode(RockProviderWeaponPartGrabModeV1 mode)
@@ -1096,6 +1246,13 @@ namespace
             outHandle->ownerToken = slot.token;
             outHandle->grantedCapabilities = slot.grantedCapabilities;
             outHandle->providerGeneration = slot.providerGeneration;
+            logger::info(
+                "ROCK provider consumer registered: mod='{}' token={} requestedCaps=0x{:08X} grantedCaps=0x{:08X} generation={}",
+                registration->modName,
+                slot.token,
+                registration->requestedCapabilities,
+                slot.grantedCapabilities,
+                slot.providerGeneration);
             return RockProviderResultV1::Ok;
         }
 
@@ -1120,6 +1277,7 @@ namespace
             clearWeaponPartTargetsForOwnerLocked(ownerToken);
             clearWeaponPartDrivesForOwnerLocked(ownerToken);
             clearWeaponPartMotionConstraintsForOwnerLocked(ownerToken);
+            clearWeaponPartInteractionZonesForOwnerLocked(ownerToken);
         }
 
         {
@@ -1479,21 +1637,32 @@ namespace
             if (!isValidWeaponPartGrabMode(target.grabMode) ||
                 !hasValidWeaponPartMatcher(target.flags, target.bodyId, target.sourceRoot, target.sourceName) ||
                 !hasValidWeaponPartTargetSemantics(target)) {
+                logger::warn(
+                    "ROCK provider rejected weapon-part target: token={} index={} flags=0x{:08X} grabMode={} generation={:016X} bodyId={} partKind={} source='{}'",
+                    ownerToken,
+                    i,
+                    target.flags,
+                    static_cast<std::uint32_t>(target.grabMode),
+                    target.weaponGenerationKey,
+                    target.bodyId,
+                    target.partKind,
+                    target.sourceName);
                 return RockProviderResultV1::InvalidArgument;
             }
         }
 
-        if (targetCount > availableWeaponPartTargetSlotsForOwnerLocked(ownerToken)) {
+        if (targetCount > availableWeaponPartTargetSlotsForOwnerLocked(ownerToken, WeaponPartSlotOrigin::Manual)) {
             return RockProviderResultV1::CapacityFull;
         }
 
-        clearWeaponPartTargetsForOwnerLocked(ownerToken);
+        clearWeaponPartTargetsForOwnerLocked(ownerToken, WeaponPartSlotOrigin::Manual);
         for (std::uint32_t i = 0; i < targetCount; ++i) {
             bool stored = false;
             for (auto& slot : s_weaponPartTargets) {
                 if (!slot.active) {
                     slot.active = true;
                     slot.ownerToken = ownerToken;
+                    slot.origin = WeaponPartSlotOrigin::Manual;
                     slot.target = targets[i];
                     slot.target.sourceName[ROCK_PROVIDER_MAX_EVIDENCE_NAME - 1] = '\0';
                     stored = true;
@@ -1501,9 +1670,23 @@ namespace
                 }
             }
             if (!stored) {
-                clearWeaponPartTargetsForOwnerLocked(ownerToken);
+                clearWeaponPartTargetsForOwnerLocked(ownerToken, WeaponPartSlotOrigin::Manual);
                 return RockProviderResultV1::CapacityFull;
             }
+        }
+        for (std::uint32_t i = 0; i < targetCount; ++i) {
+            const auto& target = targets[i];
+            logger::info(
+                "ROCK provider weapon-part target set: token={} index={} flags=0x{:08X} grabMode={} generation={:016X} bodyId={} partKind={} source='{}' exclusive={}",
+                ownerToken,
+                i,
+                target.flags,
+                static_cast<std::uint32_t>(target.grabMode),
+                target.weaponGenerationKey,
+                target.bodyId,
+                target.partKind,
+                target.sourceName,
+                hasWeaponPartTargetFlagV1(target.flags, RockProviderWeaponPartTargetFlagV1::NonExclusive) ? "no" : "yes");
         }
         return RockProviderResultV1::Ok;
     }
@@ -1519,7 +1702,7 @@ namespace
         if (ownerResult != RockProviderResultV1::Ok) {
             return ownerResult;
         }
-        clearWeaponPartTargetsForOwnerLocked(ownerToken);
+        clearWeaponPartTargetsForOwnerLocked(ownerToken, WeaponPartSlotOrigin::Manual);
         return RockProviderResultV1::Ok;
     }
 
@@ -1554,21 +1737,39 @@ namespace
                 !isFiniteWeaponPartMotionConstraintAxes(constraint) ||
                 !hasValidWeaponPartMatcher(constraint.flags, constraint.bodyId, constraint.sourceRoot, constraint.sourceName) ||
                 !hasValidWeaponPartMotionConstraintSemantics(constraint)) {
+                logger::warn(
+                    "ROCK provider rejected weapon-part motion constraint: token={} index={} flags=0x{:08X} kind={} space={} generation={:016X} bodyId={} partKind={} axis=({:.3f},{:.3f},{:.3f}) range=[{:.3f},{:.3f}] controlledRoot=0x{:X} source='{}'",
+                    ownerToken,
+                    i,
+                    constraint.flags,
+                    static_cast<std::uint32_t>(constraint.kind),
+                    static_cast<std::uint32_t>(constraint.axisSpace),
+                    constraint.weaponGenerationKey,
+                    constraint.bodyId,
+                    constraint.partKind,
+                    constraint.axisDirection[0],
+                    constraint.axisDirection[1],
+                    constraint.axisDirection[2],
+                    constraint.minValue,
+                    constraint.maxValue,
+                    constraint.controlledRoot,
+                    constraint.sourceName);
                 return RockProviderResultV1::InvalidArgument;
             }
         }
 
-        if (constraintCount > availableWeaponPartMotionConstraintSlotsForOwnerLocked(ownerToken)) {
+        if (constraintCount > availableWeaponPartMotionConstraintSlotsForOwnerLocked(ownerToken, WeaponPartSlotOrigin::Manual)) {
             return RockProviderResultV1::CapacityFull;
         }
 
-        clearWeaponPartMotionConstraintsForOwnerLocked(ownerToken);
+        clearWeaponPartMotionConstraintsForOwnerLocked(ownerToken, WeaponPartSlotOrigin::Manual);
         for (std::uint32_t i = 0; i < constraintCount; ++i) {
             bool stored = false;
             for (auto& slot : s_weaponPartMotionConstraints) {
                 if (!slot.active) {
                     slot.active = true;
                     slot.ownerToken = ownerToken;
+                    slot.origin = WeaponPartSlotOrigin::Manual;
                     slot.constraint = constraints[i];
                     slot.constraint.sourceName[ROCK_PROVIDER_MAX_EVIDENCE_NAME - 1] = '\0';
                     stored = true;
@@ -1576,9 +1777,29 @@ namespace
                 }
             }
             if (!stored) {
-                clearWeaponPartMotionConstraintsForOwnerLocked(ownerToken);
+                clearWeaponPartMotionConstraintsForOwnerLocked(ownerToken, WeaponPartSlotOrigin::Manual);
                 return RockProviderResultV1::CapacityFull;
             }
+        }
+        for (std::uint32_t i = 0; i < constraintCount; ++i) {
+            const auto& constraint = constraints[i];
+            logger::info(
+                "ROCK provider weapon-part motion constraint set: token={} index={} flags=0x{:08X} kind={} space={} generation={:016X} bodyId={} partKind={} axis=({:.3f},{:.3f},{:.3f}) range=[{:.3f},{:.3f}] controlledRoot=0x{:X} source='{}'",
+                ownerToken,
+                i,
+                constraint.flags,
+                static_cast<std::uint32_t>(constraint.kind),
+                static_cast<std::uint32_t>(constraint.axisSpace),
+                constraint.weaponGenerationKey,
+                constraint.bodyId,
+                constraint.partKind,
+                constraint.axisDirection[0],
+                constraint.axisDirection[1],
+                constraint.axisDirection[2],
+                constraint.minValue,
+                constraint.maxValue,
+                constraint.controlledRoot,
+                constraint.sourceName);
         }
         return RockProviderResultV1::Ok;
     }
@@ -1594,7 +1815,7 @@ namespace
         if (ownerResult != RockProviderResultV1::Ok) {
             return ownerResult;
         }
-        clearWeaponPartMotionConstraintsForOwnerLocked(ownerToken);
+        clearWeaponPartMotionConstraintsForOwnerLocked(ownerToken, WeaponPartSlotOrigin::Manual);
         return RockProviderResultV1::Ok;
     }
 
@@ -1634,10 +1855,10 @@ namespace
         }
 
         pruneExpiredWeaponPartDrivesLocked(frameIndex);
-        if (targetCount > availableWeaponPartDriveSlotsForOwnerLocked(ownerToken)) {
+        if (targetCount > availableWeaponPartDriveSlotsForOwnerLocked(ownerToken, WeaponPartSlotOrigin::Manual)) {
             return RockProviderResultV1::CapacityFull;
         }
-        clearWeaponPartDrivesForOwnerLocked(ownerToken);
+        clearWeaponPartDrivesForOwnerLocked(ownerToken, WeaponPartSlotOrigin::Manual);
         for (std::uint32_t i = 0; i < targetCount; ++i) {
             const auto expiresAfterFrame =
                 weapon_part_drive_lease_policy::expiresAfterFrame(frameIndex, targets[i].leaseFrames);
@@ -1646,6 +1867,7 @@ namespace
                 if (!slot.active) {
                     slot.active = true;
                     slot.ownerToken = ownerToken;
+                    slot.origin = WeaponPartSlotOrigin::Manual;
                     slot.expiresAfterFrame = expiresAfterFrame;
                     slot.target = targets[i];
                     slot.target.sourceName[ROCK_PROVIDER_MAX_EVIDENCE_NAME - 1] = '\0';
@@ -1654,7 +1876,7 @@ namespace
                 }
             }
             if (!stored) {
-                clearWeaponPartDrivesForOwnerLocked(ownerToken);
+                clearWeaponPartDrivesForOwnerLocked(ownerToken, WeaponPartSlotOrigin::Manual);
                 return RockProviderResultV1::CapacityFull;
             }
         }
@@ -1672,7 +1894,104 @@ namespace
         if (ownerResult != RockProviderResultV1::Ok) {
             return ownerResult;
         }
-        clearWeaponPartDrivesForOwnerLocked(ownerToken);
+        clearWeaponPartDrivesForOwnerLocked(ownerToken, WeaponPartSlotOrigin::Manual);
+        return RockProviderResultV1::Ok;
+    }
+
+    RockProviderResultV1 ROCK_PROVIDER_CALL apiSetWeaponPartInteractionZonesV1(
+        std::uint64_t ownerToken,
+        const RockProviderWeaponPartInteractionZoneV1* zones,
+        std::uint32_t zoneCount)
+    {
+        if (ownerToken == 0 || (zoneCount > 0 && !zones)) {
+            return RockProviderResultV1::InvalidArgument;
+        }
+        if (zoneCount > ROCK_PROVIDER_MAX_WEAPON_PART_INTERACTION_ZONES_V1) {
+            return RockProviderResultV1::CapacityFull;
+        }
+
+        std::scoped_lock lock(s_consumerMutex, s_weaponPartMutex);
+        const auto ownerResult =
+            validateRegisteredOwnerCapabilityLocked(ownerToken, RockProviderConsumerCapabilityV1::WeaponPartInteraction);
+        if (ownerResult != RockProviderResultV1::Ok) {
+            return ownerResult;
+        }
+
+        for (std::uint32_t i = 0; i < zoneCount; ++i) {
+            const auto& zone = zones[i];
+            if (zone.size != sizeof(RockProviderWeaponPartInteractionZoneV1)) {
+                return RockProviderResultV1::InvalidSize;
+            }
+            if (zone.version == 0 || zone.version > ROCK_PROVIDER_API_VERSION) {
+                return RockProviderResultV1::UnsupportedVersion;
+            }
+            if (!isValidWeaponPartInteractionZone(zone)) {
+                logger::warn(
+                    "ROCK provider rejected weapon-part interaction zone: token={} index={} generation={:016X} bodyId={} "
+                    "shape={} space={} snap={} center=({:.2f},{:.2f},{:.2f}) half=({:.2f},{:.2f},{:.2f})",
+                    ownerToken,
+                    i,
+                    zone.weaponGenerationKey,
+                    zone.bodyId,
+                    static_cast<std::uint32_t>(zone.shape),
+                    static_cast<std::uint32_t>(zone.zoneSpace),
+                    static_cast<std::uint32_t>(zone.snapMode),
+                    zone.zoneCenter[0],
+                    zone.zoneCenter[1],
+                    zone.zoneCenter[2],
+                    zone.zoneHalfExtents[0],
+                    zone.zoneHalfExtents[1],
+                    zone.zoneHalfExtents[2]);
+                return RockProviderResultV1::InvalidArgument;
+            }
+        }
+
+        if (zoneCount >
+            availableWeaponPartInteractionZoneSlotsForOwnerLocked(ownerToken, WeaponPartSlotOrigin::Manual)) {
+            return RockProviderResultV1::CapacityFull;
+        }
+
+        clearWeaponPartInteractionZonesForOwnerLocked(ownerToken, WeaponPartSlotOrigin::Manual);
+        for (std::uint32_t i = 0; i < zoneCount; ++i) {
+            bool stored = false;
+            for (auto& slot : s_weaponPartInteractionZones) {
+                if (slot.active) {
+                    continue;
+                }
+                slot.active = true;
+                slot.ownerToken = ownerToken;
+                slot.origin = WeaponPartSlotOrigin::Manual;
+                slot.zone = zones[i];
+                slot.zone.sourceName[ROCK_PROVIDER_MAX_EVIDENCE_NAME - 1] = '\0';
+                stored = true;
+                break;
+            }
+            if (!stored) {
+                clearWeaponPartInteractionZonesForOwnerLocked(ownerToken, WeaponPartSlotOrigin::Manual);
+                return RockProviderResultV1::CapacityFull;
+            }
+        }
+
+        logger::info(
+            "ROCK provider weapon-part interaction zones set: token={} count={} (exact generation/body binding; no part fallback)",
+            ownerToken,
+            zoneCount);
+        return RockProviderResultV1::Ok;
+    }
+
+    RockProviderResultV1 ROCK_PROVIDER_CALL apiClearWeaponPartInteractionZonesV1(std::uint64_t ownerToken)
+    {
+        if (ownerToken == 0) {
+            return RockProviderResultV1::InvalidArgument;
+        }
+
+        std::scoped_lock lock(s_consumerMutex, s_weaponPartMutex);
+        const auto ownerResult =
+            validateRegisteredOwnerCapabilityLocked(ownerToken, RockProviderConsumerCapabilityV1::WeaponPartInteraction);
+        if (ownerResult != RockProviderResultV1::Ok) {
+            return ownerResult;
+        }
+        clearWeaponPartInteractionZonesForOwnerLocked(ownerToken, WeaponPartSlotOrigin::Manual);
         return RockProviderResultV1::Ok;
     }
 
@@ -1883,6 +2202,8 @@ namespace
         .getWeaponPartGripStateV1 = &apiGetWeaponPartGripStateV1,
         .getRawWandButtonStateV1 = &apiGetRawWandButtonStateV1,
         .isNativePipboyInputSuppressedV1 = &apiIsNativePipboyInputSuppressedV1,
+        .setWeaponPartInteractionZonesV1 = &apiSetWeaponPartInteractionZonesV1,
+        .clearWeaponPartInteractionZonesV1 = &apiClearWeaponPartInteractionZonesV1,
     };
 }
 
@@ -1959,6 +2280,7 @@ namespace rock::provider
             s_weaponPartTargets = {};
             s_weaponPartDrives = {};
             s_weaponPartMotionConstraints = {};
+            s_weaponPartInteractionZones = {};
         }
         s_offhandReservation.store(static_cast<std::uint32_t>(RockProviderOffhandReservation::Normal), std::memory_order_release);
         s_offhandReservationOwner.store(0, std::memory_order_release);
@@ -2111,6 +2433,32 @@ namespace rock::provider
         return copied;
     }
 
+    std::uint32_t copyWeaponPartInteractionZonesV1(
+        RockProviderWeaponPartInteractionZoneV1* outZones,
+        std::uint64_t* outOwnerTokens,
+        std::uint32_t maxZones)
+    {
+        if (!outZones || !outOwnerTokens || maxZones == 0) {
+            return 0;
+        }
+
+        std::uint32_t copied = 0;
+        std::scoped_lock lock(s_weaponPartMutex);
+        for (const auto& slot : s_weaponPartInteractionZones) {
+            if (!slot.active) {
+                continue;
+            }
+            if (copied >= maxZones) {
+                break;
+            }
+            outZones[copied] = slot.zone;
+            outZones[copied].sourceName[ROCK_PROVIDER_MAX_EVIDENCE_NAME - 1] = '\0';
+            outOwnerTokens[copied] = slot.ownerToken;
+            ++copied;
+        }
+        return copied;
+    }
+
     bool resolveWeaponPartMotionConstraintV1(
         const RockProviderWeaponPartTargetQueryV1& query,
         RockProviderWeaponPartMotionConstraintResolutionV1& outResolution)
@@ -2168,6 +2516,7 @@ namespace rock::provider
         outResolution.minValue = best->constraint.minValue;
         outResolution.maxValue = best->constraint.maxValue;
         outResolution.ownerToken = best->ownerToken;
+        outResolution.controlledRoot = best->constraint.controlledRoot;
         return true;
     }
 

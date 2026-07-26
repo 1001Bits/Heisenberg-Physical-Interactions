@@ -3,12 +3,15 @@
 #include "rock/RockBridge.h"
 #include "../external/ROCK/src/ROCKMain.h"  // rock::HostNotifyExternalGrab — embedded-engine grab-lifecycle seam (audit rank 2)
 #include "../external/ROCK/src/physics-interaction/grab/TouchGrabBridge.h"
+#include "../external/ROCK/src/physics-interaction/native/HavokRuntime.h"
+#include "../external/ROCK/src/physics-interaction/TransformMath.h"
 #include "DropToHand.h"
 #include "DualWieldAPI.h"
 #include "F4VROffsets.h"
 #include "FingerCurves.h"
 #include "FRIKInterface.h"
 #include "GrabConstraint.h"
+#include "GrabPosePolicy.h"
 #include "HandCollision.h"
 #include "Hand.h"
 #include "Heisenberg.h"
@@ -33,6 +36,7 @@
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <limits>
 #include <memory>
 #include <sstream>
 
@@ -178,11 +182,17 @@ inline void UpdateWorldTransformRecursive(RE::NiAVObject* node, const RE::NiTran
     }
 }
 
+namespace heisenberg
+{
+    static RE::bhkNPCollisionObject*
+    TryResolveNpcCollisionObjectFromRaw(
+        RE::NiCollisionObject* rawCollision);
+}
+
 namespace
 {
     // Havok world scale - 1 game unit = 0.0142875 Havok units (1/70)
     constexpr float HAVOK_WORLD_SCALE = 0.0142875f;
-    constexpr float MINIMUM_AUTO_FINGER_CURL = 0.2f;
 
     void StoreCalculatedFingerCurls(heisenberg::GrabState& state,
                                     float thumb,
@@ -192,11 +202,11 @@ namespace
                                     float pinky)
     {
         state.SetRuntimeFingerCurls(
-            (std::max)(MINIMUM_AUTO_FINGER_CURL, thumb),
-            (std::max)(MINIMUM_AUTO_FINGER_CURL, index),
-            (std::max)(MINIMUM_AUTO_FINGER_CURL, middle),
-            (std::max)(MINIMUM_AUTO_FINGER_CURL, ring),
-            (std::max)(MINIMUM_AUTO_FINGER_CURL, pinky));
+            std::clamp(thumb, 0.0f, 1.0f),
+            std::clamp(index, 0.0f, 1.0f),
+            std::clamp(middle, 0.0f, 1.0f),
+            std::clamp(ring, 0.0f, 1.0f),
+            std::clamp(pinky, 0.0f, 1.0f));
     }
 
     bool ApplyRuntimeFingerCurls(const heisenberg::GrabState& state, bool isLeft)
@@ -216,13 +226,20 @@ namespace
         // re-sending the pose every frame during Holding to block controller
         // override. (See FingerAnimator.cpp line 62-68.)
         float joints[heisenberg::FingerAnimator::NUM_JOINTS];
-        heisenberg::ExpandFingerToJointValues(
-            state.runtimeThumbCurl,
-            state.runtimeIndexCurl,
-            state.runtimeMiddleCurl,
-            state.runtimeRingCurl,
-            state.runtimePinkyCurl,
-            joints);
+        if (state.hasRuntimeJointCurls) {
+            std::copy(
+                state.runtimeJointCurls.begin(),
+                state.runtimeJointCurls.end(),
+                joints);
+        } else {
+            heisenberg::ExpandFingerToJointValues(
+                state.runtimeThumbCurl,
+                state.runtimeIndexCurl,
+                state.runtimeMiddleCurl,
+                state.runtimeRingCurl,
+                state.runtimePinkyCurl,
+                joints);
+        }
 
         auto& animator = heisenberg::Heisenberg::GetSingleton().GetFingerAnimator(isLeft);
         // Prime _current so we don't lerp from the last RestoreOpen's 1.0 — start
@@ -231,13 +248,19 @@ namespace
 
         // Also push once synchronously so the very first frame sees the new pose
         // (the animator would only kick in on the next Heisenberg::Update tick).
-        frik.SetHandPoseFingerPositions(
-            isLeft,
-            state.runtimeThumbCurl,
-            state.runtimeIndexCurl,
-            state.runtimeMiddleCurl,
-            state.runtimeRingCurl,
-            state.runtimePinkyCurl);
+        if (state.hasRuntimeJointCurls) {
+            frik.SetHandPoseJointPositions(
+                isLeft,
+                state.runtimeJointCurls.data());
+        } else {
+            frik.SetHandPoseFingerPositions(
+                isLeft,
+                state.runtimeThumbCurl,
+                state.runtimeIndexCurl,
+                state.runtimeMiddleCurl,
+                state.runtimeRingCurl,
+                state.runtimePinkyCurl);
+        }
         heisenberg::Heisenberg::GetSingleton().SetFingerCurlValue(isLeft, state.runtimeThumbCurl);
         return true;
     }
@@ -299,6 +322,14 @@ namespace
         return heisenberg::g_config.enableAutomaticFingerCurls;
     }
 
+    bool UsesAuthoredGripPose(const heisenberg::GrabState& state)
+    {
+        return heisenberg::grab_pose_policy::UsesAuthoredPose(
+            state.hasItemOffset,
+            state.naturalFingerPosing,
+            HasStoredFingerCurls(state));
+    }
+
     bool HasConfiguredFingerCurls(const heisenberg::GrabState& state)
     {
         return HasStoredFingerCurls(state) || state.hasRuntimeFingerCurls;
@@ -306,18 +337,12 @@ namespace
 
     bool ApplyConfiguredFingerCurls(const heisenberg::GrabState& state, bool isLeft)
     {
-        // NATURAL (touch) grabs invert the priority: the object is held at an arbitrary
-        // touched pose, so the mesh-solved runtime curls are the ones that actually line
-        // up with it — the authored per-item pose was made for the snapped/offset seat and
-        // curls straight through the mesh here. Without this exception the per-frame
-        // reapply sites would silently revert ResolvePendingFingerCurls' geometry solve to
-        // the stored pose ONE FRAME after it lands (review-confirmed failure).
-        if (state.naturalFingerPosing && state.hasRuntimeFingerCurls && ApplyRuntimeFingerCurls(state, isLeft)) {
-            return true;
-        }
-        // A hand-authored per-item pose is authoritative.  Automatic geometry
-        // curls are only a fallback for objects that do not have one.
-        if (HasStoredFingerCurls(state) && ApplyStoredFingerCurls(state, isLeft)) {
+        // A saved transform and its curls are one coherent authored pose. The
+        // jumpsuit audit demonstrated that replacing only the curls with a live
+        // solve produces a different grip on every pull. Natural/touch grabs do
+        // not use the saved transform, so they remain geometry-driven.
+        if (UsesAuthoredGripPose(state) &&
+            ApplyStoredFingerCurls(state, isLeft)) {
             return true;
         }
         return state.hasRuntimeFingerCurls && ApplyRuntimeFingerCurls(state, isLeft);
@@ -747,95 +772,39 @@ namespace
         return nullptr;
     }
 
-    // HIGGS curve-table geometry solver (1.0 open, 0.0 closed). The ROCK
-    // curl-disk A/B solver (bUseRockFingerPose) was removed in the
-    // two-scenario cleanup.
-    static heisenberg::FingerCurlResult SolveGeometryFingerCurls(
-        RE::NiAVObject* objectNode, RE::NiAVObject* handNode,
-        const RE::NiPoint3& palmPos, const RE::NiPoint3& palmDir,
-        bool isLeft, float handSize)
-    {
-        return heisenberg::CalculateFingerCurlFromGeometry(
-            objectNode, handNode, palmPos, palmDir, isLeft, handSize);
-    }
-
     bool TryCalculateRuntimeFingerCurlsFromGeometry(heisenberg::GrabState& state, RE::NiNode* wandNode, bool isLeft)
     {
         if (!state.node || !wandNode) {
             return false;
         }
 
-        // Palm comes from the wand frame (HIGGS-style hardcoded palmPosition):
-        // that point sits on the palm skin surface, so the finger cast's
-        // palmToPoint shift moves each finger to where it will actually be
-        // once the object is snapped to the skin.
+        // Use the same live root-flattened FRIK skeleton and generated
+        // calibration that ROCK uses for physical hand contact. The old HIGGS
+        // curve-table path mixed a fixed 0.85 hand scale with already-scaled
+        // live bones and then shifted every finger toward one shared mesh
+        // point, which is why results changed across VR scales and thin meshes.
         RE::NiNode* handNode = GetSkinnedHandNode(isLeft);
         if (!handNode) handNode = wandNode;
 
-        RE::NiPoint3 palmPos = GetPalmPosition(wandNode, isLeft);
-        RE::NiPoint3 palmDir = GetPalmDirection(wandNode, isLeft);
+        RE::NiPoint3 palmPos = GetPalmPosition(handNode, isLeft);
+        RE::NiPoint3 calibratedPalm{};
+        RE::NiPoint3 calibratedDirection{};
+        if (GetCalibratedPalmWorld(isLeft, calibratedPalm, calibratedDirection)) {
+            palmPos = calibratedPalm;
+        }
 
-        auto curlResult = SolveGeometryFingerCurls(
-            state.node.get(), handNode, palmPos, palmDir, isLeft, 1.0f);
-        if (!curlResult.success) {
+        std::array<float, 15> jointCurls{};
+        if (!rock::touch_grab_bridge::SolveTouchGrabFingerPose(
+                state.node.get(),
+                handNode->world,
+                isLeft,
+                palmPos,
+                palmPos,
+                jointCurls)) {
             return false;
         }
 
-        StoreCalculatedFingerCurls(
-            state,
-            curlResult.thumb,
-            curlResult.index,
-            curlResult.middle,
-            curlResult.ring,
-            curlResult.pinky);
-        return true;
-    }
-
-    // Task #4 — per-frame geometry finger curl recomputation (throttled + smoothed).
-    // Runs once every `fingerCurlPerFrameInterval` held frames, lerps new values
-    // into the existing runtime curls with `fingerCurlSmoothingAlpha` so the
-    // fingers don't pop when the object swivels between frames.
-    bool TryRecalculateFingerCurlsPerFrame(heisenberg::GrabState& state, RE::NiNode* wandNode, bool isLeft)
-    {
-        const auto& cfg = heisenberg::g_config;
-        if (!cfg.enableAutomaticFingerCurlsPerFrame) return false;
-        if (!UseAutomaticFingerCurls()) return false;  // respect global automatic toggle
-        if (!state.node || !wandNode) return false;
-        // Saved offset curls are authoritative: never recompute geometry (nor extract the held
-        // object's mesh) per-frame for an item whose finger pose comes from its offset profile.
-        // The per-frame mesh extraction is what tanked the framerate on high-poly holds.
-        if (HasStoredFingerCurls(state)) return false;
-
-        int interval = (std::max)(1, cfg.fingerCurlPerFrameInterval);
-        state.fingerCurlRecalcFrameCounter++;
-        if (state.fingerCurlRecalcFrameCounter < static_cast<std::uint32_t>(interval)) {
-            return false;
-        }
-        state.fingerCurlRecalcFrameCounter = 0;
-
-        RE::NiNode* handNode = GetSkinnedHandNode(isLeft);
-        if (!handNode) handNode = wandNode;
-
-        RE::NiPoint3 palmPos = GetPalmPosition(wandNode, isLeft);
-        RE::NiPoint3 palmDir = GetPalmDirection(wandNode, isLeft);
-
-        auto r = SolveGeometryFingerCurls(
-            state.node.get(), handNode, palmPos, palmDir, isLeft, 1.0f);
-        if (!r.success) return false;
-
-        float alpha = std::clamp(cfg.fingerCurlSmoothingAlpha, 0.0f, 1.0f);
-        auto blend = [&](float prev, float next) {
-            // If we don't have prior runtime curls, take the new value directly.
-            return state.hasRuntimeFingerCurls ? (prev + (next - prev) * alpha) : next;
-        };
-
-        StoreCalculatedFingerCurls(
-            state,
-            blend(state.runtimeThumbCurl, r.thumb),
-            blend(state.runtimeIndexCurl, r.index),
-            blend(state.runtimeMiddleCurl, r.middle),
-            blend(state.runtimeRingCurl, r.ring),
-            blend(state.runtimePinkyCurl, r.pinky));
+        state.SetRuntimeJointCurls(jointCurls);
         return true;
     }
 
@@ -845,38 +814,42 @@ namespace
             return false;
         }
 
-        // NATURAL (touch) grabs hold the object at an arbitrary pose relative to the hand,
-        // so saved offset curls (authored against the snapped/offset pose) don't line up
-        // with the mesh — solve from the actual geometry first and use saved curls only as
-        // a fallback. Snap/offset grabs keep the original saved-curls-first order.
-        if (state.naturalFingerPosing &&
-            TryCalculateRuntimeFingerCurlsFromGeometry(state, wandNode, isLeft) &&
+        // If the saved transform is driving placement, its curls were authored
+        // against that exact transform and must arrive as the other half of the
+        // same pose. This is the path the final, correct jumpsuit grab used.
+        if (UsesAuthoredGripPose(state)) {
+            state.ClearRuntimeFingerCurls();
+            if (ApplyStoredFingerCurls(state, isLeft)) {
+                state.pendingFingerCurls = false;
+                spdlog::info(
+                    "[GRAB-POSE] {} applied paired authored offset curls",
+                    context);
+                return true;
+            }
+        }
+
+        // A touch grab is solved against the object's real, already-final world
+        // pose before ownership changes. Reuse that exact 15-joint result; a
+        // second solve after the keyframed body handoff only introduces a
+        // different pose and visible jitter.
+        if (state.hasRuntimeJointCurls &&
             ApplyRuntimeFingerCurls(state, isLeft))
         {
             state.pendingFingerCurls = false;
             spdlog::debug(
-                "[GRAB-FINGERS] {} applied geometry curls (natural grab, mesh-first): thumb={:.2f} index={:.2f} mid={:.2f} ring={:.2f} pinky={:.2f}",
-                context,
-                state.runtimeThumbCurl,
-                state.runtimeIndexCurl,
-                state.runtimeMiddleCurl,
-                state.runtimeRingCurl,
-                state.runtimePinkyCurl);
+                "[GRAB-FINGERS] {} applied stable first-contact joint pose",
+                context);
             return true;
         }
 
-        if (ApplyStoredFingerCurls(state, isLeft)) {
-            state.pendingFingerCurls = false;
-            spdlog::debug("[GRAB-FINGERS] {} applied saved offset curls", context);
-            return true;
-        }
-
+        // Natural/touch and generated placements are arbitrary relative to the
+        // hand, so solve their curls from the final visible mesh.
         if (TryCalculateRuntimeFingerCurlsFromGeometry(state, wandNode, isLeft) &&
             ApplyRuntimeFingerCurls(state, isLeft))
         {
             state.pendingFingerCurls = false;
             spdlog::debug(
-                "[GRAB-FINGERS] {} applied geometry fallback curls: thumb={:.2f} index={:.2f} mid={:.2f} ring={:.2f} pinky={:.2f}",
+                "[GRAB-FINGERS] {} applied mesh-safe geometry curls: thumb={:.2f} index={:.2f} mid={:.2f} ring={:.2f} pinky={:.2f}",
                 context,
                 state.runtimeThumbCurl,
                 state.runtimeIndexCurl,
@@ -886,14 +859,17 @@ namespace
             return true;
         }
 
-        state.ClearRuntimeFingerCurls();
+        // Fail open if geometry is unavailable or has no trustworthy
+        // first-surface intersection. Grip input must never make a missing
+        // mesh trace turn into a fist through the item.
+        StoreCalculatedFingerCurls(state, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f);
         auto& frik = heisenberg::FRIKInterface::GetSingleton();
         if (frik.IsAvailable()) {
-            frik.SetHandPoseFingerPositions(isLeft, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f);
+            ApplyRuntimeFingerCurls(state, isLeft);
         }
         state.pendingFingerCurls = false;
-        spdlog::debug("[GRAB-FINGERS] {} no stored curls and geometry failed - keeping hand open", context);
-        return false;
+        spdlog::debug("[GRAB-FINGERS] {} geometry had no safe stop - fail-open pose applied", context);
+        return true;
     }
 
     // =====================================================================
@@ -977,18 +953,29 @@ namespace
 
     // Resolve the parent transform a stored localOffset/localRotation should
     // be applied against. Priority:
-    //   1. runtimePlacementSkinnedHand → COM-tree LArm_Hand/RArm_Hand (the
+    //   1. hasRigidRenderedHandPlacement → COM-tree rendered hand. This is
+    //      the final, acquisition-time rebase that prevents a raw wand from
+    //      leading the visible FRIK hand while the player turns.
+    //   2. runtimePlacementSkinnedHand → COM-tree LArm_Hand/RArm_Hand (the
     //      same node the fingers live under, so object and fingers share a
     //      parent and can't drift apart when FRIK IK moves the bone).
-    //   2. isFRIKOffset → firstPersonSkeleton hand node (legacy saved
+    //   3. isFRIKOffset → firstPersonSkeleton hand node (legacy saved
     //      offsets were calibrated against that).
-    //   3. default (wand) — passed in as fallback.
+    //   4. default (wand) — passed in as fallback.
     void ResolveGrabParent(const heisenberg::GrabState& state, bool isLeft,
                            const RE::NiPoint3& defaultPos, const RE::NiMatrix3& defaultRot,
                            RE::NiPoint3& outPos, RE::NiMatrix3& outRot)
     {
         outPos = defaultPos;
         outRot = defaultRot;
+
+        if (state.hasRigidRenderedHandPlacement) {
+            if (RE::NiNode* skinned = GetSkinnedHandNode(isLeft)) {
+                outPos = skinned->world.translate;
+                outRot = skinned->world.rotate;
+                return;
+            }
+        }
 
         if (state.runtimePlacementSkinnedHand) {
             if (RE::NiNode* skinned = GetSkinnedHandNode(isLeft)) {
@@ -1006,6 +993,81 @@ namespace
                 outRot = frikRot;
             }
         }
+    }
+
+    // Convert the final placement selected by the normal offset/touch/geometry
+    // rules into the rendered hand's frame without changing its world pose.
+    // Thereafter both the item and the visible fingers consume the same FRIK
+    // transform each frame, so body rotation cannot make the raw wand lead the
+    // hand and create the familiar "item moves first, hand catches up" lag.
+    bool RebaseGrabPlacementToRenderedHand(
+        heisenberg::GrabState& state,
+        bool isLeft,
+        const RE::NiPoint3& defaultPos,
+        const RE::NiMatrix3& defaultRot)
+    {
+        RE::NiNode* renderedHand = GetSkinnedHandNode(isLeft);
+        if (!renderedHand) {
+            return false;
+        }
+
+        RE::NiPoint3 sourceParentPos;
+        RE::NiMatrix3 sourceParentRot;
+        ResolveGrabParent(
+            state,
+            isLeft,
+            defaultPos,
+            defaultRot,
+            sourceParentPos,
+            sourceParentRot);
+
+        RE::NiPoint3 sourceLocalPos;
+        RE::NiMatrix3 sourceLocalRot;
+        heisenberg::GetEffectiveGrabPlacement(
+            state,
+            sourceLocalPos,
+            sourceLocalRot);
+
+        // PA compensation remains a per-frame tuning offset. Include it while
+        // converting the world pose, then remove the same numeric local value
+        // from the stored base so the normal update path can add it once.
+        RE::NiPoint3 paLocal{};
+        if (heisenberg::Utils::IsPlayerInPowerArmor()) {
+            paLocal.x = heisenberg::g_config.paGrabOffsetX;
+            paLocal.y = heisenberg::g_config.paGrabOffsetY;
+            paLocal.z = heisenberg::g_config.paGrabOffsetZ;
+        }
+
+        const RE::NiPoint3 desiredWorldPos =
+            sourceParentPos +
+            sourceParentRot.Transpose() *
+                (sourceLocalPos + paLocal);
+        const RE::NiMatrix3 desiredWorldRot =
+            sourceLocalRot * sourceParentRot;
+
+        RE::NiPoint3 renderedLocalPos =
+            renderedHand->world.rotate *
+            (desiredWorldPos -
+             renderedHand->world.translate);
+        renderedLocalPos -= paLocal;
+        const RE::NiMatrix3 renderedLocalRot =
+            desiredWorldRot *
+            renderedHand->world.rotate.Transpose();
+
+        state.SetRigidRenderedHandPlacement(
+            renderedLocalPos,
+            renderedLocalRot);
+        state.grabOffsetLocal = renderedLocalPos;
+
+        spdlog::info(
+            "[GRAB-SYNC] {} '{}' placement rebased to rendered hand "
+            "without world-pose change local=({:.2f},{:.2f},{:.2f})",
+            isLeft ? "L" : "R",
+            state.node ? state.node->name.c_str() : "NULL",
+            renderedLocalPos.x,
+            renderedLocalPos.y,
+            renderedLocalPos.z);
+        return true;
     }
 
     // =====================================================================
@@ -1268,6 +1330,670 @@ namespace
         obj->SetMotionType(motion);
     }
 
+    static void RebuildBodyCollisionCachesNative(
+        void* hknpWorld,
+        std::uint32_t bodyId);
+
+    static bool CapturedHeldBodyStillOwned(
+        const heisenberg::GrabState& state,
+        RE::hknpWorld* world,
+        const heisenberg::GrabState::CapturedHeldBody& captured)
+    {
+        if (!state.collisionObject ||
+            !world ||
+            !captured.ownerCollisionObject ||
+            !captured.ownerNode) {
+            return false;
+        }
+        auto* body =
+            rock::havok_runtime::getBody(
+                world,
+                RE::hknpBodyId{ captured.bodyId });
+        if (!body) {
+            return false;
+        }
+        if (rock::havok_runtime::getCollisionObjectFromBody(body) !=
+            captured.ownerCollisionObject) {
+            return false;
+        }
+        for (auto* current = captured.ownerNode.get();
+             current;
+             current = current->parent) {
+            if (current == state.node.get()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Build a descendant's transform from the scene graph's authored local
+    // links instead of subtracting its current world transform from the root.
+    //
+    // This distinction matters for multipart clutter. Havok is allowed to
+    // write the simulated pose of a child collision owner (for example
+    // 10mmAmmo/AmmoMultiple) into ownerNode->world before the parent root is
+    // updated. Treating that transient world pose as a permanent root-local
+    // offset feeds the separation back into the next grab/release.
+    static bool TryBuildDescendantRootLocal(
+        const RE::NiAVObject* root,
+        const RE::NiAVObject* descendant,
+        RE::NiTransform& outRootLocal)
+    {
+        if (!root || !descendant) {
+            return false;
+        }
+        if (root == descendant) {
+            outRootLocal =
+                rock::transform_math::makeIdentityTransform<
+                    RE::NiTransform>();
+            return true;
+        }
+
+        constexpr std::size_t kMaxHierarchyDepth = 64;
+        std::array<const RE::NiAVObject*, kMaxHierarchyDepth> path{};
+        std::size_t depth = 0;
+        auto* current = descendant;
+        while (current && current != root) {
+            if (depth >= path.size()) {
+                return false;
+            }
+            path[depth++] = current;
+            current = current->parent;
+        }
+        if (current != root) {
+            return false;
+        }
+
+        auto result =
+            rock::transform_math::makeIdentityTransform<RE::NiTransform>();
+        while (depth > 0) {
+            result = rock::transform_math::composeTransforms(
+                result,
+                path[--depth]->local);
+        }
+        outRootLocal = result;
+        return std::isfinite(outRootLocal.translate.x) &&
+               std::isfinite(outRootLocal.translate.y) &&
+               std::isfinite(outRootLocal.translate.z) &&
+               std::isfinite(outRootLocal.scale);
+    }
+
+    static bool UsesSelectedCollisionWrapperMotionScope(
+        const heisenberg::GrabState& state)
+    {
+        const auto* refr = state.GetRefr();
+        return refr &&
+               refr->GetFormType() != RE::ENUM_FORM_ID::kACHR &&
+               state.collisionObject &&
+               state.capturedHeldBodyCount == 0 &&
+               state.isProxyCollision;
+    }
+
+    // Capture every body in the selected wrapper's shared physics system whose
+    // owner belongs to this reference subtree. Mutually exclusive mesh variants
+    // still share the same reference root; leaving a hidden alternate dynamic
+    // lets it overwrite that root after the visible body was keyframed. We keep
+    // the selected visible wrapper as placement authority, but drive all shared
+    // bodies through authored root->owner frames so they cannot split.
+    // Ragdoll/actor proxies remain outside this rigid clutter path.
+    static bool CaptureHeldCollisionBodyFrames(heisenberg::GrabState& state)
+    {
+        state.capturedHeldBodies = {};
+        state.capturedHeldBodyCount = 0;
+        state.capturedHeldBodiesExcludeAlternateWrappers = false;
+        state.capturedHeldBodiesIncludeAlternateWrappers = false;
+        if (!state.collisionObject || !state.node) {
+            return false;
+        }
+        const auto* refr = state.GetRefr();
+        const bool actorProxy =
+            refr &&
+            refr->GetFormType() == RE::ENUM_FORM_ID::kACHR;
+        if (actorProxy) {
+            return false;
+        }
+
+        auto* world = static_cast<RE::hknpWorld*>(
+            AccessWorld(state.collisionObject));
+        if (!world) {
+            return false;
+        }
+
+        struct CaptureContext
+        {
+            heisenberg::GrabState* state = nullptr;
+            RE::hknpWorld* world = nullptr;
+            RE::NiTransform rootInverse{};
+            std::uint32_t eligibleBodyCount = 0;
+            std::uint32_t alternateWrapperBodyCount = 0;
+            bool eligibleCaptureFailed = false;
+        } context{
+            &state,
+            world,
+            rock::transform_math::invertTransform(state.node->world),
+        };
+
+        auto visitor = [](std::uint32_t bodyId, void* rawContext) {
+            auto* context = static_cast<CaptureContext*>(rawContext);
+            if (!context || !context->state || !context->world) {
+                return false;
+            }
+            auto& state = *context->state;
+            auto* body = rock::havok_runtime::getBody(
+                context->world,
+                RE::hknpBodyId{ bodyId });
+            if (!body) {
+                context->eligibleCaptureFailed = true;
+                return false;
+            }
+
+            auto* ownerCollision =
+                rock::havok_runtime::getCollisionObjectFromBody(body);
+            auto* resolvedOwnerCollision =
+                heisenberg::TryResolveNpcCollisionObjectFromRaw(
+                    ownerCollision);
+            if (resolvedOwnerCollision != state.collisionObject) {
+                ++context->alternateWrapperBodyCount;
+            }
+
+            ++context->eligibleBodyCount;
+            if (state.capturedHeldBodyCount >=
+                heisenberg::GrabState::kMaxCapturedHeldBodies) {
+                context->eligibleCaptureFailed = true;
+                return false;
+            }
+
+            RE::NiTransform bodyWorld{};
+            if (!rock::havok_runtime::tryGetBodyWorldTransform(
+                    context->world,
+                    RE::hknpBodyId{ bodyId },
+                    bodyWorld)) {
+                context->eligibleCaptureFailed = true;
+                return false;
+            }
+
+            auto* ownerNode =
+                rock::havok_runtime::getOwnerNodeFromCollisionObject(
+                    ownerCollision);
+            bool ownerInsideReference = false;
+            for (auto* current = ownerNode;
+                 current;
+                 current = current->parent) {
+                if (current == state.node.get()) {
+                    ownerInsideReference = true;
+                    break;
+                }
+            }
+            if (!ownerCollision || !ownerNode ||
+                !ownerInsideReference) {
+                context->eligibleCaptureFailed = true;
+                return false;
+            }
+
+            std::uint32_t filterInfo = 0;
+            if (!heisenberg::Physics::TryReadBodyFilterInfo(
+                    context->world,
+                    bodyId,
+                    filterInfo)) {
+                context->eligibleCaptureFailed = true;
+                return false;
+            }
+
+            auto& captured =
+                state.capturedHeldBodies[state.capturedHeldBodyCount++];
+            captured.bodyId = bodyId;
+            captured.motionId = body->motionIndex;
+            captured.originalFilterInfo = filterInfo;
+            captured.ownerCollisionObject = ownerCollision;
+            captured.ownerNode.reset(ownerNode);
+            // PHANTOM-BODY FIX (Jul 25): remember whether this body belongs to the
+            // wrapper that won grab acquisition (the VISIBLE mesh variant). Bodies of
+            // alternate/hidden wrappers get dragged along invisibly and must not be
+            // allowed to knock over world objects — see ApplyCapturedHeldBodyFilters.
+            captured.isActiveWrapper = (resolvedOwnerCollision == state.collisionObject);
+            const RE::NiTransform runtimeOwnerRootLocal =
+                rock::transform_math::composeTransforms(
+                    context->rootInverse,
+                    ownerNode->world);
+            if (!TryBuildDescendantRootLocal(
+                    state.node.get(),
+                    ownerNode,
+                    captured.ownerRootLocal)) {
+                // The ancestry was already validated above, so this is only a
+                // defensive fallback for an implausibly deep/corrupt tree.
+                captured.ownerRootLocal = runtimeOwnerRootLocal;
+            } else {
+                const float frameMismatch =
+                    (runtimeOwnerRootLocal.translate -
+                     captured.ownerRootLocal.translate)
+                        .Length();
+                if (frameMismatch > 0.5f) {
+                    spdlog::warn(
+                        "[GRAB-MULTIBODY] Detected collision-owner/root split "
+                        "for body {} owner='{}': runtimeRootLocal="
+                        "({:.2f},{:.2f},{:.2f}) authoredLocalChain="
+                        "({:.2f},{:.2f},{:.2f}) mismatch={:.2f}gu",
+                        bodyId,
+                        ownerNode->name.c_str(),
+                        runtimeOwnerRootLocal.translate.x,
+                        runtimeOwnerRootLocal.translate.y,
+                        runtimeOwnerRootLocal.translate.z,
+                        captured.ownerRootLocal.translate.x,
+                        captured.ownerRootLocal.translate.y,
+                        captured.ownerRootLocal.translate.z,
+                        frameMismatch);
+                }
+            }
+            captured.bodyOwnerLocal =
+                rock::transform_math::composeTransforms(
+                    rock::transform_math::invertTransform(
+                        ownerNode->world),
+                    bodyWorld);
+            captured.valid = true;
+            captured.filterChanged = false;
+            return true;
+        };
+
+        constexpr int kMaxPhysicsSystemBodiesToInspect = 64;
+        const auto scan =
+            rock::havok_runtime::forEachPhysicsSystemBodyIdDetailed(
+                static_cast<RE::NiCollisionObject*>(state.collisionObject),
+                world,
+                kMaxPhysicsSystemBodiesToInspect,
+                visitor,
+                &context);
+        if (!scan.enumerated() ||
+            context.eligibleCaptureFailed ||
+            context.eligibleBodyCount >
+                heisenberg::GrabState::kMaxCapturedHeldBodies ||
+            state.capturedHeldBodyCount !=
+                context.eligibleBodyCount ||
+            state.capturedHeldBodyCount == 0) {
+            spdlog::warn(
+                "[GRAB-MULTIBODY] Active-wrapper capture skipped: status={} "
+                "systemBodies={} eligible={} captured={} alternates={} cap={}",
+                static_cast<std::uint32_t>(scan.status),
+                scan.bodyCount,
+                context.eligibleBodyCount,
+                state.capturedHeldBodyCount,
+                context.alternateWrapperBodyCount,
+                heisenberg::GrabState::kMaxCapturedHeldBodies);
+            state.capturedHeldBodies = {};
+            state.capturedHeldBodyCount = 0;
+            state.capturedHeldBodiesExcludeAlternateWrappers = false;
+            state.capturedHeldBodiesIncludeAlternateWrappers = false;
+            return false;
+        }
+
+        state.capturedHeldBodiesExcludeAlternateWrappers = false;
+        state.capturedHeldBodiesIncludeAlternateWrappers =
+            context.alternateWrapperBodyCount > 0;
+        if (state.capturedHeldBodyCount > 0) {
+            state.heldOriginalFilterInfo =
+                state.capturedHeldBodies[0].originalFilterInfo;
+            state.heldHadSuppressionBitOriginally =
+                (state.heldOriginalFilterInfo & 0x000B0000u) ==
+                0x000B0000u;
+        }
+        spdlog::info(
+            "[GRAB-MULTIBODY] Captured {} shared-reference body frame(s) "
+            "for {:08X} root='{}' (systemBodies={} alternateWrappers={})",
+            state.capturedHeldBodyCount,
+            state.GetRefr() ? state.GetRefr()->formID : 0,
+            state.node->name.c_str(),
+            scan.bodyCount,
+            context.alternateWrapperBodyCount);
+        for (std::uint32_t i = 0;
+             i < state.capturedHeldBodyCount;
+             ++i) {
+            const auto& body = state.capturedHeldBodies[i];
+            spdlog::info(
+                "[GRAB-MULTIBODY] body[{}]={} motion={} filter=0x{:08X} "
+                "owner='{}' ownerRootLocal=({:.2f},{:.2f},{:.2f}) "
+                "bodyOwnerLocal=({:.2f},{:.2f},{:.2f})",
+                i,
+                body.bodyId,
+                body.motionId,
+                body.originalFilterInfo,
+                body.ownerNode
+                    ? body.ownerNode->name.c_str()
+                    : "NULL",
+                body.ownerRootLocal.translate.x,
+                body.ownerRootLocal.translate.y,
+                body.ownerRootLocal.translate.z,
+                body.bodyOwnerLocal.translate.x,
+                body.bodyOwnerLocal.translate.y,
+                body.bodyOwnerLocal.translate.z);
+        }
+        return state.capturedHeldBodyCount > 0;
+    }
+
+    static bool ApplyCapturedHeldBodyFilters(heisenberg::GrabState& state)
+    {
+        if (!state.collisionObject ||
+            state.capturedHeldBodyCount == 0) {
+            return false;
+        }
+        auto* world = static_cast<RE::hknpWorld*>(
+            AccessWorld(state.collisionObject));
+        if (!world) {
+            return false;
+        }
+
+        constexpr std::uint32_t kHandGroupBits = 0x000Bu << 16;
+        bool applied = false;
+        for (std::uint32_t i = 0;
+             i < state.capturedHeldBodyCount;
+             ++i) {
+            auto& captured = state.capturedHeldBodies[i];
+            if (!captured.valid ||
+                !CapturedHeldBodyStillOwned(
+                    state,
+                    world,
+                    captured)) {
+                continue;
+            }
+            std::uint32_t current = 0;
+            if (!heisenberg::Physics::TryReadBodyFilterInfo(
+                    world,
+                    captured.bodyId,
+                    current)) {
+                continue;
+            }
+            // PHANTOM-BODY FIX (Jul 25, user-reported knockover): bodies of alternate/
+            // hidden wrappers (the invisible second Havok body of dual-body NIFs like
+            // the ammo box) are teleport-dragged along the visible mesh every frame at
+            // keyframed authority — on their native clutter layer they batted world
+            // objects over invisibly. Park them on the non-collidable layer (15, the
+            // same constant the held-object non-collidable path uses) for the capture
+            // lifetime; the raw filter write preserves group/system bits, dodging the
+            // known SetLayerLocked preset-clobber bug. The VISIBLE wrapper's body keeps
+            // the intended bHeldObjectCollidable behavior. Restore is byte-exact from
+            // originalFilterInfo on release.
+            constexpr std::uint32_t kNonCollidableLayer = 15u;
+            const std::uint32_t desired = captured.isActiveWrapper
+                ? (current | kHandGroupBits)
+                : ((current & ~0x7Fu) | kNonCollidableLayer | kHandGroupBits);
+            if (desired != current &&
+                !heisenberg::Physics::TryWriteBodyFilterInfo(
+                    world,
+                    captured.bodyId,
+                    desired)) {
+                continue;
+            }
+            // filterChanged must reflect the FULL divergence from the original filter
+            // (the old hand-bits-only test under-reported once the layer changes too),
+            // so RestoreCapturedHeldBodyFilters knows a byte-exact restore is needed.
+            captured.filterChanged = (desired != captured.originalFilterInfo);
+            if (desired != current && !captured.isActiveWrapper) {
+                // Layer transition on a live body: rebuild its pair caches so existing
+                // contact pairs drop immediately (standing rule: every raw Havok filter
+                // write needs a pair-cache rebuild).
+                RebuildBodyCollisionCachesNative(world, captured.bodyId);
+            }
+            applied = true;
+        }
+        return applied;
+    }
+
+    static bool RestoreCapturedHeldBodyFilters(heisenberg::GrabState& state)
+    {
+        if (!state.collisionObject ||
+            state.capturedHeldBodyCount == 0) {
+            return false;
+        }
+        auto* world = static_cast<RE::hknpWorld*>(
+            AccessWorld(state.collisionObject));
+        if (!world) {
+            return false;
+        }
+        bool restoredAny = false;
+        for (std::uint32_t i = 0;
+             i < state.capturedHeldBodyCount;
+             ++i) {
+            auto& captured = state.capturedHeldBodies[i];
+            if (!captured.valid ||
+                !captured.filterChanged ||
+                !CapturedHeldBodyStillOwned(
+                    state,
+                    world,
+                    captured)) {
+                continue;
+            }
+            if (heisenberg::Physics::TryWriteBodyFilterInfo(
+                    world,
+                    captured.bodyId,
+                    captured.originalFilterInfo)) {
+                restoredAny = true;
+                // Phantom bodies spent the hold on the non-collidable layer; without a
+                // pair-cache rebuild the stale "no collide" verdicts would outlive the
+                // restore and the body would stay intangible after release.
+                RebuildBodyCollisionCachesNative(world, captured.bodyId);
+                spdlog::info(
+                    "[GRAB-MULTIBODY] Restored body {} filter to "
+                    "0x{:08X} (layer={})",
+                    captured.bodyId,
+                    captured.originalFilterInfo,
+                    captured.originalFilterInfo & 0x7Fu);
+            }
+        }
+        return restoredAny;
+    }
+
+    static bool SyncCapturedHeldBodyFrames(
+        heisenberg::GrabState& state,
+        const RE::NiTransform& rootWorld,
+        RE::bhkWorld* bhkWorld)
+    {
+        if (!state.collisionObject ||
+            !bhkWorld ||
+            state.capturedHeldBodyCount == 0) {
+            return false;
+        }
+        auto* world = static_cast<RE::hknpWorld*>(
+            AccessWorld(state.collisionObject));
+        if (!world) {
+            return false;
+        }
+
+        heisenberg::Physics::WorldWriteLock lock(bhkWorld);
+
+        // Multipart clutter is one rigid visual object.  Validate the entire
+        // captured set before writing any body so a wrapper disappearing or
+        // being rebound mid-grab cannot move only half of the object.
+        for (std::uint32_t i = 0;
+             i < state.capturedHeldBodyCount;
+             ++i) {
+            const auto& captured = state.capturedHeldBodies[i];
+            if (!captured.valid ||
+                !CapturedHeldBodyStillOwned(
+                    state,
+                    world,
+                    captured)) {
+                return false;
+            }
+        }
+
+        for (std::uint32_t i = 0;
+             i < state.capturedHeldBodyCount;
+             ++i) {
+            const auto& captured = state.capturedHeldBodies[i];
+            const RE::NiTransform desiredOwnerWorld =
+                rock::transform_math::composeTransforms(
+                    rootWorld,
+                    captured.ownerRootLocal);
+            const RE::NiTransform desiredBodyWorld =
+                rock::transform_math::composeTransforms(
+                    desiredOwnerWorld,
+                    captured.bodyOwnerLocal);
+            rock::havok_runtime::setBodyTransformDeferred(
+                world,
+                captured.bodyId,
+                desiredBodyWorld,
+                1);
+        }
+        return true;
+    }
+
+    // Alternate collision variants can enter acquisition with the reference
+    // root and active visible child in different places. The concrete Fallout
+    // case is 10mmAmmo: visible AmmoMultiple can be more than a metre from the
+    // stale AmmoSingle/root body. Preserve the active visible child and stage a
+    // root correction; moving the child to the stale root is the visible
+    // "ammo box teleported away, then got pulled into my hand" bug.
+    static bool StageProxyRootRebaseToVisibleAuthority(
+        heisenberg::GrabState& state)
+    {
+        state.pendingVisibleRootRebase = false;
+        if (!state.isProxyCollision ||
+            !state.node ||
+            !state.physicsNode ||
+            state.physicsNode.get() == state.node.get()) {
+            return false;
+        }
+
+        auto* refr = state.GetRefr();
+        if (!refr ||
+            refr->GetFormType() == RE::ENUM_FORM_ID::kACHR) {
+            return false;
+        }
+
+        RE::NiTransform authoredOwnerRootLocal{};
+        if (!TryBuildDescendantRootLocal(
+                state.node.get(),
+                state.physicsNode.get(),
+                authoredOwnerRootLocal)) {
+            return false;
+        }
+
+        const RE::NiTransform oldRootWorld = state.node->world;
+        const RE::NiTransform visibleAuthorityWorld =
+            state.physicsNode->world;
+        const RE::NiTransform runtimeOwnerRootLocal =
+            rock::transform_math::composeTransforms(
+                rock::transform_math::invertTransform(oldRootWorld),
+                visibleAuthorityWorld);
+        const float splitDistance =
+            (runtimeOwnerRootLocal.translate -
+             authoredOwnerRootLocal.translate)
+                .Length();
+
+        // Small discrepancies are ordinary scene/physics update latency. Only
+        // normalize a clearly split multipart object.
+        constexpr float kMinimumSplitDistance = 2.0f;
+        if (!std::isfinite(splitDistance) ||
+            splitDistance <= kMinimumSplitDistance) {
+            return false;
+        }
+
+        // ownerWorld = rootWorld * authoredOwnerRootLocal
+        // therefore rootWorld = ownerWorld * inverse(authoredOwnerRootLocal).
+        const RE::NiTransform desiredRootWorld =
+            rock::transform_math::composeTransforms(
+                visibleAuthorityWorld,
+                rock::transform_math::invertTransform(
+                    authoredOwnerRootLocal));
+        state.pendingVisibleRootWorld = desiredRootWorld;
+        state.pendingVisibleRootRebase = true;
+        spdlog::info(
+            "[GRAB-ROOT-AUTHORITY] Ref {:08X} '{}' staged root rebase from "
+            "({:.1f},{:.1f},{:.1f}) onto active visible proxy '{}' "
+            "({:.1f},{:.1f},{:.1f}); split={:.2f}gu (applies after selected "
+            "body becomes KEYFRAMED)",
+            refr->formID,
+            state.node->name.c_str(),
+            oldRootWorld.translate.x,
+            oldRootWorld.translate.y,
+            oldRootWorld.translate.z,
+            state.physicsNode->name.c_str(),
+            visibleAuthorityWorld.translate.x,
+            visibleAuthorityWorld.translate.y,
+            visibleAuthorityWorld.translate.z,
+            splitDistance);
+        return true;
+    }
+
+    static bool SetCapturedHeldBodyVelocities(
+        heisenberg::GrabState& state,
+        RE::bhkWorld* bhkWorld,
+        const RE::hkVector4f& linear,
+        const RE::hkVector4f& angular)
+    {
+        if (!state.collisionObject ||
+            !bhkWorld ||
+            state.capturedHeldBodyCount == 0) {
+            return false;
+        }
+        auto* world = static_cast<RE::hknpWorld*>(
+            AccessWorld(state.collisionObject));
+        if (!world) {
+            return false;
+        }
+        heisenberg::Physics::WorldWriteLock lock(bhkWorld);
+
+        // Release velocity must also be all-or-nothing.  Giving only one body
+        // in a multipart NIF a velocity immediately splits its collision frame
+        // from the rendered root on the next simulation step.
+        for (std::uint32_t i = 0;
+             i < state.capturedHeldBodyCount;
+             ++i) {
+            const auto& captured = state.capturedHeldBodies[i];
+            if (!captured.valid ||
+                !CapturedHeldBodyStillOwned(
+                    state,
+                    world,
+                    captured)) {
+                return false;
+            }
+        }
+
+        for (std::uint32_t i = 0;
+             i < state.capturedHeldBodyCount;
+             ++i) {
+            const auto& captured = state.capturedHeldBodies[i];
+            rock::havok_runtime::setBodyVelocityDeferred(
+                world,
+                captured.bodyId,
+                linear,
+                angular);
+        }
+        return true;
+    }
+
+    static void RebuildCapturedHeldBodyCollisionCaches(
+        heisenberg::GrabState& state,
+        float lookAheadHavok)
+    {
+        if (!state.collisionObject ||
+            state.capturedHeldBodyCount == 0) {
+            return;
+        }
+        auto* world = static_cast<RE::hknpWorld*>(
+            AccessWorld(state.collisionObject));
+        if (!world) {
+            return;
+        }
+        for (std::uint32_t i = 0;
+             i < state.capturedHeldBodyCount;
+             ++i) {
+            const auto& captured = state.capturedHeldBodies[i];
+            if (!captured.valid ||
+                !CapturedHeldBodyStillOwned(
+                    state,
+                    world,
+                    captured)) {
+                continue;
+            }
+            RebuildBodyCollisionCachesNative(
+                world,
+                captured.bodyId);
+            heisenberg::Physics::TrySetBodyCollisionLookAhead(
+                world,
+                captured.bodyId,
+                lookAheadHavok);
+        }
+    }
+
     // Suppress collision between the held (collidable, keyframed) object and the player by
     // OR'ing ROCK's "hand group" bits (0x000B << 16 = 0x000B0000) into the held object's
     // collisionFilterInfo. The engine's pair filter recognises the 0x000B group as "hand-
@@ -1283,6 +2009,9 @@ namespace
     // body ids cleanly while they're in keyframed state).
     static bool TryDisablePlayerHeldObjectCollision(heisenberg::GrabState& state)
     {
+        if (state.capturedHeldBodyCount > 0) {
+            return ApplyCapturedHeldBodyFilters(state);
+        }
         const bool firstApply = !state.heldPlayerFilterApplied;
         if (!state.collisionObject || !state.collisionObject->spSystem) {
             if (firstApply) spdlog::warn("[GRAB-FILTER] skip: collObj/spSystem null");
@@ -1402,6 +2131,10 @@ namespace
     static void TryRestoreHeldObjectCollision(heisenberg::GrabState& state)
     {
         if (!state.heldPlayerFilterApplied) return;
+        if (state.capturedHeldBodyCount > 0) {
+            (void)RestoreCapturedHeldBodyFilters(state);
+            return;
+        }
         if (!state.collisionObject || !state.collisionObject->spSystem) return;
         void* hknpWorld = AccessWorld(state.collisionObject);
         if (!hknpWorld) return;
@@ -1762,6 +2495,14 @@ namespace heisenberg
 
     void heisenberg::GetEffectiveGrabPlacement(const GrabState& state, RE::NiPoint3& outLocalOffset, RE::NiMatrix3& outLocalRotation)
     {
+        if (state.hasRigidRenderedHandPlacement) {
+            outLocalOffset =
+                state.rigidRenderedHandPlacementPosition;
+            outLocalRotation =
+                state.rigidRenderedHandPlacementRotation;
+            return;
+        }
+
         // Prefer runtime (geometry-calculated) placement whenever it is set,
         // regardless of config — it is populated only when no exact saved
         // offset matched, or when the config flag forces geometry.
@@ -3496,7 +4237,13 @@ namespace
             // "must pull my hand back a few cm before it collides" symptom. Force the pair to be
             // destroyed+rebuilt by cycling the object's filter through the suppression bit and
             // back via the BS setter (each transition refreshes the body's pairing).
-            if (state.collisionObject && state.collisionObject->spSystem) {
+            if (state.capturedHeldBodyCount > 0) {
+                RebuildCapturedHeldBodyCollisionCaches(state, 0.25f);
+                spdlog::debug(
+                    "[REL-DIAG] rebuilt collision caches for {} "
+                    "captured held bodies",
+                    state.capturedHeldBodyCount);
+            } else if (state.collisionObject && state.collisionObject->spSystem) {
                 if (void* pokeWorld = AccessWorld(state.collisionObject)) {
                     std::uint32_t pokeBodyId = 0x7FFFFFFF;
                     heisenberg::ConstraintFunctions::BhkPhysicsSystemGetBodyId(
@@ -3568,20 +4315,35 @@ namespace
             RE::NiAVObject* syncNode = state.isProxyCollision && state.physicsNode ? state.physicsNode.get() : state.node.get();
             if (syncNode)
             {
-                RE::hkTransformf currentTransform;
-                // Build transform from current node world position/rotation
-                currentTransform.rotation = syncNode->world.rotate;
-                currentTransform.translation = RE::NiPoint4(
-                    syncNode->world.translate.x * HAVOK_WORLD_SCALE,
-                    syncNode->world.translate.y * HAVOK_WORLD_SCALE,
-                    syncNode->world.translate.z * HAVOK_WORLD_SCALE,
-                    0.0f
-                );
-                
-                SetTransformLocked(state.collisionObject, currentTransform, bhkWorld);
-                spdlog::debug("[GRAB-KEYFRAMED] Synced physics body to {} position ({:.1f}, {:.1f}, {:.1f})",
-                             state.isProxyCollision ? "physics node" : "visual",
-                             syncNode->world.translate.x, syncNode->world.translate.y, syncNode->world.translate.z);
+                const bool syncedMultipart =
+                    state.capturedHeldBodyCount > 0 &&
+                    SyncCapturedHeldBodyFrames(
+                        state,
+                        state.node->world,
+                        bhkWorld);
+                if (!syncedMultipart) {
+                    RE::hkTransformf currentTransform;
+                    // Build transform from current node world position/rotation
+                    currentTransform.rotation = syncNode->world.rotate;
+                    currentTransform.translation = RE::NiPoint4(
+                        syncNode->world.translate.x * HAVOK_WORLD_SCALE,
+                        syncNode->world.translate.y * HAVOK_WORLD_SCALE,
+                        syncNode->world.translate.z * HAVOK_WORLD_SCALE,
+                        0.0f
+                    );
+
+                    SetTransformLocked(state.collisionObject, currentTransform, bhkWorld);
+                }
+                spdlog::debug(
+                    "[GRAB-KEYFRAMED] Synced {} physics body frame(s) "
+                    "to {} position ({:.1f}, {:.1f}, {:.1f})",
+                    syncedMultipart
+                        ? state.capturedHeldBodyCount
+                        : 1,
+                    state.isProxyCollision ? "physics node" : "visual",
+                    syncNode->world.translate.x,
+                    syncNode->world.translate.y,
+                    syncNode->world.translate.z);
             }
             
             // Re-validate collision object after SetTransform (it can invalidate the body)
@@ -3603,13 +4365,54 @@ namespace
             // 1. The body is in a stable state while KEYFRAMED
             // 2. After motion type change, the body ID can become temporarily invalid
             RE::NiPoint4 zeroVel(0.0f, 0.0f, 0.0f, 0.0f);
-            SetLinearVelocityLocked(state.collisionObject, zeroVel, bhkWorld);
-            SetAngularVelocityLocked(state.collisionObject, zeroVel, bhkWorld);
-            spdlog::debug("[GRAB-KEYFRAMED] Zeroed velocities before motion type change");
+            RE::hkVector4f zeroVelocity{};
+            const bool zeroedMultipart =
+                SetCapturedHeldBodyVelocities(
+                    state,
+                    bhkWorld,
+                    zeroVelocity,
+                    zeroVelocity);
+            if (!zeroedMultipart) {
+                SetLinearVelocityLocked(state.collisionObject, zeroVel, bhkWorld);
+                SetAngularVelocityLocked(state.collisionObject, zeroVel, bhkWorld);
+            }
+            spdlog::debug(
+                "[GRAB-KEYFRAMED] Zeroed velocities on {} body frame(s) "
+                "before motion type change",
+                zeroedMultipart ? state.capturedHeldBodyCount : 1);
             
-            // Restore motion type to DYNAMIC
-            SetMotionTypeLocked(state.collisionObject, RE::hknpMotionPropertiesId::Preset::DYNAMIC, bhkWorld);
-            spdlog::debug("[GRAB-KEYFRAMED] Restored motion type to DYNAMIC");
+            // Restore the same motion scope used at setup. Alternate visual
+            // wrappers sharing this physics system were never keyframed and
+            // must not be activated or released with the selected variant.
+            const bool selectedWrapperScope =
+                UsesSelectedCollisionWrapperMotionScope(state);
+            if (selectedWrapperScope) {
+                SetMotionTypeLocked(
+                    state.collisionObject,
+                    RE::hknpMotionPropertiesId::Preset::DYNAMIC,
+                    bhkWorld);
+            } else if (state.capturedHeldBodyCount > 0) {
+                bhkWorld_SetMotionLocked(
+                    state.node.get(),
+                    RE::hknpMotionPropertiesId::Preset::DYNAMIC,
+                    true,
+                    true,
+                    true,
+                    bhkWorld);
+            } else {
+                SetMotionTypeLocked(
+                    state.collisionObject,
+                    RE::hknpMotionPropertiesId::Preset::DYNAMIC,
+                    bhkWorld);
+            }
+            spdlog::debug(
+                "[GRAB-KEYFRAMED] Restored motion type to DYNAMIC "
+                "(scope={})",
+                selectedWrapperScope
+                    ? "active collision wrapper"
+                    : (state.capturedHeldBodyCount > 0
+                           ? "reference subtree"
+                           : "primary body"));
             
             // Re-validate after SetMotionType (motion type change can affect body validity)
             if (!IsCollisionObjectValid(state.collisionObject))
@@ -3663,7 +4466,31 @@ namespace
                     throwVelocity->z * HAVOK_WORLD_SCALE,
                     0.0f
                 );
-                SetLinearVelocityLocked(state.collisionObject, hkLinearVel, bhkWorld);
+                RE::hkVector4f capturedLinearVelocity{};
+                capturedLinearVelocity.x = hkLinearVel.x;
+                capturedLinearVelocity.y = hkLinearVel.y;
+                capturedLinearVelocity.z = hkLinearVel.z;
+                RE::hkVector4f capturedAngularVelocity{};
+                if (throwAngularVelocity) {
+                    capturedAngularVelocity.x =
+                        throwAngularVelocity->x;
+                    capturedAngularVelocity.y =
+                        throwAngularVelocity->y;
+                    capturedAngularVelocity.z =
+                        throwAngularVelocity->z;
+                }
+                const bool appliedMultipartVelocity =
+                    SetCapturedHeldBodyVelocities(
+                        state,
+                        bhkWorld,
+                        capturedLinearVelocity,
+                        capturedAngularVelocity);
+                if (!appliedMultipartVelocity) {
+                    SetLinearVelocityLocked(
+                        state.collisionObject,
+                        hkLinearVel,
+                        bhkWorld);
+                }
                 spdlog::debug("[GRAB-KEYFRAMED] Applied throw velocity: ({:.1f},{:.1f},{:.1f})",
                             throwVelocity->x, throwVelocity->y, throwVelocity->z);
 
@@ -3677,7 +4504,12 @@ namespace
                         throwAngularVelocity->y,
                         throwAngularVelocity->z,
                         0.0f);
-                    SetAngularVelocityLocked(state.collisionObject, hkAngularVel, bhkWorld);
+                    if (!appliedMultipartVelocity) {
+                        SetAngularVelocityLocked(
+                            state.collisionObject,
+                            hkAngularVel,
+                            bhkWorld);
+                    }
                     spdlog::debug("[GRAB-KEYFRAMED] Applied release angular velocity: ({:.2f},{:.2f},{:.2f}) rad/s",
                                 throwAngularVelocity->x, throwAngularVelocity->y, throwAngularVelocity->z);
                 }
@@ -3704,7 +4536,20 @@ namespace
                 // The velocity is imperceptible but enough to wake the body from sleep
                 constexpr float GRAVITY_NUDGE = -0.1f;  // Tiny downward nudge in game units/sec
                 RE::NiPoint4 gravityNudge(0.0f, 0.0f, GRAVITY_NUDGE * HAVOK_WORLD_SCALE, 0.0f);
-                SetLinearVelocityLocked(state.collisionObject, gravityNudge, bhkWorld);
+                RE::hkVector4f capturedGravityNudge{};
+                capturedGravityNudge.z =
+                    GRAVITY_NUDGE * HAVOK_WORLD_SCALE;
+                RE::hkVector4f zeroAngular{};
+                if (!SetCapturedHeldBodyVelocities(
+                        state,
+                        bhkWorld,
+                        capturedGravityNudge,
+                        zeroAngular)) {
+                    SetLinearVelocityLocked(
+                        state.collisionObject,
+                        gravityNudge,
+                        bhkWorld);
+                }
                 spdlog::debug("[GRAB-KEYFRAMED] Drop - applied gravity nudge to wake physics body");
             }
         }
@@ -3874,6 +4719,239 @@ namespace heisenberg
         walk(root);
         if (best && outNode) *outNode = bestNode;
         return best;
+    }
+
+    static bool IsNodeOwnedByReferenceRoot(
+        RE::NiAVObject* node,
+        RE::NiAVObject* referenceRoot)
+    {
+        for (auto* current = node; current; current = current->parent) {
+            if (current == referenceRoot) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Keep SEH in a trivial leaf function. MSVC rejects __try in
+    // ResolvePhysicalTouchCollisionObject because that caller owns C++ objects
+    // which require unwinding (C2712).
+    static RE::bhkNPCollisionObject*
+    TryResolveNpcCollisionObjectFromRaw(
+        RE::NiCollisionObject* rawCollision)
+    {
+        if (!rawCollision) {
+            return nullptr;
+        }
+
+        RE::bhkNPCollisionObject* resolved = nullptr;
+        __try {
+            auto* rtti = rawCollision->GetRTTI();
+            if (!rtti || !rtti->GetName()) {
+                return nullptr;
+            }
+            const char* typeName = rtti->GetName();
+            if (std::strcmp(
+                    typeName,
+                    "bhkNPCollisionProxyObject") == 0) {
+                resolved = GetProxyTarget(rawCollision);
+            } else {
+                for (auto* current = rtti;
+                     current;
+                     current = current->GetBaseRTTI()) {
+                    const char* currentName = current->GetName();
+                    if (currentName &&
+                        std::strcmp(
+                            currentName,
+                            "bhkNPCollisionObject") == 0) {
+                        resolved =
+                            reinterpret_cast<
+                                RE::bhkNPCollisionObject*>(
+                                rawCollision);
+                        break;
+                    }
+                }
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            return nullptr;
+        }
+        return resolved;
+    }
+
+    // Return true only when this collision owner's own rendered subtree is
+    // visible. A nested node with a different collision wrapper belongs to a
+    // separate physics/visual variant and is deliberately excluded.
+    static bool CollisionOwnerHasVisibleGeometry(
+        RE::NiAVObject* node,
+        RE::NiAVObject* ownerNode,
+        RE::bhkNPCollisionObject* ownerCollision,
+        std::uint32_t depth)
+    {
+        if (!node || !ownerNode || !ownerCollision || depth > 64) {
+            return false;
+        }
+        if ((node->flags.flags & static_cast<std::uint64_t>(0x1)) != 0 ||
+            !(node->local.scale > 0.001f)) {
+            return false;
+        }
+
+        if (node != ownerNode) {
+            if (auto* nestedCollision =
+                    TryResolveNpcCollisionObjectFromRaw(
+                        node->collisionObject.get());
+                nestedCollision &&
+                nestedCollision != ownerCollision) {
+                return false;
+            }
+        }
+
+        if (node->IsGeometry()) {
+            return true;
+        }
+        if (auto* asNode = node->IsNode()) {
+            for (auto& child : asNode->children) {
+                if (child &&
+                    CollisionOwnerHasVisibleGeometry(
+                        child.get(),
+                        ownerNode,
+                        ownerCollision,
+                        depth + 1)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // Pick the collision wrapper whose own mesh variant is currently rendered.
+    // This is required for Bethesda NIFs such as 10mmAmmo.nif: AmmoSingle and
+    // AmmoMultiple are alternate representations sharing one physics system,
+    // not two rigid pieces of one object.
+    static RE::bhkNPCollisionObject*
+    ResolveActiveVisibleCollisionObject(
+        RE::NiAVObject* referenceRoot,
+        const RE::NiPoint3& handPosition,
+        RE::NiAVObject** outOwnerNode,
+        std::uint32_t* outWrapperCount = nullptr,
+        std::uint32_t* outVisibleWrapperCount = nullptr)
+    {
+        if (outOwnerNode) {
+            *outOwnerNode = nullptr;
+        }
+        if (outWrapperCount) {
+            *outWrapperCount = 0;
+        }
+        if (outVisibleWrapperCount) {
+            *outVisibleWrapperCount = 0;
+        }
+        if (!referenceRoot) {
+            return nullptr;
+        }
+
+        RE::bhkNPCollisionObject* bestCollision = nullptr;
+        RE::NiAVObject* bestOwner = nullptr;
+        float bestDistanceSquared =
+            (std::numeric_limits<float>::max)();
+
+        std::function<void(RE::NiAVObject*, std::uint32_t)> visit =
+            [&](RE::NiAVObject* node, std::uint32_t depth) {
+                if (!node || depth > 64) {
+                    return;
+                }
+
+                if (auto* collision =
+                        TryResolveNpcCollisionObjectFromRaw(
+                            node->collisionObject.get())) {
+                    if (outWrapperCount) {
+                        ++*outWrapperCount;
+                    }
+                    if (CollisionOwnerHasVisibleGeometry(
+                            node,
+                            node,
+                            collision,
+                            0)) {
+                        if (outVisibleWrapperCount) {
+                            ++*outVisibleWrapperCount;
+                        }
+                        const RE::NiPoint3 delta =
+                            node->world.translate - handPosition;
+                        const float distanceSquared =
+                            delta.x * delta.x +
+                            delta.y * delta.y +
+                            delta.z * delta.z;
+                        if (distanceSquared < bestDistanceSquared) {
+                            bestDistanceSquared = distanceSquared;
+                            bestCollision = collision;
+                            bestOwner = node;
+                        }
+                    }
+                }
+
+                if (auto* asNode = node->IsNode()) {
+                    for (auto& child : asNode->children) {
+                        if (child) {
+                            visit(child.get(), depth + 1);
+                        }
+                    }
+                }
+            };
+        visit(referenceRoot, 0);
+
+        if (bestCollision && outOwnerNode) {
+            *outOwnerNode = bestOwner;
+        }
+        return bestCollision;
+    }
+
+    // Resolve the collision wrapper that owns ROCK's exact contacted hknp body.
+    // GetCollisionObject() returns the first wrapper found in scene traversal,
+    // which is ambiguous for multipart clutter. The body's native backpointer is
+    // authoritative, but it is accepted only when its owner is still inside the
+    // selected reference's live scene tree so a stale body ID cannot grab an
+    // unrelated object.
+    static RE::bhkNPCollisionObject* ResolvePhysicalTouchCollisionObject(
+        RE::TESObjectREFR* refr,
+        RE::NiAVObject* referenceRoot,
+        std::uint32_t bodyId,
+        RE::NiAVObject** outOwnerNode)
+    {
+        if (outOwnerNode) {
+            *outOwnerNode = nullptr;
+        }
+        if (!refr || !referenceRoot ||
+            bodyId == rock::havok_runtime::kInvalidBodyIdValue) {
+            return nullptr;
+        }
+
+        auto* bhkWorld = GetBhkWorldFromRefr(refr);
+        auto* hknpWorld =
+            rock::havok_runtime::getHknpWorldFromBhk(bhkWorld);
+        if (!hknpWorld) {
+            return nullptr;
+        }
+
+        auto* rawCollision =
+            rock::havok_runtime::getCollisionObjectFromBody(
+                hknpWorld,
+                RE::hknpBodyId{ bodyId });
+        auto* owner =
+            rock::havok_runtime::getOwnerNodeFromCollisionObject(
+                rawCollision);
+        if (!rawCollision || !owner ||
+            !IsNodeOwnedByReferenceRoot(owner, referenceRoot)) {
+            return nullptr;
+        }
+
+        auto* resolved =
+            TryResolveNpcCollisionObjectFromRaw(rawCollision);
+
+        if (resolved && outOwnerNode) {
+            *outOwnerNode = resolved->sceneObject
+                ? resolved->sceneObject
+                : owner;
+        }
+        return resolved;
     }
 
     bool GrabManager::StartGrab(const Selection& selection, const RE::NiPoint3& handPos,
@@ -4081,6 +5159,32 @@ namespace heisenberg
             return false;
         }
 
+        // Native contact follows the rendered/skinned FRIK hand, whereas the
+        // input state supplied to StartGrab is the controller/wand frame. These
+        // normally agree closely, but the ammo repro showed a 330-gu split:
+        // ROCK was touching the round at the visible hand while the wand still
+        // lived in the other frame. A physical-touch grab must be captured and
+        // subsequently driven in the same skinned-hand frame that made contact.
+        RE::NiPoint3 grabHandPos = handPos;
+        RE::NiMatrix3 grabHandRot = handRot;
+        RE::NiNode* physicalTouchHandNode = nullptr;
+        if (selection.isPhysicalTouch) {
+            physicalTouchHandNode = GetSkinnedHandNode(isLeft);
+            if (physicalTouchHandNode) {
+                grabHandPos = physicalTouchHandNode->world.translate;
+                grabHandRot = physicalTouchHandNode->world.rotate;
+            }
+            spdlog::info(
+                "[GRAB-TOUCH] {} ref={:08X} controller=({:.1f},{:.1f},{:.1f}) "
+                "skinned=({:.1f},{:.1f},{:.1f}) delta={:.1f} skinnedResolved={}",
+                isLeft ? "L" : "R",
+                selRefr->formID,
+                handPos.x, handPos.y, handPos.z,
+                grabHandPos.x, grabHandPos.y, grabHandPos.z,
+                (grabHandPos - handPos).Length(),
+                physicalTouchHandNode ? "yes" : "no");
+        }
+
         // Log the BaseFormID for debugging item variations
         auto* baseForm = selRefr->data.objectReference;
         std::uint32_t baseFormID = baseForm ? baseForm->GetFormID() : 0;
@@ -4091,8 +5195,11 @@ namespace heisenberg
         state.SetRefr(selRefr);
         state.node = selection.node;  // NiPointer assignment
         state.collisionObject = nullptr;  // Will be set later
-        state.initialHandPos = handPos;
-        state.initialHandRot = handRot;
+        state.physicalTouchGrab = selection.isPhysicalTouch;
+        state.physicalTouchBodyId =
+            selection.physicalTouchBodyId;
+        state.initialHandPos = grabHandPos;
+        state.initialHandRot = grabHandRot;
         
         // If this was a transfer, preserve the original world parent
         if (isTransfer && transferFromOriginalParent)
@@ -4104,6 +5211,67 @@ namespace heisenberg
         
         // Get collision object first - we need it to detect special cases
         state.collisionObject = GetCollisionObject(selRefr);
+        if (selRefr->GetFormType() != RE::ENUM_FORM_ID::kACHR) {
+            RE::NiAVObject* activeOwner = nullptr;
+            std::uint32_t wrapperCount = 0;
+            std::uint32_t visibleWrapperCount = 0;
+            if (auto* activeCollision =
+                    ResolveActiveVisibleCollisionObject(
+                        state.node.get(),
+                        grabHandPos,
+                        &activeOwner,
+                        &wrapperCount,
+                        &visibleWrapperCount);
+                activeCollision &&
+                activeOwner &&
+                wrapperCount > 1) {
+                state.collisionObject = activeCollision;
+                state.physicsNode.reset(activeOwner);
+                state.isProxyCollision =
+                    activeOwner != state.node.get();
+                spdlog::info(
+                    "[GRAB-VARIANT] Selected active visible collision owner "
+                    "'{}' for {:08X} (root='{}' wrappers={} visible={} proxy={})",
+                    activeOwner->name.c_str(),
+                    selRefr->formID,
+                    state.node->name.c_str(),
+                    wrapperCount,
+                    visibleWrapperCount,
+                    state.isProxyCollision);
+            }
+        }
+        if (selection.isPhysicalTouch) {
+            RE::NiAVObject* touchedOwner = nullptr;
+            if (auto* touchedCollision =
+                    ResolvePhysicalTouchCollisionObject(
+                        selRefr,
+                        state.node.get(),
+                        selection.physicalTouchBodyId,
+                        &touchedOwner)) {
+                state.collisionObject = touchedCollision;
+                state.physicsNode.reset(
+                    touchedOwner ? touchedOwner : state.node.get());
+                state.isProxyCollision =
+                    touchedOwner &&
+                    touchedOwner != state.node.get();
+                spdlog::info(
+                    "[GRAB-TOUCH] Exact contacted body {} resolved to "
+                    "collision owner '{}' (root='{}' proxy={})",
+                    selection.physicalTouchBodyId,
+                    touchedOwner
+                        ? touchedOwner->name.c_str()
+                        : "NULL",
+                    state.node->name.c_str(),
+                    state.isProxyCollision);
+            } else {
+                spdlog::warn(
+                    "[GRAB-TOUCH] Exact contacted body {} could not be "
+                    "validated against ref {:08X}; using scene traversal "
+                    "collision wrapper",
+                    selection.physicalTouchBodyId,
+                    selRefr->formID);
+            }
+        }
         // v2: baseline must use the SAME signal as the steady-state check below (player's
         // parentCell, not the held object's — see the WORLD-CHANGE RESYNC comment).
         if (auto* worldPlayer = RE::PlayerCharacter::GetSingleton()) {
@@ -4131,7 +5299,7 @@ namespace heisenberg
                     sceneObj->name.c_str(), state.node->name.c_str());
                 state.isProxyCollision = true;  // Mark for special physics handling
                 state.physicsNode.reset(sceneObj);   // Store the physics node for later
-            } else {
+            } else if (!state.physicsNode) {
                 state.physicsNode = state.node;  // Normal case: physics is on grabbed node (NiPointer copy)
             }
 
@@ -4142,7 +5310,7 @@ namespace heisenberg
             if (g_config.enableLimbGrab && g_config.enableGrabActors && selRefr &&
                 selRefr->GetFormType() == RE::ENUM_FORM_ID::kACHR && selRefr->Get3D()) {
                 RE::NiAVObject* limbNode = nullptr;
-                if (auto* limbColl = FindClosestLimbCollision(selRefr->Get3D(), handPos, &limbNode);
+                if (auto* limbColl = FindClosestLimbCollision(selRefr->Get3D(), grabHandPos, &limbNode);
                     limbColl && limbNode) {
                     state.collisionObject = limbColl;
                     state.physicsNode.reset(limbNode);
@@ -4156,6 +5324,11 @@ namespace heisenberg
                 selRefr->formID, state.node ? state.node->name.c_str() : "NULL");
             state.physicsNode = state.node;  // NiPointer copy
         }
+
+        // If the selected active proxy is visibly somewhere else than its
+        // reference root, stage the reference correction around that visible
+        // pose before any distance, offset, or pull calculation reads objectPos.
+        StageProxyRootRebaseToVisibleAuthority(state);
         
         // ═══════════════════════════════════════════════════════════════════════════
         // PHYSICS MODE — KEYFRAMED (the only Heisenberg-owned backend after the
@@ -4171,7 +5344,10 @@ namespace heisenberg
         state.roomTrackingInitialized = false;
         
         // For VR grabbing - get object's current world transform
-        RE::NiTransform worldTransform = selection.node->world;
+        RE::NiTransform worldTransform =
+            state.pendingVisibleRootRebase
+                ? state.pendingVisibleRootWorld
+                : selection.node->world;
         RE::NiPoint3 objectPos = worldTransform.translate;
         state.initialObjectPos = objectPos;  // Save for pull animation
         
@@ -4189,7 +5365,7 @@ namespace heisenberg
         if (forceUseOffset) {
             distToCenter = 100.0f;  // Use a reasonable fake distance for offset loading calculations
         } else {
-            distToCenter = (objectPos - handPos).Length();  // Distance to center
+            distToCenter = (objectPos - grabHandPos).Length();  // Distance to center
         }
         
         // Calculate distance to SURFACE (subtract bounding radius)
@@ -4237,6 +5413,14 @@ namespace heisenberg
 
         bool isNaturalGrab = (distToObject <= naturalGrabThreshold);
         bool isPalmSnap = !isNaturalGrab;  // Everything beyond natural grab range = palm snap (no max limit)
+        // A surface-distance hit is authoritative even when the object's centre is
+        // farther from the controller (large/offset meshes such as Radroach Meat).
+        // Centre/selection distance may still decide remote pull for non-contact
+        // selections, but it must never turn a real touch into a palm snap.
+        constexpr float kTouchGrabMaxDistance = 3.0f;
+        const bool isActualTouchContact =
+            !forceUseOffset &&
+            (selection.isPhysicalTouch || distToObject <= kTouchGrabMaxDistance);
 
         // DEBUG: Log distance calculation to diagnose natural grab issues
         spdlog::debug("[GRAB] Distance check for '{}': distToObject={:.1f}cm, naturalThresh={:.1f}cm, hasExactMatch={}, isNatural={}, isPalmSnap={}",
@@ -4250,7 +5434,8 @@ namespace heisenberg
         // 2. Beyond naturalGrabDistance: rejected (too far)
         // (DropToHand bypass always uses instant snap)
         // =========================================================================
-        bool isRemoteSelection = (selection.distance > g_config.snapDistance);
+        bool isRemoteSelection =
+            selection.distance > g_config.snapDistance && !isActualTouchContact;
         bool useTelekinesis = false;  // Will this grab use telekinesis (follow-hand) mode?
         bool usePullToHand = false;   // Will this grab pull the object to the hand?
         
@@ -4268,8 +5453,13 @@ namespace heisenberg
             isPalmSnap = false;
             spdlog::debug("[GRAB] TRANSFER (natural grab) for '{}' at {:.1f}cm",
                         itemName, distToObject);
-        } else if (heisenberg::g_config.enableNaturalGrab && isNaturalGrab) {
+        } else if (heisenberg::g_config.enableNaturalGrab &&
+                   isNaturalGrab &&
+                   !isActualTouchContact) {
             // Telekinesis ON + within telekinesis range → object follows hand at distance
+            // A proven physical touch is handled by the mesh-contact branch below
+            // even when it is inside this range. Treating a touch as telekinesis
+            // forced the fingers open and bypassed the exact no-snap contact pose.
             useTelekinesis = true;
             spdlog::debug("[GRAB] TELEKINESIS for '{}' at {:.1f}cm (range={:.1f}cm)",
                         itemName, distToObject, naturalGrabThreshold);
@@ -4573,19 +5763,25 @@ namespace heisenberg
         // Log input values for debugging
         spdlog::debug("[GRAB] StartGrab: objectPos=({:.1f}, {:.1f}, {:.1f}) handPos=({:.1f}, {:.1f}, {:.1f})",
                      objectPos.x, objectPos.y, objectPos.z,
-                     handPos.x, handPos.y, handPos.z);
+                     grabHandPos.x, grabHandPos.y, grabHandPos.z);
         
         // distToObject already calculated above when determining snap mode
 
-        // Apply grab mode decided above
+        // Apply grab mode decided above. Keep this flag alive through the
+        // placement/finger stages below: a successful touch capture owns the
+        // exact no-snap hand relation and must not be erased by the generic
+        // saved-offset fallback later in this function.
+        bool touchGrabApplied = false;
         if (useTelekinesis)
         {
             // Telekinesis: object follows hand from its current world position
             // No pull, no snap — object maintains its world-space offset from hand
             // Ignore any stored item offsets — always compute fresh from world positions
             state.isPulling = false;
-            state.grabOffsetLocal = objectPos - handPos;
-            RE::NiMatrix3 handRot = wandNode ? wandNode->world.rotate : RE::NiMatrix3();
+            state.grabOffsetLocal = objectPos - grabHandPos;
+            RE::NiMatrix3 placementRot = physicalTouchHandNode
+                ? physicalTouchHandNode->world.rotate
+                : (wandNode ? wandNode->world.rotate : grabHandRot);
             // Preserve the saved per-item finger curls the block above (the `else` of
             // `!useTelekinesis`, just before this) may have just populated - the
             // documented contract ("saved per-item finger curls ALWAYS win", consumed via
@@ -4610,8 +5806,8 @@ namespace heisenberg
                 state.itemOffset.hasJointCurls = true;
                 for (int ji = 0; ji < 15; ++ji) state.itemOffset.jointCurls[ji] = preservedCurls.jointCurls[ji];
             }
-            state.itemOffset.position = handRot * state.grabOffsetLocal;
-            state.itemOffset.rotation = worldTransform.rotate * handRot.Transpose();
+            state.itemOffset.position = placementRot * state.grabOffsetLocal;
+            state.itemOffset.rotation = worldTransform.rotate * placementRot.Transpose();
             state.hasItemOffset = false;  // Not a stored offset
             state.isFRIKOffset = false;
             state.isNaturalGrab = true;
@@ -4644,8 +5840,8 @@ namespace heisenberg
             state.isPulling = true;
             state.pullProgress = 0.0f;
             HeisenbergPluginAPI::InvokePulledCallbacks(isLeft, selRefr);
-            state.grabOffsetLocal = objectPos - handPos;
-            float pullDistance = (objectPos - handPos).Length();
+            state.grabOffsetLocal = objectPos - grabHandPos;
+            float pullDistance = (objectPos - grabHandPos).Length();
             spdlog::debug("[GRAB] StartGrab: PULLING object from {:.1f}cm (center-to-hand) selDist={:.1f}",
                         pullDistance, selection.distance);
         }
@@ -4660,50 +5856,125 @@ namespace heisenberg
             // current world-space offset from the hand, no snap — and solve finger curl
             // against the object's real mesh (ROCK's own grab-finger solver) so fingers
             // stop just short of the surface instead of assuming a pre-authored pose.
-            constexpr float kTouchGrabMaxDistance = 3.0f;  // game units — genuine contact, not just "close"
-            bool touchGrabApplied = false;
-            // Review-hardened gates (Jul 24): with Telekinesis (bEnableNaturalGrab) ON, the
-            // telekinesis branch captures every ordinary in-contact grab before this block —
-            // the only things still reaching it in contact range are (a) HOLOTAPES, whose
-            // forced palm-snap + shared NOTE_DEFAULT offset above is deliberate (a touch-pose
-            // hold also visibly shifts when the 0.7x holotape rescale lands after the offset
-            // capture), and (b) users who explicitly turned Telekinesis OFF, for whom a
-            // no-snap touch hold silently overrides their chosen snap-to-palm behavior. Both
-            // must keep the normal offset path.
-            const bool touchGrabEligible = heisenberg::g_config.enableNaturalGrab && !isHolotape;
-            if (touchGrabEligible && distToObject <= kTouchGrabMaxDistance && state.node && wandNode)
+            // Genuine contact is a direct grab, independent of the optional telekinesis
+            // setting. Holotapes remain the one deliberate exception because their shared
+            // scaled placement is part of the deck/inventory interaction.
+            const bool touchGrabEligible = isActualTouchContact && !isHolotape;
+            if (touchGrabEligible && state.node && wandNode)
             {
                 std::array<float, 15> jointCurls{};
-                if (rock::touch_grab_bridge::SolveTouchGrabFingerPose(
-                        state.node.get(), wandNode->world, isLeft, handPos, jointCurls))
-                {
-                    // Preserve item dimensions (just populated above via
-                    // GetItemDimensions) and fingerDistance across the full
-                    // itemOffset reset below - otherwise the calibration UI
-                    // (ItemPositionConfigMode) shows 0x0x0 dimensions for
-                    // touch-grabbed items, and any offset saved from that
-                    // state gets disqualified by FindSimilarOffset's
-                    // dimension check. Same preserve-then-reset idiom as the
-                    // telekinesis branch above.
-                    const float preservedLength = state.itemOffset.length;
-                    const float preservedWidth = state.itemOffset.width;
-                    const float preservedHeight = state.itemOffset.height;
-                    const float preservedFingerDistance = state.itemOffset.fingerDistance;
-                    state.grabOffsetLocal = objectPos - handPos;
+                // The native contact point is independent evidence that the
+                // rendered mesh is actually under the hand. Keep it separate
+                // from the finger-skeleton solve: calibration can be
+                // temporarily unavailable even though the player is visibly
+                // touching the object, and that must not turn a no-snap grab
+                // into an authored-offset teleport. A broad collision shape
+                // whose visible mesh is elsewhere (the Vault suit case) fails
+                // this proximity check and still uses its authored offset.
+                RE::NiAVObject* contactGeometryNode =
+                    selection.isPhysicalTouch && state.physicsNode
+                        ? state.physicsNode.get()
+                        : state.node.get();
+                bool contactNearVisibleMesh = false;
+                float contactMeshDistance = -1.0f;
+                if (contactGeometryNode) {
+                    std::vector<TriangleData> contactTriangles;
+                    contactTriangles.reserve(512);
+                    GetTriangles(
+                        contactGeometryNode,
+                        contactTriangles,
+                        4096);
+                    RE::NiPoint3 closestVisiblePoint{};
+                    if (GetClosestMeshPointToPoint(
+                            contactTriangles,
+                            selection.hasPhysicalTouchPoint
+                                ? selection.hitPoint
+                                : grabHandPos,
+                            closestVisiblePoint,
+                            contactMeshDistance)) {
+                        // A native manifold point should land essentially on
+                        // the graphics mesh. Older F4VR events sometimes carry
+                        // only a body id; in that case allow the distance from
+                        // the rendered wrist to the reachable finger envelope.
+                        // The latter remains small enough that broad collision
+                        // on clothing cannot masquerade as visible contact.
+                        const float
+                            visibleContactToleranceGameUnits =
+                                selection.hasPhysicalTouchPoint
+                                    ? 5.0f
+                                    : 14.0f;
+                        contactNearVisibleMesh =
+                            contactMeshDistance <=
+                            visibleContactToleranceGameUnits;
+                    }
+                }
+                const bool solvedFingerPose =
+                    rock::touch_grab_bridge::SolveTouchGrabFingerPose(
+                        contactGeometryNode,
+                        physicalTouchHandNode ? physicalTouchHandNode->world : wandNode->world,
+                        isLeft,
+                        grabHandPos,
+                        selection.hasPhysicalTouchPoint
+                            ? selection.hitPoint
+                            : grabHandPos,
+                        jointCurls);
+                const bool preservePhysicalTouch =
+                    solvedFingerPose || contactNearVisibleMesh;
+
+                // Preserve item dimensions (just populated above via
+                // GetItemDimensions) and fingerDistance across the full
+                // itemOffset reset below - otherwise the calibration UI
+                // (ItemPositionConfigMode) shows 0x0x0 dimensions for
+                // touch-grabbed items, and any offset saved from that
+                // state gets disqualified by FindSimilarOffset's dimension
+                // check. Crucially, preserve the no-snap placement ONLY when
+                // at least one finger has a trustworthy visible-mesh stop. If
+                // no finger can reach any visible mesh (Vault 111 jumpsuit),
+                // the configured authored offset is the correct fallback.
+                if (preservePhysicalTouch) {
+                    const ItemOffset priorOffset = state.itemOffset;
+                    const RE::NiTransform& placementParent =
+                        physicalTouchHandNode ? physicalTouchHandNode->world : wandNode->world;
+                    const RE::NiPoint3 worldDelta =
+                        objectPos - placementParent.translate;
+                    const RE::NiPoint3 localOffset =
+                        placementParent.rotate * worldDelta;
+                    const RE::NiMatrix3 localRotation =
+                        worldTransform.rotate * placementParent.rotate.Transpose();
+
                     state.itemOffset = ItemOffset();
-                    state.itemOffset.length = preservedLength;
-                    state.itemOffset.width = preservedWidth;
-                    state.itemOffset.height = preservedHeight;
-                    state.itemOffset.fingerDistance = preservedFingerDistance;
-                    state.itemOffset.hasJointCurls = true;
-                    for (int ji = 0; ji < 15; ++ji) state.itemOffset.jointCurls[ji] = jointCurls[ji];
-                    state.itemOffset.position = wandNode->world.rotate * state.grabOffsetLocal;
-                    state.itemOffset.rotation = worldTransform.rotate * wandNode->world.rotate.Transpose();
+                    state.itemOffset.length = priorOffset.length;
+                    state.itemOffset.width = priorOffset.width;
+                    state.itemOffset.height = priorOffset.height;
+                    state.itemOffset.fingerDistance = priorOffset.fingerDistance;
+                    if (solvedFingerPose) {
+                        state.SetRuntimeJointCurls(jointCurls);
+                    }
+                    state.itemOffset.position = localOffset;
+                    state.itemOffset.rotation = localRotation;
+                    state.grabOffsetLocal = localOffset;
+                    state.SetRuntimeHandPlacement(
+                        localOffset,
+                        localRotation,
+                        physicalTouchHandNode != nullptr);
                     state.hasItemOffset = false;
                     state.isFRIKOffset = false;
                     state.isNaturalGrab = true;
                     touchGrabApplied = true;
-                    spdlog::debug("[GRAB] StartGrab: TOUCH GRAB — mesh-solved finger curl, no snap (dist={:.1f}cm)", distToObject);
+                    spdlog::debug(
+                        "[GRAB] StartGrab: TOUCH GRAB — no snap "
+                        "(dist={:.1f}cm frame={} fingerSolved={} "
+                        "contactMeshDist={:.2f})",
+                        distToObject,
+                        physicalTouchHandNode ? "skinned" : "wand",
+                        solvedFingerPose,
+                        contactMeshDistance);
+                } else {
+                    state.ClearRuntimeHandPlacement();
+                    spdlog::info(
+                        "[GRAB] StartGrab: TOUCH mesh solve found no reachable "
+                        "visible surface — using authored offset for '{}'",
+                        itemName);
                 }
             }
 
@@ -4732,6 +6003,7 @@ namespace heisenberg
         // Remote grabs use the stored/dims item offset and pull in normally.
         const bool useGeometryPlacement =
             !state.isTelekinesis &&
+            !state.isNaturalGrab &&
             !isRemoteSelection &&
             !state.hasItemOffset &&
             g_config.enableAutomaticHandPlacement;
@@ -4765,9 +6037,40 @@ namespace heisenberg
                     state.grabOffsetLocal.y,
                     state.grabOffsetLocal.z);
             }
-        } else {
+        } else if (!touchGrabApplied) {
             state.ClearRuntimeHandPlacement();
             spdlog::debug("[GRAB-POS] Using saved exact offset for '{}' (no geometry fallback)", itemName);
+        } else {
+            spdlog::debug(
+                "[GRAB-POS] Preserving physical-touch placement for '{}' "
+                "(body={} age={}f)",
+                itemName,
+                selection.physicalTouchBodyId,
+                selection.physicalTouchAgeFrames);
+        }
+
+        // The placement rules above intentionally decide WHERE the item should
+        // sit. Geometry/touch poses can be rebased immediately. A complete
+        // authored pose must wait until its saved fingers have reached their
+        // target, otherwise this captures a transient FRIK wrist/controller
+        // relation and gives the same saved offset a different visible seat on
+        // each grip.
+        const RE::NiPoint3 placementFallbackPos =
+            wandNode ? wandNode->world.translate : handPos;
+        const RE::NiMatrix3 placementFallbackRot =
+            wandNode ? wandNode->world.rotate : handRot;
+        if (UsesAuthoredGripPose(state)) {
+            spdlog::info(
+                "[GRAB-POSE] {} '{}' selected paired authored transform/curls; "
+                "rendered-hand rebase deferred until pull and finger pose settle",
+                isLeft ? "L" : "R",
+                state.node ? state.node->name.c_str() : "NULL");
+        } else {
+            RebaseGrabPlacementToRenderedHand(
+                state,
+                isLeft,
+                placementFallbackPos,
+                placementFallbackRot);
         }
         
         // Store initial object rotation (object will keep this rotation)
@@ -4856,7 +6159,9 @@ namespace heisenberg
         // wide open. For a CLOSE natural grab the object is right in the hand, so we DO
         // want the fingers to wrap around its mesh. Allow the curl pass for natural grabs
         // (force geometry curls so they wrap the actual shape, not a saved/open pose).
-        const bool naturalPosing = state.isTelekinesis && isNaturalGrab;
+        const bool naturalPosing =
+            touchGrabApplied ||
+            (state.isTelekinesis && isNaturalGrab);
         state.naturalFingerPosing = naturalPosing;  // persists so per-frame reapply keeps the wrap
         if ((!state.isTelekinesis || naturalPosing) && state.node)
         {
@@ -4881,6 +6186,13 @@ namespace heisenberg
                     spdlog::debug("[GRAB-FINGERS] Deferred curls (stored first, geometry fallback) until object reaches the hand");
                 } else if (!naturalPosing && hasStoredCurls && ApplyStoredFingerCurls(state, isLeft)) {
                     spdlog::debug("[GRAB-FINGERS] Applied saved offset curls for '{}'", itemName);
+                } else if (naturalPosing &&
+                           state.hasRuntimeJointCurls &&
+                           ApplyRuntimeFingerCurls(state, isLeft)) {
+                    state.pendingFingerCurls = false;
+                    spdlog::debug(
+                        "[GRAB-FINGERS] Applied stable first-contact joint pose for '{}'",
+                        itemName);
                 } else if (wandNode && (!state.isTelekinesis || state.naturalFingerPosing)) {
                     // POST-SNAP SOLVE (Jul 19 finger audit): solving here reads the object's
                     // PRE-snap resting pose — GEOM-PLACE then seats it at a DIFFERENT anchor
@@ -4893,7 +6205,12 @@ namespace heisenberg
                     // worked this way, and never showed the penetration).
                     frik.SetHandPoseFingerPositions(isLeft, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f);
                     state.pendingFingerCurls = true;
-                    state.ClearRuntimeFingerCurls();
+                    // Keep an already-solved touch pose. Only generated/snap
+                    // placements need a post-physics solve against their final
+                    // transformed mesh.
+                    if (!state.hasRuntimeJointCurls) {
+                        state.ClearRuntimeFingerCurls();
+                    }
                     spdlog::debug("[GRAB-FINGERS] Deferred geometry curls to post-snap solve for '{}'", itemName);
                 } else if (wandNode && TryCalculateRuntimeFingerCurlsFromGeometry(state, wandNode, isLeft)) {
                     // telekinesis holds without natural posing: post-physics resolve never
@@ -5072,6 +6389,49 @@ namespace heisenberg
         // No need to press grip - just hold item in storage zone
         // =====================================================================
         auto& configMode = ItemPositionConfigMode::GetSingleton();
+
+        // Item-position editing freezes the object's world pose and writes a
+        // new legacy itemOffset relative to the controller.  Do not let the
+        // acquisition-time rendered-hand placement mask those edits.  Once
+        // editing ends, rebase the newly saved offset into the rendered hand
+        // without moving the object, restoring exact hand/item synchrony for
+        // the remainder of the grab.
+        if (configMode.IsRepositionModeActive()) {
+            if (configMode.HasFrozenPosition() &&
+                state.hasRigidRenderedHandPlacement) {
+                state.ClearRigidRenderedHandPlacement();
+            }
+        } else if (!state.hasRigidRenderedHandPlacement) {
+            const bool authoredPose =
+                UsesAuthoredGripPose(state);
+            const auto& frik =
+                FRIKInterface::GetSingleton();
+            const bool authoredFingerPoseSettled =
+                !state.pendingFingerCurls &&
+                (!frik.IsAvailable() ||
+                 Heisenberg::GetSingleton()
+                         .GetFingerAnimator(isLeft)
+                         .GetState() ==
+                     FingerAnimator::State::Holding);
+
+            if (grab_pose_policy::ShouldCommitRenderedHandRebase(
+                    authoredPose,
+                    state.isPulling,
+                    authoredFingerPoseSettled) &&
+                RebaseGrabPlacementToRenderedHand(
+                    state,
+                    isLeft,
+                    handPos,
+                    handRot) &&
+                authoredPose) {
+                spdlog::info(
+                    "[GRAB-POSE] {} '{}' committed settled authored "
+                    "transform/curls to rendered-hand frame",
+                    isLeft ? "L" : "R",
+                    state.node ? state.node->name.c_str() : "NULL");
+            }
+        }
+
         float storageHoldTime = heisenberg::g_config.storageZoneHoldTime;
         // Clear skipStorageZone after 1 second (allows storage after initial Pipboy proximity)
         if (state.skipStorageZone) {
@@ -5547,9 +6907,117 @@ namespace heisenberg
                     spdlog::debug("[GRAB-KEYFRAMED] Saved collision object flags: {:X}",
                                  state.savedState.collisionObjectFlags);
 
-                    bhkWorld_SetMotionLocked(state.node.get(), RE::hknpMotionPropertiesId::Preset::KEYFRAMED, true, true, true, bhkWorld);
-                    spdlog::debug("[GRAB-KEYFRAMED] Set motion type to KEYFRAMED via bhkWorld_SetMotion (bhkWorld {:X})",
-                                reinterpret_cast<uintptr_t>(bhkWorld));
+                    // Capture every body in the shared reference physics
+                    // system before changing motion type. The selected visible
+                    // wrapper remains placement authority, while hidden
+                    // alternates are driven in lockstep so they cannot reset
+                    // the reference root to its pre-grab pose.
+                    CaptureHeldCollisionBodyFrames(state);
+                    const bool selectedWrapperScope =
+                        UsesSelectedCollisionWrapperMotionScope(state);
+                    if (selectedWrapperScope) {
+                        SetMotionTypeLocked(
+                            state.collisionObject,
+                            RE::hknpMotionPropertiesId::Preset::KEYFRAMED,
+                            bhkWorld);
+                    } else {
+                        bhkWorld_SetMotionLocked(
+                            state.node.get(),
+                            RE::hknpMotionPropertiesId::Preset::KEYFRAMED,
+                            true,
+                            true,
+                            true,
+                            bhkWorld);
+                    }
+                    spdlog::debug(
+                        "[GRAB-KEYFRAMED] Set motion type to KEYFRAMED "
+                        "(scope={} bhkWorld={:X})",
+                        selectedWrapperScope
+                            ? "active collision wrapper"
+                            : "reference subtree",
+                        reinterpret_cast<uintptr_t>(bhkWorld));
+
+                    // A visibly split child cannot become root authority while
+                    // it is dynamic: Havok would immediately restore the stale
+                    // pose. Apply the staged rebase only now, after the selected
+                    // wrapper is keyframed, then move only its captured body
+                    // frame onto the unchanged visible pose.
+                    if (state.pendingVisibleRootRebase) {
+                        const RE::NiTransform previousRootWorld =
+                            state.node->world;
+                        const RE::NiPoint3 visibleBefore =
+                            state.physicsNode
+                                ? state.physicsNode->world.translate
+                                : state.pendingVisibleRootWorld.translate;
+                        Utils::UpdateKeyframedNode(
+                            state.node.get(),
+                            state.pendingVisibleRootWorld);
+
+                        bool physicsSynced =
+                            state.capturedHeldBodyCount > 0 &&
+                            SyncCapturedHeldBodyFrames(
+                                state,
+                                state.pendingVisibleRootWorld,
+                                bhkWorld);
+                        if (!physicsSynced &&
+                            state.physicsNode &&
+                            IsCollisionObjectValid(
+                                state.collisionObject)) {
+                            RE::hkTransformf activeBodyTransform{};
+                            activeBodyTransform.rotation =
+                                state.physicsNode->world.rotate;
+                            activeBodyTransform.translation =
+                                RE::NiPoint4(
+                                    state.physicsNode->world.translate.x *
+                                        HAVOK_WORLD_SCALE,
+                                    state.physicsNode->world.translate.y *
+                                        HAVOK_WORLD_SCALE,
+                                    state.physicsNode->world.translate.z *
+                                        HAVOK_WORLD_SCALE,
+                                    0.0f);
+                            physicsSynced = SetTransformLocked(
+                                state.collisionObject,
+                                activeBodyTransform,
+                                bhkWorld);
+                        }
+
+                        if (physicsSynced) {
+                            if (refr) {
+                                refr->data.location.x =
+                                    state.node->world.translate.x;
+                                refr->data.location.y =
+                                    state.node->world.translate.y;
+                                refr->data.location.z =
+                                    state.node->world.translate.z;
+                            }
+                            const float visibleMove =
+                                state.physicsNode
+                                    ? (state.physicsNode->world.translate -
+                                       visibleBefore)
+                                          .Length()
+                                    : 0.0f;
+                            spdlog::info(
+                                "[GRAB-ROOT-AUTHORITY] Applied staged active-"
+                                "variant rebase for {:08X}; root=({:.1f},"
+                                "{:.1f},{:.1f}) visibleMove={:.3f}gu bodies={}",
+                                refr ? refr->formID : 0,
+                                state.node->world.translate.x,
+                                state.node->world.translate.y,
+                                state.node->world.translate.z,
+                                visibleMove,
+                                state.capturedHeldBodyCount);
+                        } else {
+                            Utils::UpdateKeyframedNode(
+                                state.node.get(),
+                                previousRootWorld);
+                            spdlog::warn(
+                                "[GRAB-ROOT-AUTHORITY] Cancelled staged rebase "
+                                "for {:08X}: selected collision body could not "
+                                "be synchronized",
+                                refr ? refr->formID : 0);
+                        }
+                        state.pendingVisibleRootRebase = false;
+                    }
 
                     if (heisenberg::g_config.heldObjectCollidable) {
                         // REVERTED (2026-05-29): Layer-43 experiment broke thrown-object damage
@@ -5685,13 +7153,10 @@ namespace heisenberg
         if (!state.isPulling && (!state.isTelekinesis || state.naturalFingerPosing) && !state.pendingFingerCurls &&
             !(configMode.IsRepositionModeActive() && state.stickyGrab))
         {
-            // Task #4 — optionally recompute geometry curls every N frames.
-            // Runs before ApplyConfiguredFingerCurls so the freshly-blended
-            // runtime values are what gets pushed to FRIK this frame.
-            auto* playerNodes = f4cf::f4vr::getPlayerNodes();
-            RE::NiNode* wandNode = playerNodes ? heisenberg::GetWandNode(playerNodes, isLeft) : nullptr;
-            TryRecalculateFingerCurlsPerFrame(state, wandNode, isLeft);
-
+            // Reapply the acquisition-time pose, but do not resolve it again.
+            // The held object-to-rendered-hand transform is rigid; repeated
+            // mesh solves merely sample animation/physics at different phases
+            // and were the source of changing curls and rest jitter.
             if (HasConfiguredFingerCurls(state)) {
                 if (ApplyConfiguredFingerCurls(state, isLeft)) {
                     static int curlLogCount = 0;
@@ -5831,8 +7296,29 @@ namespace heisenberg
         if (lag > 50.0f && state.keyframedSetupComplete) {
             auto* bhkWorld = GetBhkWorldFromRefr(refr);
             if (bhkWorld) {
-                bhkWorld_SetMotionLocked(state.node.get(), RE::hknpMotionPropertiesId::Preset::KEYFRAMED, true, true, true, bhkWorld);
-                spdlog::warn("[POST-PHYSICS] Re-applied KEYFRAMED (lag={:.0f}cm)", lag);
+                const bool selectedWrapperScope =
+                    UsesSelectedCollisionWrapperMotionScope(state);
+                if (selectedWrapperScope) {
+                    SetMotionTypeLocked(
+                        state.collisionObject,
+                        RE::hknpMotionPropertiesId::Preset::KEYFRAMED,
+                        bhkWorld);
+                } else {
+                    bhkWorld_SetMotionLocked(
+                        state.node.get(),
+                        RE::hknpMotionPropertiesId::Preset::KEYFRAMED,
+                        true,
+                        true,
+                        true,
+                        bhkWorld);
+                }
+                spdlog::warn(
+                    "[POST-PHYSICS] Re-applied KEYFRAMED "
+                    "(lag={:.0f}cm scope={})",
+                    lag,
+                    selectedWrapperScope
+                        ? "active collision wrapper"
+                        : "reference subtree");
             }
         }
 
@@ -6571,6 +8057,11 @@ namespace heisenberg
         // Fire dropped callback for normal releases (not stash/consume)
         if (!forStorage && refr) {
             HeisenbergPluginAPI::InvokeDroppedCallbacks(isLeft, refr);
+            // EndGrabKeyframed restores this original body and its native
+            // collision below. Suppress only ROCK's additional push impulse
+            // briefly, so a quiet ammo-box release cannot be interpreted as a
+            // fresh high-speed hand push and launched across the room.
+            rock::HostNotifyExternalRelease(isLeft, refr);
         }
 
         // ── KEYFRAMED MODE RELEASE ──
@@ -7189,6 +8680,37 @@ namespace heisenberg
                 const RE::NiPoint3 heldPrevPos = state.node->world.translate;
 
                 Utils::UpdateKeyframedNode(state.node.get(), desiredTransform);
+                // PHANTOM-BODY FIX: during the pull-in the visual mesh teleports toward the
+                // hand every frame; dragging the captured keyframed (infinite-mass) bodies
+                // along that sweep is what batted world clutter over. Park the bodies for the
+                // pull — they snap to the held pose on the first post-pull frame here, and
+                // EndGrabKeyframed's release path syncs them even if the grab ends mid-pull.
+                if (state.capturedHeldBodyCount > 0 && !state.isPulling) {
+                    RE::bhkWorld* heldBodyWorld =
+                        state.savedState.savedBhkWorld;
+                    if (stateRefr) {
+                        if (auto* currentWorld =
+                                GetBhkWorldFromRefr(stateRefr)) {
+                            heldBodyWorld = currentWorld;
+                        }
+                    }
+                    if (!SyncCapturedHeldBodyFrames(
+                            state,
+                            desiredTransform,
+                            heldBodyWorld)) {
+                        static std::uint32_t
+                            s_multibodySyncFailureLog = 0;
+                        if ((++s_multibodySyncFailureLog % 60) == 1) {
+                            spdlog::warn(
+                                "[GRAB-MULTIBODY] Failed to sync {} "
+                                "captured body frame(s) for {:08X}",
+                                state.capturedHeldBodyCount,
+                                stateRefr
+                                    ? stateRefr->formID
+                                    : 0);
+                        }
+                    }
+                }
 
                 // Held object pushes other clutter it moves toward (skipped during pull-in).
                 if (!state.isPulling)

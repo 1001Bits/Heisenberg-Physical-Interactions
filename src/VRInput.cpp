@@ -93,6 +93,10 @@ namespace heisenberg
         // Save previous state
         _leftController.previous = _leftController.current;
         _rightController.previous = _rightController.current;
+        _leftController.logicalGrabPrevious =
+            _leftController.logicalGrabCurrent;
+        _rightController.logicalGrabPrevious =
+            _rightController.logicalGrabCurrent;
         _leftController.previousTriggerValue = _leftController.triggerValue;
         _rightController.previousTriggerValue = _rightController.triggerValue;
 
@@ -124,6 +128,9 @@ namespace heisenberg
 
         _leftController.valid = false;
         _leftController.poseValid = false;
+        _leftController.logicalGrabOwned = false;
+        _leftController.logicalGrabCurrent = 0;
+        _leftController.logicalGrabValue = 0.0f;
         if (leftIndex != vr::k_unTrackedDeviceIndexInvalid) {
             vr::VRControllerState_t state{};
             bool gotState = openvrHook.GetControllerStateUnfiltered(leftIndex, &state, sizeof(state));
@@ -139,6 +146,18 @@ namespace heisenberg
                 _leftController.thumbstickY = state.rAxis[0].y;
                 _leftController.valid = true;
                 if (state.rAxis[2].x > 0.1f) _leftController.hasAnalogGrip = true;
+
+                vr::VRControllerState_t interactionState{};
+                _leftController.logicalGrabOwned =
+                    openvrHook.ApplyInteractionCallbacks(
+                        controller_bridge::kRoleLeft,
+                        leftIndex,
+                        state,
+                        interactionState);
+                _leftController.logicalGrabCurrent =
+                    interactionState.ulButtonPressed;
+                _leftController.logicalGrabValue =
+                    interactionState.rAxis[2].x;
             }
             _leftController.poseValid = poses[leftIndex].bPoseIsValid && poses[leftIndex].bDeviceIsConnected;
             if (_leftController.poseValid) {
@@ -150,6 +169,9 @@ namespace heisenberg
         // Get right controller state
         _rightController.valid = false;
         _rightController.poseValid = false;
+        _rightController.logicalGrabOwned = false;
+        _rightController.logicalGrabCurrent = 0;
+        _rightController.logicalGrabValue = 0.0f;
         bool rightGotState = false;
         vr::VRControllerState_t rightRawState{};
         if (rightIndex != vr::k_unTrackedDeviceIndexInvalid) {
@@ -165,6 +187,18 @@ namespace heisenberg
                 _rightController.thumbstickY = rightRawState.rAxis[0].y;
                 _rightController.valid = true;
                 if (rightRawState.rAxis[2].x > 0.1f) _rightController.hasAnalogGrip = true;
+
+                vr::VRControllerState_t interactionState{};
+                _rightController.logicalGrabOwned =
+                    openvrHook.ApplyInteractionCallbacks(
+                        controller_bridge::kRoleRight,
+                        rightIndex,
+                        rightRawState,
+                        interactionState);
+                _rightController.logicalGrabCurrent =
+                    interactionState.ulButtonPressed;
+                _rightController.logicalGrabValue =
+                    interactionState.rAxis[2].x;
             }
             _rightController.poseValid = poses[rightIndex].bPoseIsValid && poses[rightIndex].bDeviceIsConnected;
             if (_rightController.poseValid) {
@@ -221,6 +255,36 @@ namespace heisenberg
         }
 
         return (state.current & ButtonMask(button)) != 0;
+    }
+
+    bool VRInput::HasLogicalGrab(bool isLeftHand) const
+    {
+        const auto& state = GetControllerState(isLeftHand);
+        return state.valid && state.logicalGrabOwned;
+    }
+
+    bool VRInput::IsLogicalGrabPressed(bool isLeftHand) const
+    {
+        const auto& state = GetControllerState(isLeftHand);
+        if (!state.valid || !state.logicalGrabOwned) {
+            return false;
+        }
+        if (state.logicalGrabValue > 0.5f) {
+            return true;
+        }
+        if (state.logicalGrabValue > 0.01f) {
+            return false;
+        }
+        return (state.logicalGrabCurrent &
+                ButtonMask(VRButton::Grip)) != 0;
+    }
+
+    float VRInput::GetLogicalGrabValue(bool isLeftHand) const
+    {
+        const auto& state = GetControllerState(isLeftHand);
+        return state.valid && state.logicalGrabOwned ?
+            state.logicalGrabValue :
+            0.0f;
     }
 
     uint64_t VRInput::GetRawButtonMask(bool isLeftHand) const

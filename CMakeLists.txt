@@ -244,14 +244,35 @@ if(BUILD_HEISENBERG_TESTS)
   target_include_directories(HeisenbergPipboyMeshContactPolicyTests PRIVATE "${SOURCE_DIR}")
   add_test(NAME HeisenbergPipboyMeshContactPolicyTests COMMAND HeisenbergPipboyMeshContactPolicyTests)
 
+  add_executable(HeisenbergGrabPosePolicyTests
+    tests/GrabPosePolicyTests.cpp
+    src/GrabPosePolicy.h
+  )
+  target_compile_features(HeisenbergGrabPosePolicyTests PRIVATE cxx_std_23)
+  target_include_directories(HeisenbergGrabPosePolicyTests PRIVATE "${SOURCE_DIR}")
+  add_test(NAME HeisenbergGrabPosePolicyTests COMMAND HeisenbergGrabPosePolicyTests)
+
   add_executable(HeisenbergRockProviderApiPolicyTests
     tests/RockProviderApiPolicyTests.cpp
     external/ROCK/src/api/ROCKProviderApi.h
     external/ROCK/src/api/WeaponPartDriveLeasePolicy.h
+    external/ROCK/src/physics-interaction/collision/ContactActivityTracker.h
+    external/ROCK/src/physics-interaction/weapon/WeaponPartContactAcquisitionPolicy.h
+    external/ROCK/src/physics-interaction/weapon/WeaponSemantics.h
   )
   target_compile_features(HeisenbergRockProviderApiPolicyTests PRIVATE cxx_std_23)
-  target_include_directories(HeisenbergRockProviderApiPolicyTests PRIVATE "${ROCK_DIR}/src")
+  target_include_directories(HeisenbergRockProviderApiPolicyTests PRIVATE "${ROCK_DIR}/src" "${ROCK_DIR}/src/api")
+  target_link_libraries(HeisenbergRockProviderApiPolicyTests PRIVATE F4VRCommon::framework)
   add_test(NAME HeisenbergRockProviderApiPolicyTests COMMAND HeisenbergRockProviderApiPolicyTests)
+
+  add_executable(HeisenbergWeaponPartMotionConstraintTests
+    tests/WeaponPartMotionConstraintPolicyTests.cpp
+    external/ROCK/src/physics-interaction/weapon/WeaponPartMotionConstraintPolicy.h
+  )
+  target_compile_features(HeisenbergWeaponPartMotionConstraintTests PRIVATE cxx_std_23)
+  target_include_directories(HeisenbergWeaponPartMotionConstraintTests PRIVATE "${ROCK_DIR}/src")
+  target_link_libraries(HeisenbergWeaponPartMotionConstraintTests PRIVATE F4VRCommon::framework)
+  add_test(NAME HeisenbergWeaponPartMotionConstraintTests COMMAND HeisenbergWeaponPartMotionConstraintTests)
 endif()
 
 

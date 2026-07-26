@@ -4,6 +4,7 @@
 #include "ItemOffsets.h"
 #include "HavokPhysicsKeyframe.h"
 #include "RE/Fallout.h"
+#include <array>
 #include <unordered_map>
 #include <chrono>
 
@@ -83,11 +84,62 @@ namespace heisenberg
         bool usedSnapMode = false;      // True if snap positioning was used (distance > 10cm)
         bool usingKeyframedMode = false;   // True if using KEYFRAMED physics mode (for interiors, DynamicNode, proxy objects)
         bool isProxyCollision = false;  // True if physics is on a child node (ragdolls, animated toys)
+        bool physicalTouchGrab = false; // Selection came from ROCK's exact native hand/body contact
+        std::uint32_t physicalTouchBodyId = 0x7FFF'FFFFu;
         bool coHeldSecondary = false;  // two-handed grab: this hand is the secondary aim hand (no physics drive)
         bool heldPlayerFilterApplied = false; // ROCK-style suppression bit applied (bit 14 of body filter info)
         int  heldPlayerFilterFrames = 0;      // frame counter for periodic re-application
         std::uint32_t heldOriginalFilterInfo = 0; // body's filter info before suppression bit set (for restore)
         bool heldHadSuppressionBitOriginally = false; // true if bit 14 was already set before we ORed it (don't clear on release)
+
+        // A Bethesda physics system can contain several wrappers, including
+        // mutually exclusive visual variants (10mmAmmo has AmmoSingle and
+        // AmmoMultiple). The rendered wrapper remains placement authority, but
+        // every body in the shared reference subtree must be keyframed and
+        // driven through its authored owner frame. Otherwise an unselected
+        // dynamic wrapper can write the reference root back to its old pose
+        // every physics step while the visible wrapper is being held.
+        static constexpr std::size_t kMaxCapturedHeldBodies = 16;
+        struct CapturedHeldBody
+        {
+            std::uint32_t bodyId = 0x7FFF'FFFFu;
+            std::uint32_t motionId = 0xFFFF'FFFFu;
+            std::uint32_t originalFilterInfo = 0;
+            // True when this body belongs to the wrapper that won grab acquisition
+            // (the visible mesh variant). Alternate/hidden wrapper bodies are dragged
+            // along invisibly and are made non-collidable for the capture lifetime.
+            bool isActiveWrapper = false;
+            // A bhkPhysicsSystem can contain bodies owned by different
+            // bhkNPCollisionObject wrappers/nodes (10mmAmmo is the concrete
+            // example: 10mmAmmo + AmmoMultiple). The body backpointer must be
+            // validated against its own wrapper, not the wrapper that happened
+            // to win grab acquisition.
+            RE::NiCollisionObject* ownerCollisionObject = nullptr;
+            RE::NiPointer<RE::NiAVObject> ownerNode;
+
+            // Preserve both links in the rendered hierarchy:
+            //   root -> collision-owner node -> hknp body.
+            // Driving every body through these two frames keeps collision on
+            // its corresponding visible mesh even when a multipart NIF has
+            // independently positioned child bodies.
+            RE::NiTransform ownerRootLocal{};
+            RE::NiTransform bodyOwnerLocal{};
+            bool valid = false;
+            bool filterChanged = false;
+        };
+        std::array<CapturedHeldBody, kMaxCapturedHeldBodies> capturedHeldBodies{};
+        std::uint32_t capturedHeldBodyCount = 0;
+        bool capturedHeldBodiesExcludeAlternateWrappers = false;
+        bool capturedHeldBodiesIncludeAlternateWrappers = false;
+
+        // A child collision variant can already be visibly separated from the
+        // reference root when acquisition begins. The visible child is the
+        // authority, but the root rebase must wait until that selected body is
+        // KEYFRAMED; otherwise Havok immediately writes the stale dynamic pose
+        // back over the root. Initial placement calculations use this staged
+        // transform so the object never appears to jump away and pull back.
+        bool pendingVisibleRootRebase = false;
+        RE::NiTransform pendingVisibleRootWorld{};
 
         // =========================================================================
         // SAFE OBJECT REFERENCES - Use handles and smart pointers
@@ -141,6 +193,16 @@ namespace heisenberg
         // otherwise FRIK IK offset between wand and bone reintroduces drift.
         bool runtimePlacementSkinnedHand = false;
 
+        // Once the final grab placement is known, re-express it in the
+        // rendered COM-tree hand frame. FRIK can visually lag the raw wand
+        // during body turns; keeping the object on the wand while fingers are
+        // on the rendered hand makes the item lead the hand. This independent
+        // placement layer preserves the authored/runtime target at acquisition
+        // but then makes the object-to-visible-hand transform invariant.
+        bool hasRigidRenderedHandPlacement = false;
+        RE::NiPoint3 rigidRenderedHandPlacementPosition;
+        RE::NiMatrix3 rigidRenderedHandPlacementRotation;
+
         // Live held-object finger curls. Keep these separate from saved item
         // offset curls so automatic grab poses are never persisted to JSON.
         bool hasRuntimeFingerCurls = false;
@@ -149,10 +211,17 @@ namespace heisenberg
         float runtimeMiddleCurl = 0.6f;
         float runtimeRingCurl = 0.6f;
         float runtimePinkyCurl = 0.6f;
-
-        // Per-frame curl recompute throttle. Incremented each held frame; when
-        // it reaches `fingerCurlPerFrameInterval` we recompute geometry curls.
-        std::uint32_t fingerCurlRecalcFrameCounter = 0;
+        // The mesh solver resolves the actual 15 driven joints. Keeping that
+        // result intact avoids re-expanding five scalar curls with a distal
+        // bias that can push the rendered fingertips through thin objects.
+        bool hasRuntimeJointCurls = false;
+        std::array<float, 15> runtimeJointCurls{
+            0.6f, 0.6f, 0.6f,
+            0.6f, 0.6f, 0.6f,
+            0.6f, 0.6f, 0.6f,
+            0.6f, 0.6f, 0.6f,
+            0.6f, 0.6f, 0.6f
+        };
 
         // Sticky grab mode for config - keeps item grabbed even without grip held
         bool stickyGrab = false;            // True if in sticky grab mode (for repositioning)
@@ -277,6 +346,7 @@ namespace heisenberg
         void SetRuntimeFingerCurls(float thumb, float index, float middle, float ring, float pinky)
         {
             hasRuntimeFingerCurls = true;
+            hasRuntimeJointCurls = false;
             runtimeThumbCurl = thumb;
             runtimeIndexCurl = index;
             runtimeMiddleCurl = middle;
@@ -284,14 +354,39 @@ namespace heisenberg
             runtimePinkyCurl = pinky;
         }
 
+        void SetRuntimeJointCurls(const std::array<float, 15>& joints)
+        {
+            hasRuntimeFingerCurls = true;
+            hasRuntimeJointCurls = true;
+            runtimeJointCurls = joints;
+
+            // Preserve the public five-finger view and the Pip-Boy's temporary
+            // pointing-pose integration. The mesh solver currently emits a
+            // uniform safe value for each finger's three joints, but averaging
+            // keeps this correct if that representation is refined later.
+            auto averageFinger = [&](std::size_t finger) {
+                const std::size_t base = finger * 3;
+                return (runtimeJointCurls[base] +
+                        runtimeJointCurls[base + 1] +
+                        runtimeJointCurls[base + 2]) / 3.0f;
+            };
+            runtimeThumbCurl = averageFinger(0);
+            runtimeIndexCurl = averageFinger(1);
+            runtimeMiddleCurl = averageFinger(2);
+            runtimeRingCurl = averageFinger(3);
+            runtimePinkyCurl = averageFinger(4);
+        }
+
         void ClearRuntimeFingerCurls()
         {
             hasRuntimeFingerCurls = false;
+            hasRuntimeJointCurls = false;
             runtimeThumbCurl = 0.6f;
             runtimeIndexCurl = 0.6f;
             runtimeMiddleCurl = 0.6f;
             runtimeRingCurl = 0.6f;
             runtimePinkyCurl = 0.6f;
+            runtimeJointCurls.fill(0.6f);
         }
 
         void SetRuntimeHandPlacement(const RE::NiPoint3& position, const RE::NiMatrix3& rotation, bool skinnedHandFrame = false)
@@ -311,6 +406,23 @@ namespace heisenberg
             runtimePlacementSkinnedHand = false;
         }
 
+        void SetRigidRenderedHandPlacement(
+            const RE::NiPoint3& position,
+            const RE::NiMatrix3& rotation)
+        {
+            hasRigidRenderedHandPlacement = true;
+            rigidRenderedHandPlacementPosition = position;
+            rigidRenderedHandPlacementRotation = rotation;
+        }
+
+        void ClearRigidRenderedHandPlacement()
+        {
+            hasRigidRenderedHandPlacement = false;
+            rigidRenderedHandPlacementPosition = RE::NiPoint3();
+            rigidRenderedHandPlacementRotation = RE::NiMatrix3();
+            rigidRenderedHandPlacementRotation.MakeIdentity();
+        }
+
         void Clear()
         {
             active = false;
@@ -321,11 +433,19 @@ namespace heisenberg
             isDynamicNodeGrab = false;
             usingKeyframedMode = false;
             isProxyCollision = false;
+            physicalTouchGrab = false;
+            physicalTouchBodyId = 0x7FFF'FFFFu;
             coHeldSecondary = false;
             heldPlayerFilterApplied = false;
             heldPlayerFilterFrames = 0;
             heldOriginalFilterInfo = 0;
             heldHadSuppressionBitOriginally = false;
+            capturedHeldBodies = {};
+            capturedHeldBodyCount = 0;
+            capturedHeldBodiesExcludeAlternateWrappers = false;
+            capturedHeldBodiesIncludeAlternateWrappers = false;
+            pendingVisibleRootRebase = false;
+            pendingVisibleRootWorld = {};
             lastRoomPos = RE::NiPoint3();
             smoothedRoomDelta = RE::NiPoint3();
             roomTrackingInitialized = false;
@@ -345,6 +465,7 @@ namespace heisenberg
             hasItemOffset = false;
             isFRIKOffset = false;
             ClearRuntimeHandPlacement();
+            ClearRigidRenderedHandPlacement();
             ClearRuntimeFingerCurls();
             stickyGrab = false;
             savedState = SavedPhysicsState();
@@ -373,14 +494,13 @@ namespace heisenberg
             // for the rest of the session (and every later non-consumable grab, which
             // never runs CheckMouthConsume to clear it). isInHandInjectionZone/
             // wasInHandInjectionZoneLocal have the same latch problem for the injection-
-            // zone entry haptic. usedSnapMode/fingerCurlRecalcFrameCounter are simple
-            // per-grab counters that should start fresh too.
+            // zone entry haptic. usedSnapMode is a per-grab flag that should
+            // start fresh too.
             isInMouthZone = false;
             mouthZoneTimer = 0.0f;
             isInHandInjectionZone = false;
             wasInHandInjectionZoneLocal = false;
             usedSnapMode = false;
-            fingerCurlRecalcFrameCounter = 0;
             currentZoneName = "";
             grabStartTime = 0.0f;
             isFromLootDrop = false;

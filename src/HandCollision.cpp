@@ -7,6 +7,7 @@
 #include "f4vr/PlayerNodes.h"
 #include <f4vr/F4VRUtils.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <limits>

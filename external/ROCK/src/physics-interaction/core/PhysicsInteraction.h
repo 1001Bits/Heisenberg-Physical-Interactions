@@ -183,6 +183,8 @@ namespace rock
             _hostGrabDesired[leftHand ? 1 : 0].store(active, std::memory_order_release);
         }
 
+        void hostNotifyExternalRelease(bool isLeft, RE::TESObjectREFR* releasedRef);
+
         // HOST SEAM (Jul 24): the object this hand's colliders are ACTIVELY touching
         // (contact evidence within the touch-timeout window), or null. Lets the host's
         // grab selection prefer the physically-touched ref over a raycast pick — the
@@ -194,6 +196,42 @@ namespace rock
             const auto& hand = isLeft ? _leftHand : _rightHand;
             return hand.isTouching() ? hand.getLastTouchedRef() : nullptr;
         }
+        bool hostGetHandTouchEvidence(
+            bool isLeft,
+            std::uint32_t maxAgeFrames,
+            RE::TESObjectREFR*& outRef,
+            std::uint32_t& outBodyId,
+            std::uint32_t& outAgeFrames,
+            RE::NiPoint3& outContactPointWorld,
+            bool& outHasContactPoint) const
+        {
+            outRef = nullptr;
+            outBodyId = INVALID_CONTACT_BODY_ID;
+            outAgeFrames = 0xFFFF'FFFFu;
+            outContactPointWorld = {};
+            outHasContactPoint = false;
+
+            const auto& hand = isLeft ? _leftHand : _rightHand;
+            if (!hand.hasRecentTouch(maxAgeFrames)) {
+                return false;
+            }
+            outRef = hand.getLastTouchedRef();
+            outBodyId = hand.getLastTouchedBodyId();
+            outAgeFrames = hand.getTouchAgeFrames();
+            outHasContactPoint =
+                hand.getLastTouchPoint(outContactPointWorld);
+            return outRef != nullptr;
+        }
+
+        std::uint32_t hostCopyHandCollisionSamples(
+            bool isLeft,
+            RE::NiPoint3* outWorldPoints,
+            float* outRadiiGame,
+            std::uint32_t maxSamples) const;
+        std::uint32_t hostCopyWeaponCollisionSamples(
+            RE::NiPoint3* outWorldPoints,
+            float* outRadiiGame,
+            std::uint32_t maxSamples) const;
 
         std::uint32_t getLastTouchedWeaponPartKind() const
         {
@@ -328,6 +366,8 @@ namespace rock
         void restoreHeldMassMovementSlowdown(const char* reason);
 
         void resolveContacts(const PhysicsFrameContext& frame);
+        void logContactPenetrationDiagnostics(
+            const PhysicsFrameContext& frame);
 
         void resolveAndLogContact(const char* handName, RE::bhkWorld* bhk, RE::hknpWorld* hknp, RE::hknpBodyId bodyId);
 
@@ -415,6 +455,11 @@ namespace rock
         std::atomic<bool> _hostGrabDesired[2]{ false, false };
         bool _hostGrabWasActive[2]{ false, false };
         std::uint32_t _hostGrabReassertCounter[2]{ 0, 0 };  // PERF: throttle mid-hold re-assertion to every 10th frame
+        // A native dynamic body has just been restored by the embedded host.
+        // For a few frames it must receive normal Havok contacts, but not
+        // ROCK's additional scripted DynamicPushAssist impulse.
+        std::atomic<std::uint32_t> _hostRecentReleaseFormId[2]{ 0, 0 };
+        std::atomic<std::uint32_t> _hostRecentReleaseFrames[2]{ 0, 0 };
 
         BodyBoneColliderSet _bodyBoneColliders;
 
@@ -457,6 +502,52 @@ namespace rock
         contact_activity_tracker::ContactActivityTracker _handContactActivity;
         body_contact_runtime::BodyContactRuntime _bodyContactRuntime;
 
+        // Physics-thread manifold telemetry handed to the main thread for a
+        // visible-mesh cross-check. Signed separation comes directly from
+        // hknpManifoldProcessedEvent points; scene-graph triangle extraction
+        // is deliberately deferred to update(), where render nodes are safe.
+        struct ContactPenetrationDiagnosticRecord
+        {
+            bool valid = false;
+            bool isLeft = false;
+            bool hasRawManifoldPoint = false;
+            std::uint64_t sequence = 0;
+            std::uint32_t sourceBodyId = 0x7FFF'FFFFu;
+            std::uint32_t targetBodyId = 0x7FFF'FFFFu;
+            hand_collider_semantics::HandColliderRole role =
+                hand_collider_semantics::HandColliderRole::PalmAnchor;
+            hand_collider_semantics::HandFinger finger =
+                hand_collider_semantics::HandFinger::None;
+            hand_collider_semantics::HandFingerSegment segment =
+                hand_collider_semantics::HandFingerSegment::None;
+            int manifoldContactCount = 0;
+            int validContactPointCount = 0;
+            RE::NiPoint3 contactPointGame{};
+            RE::NiPoint3 contactNormalGame{};
+            float averageSignedSeparationGame = 0.0f;
+            float minimumSignedSeparationGame = 0.0f;
+            float maximumSignedSeparationGame = 0.0f;
+            float sourceSpeedGamePerSecond = 0.0f;
+            float targetSpeedGamePerSecond = 0.0f;
+            // Extraction telemetry, populated even when extraction failed (see
+            // havok_runtime::ContactSignalFailStage). Without these, a failed extraction and a
+            // genuine zero-penetration contact print identically.
+            int rawInlineCount = 0;
+            std::uint8_t extractFailStage = 0;
+            bool rawNormalFinite = false;
+        };
+        static constexpr std::size_t
+            kMaxContactPenetrationDiagnosticRecords = 32;
+        std::mutex _contactPenetrationDiagnosticMutex;
+        std::array<
+            ContactPenetrationDiagnosticRecord,
+            kMaxContactPenetrationDiagnosticRecords>
+            _contactPenetrationDiagnosticRecords{};
+        std::size_t _nextContactPenetrationDiagnosticSlot = 0;
+        std::uint64_t _contactPenetrationDiagnosticSequence = 0;
+        std::unordered_map<std::uint64_t, float>
+            _contactPenetrationDiagnosticCooldownUntil;
+
         static constexpr std::size_t kGeneratedBodyContactRegistryCapacity =
             (hand_collider_semantics::kHandColliderBodyCountPerHand * 2u) +
             MAX_WEAPON_COLLISION_BODIES +
@@ -487,6 +578,10 @@ namespace rock
 
         static constexpr std::uint32_t INVALID_CONTACT_BODY_ID = 0x7FFF'FFFF;
         static constexpr std::uint32_t WEAPON_CONTACT_TIMEOUT_FRAMES = 5;
+        // One frame of scheduling grace between the physics callback and game
+        // update, while remaining strict enough that moving from bolt to barrel
+        // cannot keep the bolt eligible through the normal five-frame timeout.
+        static constexpr std::uint32_t PROVIDER_EXACT_WEAPON_CONTACT_MAX_AGE_FRAMES = 1;
         struct HeldWeaponAutoEquipState
         {
             std::uint32_t formID{ 0 };
