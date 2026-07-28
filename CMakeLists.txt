@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.23)
 # >>> Project
 set(NAME "Heisenberg_F4VR")
 set(FRIENDLY_NAME "Heisenberg F4VR")
-set(VERSION 0.8.1)
+set(VERSION 0.8.4)
 
 message(">>> Start build for '${NAME}' v${VERSION}")
 

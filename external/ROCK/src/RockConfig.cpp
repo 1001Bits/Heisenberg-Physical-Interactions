@@ -164,7 +164,13 @@ namespace rock
 
         rockDeveloperModeEnabled = false;
 
-        rockLogLevel = logging_policy::DefaultLogLevel;
+        // RELEASE (v0.8.4): error-only, NOT logging_policy::DefaultLogLevel (which is Info and
+        // stays the generic policy default for tests/tools). This assignment is the EFFECTIVE
+        // default - load() and reload() both call resetToDefaults() before reading the INI, so
+        // the RockConfig.h NSDMI alone would be inert. Keep the two in sync (both 4).
+        // Every ROCK_LOG_DEBUG / ROCK_LOG_SAMPLE_DEBUG / ROCK_LOG_INFO site is gated on this
+        // level, so no log CALL had to be removed - they simply stop emitting.
+        rockLogLevel = static_cast<int>(logging_policy::LogLevel::Error);
         rockLogPattern = logging_policy::DefaultLogPattern;
         rockLogSampleMilliseconds = logging_policy::DefaultLogSampleMilliseconds;
         rockPerformanceProfilerEnabled = false;
@@ -260,6 +266,12 @@ namespace rock
         rockNativeMeleeSuppressHitFrame = true;
         rockNativeMeleeDebugLogging = false;
         rockNativeCharacterControllerObjectContactFilterEnabled = true;
+
+        rockLargeObjectPlayerBlockEnabled = true;
+        rockLargeObjectBoundThresholdGameUnits = 150.0f;
+        rockLargeObjectGrabBlockEnabled = true;
+        rockLargeObjectCharacterControllerBlockEnabled = true;
+        rockLargeObjectBlockRestrictToClutterLargeLayer = true;
 
         rockGrabEnabled = true;
         rockSelectionEnabled = true;
@@ -1183,6 +1195,18 @@ namespace rock
         rockNativeCharacterControllerObjectContactFilterEnabled = ini.GetBoolValue(
             SECTION, "bNativeCharacterControllerObjectContactFilterEnabled", rockNativeCharacterControllerObjectContactFilterEnabled);
 
+        // ── LARGE-OBJECT POLICY (car fix, #219/#220) ──
+        rockLargeObjectPlayerBlockEnabled = ini.GetBoolValue(SECTION, "bLargeObjectPlayerBlockEnabled", rockLargeObjectPlayerBlockEnabled);
+        rockLargeObjectBoundThresholdGameUnits = std::clamp(
+            static_cast<float>(ini.GetDoubleValue(SECTION, "fLargeObjectBoundThresholdGameUnits", rockLargeObjectBoundThresholdGameUnits)),
+            40.0f,
+            1000.0f);
+        rockLargeObjectGrabBlockEnabled = ini.GetBoolValue(SECTION, "bLargeObjectGrabBlockEnabled", rockLargeObjectGrabBlockEnabled);
+        rockLargeObjectCharacterControllerBlockEnabled =
+            ini.GetBoolValue(SECTION, "bLargeObjectCharacterControllerBlockEnabled", rockLargeObjectCharacterControllerBlockEnabled);
+        rockLargeObjectBlockRestrictToClutterLargeLayer =
+            ini.GetBoolValue(SECTION, "bLargeObjectBlockRestrictToClutterLargeLayer", rockLargeObjectBlockRestrictToClutterLargeLayer);
+
         rockGrabEnabled = ini.GetBoolValue(SECTION, "bGrabEnabled", rockGrabEnabled);
         rockSelectionEnabled = ini.GetBoolValue(SECTION, "bSelectionEnabled", rockSelectionEnabled);
         if (rockHostGrabOwnershipConfigured) {
@@ -1993,7 +2017,31 @@ namespace rock
             SECTION,
             "fTwoHandedMinSteeringAuthority",
             rockTwoHandedMinSteeringAuthority,
-            0.35f,
+            0.0f,
+            0.0f,
+            1.0f);
+        rockSidearmTwoHandedGripReseat =
+            ini.GetBoolValue(SECTION, "bSidearmTwoHandedGripReseat", rockSidearmTwoHandedGripReseat);
+        rockSidearmSupportGripOffsetFingers = readClampedFloat(ini,
+            SECTION, "fSidearmSupportGripOffsetFingers",
+            rockSidearmSupportGripOffsetFingers, -2.5f, -20.0f, 20.0f);
+        rockSidearmSupportGripOffsetPalmDepth = readClampedFloat(ini,
+            SECTION, "fSidearmSupportGripOffsetPalmDepth",
+            rockSidearmSupportGripOffsetPalmDepth, -1.0f, -20.0f, 20.0f);
+        rockSidearmSupportGripOffsetCrossPalm = readClampedFloat(ini,
+            SECTION, "fSidearmSupportGripOffsetCrossPalm",
+            rockSidearmSupportGripOffsetCrossPalm, -5.0f, -20.0f, 20.0f);
+        rockSidearmSupportGripRollDegrees = readClampedFloat(ini,
+            SECTION, "fSidearmSupportGripRollDegrees",
+            rockSidearmSupportGripRollDegrees, -90.0f, -180.0f, 180.0f);
+        rockSidearmSupportGripPoseId = std::clamp(
+            static_cast<int>(ini.GetLongValue(SECTION, "iSidearmSupportGripPoseId",
+                rockSidearmSupportGripPoseId)), 0, 7);
+        rockTwoHandedFiringWristFollowFactor = readClampedFloat(ini,
+            SECTION,
+            "fTwoHandedFiringWristFollowFactor",
+            rockTwoHandedFiringWristFollowFactor,
+            1.0f,
             0.0f,
             1.0f);
         rockTwoHandedMaxSteeringDegreesPerSecond = readClampedFloat(ini,
@@ -2005,13 +2053,20 @@ namespace rock
             2000.0f);
         ROCK_LOG_INFO(Config,
             "TwoHandedGrip config: leverGate={} minLever={:.1f}gu fullLever={:.1f}gu rollFactor={:.2f} "
-            "minAuthority={:.2f} maxSteerDegPerSec={:.0f}",
+            "minAuthority={:.2f} maxSteerDegPerSec={:.0f} wristFollow={:.2f} | sidearmReseat={} off=({:.1f},{:.1f},{:.1f}) roll={:.0f} pose={}",
             rockTwoHandedLeverArmAuthorityGate,
             rockTwoHandedMinSteeringLeverArmGameUnits,
             rockTwoHandedFullSteeringLeverArmGameUnits,
             rockTwoHandedPrimaryRollAuthorityFactor,
             rockTwoHandedMinSteeringAuthority,
-            rockTwoHandedMaxSteeringDegreesPerSecond);
+            rockTwoHandedMaxSteeringDegreesPerSecond,
+            rockTwoHandedFiringWristFollowFactor,
+            rockSidearmTwoHandedGripReseat,
+            rockSidearmSupportGripOffsetFingers,
+            rockSidearmSupportGripOffsetPalmDepth,
+            rockSidearmSupportGripOffsetCrossPalm,
+            rockSidearmSupportGripRollDegrees,
+            rockSidearmSupportGripPoseId);
         if (!std::isfinite(rockGrabSurfaceBehindPalmToleranceGameUnits) || rockGrabSurfaceBehindPalmToleranceGameUnits < 0.0f) {
             ROCK_LOG_WARN(Config, "Invalid fGrabSurfaceBehindPalmToleranceGameUnits={} -- using 1.5", rockGrabSurfaceBehindPalmToleranceGameUnits);
             rockGrabSurfaceBehindPalmToleranceGameUnits = 1.5f;

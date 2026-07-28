@@ -66,17 +66,39 @@ namespace rock::weapon_support_authority_policy
         return identity.hasLongGunGripKeyword || identity.hasInstanceLongGunGripKeyword;
     }
 
+    /*
+     * SIDEARM ESCAPE — restored 2026-07-27 (it had been deleted, leaving this function ignoring
+     * its parameter and returning FullTwoHandedSolver for everything).
+     *
+     * A one-handed gun must NEVER be steered by the off-hand. The solver's angular gain goes as
+     * ~1/leverArm, and a pistol's support cup measures 6-13gu against a long gun's 22gu+, so the
+     * same off-hand motion swings the gun 2-4x harder. Worse, FullTwoHandedSolver also switches on
+     * the firing-wrist drive (see supportGripAppliesPrimaryHandAuthority below), which welds the
+     * rendered firing wrist 1:1 to the weapon's rotation — the user-reported "grip of the weapon
+     * hand gets disturbed". A whole round of tuning (lever-arm gate, authority floor, angular rate
+     * limit, wrist-follow blend) failed to satisfy both ends because aim authority and wrist
+     * rigidity were the SAME scalar.
+     *
+     * Sidearms therefore take VisualOnlySupport: the off-hand is pure visual glue, the weapon and
+     * the firing hand are never touched. The off-hand is then placed ON THE GUN GRIP so it reads as
+     * a proper two-handed pistol hold rather than floating wherever the player happened to touch.
+     */
     inline constexpr WeaponSupportAuthorityMode resolveSupportAuthorityMode(
-        WeaponSupportWeaponClass)
+        WeaponSupportWeaponClass weaponClass)
     {
-        return WeaponSupportAuthorityMode::FullTwoHandedSolver;
+        return weaponClass == WeaponSupportWeaponClass::Sidearm
+            ? WeaponSupportAuthorityMode::VisualOnlySupport
+            : WeaponSupportAuthorityMode::FullTwoHandedSolver;
     }
 
     static_assert(
         resolveSupportAuthorityMode(WeaponSupportWeaponClass::Sidearm) ==
+        WeaponSupportAuthorityMode::VisualOnlySupport,
+        "A one-handed gun must never be steered by the off-hand: the off-hand is visual glue only");
+    static_assert(
+        resolveSupportAuthorityMode(WeaponSupportWeaponClass::LongGun) ==
         WeaponSupportAuthorityMode::FullTwoHandedSolver,
-        "Ordinary sidearm support grips must steer through the rigid "
-        "two-handed solver");
+        "Long guns keep the rigid two-handed solver");
 
     inline constexpr bool supportGripOwnsWeaponTransform(WeaponSupportAuthorityMode mode)
     {

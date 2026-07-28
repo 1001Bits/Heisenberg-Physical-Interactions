@@ -3,8 +3,13 @@
 #include "HavokPhysicsKeyframe.h"  // For motion type offsets
 #include "Utils.h"  // For IsPowerArmorPiece, IsPlayerInPowerArmor, GetTime
 #include "F4VROffsets.h"  // For TESObjectCell_GetbhkWorld
+// Car fix (#219/#220): the grab size ceiling reads the SAME shared-INI keys as the
+// character-controller half, via the engine's host seam. See ROCKMain.h.
+#include "../external/ROCK/src/ROCKMain.h"
 
-#include <algorithm>  // For std::partial_sort
+#include <algorithm>  // For std::partial_sort, std::max
+#include <atomic>
+#include <cmath>
 #include <unordered_set>
 #include <unordered_map>
 #include <shared_mutex>
@@ -1261,14 +1266,21 @@ namespace heisenberg::Physics
         };
         
         // BLACKLIST - large static objects that shouldn't be grabbed
+        //
+        // Car fix (#219/#220): "barrel" and "trashcan" were REMOVED (user-approved).
+        // They named exactly the man-portable layer-29 props that must stay grabbable
+        // (MetalBarrel02/04/GS01/GS02 ~1.08m, TrashCanMetal01 ~1.02m); the new size
+        // ceiling in IsOversizedForPlayerGrab is the real, measured guard, so this
+        // name list no longer has to over-reach. It also never had "tire", which is
+        // moot for the same reason. Note this whole helper likely never fires anyway:
+        // nameStr.empty() -> return false above (see the early-out at the top).
         static const std::unordered_set<std::string> blacklistWords = {
             "car", "vehicle", "truck", "bus", "van", "vertibird",
             "bollard", "barrier", "barricade",
             "sandbag", "sandbags",
             "crate", "container",
-            "dumpster", "trashcan",
+            "dumpster",
             "mailbox",
-            "barrel",
             "tank",
             "generator",
             "safe",
@@ -1481,6 +1493,101 @@ namespace heisenberg::Physics
         }
     }
 
+    // ==================================================================================
+    // GRAB CEILING — IsOversizedForPlayerGrab (car fix, #219/#220)
+    // ==================================================================================
+    // Grab selection had NO upper size bound, so a parked car was a legal grab target.
+    // The discriminator is SIZE, not layer and not mass — see the header for why both of
+    // the obvious alternatives are disqualified. Reads BOUND_DATA off the base form
+    // DIRECTLY on purpose: ItemOffsetManager::GetItemDimensions does the same arithmetic
+    // but spdlog::debug()s on every call (src/ItemOffsets.cpp:728), and this runs inside
+    // grab selection.
+
+    // POD-only SEH helper, kept in its own function exactly like
+    // HandCollision.cpp's GetObjectBounds: nothing in the __try scope needs
+    // unwinding, and no logging/formatting temporaries live in this frame.
+    static bool TryReadWorldBoundRadius(RE::TESObjectREFR* refr, float& outRadius)
+    {
+        outRadius = 0.0f;
+        bool ok = false;
+        __try {
+            auto* node = refr ? refr->Get3D(false) : nullptr;
+            if (node) {
+                outRadius = node->worldBound.fRadius;
+                ok = true;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            outRadius = 0.0f;
+            ok = false;
+        }
+        return ok;
+    }
+
+    bool IsOversizedForPlayerGrab(RE::TESObjectREFR* refr, float* outMaxAxis)
+    {
+        if (outMaxAxis) {
+            *outMaxAxis = 0.0f;
+        }
+
+        // Shared-INI master + per-half switch (bLargeObjectPlayerBlockEnabled /
+        // bLargeObjectGrabBlockEnabled). Off = pre-fix behaviour, no bound at all.
+        if (!::rock::HostIsLargeObjectGrabBlockEnabled()) {
+            return false;
+        }
+        if (!refr) {
+            return false;
+        }
+
+        auto* baseObj = refr->GetObjectReference();
+        if (!baseObj) {
+            return false;
+        }
+
+        const float threshold = ::rock::HostGetLargeObjectBoundThresholdGameUnits();
+        if (!std::isfinite(threshold) || threshold <= 0.0f) {
+            return false;
+        }
+
+        // TESObjectREFR stores scale as refScale (uint16, x100) — there is no GetScale()
+        // in this framework. Same convention as ThrownObjectTracker.cpp:772.
+        const float scale = refr->refScale > 0 ? (static_cast<float>(refr->refScale) / 100.0f) : 1.0f;
+
+        const auto& bounds = baseObj->boundData;
+        const float extentX = static_cast<float>(bounds.boundMax.x - bounds.boundMin.x);
+        const float extentY = static_cast<float>(bounds.boundMax.y - bounds.boundMin.y);
+        const float extentZ = static_cast<float>(bounds.boundMax.z - bounds.boundMin.z);
+        float maxAxis = (std::max)({ extentX, extentY, extentZ });
+
+        if (std::isfinite(maxAxis) && maxAxis > 0.0f) {
+            maxAxis *= scale;
+        } else {
+            // No BOUND_DATA (all extents <= 0). Fall back to the rendered world bound
+            // via the POD-only SEH helper above (HandCollision.cpp:67-86 pattern).
+            float radius = 0.0f;
+            const bool haveRadius = TryReadWorldBoundRadius(refr, radius);
+
+            if (!haveRadius || !std::isfinite(radius) || radius <= 0.0f) {
+                // FAIL-OPEN to today's behaviour: unmeasurable objects stay grabbable.
+                static std::atomic<bool> s_unmeasurableLogged{ false };
+                if (!s_unmeasurableLogged.exchange(true)) {
+                    spdlog::warn("[PHYSICS] IsOversizedForPlayerGrab: no BOUND_DATA and no world bound for ref {:08X} "
+                                 "(base {:08X}) — size ceiling fails open; this warning logs once",
+                                 refr->formID, baseObj->formID);
+                }
+                return false;
+            }
+
+            // worldBound is already a WORLD-space bound, so it carries the ref's scale
+            // — do NOT multiply by `scale` a second time here.
+            maxAxis = radius * 2.0f;
+        }
+
+        if (outMaxAxis) {
+            *outMaxAxis = maxAxis;
+        }
+        return maxAxis > threshold;
+    }
+
     bool IsGrabbable(RE::TESObjectREFR* refr)
     {
         if (!refr) {
@@ -1505,6 +1612,19 @@ namespace heisenberg::Physics
         // kMSTT needs blacklist check BEFORE physics (cheaper than physics check)
         if (formType == RE::ENUM_FORM_ID::kMSTT) {
             if (IsBlacklistedByName(refr)) {
+                return false;
+            }
+        }
+
+        // SIZE CEILING (car fix, #219/#220). Deliberately placed after the name
+        // blacklist and BEFORE the world lock: it is a pure form-data read, so it must
+        // not pay for the Havok lock, and it covers every grabbable form type rather
+        // than only kMSTT. This is the guard behind src/Hand.cpp:600 (ViewCaster) and
+        // src/Hand.cpp:989 (physical touch).
+        {
+            float maxAxis = 0.0f;
+            if (IsOversizedForPlayerGrab(refr, &maxAxis)) {
+                spdlog::debug("[PHYSICS] ref {:08X}: not grabbable — oversized ({:.0f} game units)", refr->formID, maxAxis);
                 return false;
             }
         }

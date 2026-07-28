@@ -539,6 +539,11 @@ namespace rock
         RE::NiTransform _primaryHandWeaponLocal{};
 
         bool _hasFiringHandWeaponLocal{ false };
+        // The firing-hand transform actually published this frame (post wrist-follow blend).
+        // computeLiveGripHandWorld returns THIS instead of recomputing the raw weld, so the
+        // ApplyWinners re-derivation cannot silently undo the blend.
+        RE::NiTransform _publishedFiringHandWorld{};
+        bool _hasPublishedFiringHandWorld{ false };
 
         // Jul 25 (pistol grip fix B): firing palm normal in weapon-local space,
         // captured at grip start — the solver's roll-about-aim-axis reference.

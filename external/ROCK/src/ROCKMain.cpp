@@ -938,6 +938,16 @@ namespace rock
         g_rockConfig.rockHandBoneColliderRadiusPadding = clamped;
     }
 
+    bool HostIsLargeObjectGrabBlockEnabled()
+    {
+        return g_rockConfig.rockLargeObjectPlayerBlockEnabled && g_rockConfig.rockLargeObjectGrabBlockEnabled;
+    }
+
+    float HostGetLargeObjectBoundThresholdGameUnits()
+    {
+        return g_rockConfig.rockLargeObjectBoundThresholdGameUnits;
+    }
+
     bool HostIsWeaponSupportEngaged(bool a_isLeft)
     {
         return s_physicsInteraction && s_physicsInteraction->hostIsWeaponSupportEngaged(a_isLeft);

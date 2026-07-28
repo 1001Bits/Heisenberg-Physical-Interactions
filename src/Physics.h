@@ -69,7 +69,27 @@ namespace heisenberg
 
         // Check if an object can be grabbed
         bool IsGrabbable(RE::TESObjectREFR* refr);
-        
+
+        /**
+         * GRAB CEILING (car fix, #219/#220). Grab selection previously had NO upper
+         * size bound at all, so a parked car was a legal grab target.
+         *
+         * The discriminator is SIZE, not layer and not mass:
+         *   - Layer fails: all vanilla vehicles are on CLUTTER_LARGE(29), but so are
+         *     metal barrels, tyres, trash cans and the baby carriage.
+         *   - Mass fails: GetHeldObjectMass (below) returns 0 for static AND keyframed
+         *     bodies, so a parked car reads identical to a wall.
+         * Measure = base-form BOUND_DATA largest axis x ref scale, in game units
+         * (1 gu = 0.0142875 m). Threshold comes from the SHARED INI via
+         * rock::HostGetLargeObjectBoundThresholdGameUnits (default 150).
+         *
+         * FAILS OPEN: if neither BOUND_DATA nor the 3D world bound can be read, this
+         * returns false (today's behaviour) and logs once.
+         *
+         * @param outMaxAxis optional; receives the measured scaled largest axis.
+         */
+        bool IsOversizedForPlayerGrab(RE::TESObjectREFR* refr, float* outMaxAxis = nullptr);
+
         // Clear the blacklist cache (call on cell change)
         void ClearBlacklistCache();
 

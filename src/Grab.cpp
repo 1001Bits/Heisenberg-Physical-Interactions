@@ -5029,6 +5029,18 @@ namespace heisenberg
         // STEALING CHECK: Block grab if picking up this item would be stealing (unless config allows it)
         RE::TESObjectREFR* selRefr = selection.GetRefr();
 
+        // SIZE CEILING (car fix, #219/#220). This is the ONLY guard that covers
+        // StartGrabOnRef (~:8233-8245) — loot-to-hand / DropToHand build a Selection
+        // directly and never call Physics::IsGrabbable, so the check in IsGrabbable
+        // does not protect that path. Cars must not become grabbable through it.
+        if (selRefr) {
+            float oversizeMaxAxis = 0.0f;
+            if (heisenberg::Physics::IsOversizedForPlayerGrab(selRefr, &oversizeMaxAxis)) {
+                spdlog::debug("[GRAB] Item {:08X} is oversized ({:.0f} game units) - cannot grab", selRefr->formID, oversizeMaxAxis);
+                return false;
+            }
+        }
+
         if (!g_config.allowGrabbingOwnedItems && selRefr && TESObjectREFR_IsCrimeToActivate(selRefr)) {
             spdlog::debug("[GRAB] Item {:08X} is owned - cannot grab (would be stealing)", selRefr->formID);
             g_vrInput.TriggerHaptic(isLeft, 500);  // Feedback that grab was blocked
@@ -6598,7 +6610,11 @@ namespace heisenberg
         // =====================================================================
         // VH HOLSTER ZONE CHECK — haptic when grabbed weapon enters VH zone
         // =====================================================================
-        if (!configMode.IsRepositionModeActive() && !state.isPulling && IsWeapon(refr))
+        // Throwables are WEAP records and pass IsWeapon(), so they must be excluded
+        // explicitly or grenades holster on VH zones alongside guns.
+        const bool throwableHolsterBlocked =
+            !heisenberg::g_config.enableThrowableHolstering && IsThrowableWeapon(refr);
+        if (!configMode.IsRepositionModeActive() && !state.isPulling && IsWeapon(refr) && !throwableHolsterBlocked)
         {
             auto* vhApi = VirtualHolsters::RequestVirtualHolstersAPI();
             if (vhApi && vhApi->IsInitialized() && heisenberg::g_config.enableVHHolstering)

@@ -97,6 +97,16 @@ namespace rock
     // rebuilds the capsules mid-session. Push every frame like the other HostSet seams.
     void HostSetHandColliderRadiusPadding(float a_padding);
 
+    // ── LARGE-OBJECT POLICY (car fix, #219/#220) ────────────────────────────────────────
+    // The size ceiling that stops the player grabbing a car has to agree with the
+    // character-controller half of the same fix, so BOTH halves read the SAME shared-INI
+    // keys ([PhysicsInteraction] in Heisenberg_F4VR.ini). Half B lives inside the engine;
+    // half A lives in Heisenberg's own grab selection, so it reads the values back out
+    // through these two seams instead of duplicating the keys in a second config object.
+    // Safe before/without engine load: they return the compiled defaults (true / 150.0).
+    bool HostIsLargeObjectGrabBlockEnabled();
+    float HostGetLargeObjectBoundThresholdGameUnits();
+
     // EMBED (Jul 24): the object ref this hand's colliders are ACTIVELY touching (contact
     // evidence, few-frame staleness window), or null. For the host's touch-priority grab
     // selection — a raycast pick must not beat the object physically under the hand.

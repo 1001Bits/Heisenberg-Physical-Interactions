@@ -102,6 +102,18 @@ namespace rock
 {
     namespace
     {
+        /*
+         * Car fix (#219/#220). Single source of truth for "large objects must keep
+         * their native character-controller collision". Both the registration path
+         * and the drift watchdog read this so they can never disagree about what
+         * the CLUTTER_LARGE column is supposed to hold.
+         */
+        bool largeObjectCharacterControllerBlockDesired()
+        {
+            return g_rockConfig.rockLargeObjectPlayerBlockEnabled &&
+                   g_rockConfig.rockLargeObjectCharacterControllerBlockEnabled;
+        }
+
         constexpr float kRawParityWarnPosition = 0.10f;
         constexpr float kRawParityWarnRotationDegrees = 0.5f;
         constexpr float kRawParityFailPosition = 0.50f;
@@ -3122,9 +3134,13 @@ namespace rock
                 g_rockConfig.rockHandCollisionStaticWorldEnabled);
             const auto desiredBodyMask = collision_layer_policy::buildRockBodyExpectedMask(g_rockConfig.rockBodyBoneCollisionStaticWorldEnabled);
             const bool desiredNativeControllerPolicyEnabled = g_rockConfig.rockNativeCharacterControllerObjectContactFilterEnabled;
+            // Car fix (#219/#220): a live flip of the large-object block must re-register
+            // too — the CLUTTER_LARGE column changes meaning without any other mask moving.
+            const bool desiredLargeObjectBlockEnabled = largeObjectCharacterControllerBlockDesired();
             const bool nativeControllerPolicyModeChanged =
                 _nativeCharacterControllerLayerPolicyCaptured &&
-                _nativeCharacterControllerLayerPolicyEnabled != desiredNativeControllerPolicyEnabled;
+                (_nativeCharacterControllerLayerPolicyEnabled != desiredNativeControllerPolicyEnabled ||
+                    _nativeCharacterControllerLargeObjectBlockEnabled != desiredLargeObjectBlockEnabled);
             if (!collision_layer_policy::matrixLayerMaskMatches(_expectedHandLayerMask, desiredHandMask) ||
                 !collision_layer_policy::matrixLayerMaskMatches(_expectedWeaponLayerMask, desiredWeaponMask) ||
                 !collision_layer_policy::matrixLayerMaskMatches(_expectedReloadLayerMask, desiredReloadMask) ||
@@ -4948,6 +4964,11 @@ namespace rock
         _expectedNativeCharacterControllerLayerMask = 0;
         _nativeCharacterControllerLayerPolicyCaptured = false;
         _nativeCharacterControllerLayerPolicyEnabled = false;
+        _nativeCharacterControllerLargeObjectBlockEnabled = false;
+        // Car fix (#219/#220): the large-blocking-object memo is keyed by BASE FormID,
+        // which stays valid across cells, but the world identity it was built against
+        // does not — drop it with the rest of the world-scoped state.
+        clearLargeBlockingObjectCache();
         _initialized = false;
         observeLifecycleFrame(nullptr, nullptr, reason);
         _hasPrevPositions = false;
@@ -5301,10 +5322,12 @@ namespace rock
             g_rockConfig.rockBodyBoneCollisionStaticWorldEnabled,
             g_rockConfig.rockWeaponCollisionBlocksProjectiles,
             g_rockConfig.rockWeaponCollisionBlocksSpells);
+        const bool blockLargeObjects = largeObjectCharacterControllerBlockDesired();
         collision_layer_policy::applyNativeCharacterControllerObjectSuppressionPolicy(
             matrix,
             g_rockConfig.rockNativeCharacterControllerObjectContactFilterEnabled,
-            _originalNativeCharacterControllerLayerMask);
+            _originalNativeCharacterControllerLayerMask,
+            blockLargeObjects);
 
         _expectedHandLayerMask = collision_layer_policy::buildRockHandExpectedMask(true, g_rockConfig.rockHandCollisionStaticWorldEnabled);
         _expectedWeaponLayerMask =
@@ -5322,8 +5345,10 @@ namespace rock
         _expectedNativeCharacterControllerLayerMask =
             collision_layer_policy::nativeCharacterControllerExpectedMask(
                 _originalNativeCharacterControllerLayerMask,
-                g_rockConfig.rockNativeCharacterControllerObjectContactFilterEnabled);
+                g_rockConfig.rockNativeCharacterControllerObjectContactFilterEnabled,
+                blockLargeObjects);
         _nativeCharacterControllerLayerPolicyEnabled = g_rockConfig.rockNativeCharacterControllerObjectContactFilterEnabled;
+        _nativeCharacterControllerLargeObjectBlockEnabled = blockLargeObjects;
         _collisionLayerRegistered = true;
 
         const bool nativeControllerObjectPairsMatch =
@@ -5334,7 +5359,7 @@ namespace rock
                 (nativeControllerObjectPairsMatch ? "restored" : "bad");
 
         ROCK_LOG_INFO(Config,
-            "Registered ROCK collision layers: hand={} mask=0x{:016X}, weapon={} mask=0x{:016X}, reload={} mask=0x{:016X}, body={} mask=0x{:016X}, actorPairs(biped={},deadbip={},bipedNoCC={}), bodyPairs(hand={},weapon={},self={},static={},animstatic={},clutter={},query={},charController={}), handStaticWorld={}, weaponStaticWorld={}, bodyStaticWorld={}, projectiles={}, spells={}, nativeBubbleObjects={}",
+            "Registered ROCK collision layers: hand={} mask=0x{:016X}, weapon={} mask=0x{:016X}, reload={} mask=0x{:016X}, body={} mask=0x{:016X}, actorPairs(biped={},deadbip={},bipedNoCC={}), bodyPairs(hand={},weapon={},self={},static={},animstatic={},clutter={},query={},charController={}), handStaticWorld={}, weaponStaticWorld={}, bodyStaticWorld={}, projectiles={}, spells={}, nativeBubbleObjects={}, largeObjectCharControllerBlock={} (clutterLarge29 pair={}), largeObjectThresholdGameUnits={:.1f}",
             collision_layer_policy::ROCK_LAYER_HAND,
             matrix[collision_layer_policy::ROCK_LAYER_HAND],
             collision_layer_policy::ROCK_LAYER_WEAPON,
@@ -5422,7 +5447,17 @@ namespace rock
             g_rockConfig.rockBodyBoneCollisionStaticWorldEnabled ? "enabled" : "disabled",
             g_rockConfig.rockWeaponCollisionBlocksProjectiles ? "enabled" : "disabled",
             g_rockConfig.rockWeaponCollisionBlocksSpells ? "enabled" : "disabled",
-            nativeControllerObjectStatus);
+            nativeControllerObjectStatus,
+            blockLargeObjects ? "enabled" : "disabled",
+            collision_layer_policy::layerPairSymmetricMatches(
+                matrix,
+                collision_layer_policy::FO4_LAYER_CHARCONTROLLER,
+                collision_layer_policy::FO4_LAYER_CLUTTER_LARGE,
+                collision_layer_policy::maskEnablesLayer(
+                    _expectedNativeCharacterControllerLayerMask, collision_layer_policy::FO4_LAYER_CLUTTER_LARGE)) ?
+                "ok" :
+                "bad",
+            g_rockConfig.rockLargeObjectBoundThresholdGameUnits);
     }
 
     bool PhysicsInteraction::createHandCollisions(RE::hknpWorld* world, void* bhkWorld)

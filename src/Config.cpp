@@ -224,8 +224,8 @@ bHideAllWandHUD = false
 
 [Debug]
 ; Log level: 0=trace, 1=debug, 2=info, 3=warn, 4=error
-; Default: 2 (info)
-iLogLevel = 2
+; Default: 4 (error) - release default, keeps the log quiet. Use 2 (info) or 1 (debug) to diagnose.
+iLogLevel = 4
 )";
 
     void Config::Load()
@@ -332,6 +332,7 @@ iLogLevel = 2
         enableStickyGrab = ini.GetBoolValue("ObjectPickup", "bEnableStickyGrab", enableStickyGrab);
         weaponEquipMode = static_cast<int>(ini.GetLongValue("ObjectPickup", "iWeaponEquipMode", weaponEquipMode));
         enableVHHolstering = ini.GetBoolValue("ObjectPickup", "bEnableVHHolstering", enableVHHolstering);
+        enableThrowableHolstering = ini.GetBoolValue("ObjectPickup", "bEnableThrowableHolstering", enableThrowableHolstering);
         showHolsterMessages = ini.GetBoolValue("ObjectPickup", "bShowHolsterMessages", showHolsterMessages);
         showUnequipMessages = ini.GetBoolValue("ObjectPickup", "bShowUnequipMessages", showUnequipMessages);
         enableUnarmedAutoUnequip = ini.GetBoolValue("ObjectPickup", "bEnableUnarmedAutoUnequip", enableUnarmedAutoUnequip);
@@ -827,6 +828,7 @@ iLogLevel = 2
         ini.SetBoolValue("ObjectPickup", "bEnableStickyGrab", enableStickyGrab, "; Press grip once to pick up, again to release");
         ini.SetLongValue("ObjectPickup", "iWeaponEquipMode", weaponEquipMode, "; 0=Disabled, 1=Drop on weapon hand, 2=Auto equip");
         ini.SetBoolValue("ObjectPickup", "bEnableVHHolstering", enableVHHolstering, "; Drop weapon on VH holster zone to holster");
+        ini.SetBoolValue("ObjectPickup", "bEnableThrowableHolstering", enableThrowableHolstering, "; Holster throwables (grenades/mines) on VH holster zones");
         ini.SetBoolValue("ObjectPickup", "bEnableUnarmedAutoUnequip", enableUnarmedAutoUnequip, "; Auto-unequip Unarmed when grip pressed (disable if melee broken)");
         ini.SetBoolValue("ObjectPickup", "bDisableGripWeaponDraw", disableGripWeaponDraw, "; Prevent grip from drawing/sheathing weapons");
         ini.SetBoolValue("ObjectPickup", "bPassGripToActivatorSecondary", passGripToActivatorSecondary, "; When grip-weapon-draw is off, still pass primary grip to the game when aiming at an activator/furniture (mod secondary actions)");

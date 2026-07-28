@@ -442,6 +442,10 @@ namespace rock
         std::uint64_t _expectedNativeCharacterControllerLayerMask = 0;
         bool _nativeCharacterControllerLayerPolicyCaptured = false;
         bool _nativeCharacterControllerLayerPolicyEnabled = false;
+        // Car fix (#219/#220): remembers whether CLUTTER_LARGE was restored to its
+        // captured original value on the last registration, so a live config flip
+        // re-registers the matrix instead of waiting for a drift event.
+        bool _nativeCharacterControllerLargeObjectBlockEnabled = false;
         HandBoneCache _handBoneCache;
         HandFrameResolver _handFrameResolver;
 

@@ -83,6 +83,9 @@ namespace heisenberg
         // 2 = Auto equip on grab
         int weaponEquipMode = 1;
         bool enableVHHolstering = true;  // Drop weapon on VH holster zone to holster
+        // Throwables (grenades/mines) are WEAP records, so they pass IsWeapon() and would
+        // otherwise holster on VH zones along with guns. This gates them separately.
+        bool enableThrowableHolstering = false; // Holster throwables on VH holster zones
         bool showHolsterMessages = true; // Show HUD message when holstering/equipping weapons
         bool showUnequipMessages = true; // Show HUD message when unequipping weapons (storage zone)
         
@@ -549,7 +552,13 @@ namespace heisenberg
         // Debug
         bool debugDrawControllers = false;
         bool debugLogging = false;  // Enable verbose per-frame logging (impacts performance!)
-        int logLevel = 2; // 0=trace, 1=debug, 2=info, 3=warn, 4=error
+        // RELEASE (v0.8.4): default is ERROR-ONLY. Info/debug chatter costs frame time in VR
+        // and fills testers' logs; fatal/startup errors and warnings-escalated-to-error still
+        // print. Set iLogLevel=2 (or 1) in Heisenberg_F4VR.ini when diagnosing.
+        // NOTE: this NSDMI IS the effective default - Config::Load() passes the live member as
+        // the GetLongValue fallback, and the embedded kDefaultConfig block (Config.cpp) must
+        // agree with it or the embedded copy wins.
+        int logLevel = 4; // 0=trace, 1=debug, 2=info, 3=warn, 4=error
 
         // =====================================================================
         // GRIP WEAPON DRAW

@@ -128,6 +128,45 @@ namespace rock::two_handed_weapon_policy
     }
 
     /*
+     * FIRING-WRIST FOLLOW BLEND (Jul 27) — the third state the authority enum never had.
+     *
+     * The firing hand was published as the RIGID weld compose(weaponWorld, primaryHandWeaponLocal),
+     * so under the row-vector convention its rotation is L.rotate * W.rotate: every degree the
+     * solver rotates the gun was demanded 1:1 of the RENDERED firing wrist, 0% controller. That is
+     * correct physics for a real rigid gun, but in VR nothing forces the player's actual wrist to
+     * follow, so the rendered wrist rotates away from the real one — the reported "grip of the
+     * weapon hand gets disturbed". Previously the ONLY way to reduce it was to lower the steering
+     * weight, which also throttled the gun, so aim authority and wrist rigidity were the same
+     * scalar and no value satisfied both complaints.
+     *
+     * This blends the published wrist ROTATION between the weld (followFactor 1 = legacy) and the
+     * live controller orientation (0 = wrist stays where the player's hand actually is), leaving
+     * TRANSLATION on the weld because reanchorAtPrimaryGrip already pins that to the controller.
+     * Aim authority is now free to run at full strength independently.
+     */
+    template <class Transform>
+    [[nodiscard]] inline Transform blendFiringWristTowardController(
+        const Transform& weldWorld,
+        const Transform& controllerWorld,
+        float followFactor)
+    {
+        if (!std::isfinite(followFactor) || followFactor >= 1.0f) {
+            return weldWorld;  // bit-exact legacy path
+        }
+        const float t = (followFactor > 0.0f) ? followFactor : 0.0f;
+        Transform result = weldWorld;  // keep the weld's translation and scale
+        for (int i = 0; i < 3; ++i) {
+            for (int k = 0; k < 3; ++k) {
+                result.rotate.entry[i][k] =
+                    controllerWorld.rotate.entry[i][k] +
+                    (weldWorld.rotate.entry[i][k] - controllerWorld.rotate.entry[i][k]) * t;
+            }
+        }
+        // Element-wise blending leaves the basis slightly non-orthonormal; callers orthonormalize.
+        return result;
+    }
+
+    /*
      * Re-anchoring is the final invariant of every full two-hand solve. Rotation
      * cleanup and support-hand corrections may change the weapon basis, but the
      * captured firing grip must remain exactly at the firing controller target.

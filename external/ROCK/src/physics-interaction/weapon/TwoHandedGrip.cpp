@@ -876,6 +876,7 @@ namespace rock
         _hasWeaponNodeLocalBaseline = false;
         _primaryHandWeaponLocal = {};
         _hasFiringHandWeaponLocal = false;
+        _hasPublishedFiringHandWorld = false;
         _hasPrimaryRollWeaponLocal = false;
         _primaryGripConfidence = 0.0f;
         resetLockedHandVisualLerp();
@@ -1503,6 +1504,31 @@ namespace rock
         return true;
     }
 
+    namespace
+    {
+        // Proper roll about the hand's local X (distal) axis, in the project's STORED-ROW
+        // convention. Deliberately a rotation and not a mirror: a determinant -1 matrix would
+        // invert the skinning and FRIK's arm solve downstream of composeTransforms.
+        RE::NiMatrix3 makeRollAboutLocalXStored(float degrees)
+        {
+            const float r = degrees * 0.017453292519943295f;
+            const float c = std::cos(r);
+            const float s = std::sin(r);
+            RE::NiMatrix3 m{};
+            m.entry[0][0] = 1.0f; m.entry[0][1] = 0.0f; m.entry[0][2] = 0.0f;
+            m.entry[1][0] = 0.0f; m.entry[1][1] = c;    m.entry[1][2] = s;
+            m.entry[2][0] = 0.0f; m.entry[2][1] = -s;   m.entry[2][2] = c;
+            return m;
+        }
+
+        WeaponGripPoseId clampWeaponGripPoseId(int value)
+        {
+            constexpr int kMax = static_cast<int>(WeaponGripPoseId::ReceiverSupport);
+            const int clamped = (value < 0) ? 0 : ((value > kMax) ? kMax : value);
+            return static_cast<WeaponGripPoseId>(clamped);
+        }
+    }
+
     void TwoHandedGrip::lockPartGripToWeaponRoot(bool isLeft)
     {
         /*
@@ -1555,6 +1581,7 @@ namespace rock
         _hasWeaponNodeLocalBaseline = true;
         _primaryGripConfidence = 0.0f;
         _hasFiringHandWeaponLocal = false;
+        _hasPublishedFiringHandWorld = false;
         _hasPrimaryRollWeaponLocal = false;
         resetLockedHandVisualLerp();
         clearPrimaryGripPose(primaryHandIsLeft);
@@ -1648,6 +1675,87 @@ namespace rock
             // node here feeds its per-frame animation/flattening back into the next weapon
             // solve and makes the captured palm creep along the gun while locomoting.
             lockPartGripToWeaponRoot(supportHandIsLeft);
+        }
+
+        /*
+         * SIDEARM TWO-HANDED PISTOL HOLD (Jul 27, user: "treat any offhanding on a 1 handed gun as
+         * holding the gun grip with 2 hands ... bring the offhand to the gun grip").
+         *
+         * By default the support hand is published wherever the player's palm happened to touch the
+         * gun. Live telemetry on one 10mm across four consecutive grips: supportLocal Y landed at
+         * +9.90, +7.65, +2.85 and -3.43 (gripSeparation 13.3 / 15.5 / 7.1 / 9.2) while the FIRING
+         * frame repeated to 0.01gu. For a pistol that scatter IS the bug — there is no foregrip to
+         * seat on, so the "seat" is noise.
+         *
+         * Reseat the support hand as a rigid offset off the FIRING hand's own captured frame. Since
+         * a sidearm now runs VisualOnlySupport, ROCK writes neither the weapon nor the firing hand,
+         * so the weapon stays welded to the firing hand by FRIK and this offset is effectively
+         * firing-hand-local: the off-hand rides the grip and the firing hand is provably untouched.
+         *
+         * Offsets are in the firing hand's RAW local basis (HandColliderTypes.h:655-658):
+         * raw X = distal/toward fingertips, raw +Y = back of hand (-Y = palm face), raw Z =
+         * cross-palm. Both bone bases are proper right-handed rotations, so raw +Z is PINKY-ward on
+         * the RIGHT hand and THUMB-ward on the LEFT — hence the Z (and roll) sign flips for a
+         * left-handed firing grip, matching this codebase's own precedent of negating authored Z to
+         * express one anatomical point on both hands (RockConfig.cpp palm pivot +0.2 / -0.2).
+         *
+         * The rotation is a proper ROLL, never a mirror: a reflection has determinant -1 and would
+         * propagate through composeTransforms into the published NiTransform, inverting both the
+         * skinning and FRIK's arm solve.
+         */
+        if (g_rockConfig.rockSidearmTwoHandedGripReseat &&
+            _authorityMode == weapon_support_authority_policy::WeaponSupportAuthorityMode::VisualOnlySupport &&
+            !capturedSupportGrip.attachOnly &&
+            _hasFiringHandWeaponLocal) {
+            WeaponPartGrip& reseat = partGrip(supportHandIsLeft);
+            const float mirror = _firingHandIsLeft ? -1.0f : 1.0f;
+
+            RE::NiTransform offsetLocal{};
+            offsetLocal.scale = 1.0f;
+            offsetLocal.translate = RE::NiPoint3{
+                g_rockConfig.rockSidearmSupportGripOffsetFingers,
+                g_rockConfig.rockSidearmSupportGripOffsetPalmDepth,
+                g_rockConfig.rockSidearmSupportGripOffsetCrossPalm * mirror,
+            };
+            offsetLocal.rotate = makeRollAboutLocalXStored(
+                g_rockConfig.rockSidearmSupportGripRollDegrees * mirror);
+
+            reseat.handWeaponLocal =
+                transform_math::composeTransforms(_primaryHandWeaponLocal, offsetLocal);
+            reseat.hasHandWeaponLocal = true;
+
+            /*
+             * MANDATORY, and the reason a naive version of this is a silent per-frame no-op: every
+             * consumer that re-derives the support hand — resolvePartGripHandWorld,
+             * resolvePartGripHandWorldForWeaponWorld and sehComputePartGripHandWorldRaw (the
+             * HandAuthority::ApplyWinners seam) — prefers grip.handSourceLocal whenever
+             * hasSourceFrames is set, and capturePartGrip sets it on EVERY capture because the
+             * attachment root is never null. Drop to the weapon-root frame so the override is the
+             * only surviving source. lockPartGripToWeaponRoot above only runs for the full solver.
+             */
+            reseat.hasSourceFrames = false;
+            reseat.hasAttachmentWeaponLocal = false;
+
+            // The mesh-solved per-joint finger overrides were solved for the DISCARDED touch point
+            // and are published unconditionally by publishGripHandPoses; keeping them would pose the
+            // fingers for geometry the hand is no longer anywhere near.
+            reseat.hasFingerLocalTransforms = false;
+            reseat.fingerLocalTransformMask = 0;
+
+            setSupportGripPose(
+                supportHandIsLeft,
+                clampWeaponGripPoseId(g_rockConfig.rockSidearmSupportGripPoseId),
+                nullptr);
+
+            ROCK_LOG_INFO(Weapon,
+                "TwoHandedGrip: sidearm two-handed hold — support hand reseated onto the firing "
+                "grip (offset=({:.2f},{:.2f},{:.2f})gu roll={:.1f}deg firingLeft={} pose={})",
+                offsetLocal.translate.x,
+                offsetLocal.translate.y,
+                offsetLocal.translate.z,
+                g_rockConfig.rockSidearmSupportGripRollDegrees * mirror,
+                _firingHandIsLeft,
+                static_cast<int>(g_rockConfig.rockSidearmSupportGripPoseId));
         }
 
         const RE::NiPoint3 supportGripWorldPoint = resolvePartGripWorld(partGrip(supportHandIsLeft), weaponNode);
@@ -1766,6 +1874,7 @@ namespace rock
         }
         _primaryHandWeaponLocal = {};
         _hasFiringHandWeaponLocal = false;
+        _hasPublishedFiringHandWorld = false;
         _hasPrimaryRollWeaponLocal = false;
         _primaryGripConfidence = 0.0f;
         _activeWeaponNode = nullptr;
@@ -2323,6 +2432,7 @@ namespace rock
         _hasSolvedWeaponTransform = false;
         _primaryHandWeaponLocal = {};
         _hasFiringHandWeaponLocal = false;
+        _hasPublishedFiringHandWorld = false;
         _hasPrimaryRollWeaponLocal = false;
         _primaryHandVisualLerp = {};
         _state = TwoHandedState::PrimaryOnly;
@@ -3015,6 +3125,14 @@ namespace rock
         }
         // Firing/primary hand?
         if (_hasFiringHandWeaponLocal && _firingHandIsLeft == isLeft) {
+            // Return the transform that was ACTUALLY published this frame rather than recomputing
+            // the raw rigid weld. ApplyWinners re-derives through here for "ROCK_Weapon*" tags, so
+            // recomputing would discard the wrist-follow blend applied in
+            // applyFiringHandLockedVisual and silently restore the 1:1 weld every frame.
+            if (_hasPublishedFiringHandWorld && isFiniteTransform(_publishedFiringHandWorld)) {
+                out = _publishedFiringHandWorld;
+                return true;
+            }
             RE::NiTransform freshTarget{};
             if (!sehComputeGripHandWorldRaw(_activeWeaponNode, &_primaryHandWeaponLocal, &freshTarget)) {
                 return false;
@@ -3159,10 +3277,31 @@ namespace rock
             return false;
         }
 
-        const RE::NiTransform firingHandWorld =
+        RE::NiTransform firingHandWorld =
             weapon_visual_authority_math::weaponLocalFrameToWorld(weaponNode->world, _primaryHandWeaponLocal);
+
+        // Relax the 1:1 weapon->wrist weld toward the player's real controller orientation. Only
+        // possible when we actually know where the live hand is; otherwise keep the legacy weld.
+        if (liveHandWorld) {
+            firingHandWorld = two_handed_weapon_policy::blendFiringWristTowardController(
+                firingHandWorld,
+                *liveHandWorld,
+                g_rockConfig.rockTwoHandedFiringWristFollowFactor);
+            firingHandWorld.rotate = orthonormalizeStoredRotation(firingHandWorld.rotate);
+        }
+
         const RE::NiTransform appliedFiringHandWorld =
             resolveLockedHandVisualTarget(firingHandWorld, liveHandWorld, dt, _primaryHandVisualLerp, forceExact);
+
+        // SINGLE SOURCE OF TRUTH. HandAuthority::ApplyWinners discards the transform published here
+        // for any "ROCK_Weapon*" tag and re-derives it via HostGetLiveGripHandWorld ->
+        // computeLiveGripHandWorld, which recomputed the RAW weld — so a change made only here was
+        // silently overwritten every frame (the same two-sites-disagree failure that made an
+        // earlier fix a no-op). Cache what was actually published and hand that exact transform
+        // back on re-derivation instead of recomputing it.
+        _publishedFiringHandWorld = appliedFiringHandWorld;
+        _hasPublishedFiringHandWorld = true;
+
         return frik_visual_authority::applyExternalHandWorldTransform(
             PRIMARY_GRIP_TAG, handFromBool(_firingHandIsLeft), appliedFiringHandWorld, GRIP_HAND_POSE_PRIORITY);
     }

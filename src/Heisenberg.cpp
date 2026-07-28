@@ -400,9 +400,13 @@ namespace heisenberg
         // proper Documents/My Games/Fallout4VR/F4SE/HeisenbergF4VR.log.
         F4SE::Init(a_f4se);
 
-        // Default to INFO so startup/config messages are visible until
-        // Config::Load() applies the user's iLogLevel setting.
-        spdlog::set_level(spdlog::level::info);
+        // RELEASE (v0.8.4): bootstrap at ERROR so nothing chats before Config::Load()
+        // applies the user's iLogLevel. F4SE::Init() has ALREADY emitted the
+        // "{plugin} v{version}" banner above under log::init()'s own level, so the
+        // version stamp still lands in the log; only our own pre-config info lines go
+        // quiet. Errors/criticals from a failed startup still print. Raise to
+        // spdlog::level::info here when you need to see startup before the INI is read.
+        spdlog::set_level(spdlog::level::err);
         // PERF (Jul 5): flush per WARN, not per INFO — flushing on every info line is an
         // fflush write syscall per log call on the frame thread (~1000/s under load = real
         // FPS cost). WER minidumps + dmp.py/sym.py cover crash forensics; bump to info/trace

@@ -79,7 +79,11 @@ namespace rock
 
         bool rockDeveloperModeEnabled = false;
 
-        int rockLogLevel = 2;
+        // RELEASE (v0.8.4): error-only. NOTE the NSDMI is NOT the effective default -
+        // load()/reload() both call resetToDefaults() first, so RockConfig.cpp's
+        // resetToDefaults() value is authoritative. Both are set to 4 (error); keep them
+        // in sync or the header value is inert.
+        int rockLogLevel = 4;
         // EMBED: default-empty on purpose. A >15-char std::string literal NSDMI on a namespace-scope
         // global (g_rockConfig) miscompiles in the static-lib embed: MSVC constexpr-materializes the
         // heap ("large-mode") representation but the buffer pointer comes out NULL, so the first
@@ -129,7 +133,7 @@ namespace rock
         float rockWeaponFiringGripDetachHapticIntensity = 0.30f;
         float rockWeaponSupportGripHapticIntensity = 0.50f;
         bool rockEquippedWeaponShoulderStashEnabled = true;
-        bool rockRealisticWeaponHandlingEnabled = false;
+        bool rockRealisticWeaponHandlingEnabled = true;
         float rockRealisticGrenadeFuseSeconds = 5.0f;
         bool rockGrabbedWeaponAutoEquipEnabled = false;
         float rockGrabbedWeaponAutoEquipSettleSeconds = 0.75f;
@@ -184,6 +188,25 @@ namespace rock
         bool rockNativeMeleeSuppressHitFrame = true;
         bool rockNativeMeleeDebugLogging = false;
         bool rockNativeCharacterControllerObjectContactFilterEnabled = true;
+
+        // ── LARGE-OBJECT POLICY (car fix, #219/#220) ─────────────────────────────────────
+        // The native character-controller object suppression above is what lets the player
+        // walk through parked cars: it clears the CHARCONTROLLER row against CLUTTER(4),
+        // WEAPON(5), DEBRIS_SMALL(19), DEBRIS_LARGE(20), SHELLCASING(25) and
+        // CLUTTER_LARGE(29). Cars are all layer 29 — but so are barrels, tyres, trash cans
+        // and the baby carriage, which must stay hand-reachable. The discriminator is
+        // therefore SIZE (base-form BOUND_DATA largest axis x GetScale, in game units),
+        // NOT layer and NOT mass: Physics::GetHeldObjectMass returns 0 for static and
+        // keyframed bodies, so a parked car reads identical to a wall.
+        //
+        // Measured game units (1 gu = 0.0142875 m): tyre/cone 43-44, barrel/trash can
+        // 71-76, baby carriage 107 (largest keeper), motorcycle 199, sedan 427.
+        // 150 is the user-approved threshold; the usable window is 110-195.
+        bool rockLargeObjectPlayerBlockEnabled = true;              // master for both halves
+        float rockLargeObjectBoundThresholdGameUnits = 150.0f;      // clamped 40..1000 on load
+        bool rockLargeObjectGrabBlockEnabled = true;                // half A: grab ceiling
+        bool rockLargeObjectCharacterControllerBlockEnabled = true; // half B: player collision
+        bool rockLargeObjectBlockRestrictToClutterLargeLayer = true;// cheap early-out: layer 29 only
 
         // ── Embedded-host ownership masters (added for the Heisenberg single-DLL embed) ──
         // When ROCK runs embedded inside Heisenberg, the host's iGrabMode chooses whether
@@ -521,7 +544,39 @@ namespace rock
         // vs 11.6gu/s -> 0.11gu), so killing the bounce removes the deep re-impacts at the source
         // instead of padding the hand out to hide them. 0 = off/legacy.
         float rockHandContactRestitutionDamping = 0.55f;
-        float rockTwoHandedMinSteeringAuthority = 0.35f;
+        // Jul 27: aim authority now runs at FULL strength. At anything less the RENDERED
+        // off-hand (welded to the gun) lands at aimW*theta while the physical hand is at
+        // theta, leaving 3-6cm of visible hand/controller disagreement that reads as "the
+        // off-hand has no authority". At 1.0 that residual is zero by construction. Wrist
+        // rigidity is now a SEPARATE knob (below), so this no longer trades against the grip.
+        float rockTwoHandedMinSteeringAuthority = 0.0f;   // inert: sidearms now take the class-level VisualOnlySupport escape
+        // How much of the weapon's rotation the RENDERED firing wrist is forced to take.
+        // 1.0 = the old rigid 1:1 weld (wrist rotates fully with the gun); 0.0 = the firing hand
+        // is NEVER rotated by off-hand steering and simply stays on the controller.
+        //
+        // DEFAULT 0.0 IS A HARD REQUIREMENT, not a taste setting (user, Jul 27: "gun hand grip on
+        // pistol cannot be disturbed by offhand authority"). Translation is unaffected regardless:
+        // reanchorAtPrimaryGrip already pins the captured grip origin onto the firing controller,
+        // so at 0.0 the published firing hand is exactly the player's real hand - position AND
+        // orientation - and no amount of off-hand steering can move it.
+        //
+        // The trade this deliberately accepts: the gun now rotates WITHIN the firing hand instead
+        // of carrying the hand with it, so the grip alignment between palm and weapon drifts
+        // visually while steering. That is the only alternative to moving the hand, because the
+        // player's real wrist does not rotate when the off-hand steers.
+        float rockTwoHandedFiringWristFollowFactor = 1.0f;
+        // SIDEARM TWO-HANDED PISTOL HOLD (Jul 27). A one-handed gun has no foregrip, so the
+        // captured "seat" is noise (measured: the same 10mm seated 13gu apart across four grips).
+        // Reseat the off-hand as a rigid offset off the FIRING hand's own frame instead.
+        // Offsets are in the FIRING hand's RAW local basis, authored for a RIGHT firing hand:
+        //   X = distal (+ toward fingertips), +Y = back of hand (-Y = palm face), Z = cross-palm
+        //   (+Z is PINKY-ward on the right hand). Z and the roll auto-negate for a left firing hand.
+        bool  rockSidearmTwoHandedGripReseat = true;
+        float rockSidearmSupportGripOffsetFingers = -2.5f;    // gu (-3.6cm) support wrist below/behind
+        float rockSidearmSupportGripOffsetPalmDepth = -1.0f;  // gu (-1.4cm) palmar bias onto the fingers
+        float rockSidearmSupportGripOffsetCrossPalm = -5.0f;  // gu (-7.1cm) thumb-ward, heels together
+        float rockSidearmSupportGripRollDegrees = -90.0f;     // wrap roll about the distal axis
+        int   rockSidearmSupportGripPoseId = 3;               // WeaponGripPoseId::VerticalForegrip  // legacy weld; only reachable for LONG GUNS now
         // The real reason a pistol's off-hand broke the firing grip: solver angular gain is ~1/leverArm,
         // so a short lever swings the gun ~2x faster per unit of off-hand travel than a rifle, and on
         // FRIK v3 the firing hand's visual delivery cannot track that fast — the grip visibly diverges.
