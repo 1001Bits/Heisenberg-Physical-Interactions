@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.23)
+cmake_minimum_required(VERSION 4.0)
 
 
 # >>> Project
@@ -41,11 +41,60 @@ else()
 endif()
 
 
-# >>> Locate F4VRCommonFramework (use the one from frik)
-set(F4VR_COMMON_FRAMEWORK_PATH "${ROOT_DIR}/../frik/external/F4VRCommonFramework" CACHE STRING "")
-message(">>> Using F4VRCommonFramework: '${F4VR_COMMON_FRAMEWORK_PATH}'")
+# >>> Locate/pin F4VRCommonFramework.
+# ROCK's known-good framework checkout remains the fast developer path. A clean
+# checkout fetches that exact public revision and applies our small tracked
+# compatibility patch, so the embedded ROCK snapshot sees the CommonLib API it
+# was built against without making that separate mod a runtime dependency.
+set(F4VR_COMMON_FRAMEWORK_PATH "${ROOT_DIR}/../../ROCK/fw-latest" CACHE STRING "")
+set(HEISENBERG_FRAMEWORK_BASE_REVISION
+  "5f67adf35c7d8f6d60ee5b353524d32047ed235f"
+  CACHE STRING "Pinned public F4VRCommonFramework base revision")
+set(HEISENBERG_FRAMEWORK_LOCAL_REVISION
+  "5f67adf35c7d8f6d60ee5b353524d32047ed235f"
+  CACHE STRING "Accepted sibling revision containing the tracked compatibility changes")
+option(HEISENBERG_ALLOW_UNPINNED_FRAMEWORK
+  "Allow a sibling F4VRCommonFramework checkout at an unverified revision"
+  OFF)
+set(_heisenberg_fetch_framework OFF)
 if(NOT EXISTS "${F4VR_COMMON_FRAMEWORK_PATH}/src/ModBase.h")
-  message(FATAL_ERROR ">> F4VRCommonFramework path not found in '${F4VR_COMMON_FRAMEWORK_PATH}'!")
+  set(_heisenberg_fetch_framework ON)
+  include(FetchContent)
+  find_package(Git REQUIRED)
+  FetchContent_Declare(
+    heisenberg_f4vr_common_framework
+    GIT_REPOSITORY https://github.com/ArthurHub/F4VRCommonFramework.git
+    GIT_TAG "${HEISENBERG_FRAMEWORK_BASE_REVISION}"
+    GIT_SHALLOW FALSE
+    GIT_SUBMODULES_RECURSE TRUE
+    PATCH_COMMAND
+      "${GIT_EXECUTABLE}" apply --whitespace=nowarn
+      "${ROOT_DIR}/cmake/patches/F4VRCommonFramework-heisenberg.patch"
+  )
+  message(">>> F4VRCommonFramework sibling not found; using pinned FetchContent fallback")
+else()
+  find_package(Git QUIET)
+  if(Git_FOUND AND EXISTS "${F4VR_COMMON_FRAMEWORK_PATH}/.git")
+    execute_process(
+      COMMAND "${GIT_EXECUTABLE}" -C "${F4VR_COMMON_FRAMEWORK_PATH}" rev-parse HEAD
+      OUTPUT_VARIABLE _heisenberg_framework_revision
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET
+    )
+    if(NOT "${_heisenberg_framework_revision}" STREQUAL "${HEISENBERG_FRAMEWORK_LOCAL_REVISION}" AND
+       NOT "${_heisenberg_framework_revision}" STREQUAL "${HEISENBERG_FRAMEWORK_BASE_REVISION}")
+      if(HEISENBERG_ALLOW_UNPINNED_FRAMEWORK)
+        message(WARNING
+          ">>> Unpinned F4VRCommonFramework revision '${_heisenberg_framework_revision}' allowed by override")
+      else()
+        message(FATAL_ERROR
+          ">> F4VRCommonFramework revision '${_heisenberg_framework_revision}' is not pinned. "
+          "Use revision ${HEISENBERG_FRAMEWORK_LOCAL_REVISION}, remove the sibling to use the "
+          "reproducible fetch fallback, or explicitly set HEISENBERG_ALLOW_UNPINNED_FRAMEWORK=ON.")
+      endif()
+    endif()
+  endif()
+  message(">>> Using F4VRCommonFramework: '${F4VR_COMMON_FRAMEWORK_PATH}'")
 endif()
 
 
@@ -58,12 +107,47 @@ message(">>> Building project '${PROJECT_NAME}' v:${PROJECT_VERSION}")
 add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 set(Boost_USE_STATIC_RUNTIME OFF CACHE BOOL "")
 set(Boost_USE_STATIC_LIBS ON)
-set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+option(HEISENBERG_ENABLE_IPO
+  "Enable whole-program optimization (/GL + /LTCG). Disabled by default because it greatly increases peak build memory."
+  OFF)
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION "${HEISENBERG_ENABLE_IPO}")
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_DEBUG OFF)
+set(HEISENBERG_MSVC_COMPILE_PROCESSES "2" CACHE STRING
+  "Bounded concurrent cl.exe compilations per target (/MP); 2 keeps useful throughput without the /MP4 memory spike")
+set(HEISENBERG_MSVC_CODEGEN_PROCESSES "1" CACHE STRING
+  "Maximum concurrent MSVC LTCG code-generation threads (/CGTHREADS)")
 
 
 # >>> Bring in the framework (it brings CommonLibF4 transitively)
-add_subdirectory(${F4VR_COMMON_FRAMEWORK_PATH} "F4VRCommonFramework" EXCLUDE_FROM_ALL)
+if(_heisenberg_fetch_framework)
+  FetchContent_MakeAvailable(heisenberg_f4vr_common_framework)
+  set(F4VR_COMMON_FRAMEWORK_PATH
+    "${heisenberg_f4vr_common_framework_SOURCE_DIR}"
+    CACHE STRING "" FORCE)
+else()
+  add_subdirectory(${F4VR_COMMON_FRAMEWORK_PATH} "F4VRCommonFramework" EXCLUDE_FROM_ALL)
+endif()
+
+# The dependency enables IPO and /Zi unconditionally. Override both after its
+# targets exist: release DLLs do not ship symbols, and /GL+/LTCG was the major
+# peak-memory/link-time source in this combined build.
+foreach(_heisenberg_dependency_target IN ITEMS F4VRCommonFramework CommonLibF4)
+  if(TARGET ${_heisenberg_dependency_target})
+    set_target_properties(${_heisenberg_dependency_target} PROPERTIES
+      INTERPROCEDURAL_OPTIMIZATION OFF
+      INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF)
+    get_target_property(
+      _heisenberg_dependency_compile_options
+      ${_heisenberg_dependency_target}
+      COMPILE_OPTIONS)
+    if(_heisenberg_dependency_compile_options)
+      list(FILTER _heisenberg_dependency_compile_options EXCLUDE REGEX "^/Zi$")
+      set_property(
+        TARGET ${_heisenberg_dependency_target}
+        PROPERTY COMPILE_OPTIONS "${_heisenberg_dependency_compile_options}")
+    endif()
+  endif()
+endforeach()
 
 
 # >>> Vendored ROCK engine (Route A: pristine source compiled as a static lib).
@@ -73,7 +157,18 @@ add_subdirectory(${F4VR_COMMON_FRAMEWORK_PATH} "F4VRCommonFramework" EXCLUDE_FRO
 # HostLoad after its own init, gated on bUseRockEngineArchitecture. So ROCKMain.cpp is now
 # COMPILED INTO rock_engine (no longer filtered out).
 set(ROCK_DIR "${ROOT_DIR}/external/ROCK")
-if(EXISTS "${ROCK_DIR}/src/PCH.h")
+set(ROCK_COMMONLIB_COMPAT_DIR "${ROCK_DIR}/src/compat")
+if(NOT EXISTS "${ROCK_DIR}/src/PCH.h")
+  message(FATAL_ERROR
+    ">> The vendored ROCK tree is incomplete: '${ROCK_DIR}/src/PCH.h' is missing. "
+    "All files under external/ROCK/src must be present in the checkout.")
+elseif(NOT EXISTS "${ROCK_COMMONLIB_COMPAT_DIR}/RE/Havok/hknpWorld.h"
+    OR NOT EXISTS "${ROCK_COMMONLIB_COMPAT_DIR}/RE/Bethesda/BSSkin.h")
+  message(FATAL_ERROR
+    ">> The vendored ROCK CommonLibF4VR compatibility headers are incomplete in "
+    "'${ROCK_COMMONLIB_COMPAT_DIR}'. A clean checkout must not depend on local "
+    "untracked headers from a sibling FRIK checkout.")
+else()
   file(GLOB_RECURSE rock_sources CONFIGURE_DEPENDS "${ROCK_DIR}/src/*.cpp")
   file(GLOB_RECURSE rock_headers CONFIGURE_DEPENDS "${ROCK_DIR}/src/*.h")
   file(GLOB_RECURSE rock_inls    CONFIGURE_DEPENDS "${ROCK_DIR}/src/*.inl")
@@ -81,15 +176,21 @@ if(EXISTS "${ROCK_DIR}/src/PCH.h")
   add_library(rock_engine STATIC EXCLUDE_FROM_ALL ${rock_sources} ${rock_headers} ${rock_inls})
   target_compile_features(rock_engine PRIVATE cxx_std_23)
   target_compile_definitions(rock_engine PRIVATE _UNICODE)
-  target_include_directories(rock_engine PRIVATE "${ROCK_DIR}/generated" "${ROCK_DIR}/src")
+  target_include_directories(rock_engine BEFORE PRIVATE
+    "${ROCK_COMMONLIB_COMPAT_DIR}"
+    "${ROCK_DIR}/generated"
+    "${ROCK_DIR}/src")
   find_package(cpptrace CONFIG REQUIRED)
   target_link_libraries(rock_engine PRIVATE F4VRCommon::framework cpptrace::cpptrace d3d11.lib dxgi.lib d3dcompiler.lib)
   target_precompile_headers(rock_engine PRIVATE "${ROCK_DIR}/src/PCH.h")
   # Vendored code: relax warnings (no /WX), mirror ROCK's essential flags.
-  target_compile_options(rock_engine PRIVATE /utf-8 /permissive- /Zc:preprocessor /EHsc /bigobj /W1)
+  target_compile_options(rock_engine PRIVATE
+    /utf-8 /permissive- /Zc:preprocessor /EHsc /bigobj /W1
+    "$<$<CXX_COMPILER_ID:MSVC>:/MP${HEISENBERG_MSVC_COMPILE_PROCESSES}>"
+  )
   # Disable LTO/LTCG for rock_engine so its codegen matches the known-good STANDALONE ROCK build
-  # (which builds this identical source with IPO OFF). The directory-scope
-  # CMAKE_INTERPROCEDURAL_OPTIMIZATION=ON (line 61) is otherwise inherited by this target.
+  # (which builds this identical source with IPO OFF). Keep this explicit even when
+  # HEISENBERG_ENABLE_IPO is opted into for the host DLL.
   # NOTE: LTCG was investigated as, but PROVEN NOT to be, the cause of the g_rockConfig config-load
   # CTD (a minimal MSVC repro showed heap-std::string NSDMIs compile to a valid non-null buffer
   # under /GL+/LTCG too). The real cause of that "unkillable" crash was a STALE BUILD (a 3-week-old
@@ -100,6 +201,10 @@ if(EXISTS "${ROCK_DIR}/src/PCH.h")
   # harmless parity-with-standalone insurance, not as the fix. See memory
   # project_rock_embed_build_milestone_jun13.md ("FOURTH-CRASH REAL ROOT CAUSE").
   set_target_properties(rock_engine PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF)
+  if(MSVC AND CMAKE_GENERATOR MATCHES "Visual Studio")
+    set_target_properties(rock_engine PROPERTIES
+      VS_GLOBAL_CL_MPCount "${HEISENBERG_MSVC_COMPILE_PROCESSES}")
+  endif()
   message(">>> rock_engine target defined (vendored ROCK source, compile-proof; LTO OFF = standalone parity)")
 endif()
 
@@ -136,6 +241,10 @@ add_library(${PROJECT_NAME} SHARED
   ${BUILD_DIR}/include/Version.h
   ${BUILD_DIR}/version.rc
 )
+if(MSVC AND CMAKE_GENERATOR MATCHES "Visual Studio")
+  set_target_properties(${PROJECT_NAME} PROPERTIES
+    VS_GLOBAL_CL_MPCount "${HEISENBERG_MSVC_COMPILE_PROCESSES}")
+endif()
 
 
 # >>> C++ standard & defs
@@ -145,7 +254,8 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE _UNICODE HEISENBERG_F4VR_EXPO
 
 # >>> Includes
 target_include_directories(${PROJECT_NAME}
-  PRIVATE
+  BEFORE PRIVATE
+    ${ROCK_COMMONLIB_COMPAT_DIR}
     ${BUILD_DIR}/include
     ${SOURCE_DIR}
     ${ROCK_DIR}/src
@@ -158,18 +268,25 @@ target_link_libraries(${PROJECT_NAME}
     F4VRCommon::framework
     rock_engine   # embedded ROCK grab/physics engine (second architecture; gated at runtime)
 )
+if(MSVC AND HEISENBERG_ENABLE_IPO)
+  target_link_options(${PROJECT_NAME} PRIVATE
+    "$<$<CONFIG:Release>:/LTCG>"
+    "/CGTHREADS:${HEISENBERG_MSVC_CODEGEN_PROCESSES}")
+endif()
 
 
 # >>> PCH
-target_precompile_headers(${PROJECT_NAME} PRIVATE backups/0.7.2/PCH.h)
+target_precompile_headers(${PROJECT_NAME} PRIVATE src/PCH.h)
 
 
 # >>> Compile / Link options
 target_compile_options(${PROJECT_NAME}
   PRIVATE
+    "$<$<CXX_COMPILER_ID:MSVC>:/MP${HEISENBERG_MSVC_COMPILE_PROCESSES}>"
     /sdl
     /utf-8
-    /Zi
+    "$<$<CONFIG:DEBUG>:/Zi>"
+    "$<$<CONFIG:RELWITHDEBINFO>:/Zi>"
     /permissive-
     /Zc:alignedNew
     /Zc:auto
@@ -188,13 +305,7 @@ target_compile_options(${PROJECT_NAME}
     /Zc:sizedDealloc
     /Zc:strictStrings
     /Zc:ternary
-    # threadSafeInit- : use a simple init-flag for function-local statics instead of the
-    # locking guard. The locking guard (_Init_thread_wait_v2) DEADLOCKS when a static's
-    # initialization is unwound by an SEH __except (e.g. HookEndUpdate's "tape deck skipped"
-    # guard interrupting a lazy static init in the holotape path) — the guard is left locked
-    # and the NEXT access waits forever (the second-holotape-insert freeze). With '-', an
-    # interrupted init simply retries on next access instead of hanging.
-    /Zc:threadSafeInit-
+    /Zc:threadSafeInit
     /Zc:tlsGuards
     /Zc:trigraphs
     /Zc:wchar_t
@@ -208,7 +319,7 @@ target_link_options(${PROJECT_NAME}
   PRIVATE
     /WX
     "$<$<CONFIG:DEBUG>:/INCREMENTAL;/OPT:NOREF;/OPT:NOICF>"
-    "$<$<CONFIG:RELEASE>:/INCREMENTAL:NO;/OPT:REF;/OPT:ICF;/DEBUG:FULL>"
+    "$<$<CONFIG:RELEASE>:/INCREMENTAL:NO;/OPT:REF;/OPT:ICF;/DEBUG:NONE>"
 )
 
 string(REPLACE "/Ob2" "/Ob3" CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}")
@@ -227,9 +338,28 @@ if(BUILD_HEISENBERG_TESTS)
   target_include_directories(HeisenbergFrikIniReconcilerTests PRIVATE "${SOURCE_DIR}")
   add_test(NAME HeisenbergFrikIniReconcilerTests COMMAND HeisenbergFrikIniReconcilerTests)
 
+  add_executable(HeisenbergFrikCompatibilityPolicyTests
+    tests/FrikCompatibilityPolicyTests.cpp
+    external/ROCK/src/physics-interaction/visual/FrikCompatibilityPolicy.h
+  )
+  target_compile_features(HeisenbergFrikCompatibilityPolicyTests PRIVATE cxx_std_23)
+  target_include_directories(HeisenbergFrikCompatibilityPolicyTests PRIVATE "${ROCK_DIR}/src")
+  add_test(NAME HeisenbergFrikCompatibilityPolicyTests COMMAND HeisenbergFrikCompatibilityPolicyTests)
+
+  add_executable(HeisenbergFrikFingerPoseBridgeTests
+    tests/FrikFingerPoseBridgeTests.cpp
+    external/ROCK/src/api/FRIKApi.h
+    external/ROCK/src/physics-interaction/visual/FrikVisualAuthorityBridge.h
+  )
+  target_compile_features(HeisenbergFrikFingerPoseBridgeTests PRIVATE cxx_std_23)
+  target_include_directories(HeisenbergFrikFingerPoseBridgeTests PRIVATE "${ROCK_DIR}/src")
+  target_link_libraries(HeisenbergFrikFingerPoseBridgeTests PRIVATE F4VRCommon::framework)
+  add_test(NAME HeisenbergFrikFingerPoseBridgeTests COMMAND HeisenbergFrikFingerPoseBridgeTests)
+
   add_executable(HeisenbergTwoHandedWeaponPolicyTests
     tests/TwoHandedWeaponPolicyTests.cpp
     external/ROCK/src/physics-interaction/weapon/TwoHandedWeaponPolicy.h
+    external/ROCK/src/physics-interaction/weapon/WeaponInteractionProbeFramePolicy.h
     external/ROCK/src/physics-interaction/TransformMath.h
   )
   target_compile_features(HeisenbergTwoHandedWeaponPolicyTests PRIVATE cxx_std_23)
@@ -252,6 +382,22 @@ if(BUILD_HEISENBERG_TESTS)
   target_include_directories(HeisenbergGrabPosePolicyTests PRIVATE "${SOURCE_DIR}")
   add_test(NAME HeisenbergGrabPosePolicyTests COMMAND HeisenbergGrabPosePolicyTests)
 
+  add_executable(HeisenbergEmbeddedOffsetsTests
+    tests/EmbeddedOffsetsTests.cpp
+    src/EmbeddedOffsets.h
+  )
+  target_compile_features(HeisenbergEmbeddedOffsetsTests PRIVATE cxx_std_23)
+  target_include_directories(HeisenbergEmbeddedOffsetsTests PRIVATE "${SOURCE_DIR}")
+  add_test(NAME HeisenbergEmbeddedOffsetsTests COMMAND HeisenbergEmbeddedOffsetsTests)
+
+  add_executable(HeisenbergHeldCollisionBodySetPolicyTests
+    tests/HeldCollisionBodySetPolicyTests.cpp
+    src/HeldCollisionBodySetPolicy.h
+  )
+  target_compile_features(HeisenbergHeldCollisionBodySetPolicyTests PRIVATE cxx_std_23)
+  target_include_directories(HeisenbergHeldCollisionBodySetPolicyTests PRIVATE "${SOURCE_DIR}")
+  add_test(NAME HeisenbergHeldCollisionBodySetPolicyTests COMMAND HeisenbergHeldCollisionBodySetPolicyTests)
+
   add_executable(HeisenbergRockProviderApiPolicyTests
     tests/RockProviderApiPolicyTests.cpp
     external/ROCK/src/api/ROCKProviderApi.h
@@ -273,7 +419,34 @@ if(BUILD_HEISENBERG_TESTS)
   target_include_directories(HeisenbergWeaponPartMotionConstraintTests PRIVATE "${ROCK_DIR}/src")
   target_link_libraries(HeisenbergWeaponPartMotionConstraintTests PRIVATE F4VRCommon::framework)
   add_test(NAME HeisenbergWeaponPartMotionConstraintTests COMMAND HeisenbergWeaponPartMotionConstraintTests)
+
+  add_executable(HeisenbergCollisionLayerPolicyTests
+    tests/CollisionLayerPolicyTests.cpp
+    external/ROCK/src/physics-interaction/collision/CollisionLayerPolicy.h
+    external/ROCK/src/physics-interaction/NativeMeleeSuppressionPolicy.h
+  )
+  target_compile_features(HeisenbergCollisionLayerPolicyTests PRIVATE cxx_std_23)
+  target_include_directories(HeisenbergCollisionLayerPolicyTests PRIVATE "${ROCK_DIR}/src")
+  add_test(NAME HeisenbergCollisionLayerPolicyTests COMMAND HeisenbergCollisionLayerPolicyTests)
+
+  add_executable(HeisenbergGeneratedContactBufferPolicyTests
+    tests/GeneratedContactBufferPolicyTests.cpp
+    external/ROCK/src/physics-interaction/grab/GeneratedContactBufferPolicy.h
+  )
+  target_compile_features(HeisenbergGeneratedContactBufferPolicyTests PRIVATE cxx_std_23)
+  target_include_directories(HeisenbergGeneratedContactBufferPolicyTests PRIVATE "${ROCK_DIR}/src")
+  add_test(NAME HeisenbergGeneratedContactBufferPolicyTests COMMAND HeisenbergGeneratedContactBufferPolicyTests)
 endif()
+
+# >>> Install/package manifest
+# `cmake --install` now produces a complete mod payload instead of a bare DLL.
+install(TARGETS ${PROJECT_NAME}
+  RUNTIME DESTINATION "F4SE/Plugins")
+install(DIRECTORY "${ROOT_DIR}/Data/"
+  DESTINATION "."
+  FILES_MATCHING
+    PATTERN "*.ini"
+    PATTERN "*.json")
 
 
 # >>> Post build command to copy plugin

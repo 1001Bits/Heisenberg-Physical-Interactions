@@ -57,6 +57,7 @@ namespace heisenberg
     {
         _modeActive = true;
         _isHoldingThumbstick = false;
+        _modeEnteredTime = std::chrono::steady_clock::now();
         
         // Show entry message
         heisenberg::Hooks::ShowHUDMessageDirect("Node Capture Mode: ACTIVE");
@@ -102,10 +103,26 @@ namespace heisenberg
         // IN MODE: Force pointing pose and check for hold to capture
         // =====================================================================
         else {
+            // Inactivity auto-exit: never hold a forced hand pose indefinitely.
+            // Checked BEFORE the pose is re-applied so the exit frame restores
+            // the open hand instead of re-curling it.
+            {
+                const auto activeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - _modeEnteredTime).count();
+                if (activeMs >= static_cast<long long>(MODE_AUTO_EXIT_MS)) {
+                    heisenberg::Hooks::ShowHUDMessageDirect("Node Capture Mode: timed out");
+                    spdlog::info("[NodeCaptureMode] Auto-exit after {} ms with no capture — "
+                                 "restoring the right hand pose", activeMs);
+                    ExitMode();
+                    _thumbstickWasPressed = thumbstickPressed;
+                    return;
+                }
+            }
+
             // Force RIGHT hand pointing pose: index extended, others curled
             auto& frik = FRIKInterface::GetSingleton();
             frik.SetHandPoseFingerPositions(false, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f);  // thumb, index, middle, ring, pinky
-            
+
             if (thumbstickPressed && !_thumbstickWasPressed) {
                 // Just started pressing - begin hold timer for capture
                 _thumbstickHoldStartTime = now;

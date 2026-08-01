@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <span>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -13,9 +14,9 @@
 #include "physics-interaction/native/BethesdaPhysicsBody.h"
 #include "physics-interaction/native/GeneratedKeyframedBodyDrive.h"
 #include "physics-interaction/native/HavokPhysicsTiming.h"
+#include "physics-interaction/native/PhysicsCallbackQuiescenceGate.h"
 #include "physics-interaction/PhysicsLog.h"
 #include "physics-interaction/native/PhysicsUtils.h"
-#include "physics-interaction/grab/MeshGrab.h"
 #include "physics-interaction/weapon/WeaponTypes.h"
 #include "physics-interaction/weapon/WeaponAuthority.h"
 #include "physics-interaction/weapon/WeaponGeometry.h"
@@ -25,6 +26,8 @@
 #include "RE/Havok/hknpBodyCinfo.h"
 #include "RE/Havok/hknpBodyId.h"
 #include "RE/Havok/hknpWorld.h"
+#include "RE/NetImmerse/NiPoint.h"
+#include "RE/NetImmerse/NiTransform.h"
 
 namespace RE
 {
@@ -55,6 +58,8 @@ namespace rock
     public:
         WeaponCollision();
 
+        void setPhysicsCallbackGate(PhysicsCallbackQuiescenceGate* gate) { _physicsCallbackGate = gate; }
+
         struct WeaponBodySnapshot
         {
             std::uint64_t generationKey{ 0 };
@@ -62,27 +67,96 @@ namespace rock
             std::array<std::uint32_t, MAX_WEAPON_COLLISION_BODIES> bodyIds{};
         };
 
+        struct ReleaseGeometrySnapshot
+        {
+            float leverGameUnits{ 0.0f };
+            bool hasCapturedWeaponWorld{ false };
+            RE::NiTransform capturedWeaponWorld{};
+        };
+
+        /*
+         * Immutable, generation/ownership/form-keyed view of the assembled
+         * optical-sight geometry. The anchor is expressed in the equipped
+         * weapon root's local frame and is published under the same seqlock as
+         * the generated body/evidence bank, so readers never combine bounds
+         * from different weapon publications.
+         */
+        struct NativeScopeSightAnchorSnapshot
+        {
+            bool valid{ false };
+            bool manualDirectTransitionRequired{ false };
+            bool nativeScopeOverlayValid{ false };
+            std::uint64_t weaponGenerationKey{ 0 };
+            std::uint64_t equippedWeaponOwnershipKey{ 0 };
+            std::uint32_t weaponFormID{ 0 };
+            std::uint32_t nativeScopeOverlayIndex{ 0 };
+            RE::NiPoint3 anchorWeaponLocal{};
+            RE::NiPoint3 sightBoundsMinWeaponLocal{};
+            RE::NiPoint3 sightBoundsMaxWeaponLocal{};
+            std::uint32_t sightBodyCount{ 0 };
+        };
+
+        static constexpr std::size_t kMaxWeaponCompositionEntries = 64;
+
+        struct WeaponCompositionEntrySnapshot
+        {
+            std::uint32_t omodFormId{ 0 };
+            std::uint32_t attachPointFormId{ 0 };
+            std::uint32_t stableIndex{ 0 };
+            std::uint32_t flags{ 0 };
+            std::uint64_t semanticCoverageMask{ 0 };
+        };
+
+        struct WeaponCompositionSnapshot
+        {
+            std::array<WeaponCompositionEntrySnapshot,
+                kMaxWeaponCompositionEntries> entries{};
+            std::uint32_t entryCount{ 0 };
+            std::uint64_t weaponGenerationKey{ 0 };
+            std::uint64_t compositionSignature{ 0 };
+            std::uint64_t semanticCoverageMask{ 0 };
+            std::uint64_t missingCoverageMask{ 0 };
+            std::uint64_t publicationSequence{ 0 };
+            std::uint32_t weaponFormId{ 0 };
+        };
+
+        /*
+         * Frame-scoped, non-owning view of one generated weapon body's source
+         * triangles. The triangle storage remains owned by WeaponCollision and
+         * is immutable for the published weapon generation. Consumers must use
+         * the view synchronously on the main thread and must not retain it past
+         * the next WeaponCollision update/rebuild.
+         *
+         * Keeping the source-local representation avoids copying and
+         * transforming an unbounded high-poly weapon part before a consumer can
+         * apply its own bounded evidence policy.
+         */
+        struct SupportGripEvidenceView
+        {
+            std::span<const TriangleData> localTriangles{};
+            RE::NiTransform localToWorld{};
+            std::uint64_t weaponGenerationKey{ 0 };
+            bool sourceNodeCurrent{ false };
+        };
+
         void init(RE::hknpWorld* world, void* bhkWorld);
 
         void shutdown();
+        void abandonHavokStateAfterWorldLoss();
 
         void update(RE::hknpWorld* world, RE::NiAVObject* weaponNode, float dt, bool weaponDrawn);
 
         void requestWorkbenchExitRebuild();
 
-        /*
-         * Armed only by the workbench menu-close sink (never by internal
-         * rebuild requests such as the OMOD self-heal, which would loop:
-         * reattach -> fresh tree -> heal -> rebuild -> reattach). Fires the
-         * engine's own equipped-weapon attach once, a short delay after the
-         * menu closes, to recover the rendered weapon copy the engine's
-         * post-workbench actor reset leaves invisible.
-         */
-        void armWorkbenchWeaponReattach();
-
         bool hasWeaponBody() const;
 
         std::uint32_t getWeaponBodyCount() const;
+
+        // One-frame, read-only release geometry query. The caller must consume
+        // this before destroyWeaponBody retires the equipped body bank.
+        ReleaseGeometrySnapshot getCurrentWeaponReleaseGeometry(
+            const RE::NiPoint3& gripWorldPoint,
+            const RE::NiTransform& capturedWeaponWorld) const;
 
         RE::hknpBodyId getWeaponBodyId() const;
 
@@ -102,6 +176,12 @@ namespace rock
 
         std::vector<WeaponCollisionProfileEvidenceDescriptor> getProfileEvidenceDescriptors() const;
 
+        WeaponEmitterSnapshot getWeaponEmitterSnapshot() const;
+
+        NativeScopeSightAnchorSnapshot getNativeScopeSightAnchorSnapshot() const;
+
+        WeaponCompositionSnapshot getWeaponCompositionSnapshot() const;
+
         bool tryGetProfileEvidenceDescriptorForBodyId(
             std::uint32_t bodyId,
             WeaponCollisionProfileEvidenceDescriptor& outDescriptor,
@@ -109,9 +189,50 @@ namespace rock
 
         std::uint64_t getCurrentEquippedWeaponGenerationKey() const { return _cachedWeaponKey; }
 
+        std::uint64_t getCurrentEquippedWeaponIdentityKey() const { return _observedEquippedWeaponIdentityKey; }
+
+        std::uint64_t getCurrentEquippedWeaponOwnershipKey() const { return _observedEquippedWeaponOwnershipKey; }
+
+        std::uint32_t getCurrentObservedEquippedWeaponFormID() const { return _observedEquippedWeaponFormID; }
+
         weapon_generation_identity_policy::EquippedWeaponGenerationIdentity getEquippedWeaponClassification() const;
 
         std::uint64_t getCurrentWeaponGenerationKey() const { return _weaponBodySetKeyAtomic.load(std::memory_order_acquire); }
+
+        /*
+         * EMBEDDED-HOST SEAM: generated weapon hull sample points (world) + convex
+         * radii for the host's own contact reasoning.
+         */
+        std::uint32_t copyInteractionCollisionSamples(
+            const RE::NiAVObject* weaponNode,
+            RE::NiPoint3* outWorldPoints,
+            float* outRadiiGame,
+            std::uint32_t maxSamples) const;
+
+        /*
+         * Event-driven weapon/world contact anchor. Native Havok evidence
+         * already identifies the exact generated body that touched the world;
+         * use that body directly instead of trying to associate the contact
+         * with a small, whole-weapon sample buffer. The stored local point is
+         * allocation-free and can be resolved on subsequent cached-plane
+         * frames without proactive world casts.
+         */
+        bool tryCaptureInteractionCollisionProbeAnchor(
+            const RE::NiAVObject* weaponNode,
+            std::uint32_t sourceBodyId,
+            const RE::NiPoint3& contactPointWorld,
+            RE::NiPoint3& outAnchorLocal,
+            bool& outUsesSourceLocal,
+            RE::NiPoint3& outProbeWorld,
+            float& outRadiusGame) const;
+
+        bool tryResolveInteractionCollisionProbeAnchor(
+            const RE::NiAVObject* weaponNode,
+            std::uint32_t sourceBodyId,
+            const RE::NiPoint3& anchorLocal,
+            bool usesSourceLocal,
+            RE::NiPoint3& outProbeWorld,
+            float& outRadiusGame) const;
 
         bool tryFindInteractionContactNearPoint(
             const RE::NiAVObject* weaponNode,
@@ -120,11 +241,11 @@ namespace rock
             WeaponInteractionContact& outContact) const;
 
         /*
-         * Strict provider-target contact recovery. Tests only one already
-         * matched body and its actual world-space mesh triangles against the
-         * live generated hand-collider hull samples. This is deliberately not
-         * the forgiving whole-weapon palm probe: callers must resolve the
-         * provider whitelist first and pass that exact bodyId.
+         * Strict provider-target contact recovery. Tests one already matched
+         * body and its actual mesh triangles against the live generated hand
+         * collider samples. Unlike the forgiving whole-weapon palm probe, the
+         * caller must first resolve the provider whitelist and pass that exact
+         * body id.
          */
         bool tryFindInteractionContactOverlappingSamples(
             const RE::NiAVObject* weaponNode,
@@ -135,16 +256,10 @@ namespace rock
             float contactToleranceGame,
             WeaponInteractionContact& outContact) const;
 
-        std::uint32_t copyInteractionCollisionSamples(
-            const RE::NiAVObject* weaponNode,
-            RE::NiPoint3* outWorldPoints,
-            float* outRadiiGame,
-            std::uint32_t maxSamples) const;
-
-        bool tryBuildSupportGripEvidenceTriangles(
+        bool tryGetSupportGripEvidenceView(
             std::uint32_t bodyId,
             const RE::NiAVObject* currentWeaponRoot,
-            std::vector<TriangleData>& outTriangles) const;
+            SupportGripEvidenceView& outView) const;
 
         BethesdaPhysicsBody& getWeaponBody();
 
@@ -269,6 +384,8 @@ namespace rock
             std::uint64_t equippedKey{ 0 };
             std::uint64_t visualKey{ 0 };
             std::uint64_t identityKey{ 0 };
+            std::uint64_t ownershipKey{ 0 };
+            std::uint32_t weaponFormID{ 0 };
             std::uint32_t visualRootCount{ 0 };
             std::uint32_t visibleTriShapeCount{ 0 };
             float convexRadius{ -1.0f };
@@ -279,6 +396,12 @@ namespace rock
             std::size_t createdCount{ 0 };
             std::vector<GeneratedHullSource> sources;
             weapon_generated_source_completeness_policy::GeneratedSourceCompleteness summary{};
+        };
+
+        struct OmodCoverageAuditResult
+        {
+            bool ran{ false };
+            bool sceneEnriched{ false };
         };
 
         WeaponBodyBank& activeWeaponBodies();
@@ -312,12 +435,28 @@ namespace rock
         void unpublishAtomicBodyIds();
         void beginWeaponBodyPublication();
         void endWeaponBodyPublication();
-        std::vector<WeaponCollisionProfileEvidenceDescriptor> buildProfileEvidenceSnapshot(const WeaponBodyBank& bank) const;
+        std::vector<WeaponCollisionProfileEvidenceDescriptor> buildProfileEvidenceSnapshot(
+            const WeaponBodyBank& bank,
+            WeaponCompositionSnapshot& outComposition) const;
+        WeaponEmitterSnapshot buildWeaponEmitterSnapshot(
+            RE::NiAVObject* weaponNode,
+            std::uint64_t equippedWeaponKey,
+            std::uint64_t weaponGenerationKey,
+            std::uint64_t rootSetKey) const;
+        void updateWeaponEmitterSnapshot(RE::NiAVObject* weaponNode, std::uint64_t equippedWeaponKey);
+        void clearWeaponEmitterSnapshot();
         void publishSampledVelocityAtomic(std::uint32_t publicationIndex, const GeneratedKeyframedBodyDriveQueueResult& queueResult);
         void dumpEquippedWeaponOmodEvidence(const WeaponBodyBank& bank, RE::NiAVObject* packageDriveNode);
-        void maybeRunWeaponOmodCoverageAudit(RE::NiAVObject* weaponNode);
+        OmodCoverageAuditResult maybeRunWeaponOmodCoverageAudit(
+            RE::NiAVObject* weaponNode,
+            std::uint64_t auditedEquippedKey,
+            bool forceBeforeInitialBuild = false);
 
-        std::size_t findGeneratedWeaponShapeSources(RE::NiAVObject* weaponNode, std::vector<GeneratedHullSource>& outSources, float maxSourceDistanceGame);
+        std::size_t findGeneratedWeaponShapeSources(
+            RE::NiAVObject* weaponNode,
+            std::uint64_t equippedWeaponKey,
+            std::vector<GeneratedHullSource>& outSources,
+            float maxSourceDistanceGame);
 
         void findGeneratedWeaponShapeSourcesRecursive(RE::NiAVObject* node, RE::NiAVObject* sourceRoot, const RE::NiTransform& weaponRootTransform,
             int depth,
@@ -327,7 +466,8 @@ namespace rock
             const std::unordered_set<std::uintptr_t>& claimedSourceGroups,
             std::unordered_set<std::uintptr_t>& candidateExtractedSourceGroups,
             float maxSourceDistanceGame,
-            std::uint32_t& culledForDistance);
+            std::uint32_t& culledForDistance,
+            std::uint32_t& culledForEffectGeometry);
         RE::NiTransform makeGeneratedBodyWorldTransform(const RE::NiTransform& weaponRootTransform, const RE::NiPoint3& localCenterGame) const;
         bool weaponCollisionSettingsChanged() const;
         void handleGeneratedBodyDriveResult(const GeneratedKeyframedBodyDriveResult& result, const char* ownerName, std::uint32_t bodyIndex);
@@ -345,6 +485,8 @@ namespace rock
         bool beginPendingGeneratedWeaponBuild(std::uint64_t equippedKey,
             std::uint64_t visualKey,
             std::uint64_t identityKey,
+            std::uint64_t ownershipKey,
+            std::uint32_t weaponFormID,
             const WeaponVisualKeyStats& visualKeyStats,
             bool replacingExisting,
             bool settingsChanged,
@@ -352,10 +494,17 @@ namespace rock
             std::vector<GeneratedHullSource> sources,
             const weapon_generated_source_completeness_policy::GeneratedSourceCompleteness& summary);
         bool advancePendingGeneratedWeaponBuild(RE::hknpWorld* world);
-        bool pendingGeneratedWeaponBuildMatches(std::uint64_t equippedKey) const;
+        bool pendingGeneratedWeaponBuildMatches(
+            std::uint64_t equippedKey,
+            std::uint64_t ownershipKey,
+            std::uint32_t weaponFormID) const;
         void resetWeaponCollisionSettingsCache();
 
-        std::uint64_t getEquippedWeaponIdentityKey(std::uint64_t* outIdentityKey = nullptr, WeaponSizeClass* outSizeClass = nullptr) const;
+        std::uint64_t getEquippedWeaponIdentityKey(
+            std::uint64_t* outIdentityKey = nullptr,
+            std::uint64_t* outOwnershipKey = nullptr,
+            WeaponSizeClass* outSizeClass = nullptr,
+            std::uint32_t* outFormID = nullptr) const;
         std::uint64_t getWeaponVisualCompositionKey(RE::NiAVObject* weaponNode, WeaponVisualKeyStats& stats) const;
 
         void maybeDumpWeaponAnimNodeDiagnostics(RE::NiAVObject* updateWeaponNode, std::uint64_t observedKey);
@@ -364,13 +513,38 @@ namespace rock
 
         WeaponBodyBank _weaponBodies{};
         WeaponBodyBank _weaponReplacementBodies{};
-        std::array<RetiredWeaponBodyPayload, MAX_RETIRED_GENERATED_WEAPON_BODY_PAYLOADS> _retiredWeaponBodyPayloads{};
-        std::uint32_t _retiredWeaponBodyPayloadCount{ 0 };
-        mutable std::mutex _retiredWeaponBodyPayloadMutex;
+        /*
+         * Process-lifetime retirement bank. PhysicsInteraction can be
+         * destroyed/recreated before the grace window elapses; instance-owned
+         * storage would then discard the only payload owner. A later instance
+         * continues servicing this shared queue after completed solves.
+         */
+        inline static std::array<
+            RetiredWeaponBodyPayload,
+            MAX_RETIRED_GENERATED_WEAPON_BODY_PAYLOADS>
+            s_retiredWeaponBodyPayloads{};
+        inline static std::uint32_t s_retiredWeaponBodyPayloadCount{ 0 };
+        inline static std::atomic<bool> s_hasRetiredWeaponBodyPayloads{ false };
+        inline static std::mutex s_retiredWeaponBodyPayloadMutex;
         bool _usingReplacementWeaponBodies{ false };
+        PhysicsCallbackQuiescenceGate* _physicsCallbackGate{ nullptr };
         std::uint64_t _cachedWeaponKey{ 0 };
         std::uint64_t _cachedWeaponVisualKey{ 0 };
         std::uint64_t _cachedWeaponIdentityKey{ 0 };
+        // Body-associated ownership witnesses. Unlike the observed fields
+        // below, these remain bound to the currently published body set.
+        std::uint64_t _cachedWeaponOwnershipKey{ 0 };
+        std::uint32_t _cachedWeaponFormID{ 0 };
+        // Available before generated bodies publish; the cached identity above
+        // remains body-associated for replacement safety.
+        std::uint64_t _observedEquippedWeaponIdentityKey{ 0 };
+        // Instance-bound authority witness; never substitute this for a
+        // collision generation or content-equivalence key.
+        std::uint64_t _observedEquippedWeaponOwnershipKey{ 0 };
+        // Form paired with the observed identity/ownership witnesses above.
+        // Consumers use it to reject the one-frame old-generation/new-form
+        // overlap during direct Pip-Boy equipment changes.
+        std::uint32_t _observedEquippedWeaponFormID{ 0 };
         std::uint64_t _cachedWeaponBodySetKey{ 0 };
         std::uint64_t _weaponBodySetEpoch{ 0 };
         weapon_generated_source_completeness_policy::GeneratedSourceCompleteness _cachedGeneratedSourceCompleteness{};
@@ -399,8 +573,12 @@ namespace rock
         std::atomic<std::uint32_t> _weaponBodyCountAtomic{ 0 };
         std::atomic<std::uint64_t> _weaponBodySetKeyAtomic{ 0 };
         std::atomic<std::uint64_t> _weaponBodyPublicationVersion{ 0 };
-        mutable std::mutex _profileEvidenceSnapshotMutex;
+        mutable std::mutex _weaponEvidenceSnapshotMutex;
         std::vector<WeaponCollisionProfileEvidenceDescriptor> _profileEvidenceSnapshot;
+        WeaponEmitterSnapshot _weaponEmitterSnapshot{};
+        NativeScopeSightAnchorSnapshot _nativeScopeSightAnchorSnapshot{};
+        WeaponCompositionSnapshot _weaponCompositionSnapshot{};
+        std::uint64_t _weaponCompositionPublicationSequence{ 0 };
         // Debug OMOD evidence dump fires once per weapon generation key.
         std::uint64_t _lastOmodDumpGenerationKey{ 0 };
         /*
@@ -412,6 +590,10 @@ namespace rock
         std::uint64_t _omodCoverageAuditBodySetKey{ 0 };
         int _omodCoverageAuditFrameCounter{ 0 };
         std::uint32_t _omodCoverageAuditRunIndex{ 0 };
+        // Run the mutating pre-build audit once for an exact equipped identity
+        // and assembled root; the later cadence remains a safety net.
+        std::uint64_t _omodPrebuildAuditEquippedKey{ 0 };
+        RE::NiAVObject* _omodPrebuildAuditRoot{ nullptr };
         /*
          * Self-heal attempts are keyed by (weapon instance node address ^
          * OMOD formID): the same assembled tree is never retried (a failed or
@@ -420,11 +602,6 @@ namespace rock
          * and legitimately re-opens healing.
          */
         std::unordered_set<std::uint64_t> _omodSelfHealAttempted;
-        // Frames until the one-shot post-workbench weapon reattach fires; 0 = disarmed.
-        std::atomic<int> _workbenchReattachFramesRemaining{ 0 };
-
-        void maybeFireWorkbenchWeaponReattach();
-
         int _posLogCounter{ 0 };
 
         float _cachedConvexRadius{ -1.0f };

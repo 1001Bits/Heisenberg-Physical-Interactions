@@ -12,13 +12,19 @@
  *   3. Use the returned interface pointer to call Heisenberg functions
  * 
  * Thread Safety:
- *   - Most functions should only be called from the main game thread
- *   - Callbacks are invoked from the main game thread
- *   - IsHoldingObject/GetGrabbedObject are safe to call from any thread
+ *   - Interface queries and mutations must be called from the main game thread
+ *     unless a method explicitly documents another context.
+ *   - Grab/drop/stash/consume callbacks are normally invoked on the main game
+ *     thread. Physics callbacks may run on the Havok thread.
+ *   - Callback registration is synchronized, but this revision has no generic
+ *     unregister operation. The registering module must remain loaded.
  */
 
 #include "RE/Fallout.h"
 #include "DualWieldAPI.h"
+#include <cstddef>
+#include <cstdint>
+#include <type_traits>
 
 namespace HeisenbergPluginAPI {
 
@@ -41,10 +47,17 @@ namespace HeisenbergPluginAPI {
     {
         // Unique message type ID (randomly generated)
         enum { kMessage_GetInterface = 0xF4D3B7A2 };
+        enum : std::uint32_t { kMessageAbiVersion = 1 };
 
         // Callback that Heisenberg fills in
         // Call with revision=1 to get IHeisenbergInterface001*
         void* (*GetApiFunction)(unsigned int revisionNumber) = nullptr;
+
+        // Append-only handshake metadata. Heisenberg still accepts the original
+        // 8-byte message and only fills members present in dataLen.
+        std::uint32_t structSize = 0;
+        std::uint32_t abiVersion = kMessageAbiVersion;
+        std::uint32_t interfaceBuild = 0;
     };
 
     /**
@@ -117,7 +130,8 @@ namespace HeisenbergPluginAPI {
         
         /**
          * Check if a hand is currently holding an object.
-         * Thread-safe - can be called from any thread.
+         * Main-game-thread only. The returned state belongs to the live grab
+         * manager and is not published as a cross-thread snapshot.
          * 
          * @param isLeft True for left hand, false for right hand
          * @return True if that hand is holding an object
@@ -143,7 +157,8 @@ namespace HeisenbergPluginAPI {
 
         /**
          * Get the currently held object reference.
-         * Thread-safe via handle system.
+         * Main-game-thread only. The returned raw pointer is borrowed and must
+         * not be retained across frames or load boundaries.
          * 
          * @param isLeft Which hand to check
          * @return Pointer to the held TESObjectREFR, or nullptr if not holding
@@ -476,7 +491,11 @@ namespace HeisenbergPluginAPI {
         /**
          * Get a Heisenberg INI setting value.
          * 
-         * @param name The setting name (e.g., "fGrabStrength", "bEnablePullToHand")
+         * The name may be a unique INI key (for example
+         * "bEnablePullToHand") or "Section.key" (for example
+         * "Selection.fPullSpeed"). Values use the units serialized to the INI.
+         *
+         * @param name The numeric setting name
          * @param out Output parameter for the value
          * @return True if the setting exists and was retrieved
          */
@@ -484,7 +503,8 @@ namespace HeisenbergPluginAPI {
 
         /**
          * Set a Heisenberg INI setting value.
-         * Note: Not all settings take effect immediately; some require reload.
+         * Persists to the authoritative MCM overlay or plugin INI and reloads
+         * the effective configuration. Main-game-thread only.
          * 
          * @param name The setting name
          * @param val The new value
@@ -567,7 +587,7 @@ namespace HeisenbergPluginAPI {
          */
         virtual void EnableWeaponCollision(bool enable) = 0;
 
-        /** True while weapon collision is disabled via this API (lease active). */
+        /** True while weapon collision is disabled via this API latch. */
         virtual bool IsWeaponCollisionDisabled() = 0;
 
         /**
@@ -601,8 +621,8 @@ namespace HeisenbergPluginAPI {
         // ABI: build 3, appended after every build-2 slot above. Never reorder.
         // All methods below require GetBuildNumber() >= 3.
         // Registration owns one callback slot and never replaces another owner.
-        // Unregister waits for in-flight calls. A callback/provider must therefore
-        // never unregister itself from inside its own invocation.
+        // Unregister waits for in-flight calls. Self-unregistration is supported:
+        // it defers the final drain until the current invocation returns.
         // =====================================================================
         virtual bool RegisterDualWieldStateProvider(DualWieldStateProvider provider) = 0;
         virtual bool UnregisterDualWieldStateProvider(DualWieldStateProvider provider) = 0;
@@ -627,7 +647,11 @@ namespace HeisenbergPluginAPI {
      *
      * @param message The HeisenbergMessage to fill in
      */
-    void HandleInterfaceRequest(HeisenbergMessage* message);
+    void HandleInterfaceRequest(HeisenbergMessage* message, std::size_t messageSize);
+
+    static_assert(std::is_standard_layout_v<HeisenbergMessage>);
+    static_assert(offsetof(HeisenbergMessage, GetApiFunction) == 0);
+    static_assert(offsetof(HeisenbergMessage, structSize) == sizeof(void*));
 
     /**
      * Get the API interface pointer for a given revision.

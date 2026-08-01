@@ -48,12 +48,18 @@ namespace heisenberg
         // FRIK-GOAL seam (FrikArmGoalHook): read the current per-hand winning target
         // latched by ApplyWinners. Level-triggered; returns false when no fresh winner.
         static bool TryConsumeLatched(bool isLeft, RE::NiTransform& out,
-            bool* rigidWeaponTarget = nullptr);
+            bool* reachLimitedRigidTarget = nullptr,
+            bool* controllerRelativeTarget = nullptr);
 
-        // Project a free visual target onto the current anatomical wrist-reach sphere.
-        // Full-solver rigid weapon targets are handled by the complete support-arm solve;
-        // TryConsumeLatched reports that capability so callers do not separate a rigid
-        // palm from its weapon with an earlier hand-only projection.
+        // Project an unconstrained free visual target onto the current anatomical
+        // wrist-reach sphere. A bounded controller-relative target (soft contact)
+        // must bypass this projection: its correction is already constrained
+        // relative to controller truth, and a shoulder-sphere projection can add a
+        // much larger displacement unrelated to the contacted surface.
+        // Full-solver rigid weapon and object co-hold targets are handled by a
+        // complete support-arm solve; TryConsumeLatched reports that capability
+        // so callers do not separate a rigid palm from its held target with an
+        // earlier hand-only projection.
         static bool ConstrainTargetToArmReach(bool isLeft, RE::NiTransform& target,
             float* requestedDistance = nullptr, float* maxReach = nullptr);
 

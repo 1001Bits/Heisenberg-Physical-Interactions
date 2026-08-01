@@ -13,7 +13,10 @@
             "architecture": "x64",
             "binaryDir": "${sourceDir}/build",
             "cacheVariables": {
-                "CMAKE_CXX_FLAGS": "/EHsc /MP /W4",
+                "CMAKE_CXX_FLAGS": "/EHsc /W4",
+                "HEISENBERG_ENABLE_IPO": "OFF",
+                "HEISENBERG_MSVC_COMPILE_PROCESSES": "2",
+                "HEISENBERG_MSVC_CODEGEN_PROCESSES": "1",
                 "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
                 "VCPKG_TARGET_TRIPLET": "x64-windows-static"
             }
@@ -39,12 +42,14 @@
         {
             "name": "debug",
             "configurePreset": "debug",
-            "configuration": "Debug"
+            "configuration": "Debug",
+            "jobs": 1
         },
         {
             "name": "release",
             "configurePreset": "release",
-            "configuration": "Release"
+            "configuration": "Release",
+            "jobs": 1
         }
     ]
 }

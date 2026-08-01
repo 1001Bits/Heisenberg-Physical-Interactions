@@ -13,6 +13,7 @@
 //   EjectButton_mesh:0  - Button mesh, translates Z based on finger proximity
 
 #include "RE/Fallout.h"
+#include "PipboyNodeSnapshotPolicy.h"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -106,6 +107,11 @@ namespace heisenberg
         RE::NiAVObject* GetPipboyArmNode();
         RE::NiPoint3    GetFingerPosition();
         RE::NiAVObject* GetCachedTapeDeckNode();
+        void            BeginNodeValidationPhase();
+        void            ValidatePersistentNodeCaches();
+        bool            CachedNodeIsLiveWithin(
+                            const RE::NiAVObject* root,
+                            const RE::NiAVObject* target) const;
         void            InvalidateFrameCache();
         void            PlaySound(std::uint32_t formID);
         void            PlayWavSound(const char* filename, std::uint32_t fallbackFormID = 0);
@@ -217,6 +223,10 @@ namespace heisenberg
         bool            _terminalRedirectActive     = false; // True = terminal is active with redirect
         bool            _isWorldTerminalRedirect    = false; // True = world terminal (Screen:0), false = holotape (FRIK wrist)
         bool            _terminalPatchesSuspended   = false; // True = binary patches reverted (PA/projected mode)
+        bool            _terminalForcedFrikScreenVisible = false; // We overrode FRIK's holo-hidden state to render the terminal on the wrist; teardown owes it back
+        bool            _terminalClosePipboyPending = false; // Grip-exit on a redirected terminal: lower the holo Pip-Boy too (owner: one grip closes EVERYTHING)
+        float           _terminalClosePipboyDeadline  = 0.0f; // Bounded watchdog budget (s) for grip-exit ClosedownPipboy retries
+        float           _terminalClosePipboyNextRetry = 0.0f; // Seconds until the next bounded retry
         bool            _hasReachedExterior         = false; // One-way latch: player has LEFT Vault 111 (exterior cell). Terminal redirect gated on this.
         bool            _pipboyOpenedSinceAcquire   = false; // One-way latch: player opened the Pip-Boy at least once after acquiring it (vanilla bootup). Intro ceremony waits for this + Pip-Boy closed.
 
@@ -342,6 +352,16 @@ namespace heisenberg
         RE::NiPoint3    _cachedFingerPos{};
         bool            _frameCacheValid = false;
         bool            _fingerPosCached = false;
+
+        // A fresh, allocation-free arm-subtree snapshot is captured separately
+        // in OnFrameUpdate and HookEndUpdate. Cached pointers are compared only
+        // by address; they are never dereferenced to prove liveness.
+        static constexpr std::size_t PIPBOY_NODE_SNAPSHOT_CAPACITY = 2048;
+        pipboy_node_snapshot::FixedSubtreeMembership<
+            PIPBOY_NODE_SNAPSHOT_CAPACITY> _nodeSnapshot;
+        RE::NiAVObject* _nodeSnapshotArm = nullptr;
+        bool _nodeSnapshotPhaseAttempted = false;
+        bool _nodeSnapshotUsable = false;
 
         // Persistent node caches (invalidated in ClearState / on skeleton change)
         RE::NiAVObject* _cachedEjectButton     = nullptr;

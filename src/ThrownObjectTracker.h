@@ -8,10 +8,11 @@
  *   2. Subscribes to per-body CONTACT_STARTED via hknpWorld_getEventSignal_Body
  *      (same pattern as ContactImpulseListener / bhkTelekinesisListener)
  *   3. On the first contact, dispatches:
- *        - Impact damage via bhkCharacterController::ProcessHurtfulBody (actors)
+ *        - Capped mass/speed impact damage plus an explicit knock reaction (actors)
  *        - Destructible damage via TaskQueueInterface::QueueUpdateDestructibleObject
  *        - AI detection event via AIProcess::SetActorsDetectionEvent
- *      Hit events fall out of ProcessHurtfulBody naturally (engine path).
+ *      Native ProcessHurtfulBody is intentionally not called after manual
+ *      damage because it applies a second, uncapped physics-damage pass.
  *   4. Auto-expires entries after a few seconds so we don't leak signals.
  */
 
@@ -66,6 +67,8 @@ namespace heisenberg
         struct Entry
         {
             RE::ObjectRefHandle refrHandle;
+            void* hknpWorld = nullptr;       // exact body-ID namespace for this throw
+            std::uint64_t generation = 0;   // rejects delayed contacts after a same-body rethrow
             float throwSpeed = 0.0f;        // game units / sec at release
             float thrownMass = 0.0f;        // form weight of thrown object (HIGGS-style proxy for havok mass)
             std::uint64_t expiryNs = 0;     // steady_clock ns; 0 = no expiry
@@ -76,7 +79,11 @@ namespace heisenberg
         // targetFormId is resolved at contact time (in the callback, where the contacted
         // body id is fresh) and passed through, rather than re-resolved a frame later in
         // the drain (a recycled/stale body index there resolved to nothing → "world").
-        void HandleContact(std::uint32_t thrownBodyId, std::uint32_t targetFormId);
+        void HandleContact(
+            void* hknpWorld,
+            std::uint32_t thrownBodyId,
+            std::uint64_t throwGeneration,
+            std::uint32_t targetFormId);
         void DispatchImpact(RE::TESObjectREFR* thrownRefr,
                             RE::TESObjectREFR* targetRefr, float impactSpeed,
                             float thrownMass, std::uint32_t thrownBodyId);
@@ -98,10 +105,13 @@ namespace heisenberg
         // calls happen in DrainPendingImpacts() on the game thread.
         struct PendingImpact
         {
+            void* hknpWorld = nullptr;
             std::uint32_t thrownBodyId = 0;
+            std::uint64_t throwGeneration = 0;
             std::uint32_t targetFormId = 0;  // resolved at contact time; 0 = world / unresolved
         };
         std::vector<PendingImpact> _pendingImpacts;
+        std::uint64_t _nextThrowGeneration = 1;
 
         // Per-actor cooldown so a single thrown object that bounces off an NPC
         // doesn't tag them twice in quick succession (mirrors PLANCK's contact

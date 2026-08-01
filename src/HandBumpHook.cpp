@@ -1,7 +1,7 @@
 #include "HandBumpHook.h"
 
 #include "Physics.h"
-#include "rock_integration/CollisionLayerPolicy.h"
+#include "../external/ROCK/src/physics-interaction/collision/CollisionLayerPolicy.h"
 
 #include <Windows.h>
 #include <array>
@@ -61,16 +61,16 @@ namespace heisenberg::HandBumpHook
             }
 
             __try {
-                const auto decision = heisenberg::rock_core::collision_layer_policy::evaluatePlayerCharacterControllerContact(
-                    heisenberg::rock_core::collision_layer_policy::PlayerCharacterControllerContactPolicyInput{
+                const auto decision = rock::collision_layer_policy::evaluatePlayerCharacterControllerContact(
+                    rock::collision_layer_policy::PlayerCharacterControllerContactPolicyInput{
                         .filterEnabled = true,
                         .playerController = isPlayerCharacterController(controller),
                         .targetLayerKnown = bumpedCC != nullptr,
-                        .targetLayer = heisenberg::rock_core::collision_layer_policy::FO4_LAYER_CHARCONTROLLER,
+                        .targetLayer = rock::collision_layer_policy::FO4_LAYER_CHARCONTROLLER,
                     });
 
                 if (decision.suppress) {
-                    // CTD guard: drop the player-proxy bump our hand bodies generated.
+                    // Only unknown or explicitly generated targets are suppressed.
                     return;
                 }
 

@@ -66,6 +66,14 @@ namespace rock::collision_layer_policy
      * metadata distinguishes reload contacts from real hands and weapon hulls.
      */
     inline constexpr std::uint32_t ROCK_LAYER_RELOAD = ROCK_LAYER_HAND;
+    /*
+     * Dynamic hand proxy bodies live on their own extended row so they collide
+     * ONLY with static world-surface layers:
+     * no clutter, actors, projectiles, or other ROCK layers, and never each
+     * other. The proxy is a solver-side visual-stop driver, not gameplay
+     * contact evidence.
+     */
+    inline constexpr std::uint32_t ROCK_LAYER_DYNAMIC_HAND_PROXY = 48;
 
     inline constexpr std::uint32_t FO4_LAYER_VANILLA_CONFIGURED_COUNT = 47;
     inline constexpr std::uint32_t FO4_LAYER_LAST_VANILLA_CONFIGURED = FO4_LAYER_DROPPINGPICK;
@@ -80,6 +88,11 @@ namespace rock::collision_layer_policy
     inline constexpr bool isRockOwnedReusableLayer(std::uint32_t layer)
     {
         return layer == ROCK_LAYER_HAND || layer == ROCK_LAYER_WEAPON || layer == ROCK_LAYER_BODY;
+    }
+
+    inline constexpr bool isRockGeneratedCharacterControllerSuppressionLayer(std::uint32_t layer)
+    {
+        return isRockOwnedReusableLayer(layer) || layer == ROCK_LAYER_DYNAMIC_HAND_PROXY;
     }
 
     inline constexpr bool isDynamicPropInteractionLayer(std::uint32_t layer)
@@ -100,6 +113,19 @@ namespace rock::collision_layer_policy
     inline constexpr bool isActorOrBipedLayer(std::uint32_t layer)
     {
         return layer == FO4_LAYER_BIPED || layer == FO4_LAYER_DEADBIP || layer == FO4_LAYER_BIPED_NO_CC;
+    }
+
+    /*
+     * These native layers can directly deliver damage to the player. They must
+     * never be dropped by ROCK's character-controller contact filter: the
+     * generated ROCK body is intentionally not a replacement damage hitbox.
+     */
+    inline constexpr bool isNativeDamageDeliveryLayer(std::uint32_t layer)
+    {
+        return layer == FO4_LAYER_PROJECTILE ||
+               layer == FO4_LAYER_CONEPROJECTILE ||
+               layer == FO4_LAYER_SPELL ||
+               layer == FO4_LAYER_SPELLEXPLOSION;
     }
 
     inline constexpr bool isWorldSurfaceLayer(std::uint32_t layer)
@@ -124,12 +150,10 @@ namespace rock::collision_layer_policy
     }
 
     /*
-     * Fallout VR's native player character controller must keep authoritative
-     * world support and hard blockers, but its broad contact bubble should not
-     * be the system that imparts impulses to clutter, guns, actors, ragdolls, or
-     * ROCK-generated tool bodies. This policy lives beside the layer constants
-     * so hooks can make a per-contact decision without rewriting the global
-     * layer matrix or changing ROCK hand/body collider layers.
+     * Fallout VR's native player character controller remains authoritative for
+     * every readable vanilla body. The narrow filter exists only to remove ROCK's
+     * generated hand/weapon/body/proxy colliders and unreadable transient body
+     * references before the native solver sees them.
      */
     struct PlayerCharacterControllerContactPolicyInput
     {
@@ -137,17 +161,6 @@ namespace rock::collision_layer_policy
         bool playerController = false;
         bool targetLayerKnown = false;
         std::uint32_t targetLayer = FO4_LAYER_UNIDENTIFIED;
-        bool targetIsMovableStatic = false;
-        /*
-         * Car fix (#219/#220). Clearing the CHARCONTROLLER<->CLUTTER_LARGE matrix
-         * column is only half the story: this per-contact hook independently
-         * suppresses every non-support layer, so a car would still be dropped
-         * here. Set when the target body resolves to a base form whose BOUND_DATA
-         * largest axis (x ref scale) exceeds the configured threshold — barrels,
-         * tyres and trash cans on the same layer 29 stay suppressed and therefore
-         * stay hand-reachable.
-         */
-        bool targetIsLargeBlockingObject = false;
     };
 
     struct PlayerCharacterControllerContactPolicyDecision
@@ -161,12 +174,13 @@ namespace rock::collision_layer_policy
         return isWorldSurfaceLayer(layer);
     }
 
-    inline constexpr bool isNativePlayerCollisionSuppressionLayer(std::uint32_t layer)
-    {
-        return !isRockOwnedReusableLayer(layer) &&
-               layer != FO4_LAYER_CHARCONTROLLER &&
-               isActorOrBipedLayer(layer);
-    }
+    /*
+     * Native BIPED bodies remain Fallout's projectile/spell/melee damage
+     * authority. A global per-body no-collide bit would suppress every one of
+     * those systems at once, so ROCK never owns such a rewrite. Object-contact
+     * noise is handled only by the narrow CHARCONTROLLER policy below.
+     */
+    inline constexpr bool kAllowGlobalNativePlayerBodySuppression = false;
 
     inline constexpr PlayerCharacterControllerContactPolicyDecision evaluatePlayerCharacterControllerContact(
         const PlayerCharacterControllerContactPolicyInput& input)
@@ -178,18 +192,24 @@ namespace rock::collision_layer_policy
             return PlayerCharacterControllerContactPolicyDecision{ .suppress = false, .reason = "nonPlayerController" };
         }
         if (!input.targetLayerKnown) {
-            return PlayerCharacterControllerContactPolicyDecision{ .suppress = false, .reason = "unknownTargetLayer" };
+            return PlayerCharacterControllerContactPolicyDecision{ .suppress = true, .reason = "unknownTargetLayerSuppressed" };
         }
-        if (input.targetIsLargeBlockingObject) {
-            return PlayerCharacterControllerContactPolicyDecision{ .suppress = false, .reason = "largeBlockingObject" };
+        if (isRockGeneratedCharacterControllerSuppressionLayer(input.targetLayer)) {
+            return PlayerCharacterControllerContactPolicyDecision{ .suppress = true, .reason = "rockGeneratedBody" };
         }
-        if (input.targetIsMovableStatic && isPlayerCharacterControllerSupportLayer(input.targetLayer)) {
-            return PlayerCharacterControllerContactPolicyDecision{ .suppress = true, .reason = "movableStaticSupportLayer" };
+        if (input.targetLayer == FO4_LAYER_BIPED_NO_CC) {
+            return PlayerCharacterControllerContactPolicyDecision{ .suppress = true, .reason = "heldNoCharacterController" };
+        }
+        if (isNativeDamageDeliveryLayer(input.targetLayer)) {
+            return PlayerCharacterControllerContactPolicyDecision{ .suppress = false, .reason = "nativeDamageAuthority" };
         }
         if (isPlayerCharacterControllerSupportLayer(input.targetLayer)) {
             return PlayerCharacterControllerContactPolicyDecision{ .suppress = false, .reason = "supportLayer" };
         }
-        return PlayerCharacterControllerContactPolicyDecision{ .suppress = true, .reason = "nonSupportLayer" };
+        if (input.targetLayer < FO4_LAYER_VANILLA_CONFIGURED_COUNT) {
+            return PlayerCharacterControllerContactPolicyDecision{ .suppress = false, .reason = "nativeBody" };
+        }
+        return PlayerCharacterControllerContactPolicyDecision{ .suppress = true, .reason = "nonNativeLayer" };
     }
 
     inline constexpr bool isQueryOnlyLayer(std::uint32_t layer)
@@ -309,13 +329,15 @@ namespace rock::collision_layer_policy
      * LARGE-OBJECT SPLIT (car fix, #219/#220).
      *
      * MANAGED != SUPPRESSED. The managed mask is the set of CHARCONTROLLER matrix
-     * COLUMNS this policy owns — it is what the apply loop iterates and what the
-     * drift watchdog guards, so it must stay CONSTANT regardless of configuration.
-     * The suppressed mask is the subset actually cleared. Dropping CLUTTER_LARGE
-     * from the managed mask (rather than from the suppressed mask) would mean the
-     * bit is never written back after a native re-init and the watchdog would stop
-     * guarding it, so bit 29 is instead ACTIVELY RE-SET to the captured original
-     * value whenever large objects must block the player.
+     * columns this policy owns, so it stays constant for the drift watchdog.
+     *
+     * A layer row cannot express object ownership or safely distinguish a generated
+     * collider from native clutter. Clearing a global CLUTTER/WEAPON pair also prevents
+     * Havok from generating the small-prop/car contact the native solver needs, so those
+     * pairs are restored to their captured native value. BIPED_NO_CC is different: a
+     * body explicitly opts into that native no-controller layer while held, so its one
+     * controller pair is disabled. The installed ProcessConstraints pre-filter remains
+     * the exact-body path for generated ROCK bodies.
      */
     inline constexpr std::uint64_t nativeCharacterControllerManagedLayerMask()
     {
@@ -324,17 +346,25 @@ namespace rock::collision_layer_policy
                layerBitOrZero(FO4_LAYER_DEBRIS_SMALL) |
                layerBitOrZero(FO4_LAYER_DEBRIS_LARGE) |
                layerBitOrZero(FO4_LAYER_SHELLCASING) |
-               layerBitOrZero(FO4_LAYER_CLUTTER_LARGE);
+               layerBitOrZero(FO4_LAYER_CLUTTER_LARGE) |
+               /*
+                * BIPED_NO_CC is the native per-body escape hatch used while an
+                * object is held.  Unlike CLUTTER/WEAPON, suppressing this pair
+                * cannot make an unleased world prop or car pass through the
+                * player: only bodies explicitly moved to layer 33 opt in.
+                *
+                * This matrix pair is also required for the constraint-only
+                * character-controller callback layout.  Those rows carry no
+                * target body ID, so the exact held-body pre-filter cannot
+                * identify and compact them safely.
+                */
+               layerBitOrZero(FO4_LAYER_BIPED_NO_CC);
     }
 
     inline constexpr std::uint64_t nativeCharacterControllerSuppressedLayerMask(bool blockLargeObjects)
     {
-        const std::uint64_t base = layerBitOrZero(FO4_LAYER_CLUTTER) |
-                                   layerBitOrZero(FO4_LAYER_WEAPON) |
-                                   layerBitOrZero(FO4_LAYER_DEBRIS_SMALL) |
-                                   layerBitOrZero(FO4_LAYER_DEBRIS_LARGE) |
-                                   layerBitOrZero(FO4_LAYER_SHELLCASING);
-        return blockLargeObjects ? base : (base | layerBitOrZero(FO4_LAYER_CLUTTER_LARGE));
+        (void)blockLargeObjects;
+        return layerBitOrZero(FO4_LAYER_BIPED_NO_CC);
     }
 
     inline constexpr bool isNativeCharacterControllerManagedLayer(std::uint32_t layer)
@@ -352,7 +382,15 @@ namespace rock::collision_layer_policy
         bool suppressDynamicObjects,
         bool blockLargeObjects = false)
     {
-        return suppressDynamicObjects ? (originalMask & ~nativeCharacterControllerSuppressedLayerMask(blockLargeObjects)) : originalMask;
+        (void)suppressDynamicObjects;
+        /*
+         * Layer 33 means "BIPED_NO_CC"; honour that contract independently of
+         * the optional generated-object contact filter setting.  Damage pairs
+         * (projectile/spell/melee versus BIPED_NO_CC) are untouched.
+         */
+        return originalMask &
+               ~nativeCharacterControllerSuppressedLayerMask(
+                   blockLargeObjects);
     }
 
     inline constexpr std::uint64_t buildRockHandExpectedMask(bool includeWeaponLayer, bool includeStaticWorld = true)
@@ -567,6 +605,22 @@ namespace rock::collision_layer_policy
         applyLayerExpectedMask(matrix, ROCK_LAYER_BODY, buildRockBodyExpectedMask(includeStaticWorld));
     }
 
+    inline constexpr std::uint64_t buildRockDynamicHandProxyExpectedMask()
+    {
+        std::uint64_t mask = 0;
+        for (std::uint32_t layer = 0; layer < FO4_LAYER_MATRIX_ADDRESSABLE_COUNT; ++layer) {
+            if (isWorldSurfaceLayer(layer)) {
+                mask = withLayer(mask, layer);
+            }
+        }
+        return mask;
+    }
+
+    inline void applyRockDynamicHandProxyLayerPolicy(std::uint64_t* matrix)
+    {
+        applyLayerExpectedMask(matrix, ROCK_LAYER_DYNAMIC_HAND_PROXY, buildRockDynamicHandProxyExpectedMask());
+    }
+
     inline void applyNativeCharacterControllerObjectSuppressionPolicy(
         std::uint64_t* matrix,
         bool suppressDynamicObjects,
@@ -578,10 +632,10 @@ namespace rock::collision_layer_policy
         }
 
         /*
-         * The loop walks the MANAGED mask, not the suppressed mask, so
-         * CLUTTER_LARGE is written on every pass: when blockLargeObjects is on it
-         * is actively re-set to the captured original value rather than merely
-         * left alone, which is what keeps the drift watchdog able to guard it.
+         * The loop walks the MANAGED mask. Native CLUTTER/WEAPON/car pairs are
+         * restored to their captured values; only the explicit BIPED_NO_CC opt-in
+         * pair is disabled. Keeping the parameters preserves configuration and
+         * ABI compatibility; generated-body suppression remains per contact.
          */
         const auto managedMask = nativeCharacterControllerManagedLayerMask();
         const auto expectedMask = nativeCharacterControllerExpectedMask(originalCharacterControllerMask, suppressDynamicObjects, blockLargeObjects);
@@ -612,5 +666,6 @@ namespace rock::collision_layer_policy
             buildRockWeaponExpectedMask(weaponBlocksProjectiles, weaponBlocksSpells, weaponStaticWorld, true));
         applyRockReloadLayerPolicy(matrix, weaponBlocksProjectiles, weaponBlocksSpells, handStaticWorld);
         applyRockBodyLayerPolicy(matrix, bodyStaticWorld);
+        applyRockDynamicHandProxyLayerPolicy(matrix);
     }
 }

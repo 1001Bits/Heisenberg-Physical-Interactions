@@ -2,11 +2,11 @@
 
 #include "physics-interaction/PhysicsLog.h"
 
+#include "rock_support/ResourceUtils.h"
+
 #include "RE/Bethesda/TESForms.h"
 #include "RE/Bethesda/TESDataHandler.h"
 
-#include <atomic>
-#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
@@ -21,14 +21,11 @@ namespace rock::saved_grab_offset
 {
     namespace
     {
-        constexpr auto kSavedGrabOffsetsPath = R"(Data\F4SE\Plugins\Heisenberg\SavedGrabOffsets)";
+        constexpr auto kSavedGrabOffsetsRelativePath = R"(\My Games\Fallout4VR\ROCK_Config\SavedGrabOffsets)";
 
         std::string resolveStoreDirectory()
         {
-            // Keep embedded ROCK's generated data under Heisenberg as well.
-            // This prevents any feature from recreating Documents\...\ROCK_Config
-            // after the standalone ROCK.ini was folded into Heisenberg_F4VR.ini.
-            return kSavedGrabOffsetsPath;
+            return rock::resources::getPathInDocuments(kSavedGrabOffsetsRelativePath);
         }
 
         // Plugin names become file-name components; keep letters, digits,
@@ -90,15 +87,7 @@ namespace rock::saved_grab_offset
                     if (ec) {
                         break;
                     }
-
-                    // Fresh per-entry code: reusing the directory_iterator's `ec` here meant one
-                    // entry's transient is_regular_file failure (e.g. a file deleted/permission-
-                    // denied mid-scan) left a stale error in `ec`, which the NEXT iteration's
-                    // `if (ec) break;` then misread as the directory_iterator itself having
-                    // failed - silently truncating the scan and dropping every saved grab offset
-                    // that happened to sort after the problem entry.
-                    std::error_code entryEc;
-                    if (!entry.is_regular_file(entryEc) || entry.path().extension() != ".json") {
+                    if (!entry.is_regular_file(ec) || entry.path().extension() != ".json") {
                         continue;
                     }
 
@@ -192,7 +181,7 @@ namespace rock::saved_grab_offset
                         _wake.wait(lock, [this]() { return _stop || !_queue.empty(); });
                         if (_queue.empty()) {
                             if (_stop) {
-                                break;
+                                return;
                             }
                             continue;
                         }
@@ -220,10 +209,6 @@ namespace rock::saved_grab_offset
                         ROCK_LOG_WARN(Config, "Saved grab offset: rename to '{}' failed: {}", write.path, ec.message());
                     }
                 }
-                // Set only after the loop's _mutex-guarded section has been released (never
-                // inside it) - shutdown() below treats observing this as true as its signal that
-                // _mutex is safe to reacquire. See shutdown() for why that ordering matters.
-                _writerExited.store(true, std::memory_order_release);
             }
 
             void shutdown()
@@ -236,44 +221,11 @@ namespace rock::saved_grab_offset
                     _stop = true;
                 }
                 _wake.notify_one();
-
                 if (_writer.joinable()) {
-                    // Bounded wait, not an unconditional join(): this destructor can run during
-                    // static teardown via ExitProcess(), which force-suspends every OTHER thread
-                    // in the process - including the writer, possibly mid-writerLoop() while it
-                    // still holds _mutex or a CRT file-handle lock - before our destructor runs
-                    // on the (sole surviving) main thread. An unconditional join(), or the old
-                    // unconditional re-lock of _mutex that followed it, would then wait forever
-                    // on a thread Windows will never resume, hanging the whole process on every
-                    // exit. Give the writer a short window to notice _stop and finish; if it
-                    // doesn't, abandon it instead of hanging - the process is exiting either way,
-                    // so a detached thread is harmless, and losing the last pending write beats
-                    // an unkillable hang.
-                    constexpr auto kShutdownWaitTimeout = std::chrono::milliseconds(500);
-                    constexpr auto kPollInterval = std::chrono::milliseconds(10);
-                    const auto deadline = std::chrono::steady_clock::now() + kShutdownWaitTimeout;
-                    while (!_writerExited.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
-                        std::this_thread::sleep_for(kPollInterval);
-                    }
-
-                    if (_writerExited.load(std::memory_order_acquire)) {
-                        // Confirmed the writer already released _mutex and is only moments from
-                        // returning out of the OS thread proc - safe to join (near-instant) and
-                        // safe to touch _mutex again below.
-                        _writer.join();
-                        std::lock_guard lock(_mutex);
-                        _writerStarted = false;
-                    } else {
-                        // Never reacquire _mutex on this path: it may be held by a thread that
-                        // will never run again. Leave _writerStarted set; this Store instance is
-                        // being destroyed regardless, and no other call site can observe the
-                        // stale flag afterward.
-                        _writer.detach();
-                    }
-                } else {
-                    std::lock_guard lock(_mutex);
-                    _writerStarted = false;
+                    _writer.join();
                 }
+                std::lock_guard lock(_mutex);
+                _writerStarted = false;
             }
 
             std::string _directory;
@@ -284,7 +236,6 @@ namespace rock::saved_grab_offset
             std::unordered_map<std::string, SavedGrabOffsetFile> _cache;
             bool _stop{ false };
             bool _writerStarted{ false };
-            std::atomic<bool> _writerExited{ false };
         };
 
         Store& instance()

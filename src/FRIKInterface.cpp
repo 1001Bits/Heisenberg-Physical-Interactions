@@ -163,6 +163,13 @@ namespace heisenberg
         return api && api->isOffHandGrippingWeapon && api->isOffHandGrippingWeapon();
     }
 
+    bool FRIKInterface::IsWristPipboyOpen() const
+    {
+        if (DEBUG_DISABLE_FRIK_API) return false;
+        auto* api = Api();
+        return api && api->isWristPipboyOpen && api->isWristPipboyOpen();
+    }
+
     const char* FRIKInterface::GetModVersion() const
     {
         auto* api = Api();

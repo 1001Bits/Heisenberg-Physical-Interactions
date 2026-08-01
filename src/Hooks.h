@@ -83,9 +83,16 @@ namespace heisenberg
         void InstallGripWeaponDrawHook();
 
         /**
-         * Install the ActorEquipManager::EquipObject detour hook.
+         * Install the ActorEquipManager::EquipObject detour hook (0xE6FEA0).
          * Intercepts consumable equips from Pipboy/Favorites menus
          * and redirects them to drop-to-hand when configured.
+         *
+         * SOLE OWNER of that entry: a function entry can hold exactly one raw detour, and this
+         * one is installed first (Hooks::Install runs before rock::HostLoad). The embedded ROCK
+         * engine's loose-grenade equip interception is therefore CALLED from HookEquipObject
+         * (rock::HostTryInterceptEquipObject) rather than hooked. Every exit from this function
+         * reports its outcome via rock::HostSetEquipObjectDetourInstalled, which is the gate on
+         * ROCK's pending-grenade-equip queue.
          */
         void InstallEquipObjectHook();
 
@@ -103,6 +110,14 @@ namespace heisenberg
         void InstallHUDRolloverHook();
         void InitRolloverStrings();
         void CheckHUDRolloverVtableIntegrity();
+
+        /**
+         * Recompute, on the main thread, whether each wand is pointing at a tracked activator
+         * or terminal. The rollover vtable hook runs on the rendering thread and reads the
+         * cached answer instead of walking ActivatorHandler's vectors, which the main thread
+         * clears and rebuilds on every cell scan.
+         */
+        void RefreshWandActivatorTargets();
 
         /**
          * Apply or revert binary patches on ShowActivateButton (0xab7610)

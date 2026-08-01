@@ -3,7 +3,12 @@
 
 #include <SimpleIni.h>
 #include <chrono>
+#include <cerrno>
+#include <cstdlib>
 #include <fstream>
+#include <limits>
+#include <mutex>
+#include <string_view>
 #include <vector>
 #include <string>
 #include <utility>
@@ -17,6 +22,158 @@ namespace heisenberg
     // Conversion factor: 1 game unit = 1.4 cm, so 1 cm = 0.714 game units
     static constexpr float CM_TO_GAME_UNITS = 1.0f / 1.4f;  // ≈ 0.714
     static constexpr float GAME_UNITS_TO_CM = 1.4f;
+
+    namespace
+    {
+        struct NumericSettingLocation
+        {
+            std::string section;
+            std::string key;
+        };
+
+        constexpr std::array<std::string_view, 23> kHeisenbergIniSections{
+            "Selection", "SeatedMode", "ObjectPickup", "ItemPositioning",
+            "DropToHand", "Impact", "ItemStorage", "Consumables", "Equipping",
+            "ROCK", "Throw", "Haptics", "Timing", "Cooking", "SmartGrab",
+            "Activators", "Pipboy", "Water", "Pickpocket", "Debug",
+            "RockIntegration", "RockEngine", "VRInput"
+        };
+
+        std::mutex g_numericSettingMutex;
+
+        bool ResolveNumericSetting(
+            const CSimpleIniA& ini,
+            const char* rawName,
+            NumericSettingLocation& result)
+        {
+            if (!rawName || !*rawName) {
+                return false;
+            }
+
+            const std::string_view name(rawName);
+            const auto separator = name.find('.');
+            if (separator != std::string_view::npos) {
+                if (separator == 0 || separator + 1 >= name.size()) {
+                    return false;
+                }
+
+                NumericSettingLocation qualified{
+                    std::string(name.substr(0, separator)),
+                    std::string(name.substr(separator + 1))
+                };
+                if (!ini.GetValue(qualified.section.c_str(), qualified.key.c_str(), nullptr)) {
+                    return false;
+                }
+                result = std::move(qualified);
+                return true;
+            }
+
+            bool found = false;
+            for (const auto section : kHeisenbergIniSections) {
+                const std::string sectionName(section);
+                if (!ini.GetValue(sectionName.c_str(), rawName, nullptr)) {
+                    continue;
+                }
+                // An unqualified duplicate is ambiguous by definition. Require
+                // callers to use Section.key instead of silently editing one.
+                if (found) {
+                    return false;
+                }
+                result = { sectionName, rawName };
+                found = true;
+            }
+            return found;
+        }
+
+        bool DecodeNumericValue(const char* textValue, double& value)
+        {
+            if (!textValue) {
+                return false;
+            }
+            if (_stricmp(textValue, "true") == 0) {
+                value = 1.0;
+                return true;
+            }
+            if (_stricmp(textValue, "false") == 0) {
+                value = 0.0;
+                return true;
+            }
+
+            errno = 0;
+            char* end = nullptr;
+            const double parsed = std::strtod(textValue, &end);
+            while (end && *end == ' ') {
+                ++end;
+            }
+            if (errno == ERANGE || end == textValue || (end && *end != '\0') ||
+                !std::isfinite(parsed)) {
+                return false;
+            }
+            value = parsed;
+            return true;
+        }
+
+        bool AssignNumericValue(
+            CSimpleIniA& ini,
+            const NumericSettingLocation& setting,
+            double value)
+        {
+            if (!std::isfinite(value) || setting.key.empty()) {
+                return false;
+            }
+
+            const char kind = setting.key.front();
+            SI_Error result = SI_FAIL;
+            switch (kind) {
+            case 'b':
+                if (value != 0.0 && value != 1.0) {
+                    return false;
+                }
+                result = ini.SetBoolValue(
+                    setting.section.c_str(), setting.key.c_str(), value != 0.0);
+                break;
+            case 'i': {
+                const double integral = std::trunc(value);
+                if (integral != value ||
+                    integral < static_cast<double>((std::numeric_limits<long>::min)()) ||
+                    integral > static_cast<double>((std::numeric_limits<long>::max)())) {
+                    return false;
+                }
+                result = ini.SetLongValue(
+                    setting.section.c_str(),
+                    setting.key.c_str(),
+                    static_cast<long>(integral));
+                break;
+            }
+            case 'f':
+                result = ini.SetDoubleValue(
+                    setting.section.c_str(), setting.key.c_str(), value);
+                break;
+            default:
+                return false;
+            }
+            return result >= 0;
+        }
+
+        bool SaveIniAtomically(CSimpleIniA& ini, const char* path)
+        {
+            const std::string temporaryPath = std::string(path) + ".tmp";
+            if (ini.SaveFile(temporaryPath.c_str()) < 0) {
+                spdlog::error("[Config] Failed writing temporary settings file {}", temporaryPath);
+                return false;
+            }
+            if (!MoveFileExA(
+                    temporaryPath.c_str(),
+                    path,
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                const auto error = GetLastError();
+                DeleteFileA(temporaryPath.c_str());
+                spdlog::error("[Config] Failed replacing {} (Win32 error {})", path, error);
+                return false;
+            }
+            return true;
+        }
+    }
     
     // =========================================================================
     // EMBEDDED DEFAULT CONFIG
@@ -213,7 +370,7 @@ bEnableTerminalOnWorldScreen = false
 ; Holotape deck push close radius
 ; Distance at which your hand starts pushing the holotape deck closed (game units)
 ; Higher values = easier to close the deck by hand
-fTapeDeckPushCloseRadius = 3.0
+fTapeDeckPushCloseRadius = 1.2
 
 ; Hide action prompts ([A] Take, [B] Transfer) from wand rollover HUD
 ; Item names still show. Binary patches ShowActivateButton/ShowSecondaryButton.
@@ -223,8 +380,12 @@ bHideWandHUD = true
 bHideAllWandHUD = false
 
 [Debug]
+; Temporarily enable debug-level startup/config/hook diagnostics before iLogLevel
+; is applied. This does not change the steady-state log level below.
+bVerboseLaunch = false
+
 ; Log level: 0=trace, 1=debug, 2=info, 3=warn, 4=error
-; Default: 4 (error) - release default, keeps the log quiet. Use 2 (info) or 1 (debug) to diagnose.
+; Default: 4 (error) - release default. Use 2 (info) or 1 (debug) to diagnose.
 iLogLevel = 4
 )";
 
@@ -430,12 +591,40 @@ iLogLevel = 4
         // clearest, most unambiguous "user wants this off" signal an external tool can produce,
         // and it must never be silently defeated by a stale sibling key. Self-heals: the next
         // Config::Save() persists iDropToHandMode=0, so the two keys agree from then on.
-        const bool legacyDropToHandExplicitlyOff = ini.GetValue("DropToHand", "bEnableDropToHand") &&
-            !ini.GetBoolValue("DropToHand", "bEnableDropToHand", true);
+        //
+        // SYMMETRY FIX: the override used to be one-directional, which stranded the ON case.
+        // Toggling the MCM switch OFF forced mode 0, the "self-heal" then persisted
+        // iDropToHandMode=0 to Heisenberg_F4VR.ini, and toggling the switch back ON only
+        // cleared the override - control fell through to the iDropToHandMode branch, which
+        // read back the persisted 0. The menu showed the feature ON while dropped items kept
+        // falling to the floor, and there was no way out in-game because iDropToHandMode is
+        // not an MCM control (config.json exposes only bEnableDropToHand:DropToHand) and
+        // BuildIni deliberately never writes bEnableDropToHand. An explicit true is now just
+        // as authoritative as an explicit false: it promotes a stranded 0 back to mode 1
+        // while still honouring any non-zero mode the user picked by hand.
+        // Presence must come from a USER-authored layer. The merged `ini` always contains
+        // kDefaultConfig's bEnableDropToHand=true, so probing it makes an explicitly authored
+        // iDropToHandMode=0 look as if the user also authored legacy=true and promotes 0 back
+        // to 1. MCM is the highest-priority user layer, matching the merge order above.
+        const CSimpleIniA* legacyDropToHandSource = nullptr;
+        if (mcmIni.GetValue("DropToHand", "bEnableDropToHand", nullptr)) {
+            legacyDropToHandSource = &mcmIni;
+        } else if (externalIni.GetValue("DropToHand", "bEnableDropToHand", nullptr)) {
+            legacyDropToHandSource = &externalIni;
+        }
+        const bool legacyDropToHandPresent = legacyDropToHandSource != nullptr;
+        const bool legacyDropToHandValue = legacyDropToHandSource
+            ? legacyDropToHandSource->GetBoolValue("DropToHand", "bEnableDropToHand", true)
+            : true;
+        const bool legacyDropToHandExplicitlyOff = legacyDropToHandPresent && !legacyDropToHandValue;
+        const bool legacyDropToHandExplicitlyOn = legacyDropToHandPresent && legacyDropToHandValue;
         if (legacyDropToHandExplicitlyOff) {
             dropToHandMode = 0;
         } else if (ini.GetValue("DropToHand", "iDropToHandMode")) {
             dropToHandMode = static_cast<int>(ini.GetLongValue("DropToHand", "iDropToHandMode", dropToHandMode));
+            if (legacyDropToHandExplicitlyOn && dropToHandMode == 0) {
+                dropToHandMode = 1;
+            }
         } else {
             dropToHandMode = ini.GetBoolValue("DropToHand", "bEnableDropToHand", true) ? 1 : 0;
         }
@@ -491,13 +680,19 @@ iLogLevel = 4
         // Hand collision
         enableHandCollision = ini.GetBoolValue("ObjectPickup", "bEnableHandCollision", enableHandCollision);
 
-        // [RockIntegration] — two-scenario cleanup: only CollisionLayerPolicy (header-only),
-        // HavokTimingFixPolicy (keys read further below) and the fHandColliderRadiusPadding
-        // embed-engine bridge survive from the old hand-ported subsystem set.
+        // These two engine-tuning values are diagnostic controls, not supported
+        // release settings. Keep them configurable in _DEBUG builds while making a
+        // Release immune to stale external/MCM overrides from older packages.
+#if defined(_DEBUG)
         handColliderRadiusPadding        = static_cast<float>(ini.GetDoubleValue("RockIntegration", "fHandColliderRadiusPadding", handColliderRadiusPadding));
+        offHandSteeringAuthority         = static_cast<float>(ini.GetDoubleValue("RockIntegration", "fOffHandSteeringAuthority", offHandSteeringAuthority));
+#else
+        handColliderRadiusPadding = Config::kHandColliderRadiusPaddingDefault;
+        offHandSteeringAuthority = Config::kOffHandSteeringAuthorityDefault;
+#endif
         rockHandBumpGuard                = ini.GetBoolValue("RockIntegration", "bHandBumpGuard",                rockHandBumpGuard);
-        spdlog::info("[Config] RockIntegration: BumpGuard={} colliderPadding={:.2f}",
-                     rockHandBumpGuard, handColliderRadiusPadding);
+        spdlog::info("[Config] RockIntegration: BumpGuard={} colliderPadding={:.2f} offHandAuthority={:.2f}",
+                     rockHandBumpGuard, handColliderRadiusPadding, offHandSteeringAuthority);
         handCollisionRadius = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fHandCollisionRadius", handCollisionRadius));
         handContactSlop = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fHandContactSlop", handContactSlop));
         handPushVelocityThreshold = static_cast<float>(ini.GetDoubleValue("ObjectPickup", "fHandPushVelocityThreshold", handPushVelocityThreshold));
@@ -528,6 +723,7 @@ iLogLevel = 4
         mouthVelocityThreshold = static_cast<float>(ini.GetDoubleValue("Consumables", "fMouthVelocityThreshold", mouthVelocityThreshold));
         mouthDropHapticStrength = static_cast<float>(ini.GetDoubleValue("Consumables", "fMouthHapticStrength", mouthDropHapticStrength));
         blockConsumptionInPA = ini.GetBoolValue("Consumables", "bBlockConsumptionInPA", blockConsumptionInPA);
+        allowWeaponGrabInPowerArmor = ini.GetBoolValue("Grab", "bAllowWeaponGrabInPowerArmor", allowWeaponGrabInPowerArmor);
         consumableToHand = ini.GetBoolValue("Consumables", "bConsumableToHand", consumableToHand);
         holotapeToHand = ini.GetBoolValue("Consumables", "bHolotapeToHand", holotapeToHand);
         showConsumeMessages = ini.GetBoolValue("Consumables", "bShowConsumeMessages", showConsumeMessages);
@@ -681,6 +877,7 @@ iLogLevel = 4
         // against the finger's physics capsule, and FO4 clutter hulls are inset), which padding is
         // exactly the right compensator for.
         clampFloat(handColliderRadiusPadding, 0.0f, 3.0f, "fHandColliderRadiusPadding");
+        clampFloat(offHandSteeringAuthority, 0.35f, 1.0f, "fOffHandSteeringAuthority");
         clampFloat(maxGrabDistance, 0.0f, 500.0f, "fMaxGrabDistance");
         clampFloat(proximityRadius, 0.0f, 500.0f, "fProximityRadius");
         clampFloat(nearCastRadius, 0.0f, 500.0f, "fNearCastRadius");
@@ -797,6 +994,82 @@ iLogLevel = 4
         if (rc < 0) {
             spdlog::error("Failed to save config file");
         }
+    }
+
+    bool Config::GetNumericSetting(const char* name, double& out) const
+    {
+        std::lock_guard lock(g_numericSettingMutex);
+
+        CSimpleIniA effective;
+        effective.SetUnicode();
+        BuildIni(&effective);
+
+        NumericSettingLocation setting;
+        if (!ResolveNumericSetting(effective, name, setting)) {
+            return false;
+        }
+        return DecodeNumericValue(
+            effective.GetValue(setting.section.c_str(), setting.key.c_str(), nullptr),
+            out);
+    }
+
+    bool Config::SetNumericSetting(const char* name, double value)
+    {
+        std::lock_guard lock(g_numericSettingMutex);
+
+        // Resolve against a serialization of the live effective state. This
+        // both constrains edits to Heisenberg-owned numeric keys and reports
+        // values in the same units the INI exposes.
+        CSimpleIniA effective;
+        effective.SetUnicode();
+        BuildIni(&effective);
+
+        NumericSettingLocation setting;
+        if (!ResolveNumericSetting(effective, name, setting)) {
+            return false;
+        }
+
+        // MCM settings overlay the plugin INI during Load(). If the key exists
+        // there, edit that authoritative value; otherwise edit the plugin INI.
+        CSimpleIniA mcm;
+        mcm.SetUnicode();
+        const bool hasMcmOverlay =
+            mcm.LoadFile(kMCMSettingsPath) >= 0 &&
+            mcm.GetValue(setting.section.c_str(), setting.key.c_str(), nullptr);
+
+        if (hasMcmOverlay) {
+            if (setting.key.front() == 'b') {
+                if ((value != 0.0 && value != 1.0) ||
+                    mcm.SetValue(
+                        setting.section.c_str(),
+                        setting.key.c_str(),
+                        value != 0.0 ? "1" : "0") < 0) {
+                    return false;
+                }
+            } else if (!AssignNumericValue(mcm, setting, value)) {
+                return false;
+            }
+            const std::string marker = setting.section + "." + setting.key;
+            mcm.Delete("__HeisenbergSeededDefaults", marker.c_str());
+            if (!SaveIniAtomically(mcm, kMCMSettingsPath)) {
+                return false;
+            }
+        } else {
+            CSimpleIniA primary;
+            primary.SetUnicode();
+            if (primary.LoadFile(kConfigPath) < 0) {
+                // Preserve all current Heisenberg defaults when creating a
+                // previously absent file.
+                BuildIni(&primary);
+            }
+            if (!AssignNumericValue(primary, setting, value) ||
+                !SaveIniAtomically(primary, kConfigPath)) {
+                return false;
+            }
+        }
+
+        Load();
+        return true;
     }
 
     void Config::BuildIni(void* iniPtr) const
@@ -935,6 +1208,7 @@ iLogLevel = 4
         ini.SetDoubleValue("Consumables", "fMouthVelocityThreshold", mouthVelocityThreshold, "; m/s - must be moving slower than this to consume");
         ini.SetDoubleValue("Consumables", "fMouthHapticStrength", mouthDropHapticStrength, "; Haptic strength when consuming at mouth (0.0-1.0)");
         ini.SetBoolValue("Consumables", "bBlockConsumptionInPA", blockConsumptionInPA, "; Block manual consumption/chem use while in Power Armor");
+        ini.SetBoolValue("Grab", "bAllowWeaponGrabInPowerArmor", allowWeaponGrabInPowerArmor, "; Allow grabbing weapons while in Power Armor (false restores the legacy block)");
         ini.SetBoolValue("Consumables", "bShowConsumeMessages", showConsumeMessages, "; Show HUD message when consuming items");
         ini.SetBoolValue("Consumables", "bConsumableToHand", consumableToHand, "; Redirect Pipboy consume to drop-to-hand");
         ini.SetBoolValue("Consumables", "bHolotapeToHand", holotapeToHand, "; Redirect Pipboy holotape play to drop-to-hand");
@@ -1050,13 +1324,12 @@ iLogLevel = 4
         ini.SetBoolValue("Debug", "bDebugLogging", debugLogging, "; Enable verbose debug logging (PERFORMANCE IMPACT!)");
         ini.SetLongValue("Debug", "iLogLevel", logLevel, "; 0=trace, 1=debug, 2=info, 3=warn, 4=error");
 
-        // [RockIntegration] — surviving keys only: the hand-ported subsystems were removed in the
-        // two-scenario cleanup; what remains is CollisionLayerPolicy (header-only, no key),
-        // HavokTimingFixPolicy (bHavokTimingFix / fHavokTimingMinFrameRate / iHavokTimingMaxSubsteps)
-        // and fHandColliderRadiusPadding (bridged into the embedded ROCK engine via
-        // rock::HostSetHandColliderRadiusPadding). Keys READ in Load() MUST also be serialized here
-        // or Save() (which overwrites the INI) would silently drop the user's settings.
+        // Diagnostic-only ROCK tuning remains round-trippable in _DEBUG builds.
+        // Release neither exposes nor serializes it, matching the fixed runtime values.
+#if defined(_DEBUG)
         ini.SetDoubleValue("RockIntegration", "fHandColliderRadiusPadding",    handColliderRadiusPadding,        "; Padding (game units) added to every hand/arm collider radius — reduces resting-object clip-through, 0=unchanged");
+        ini.SetDoubleValue("RockIntegration", "fOffHandSteeringAuthority",     offHandSteeringAuthority,         "; Minimum support-hand steering authority: 0.35=current balanced behavior, 1.0=full authority (safety rate limit still applies)");
+#endif
         ini.SetBoolValue  ("RockIntegration", "bHandBumpGuard",                rockHandBumpGuard,                "; Char-proxy bump CTD guard (auto-armed when the embedded engine is hosted)");
         ini.SetBoolValue  ("RockIntegration", "bHavokTimingFix",               havokTimingFix,                   "; Override physics substeps to hold a min physics rate on long frames");
         ini.SetDoubleValue("RockIntegration", "fHavokTimingMinFrameRate",      havokTimingMinFrameRate,          "; Min physics frame rate, clamped [30,240] (default 70)");
@@ -1093,9 +1366,9 @@ iLogLevel = 4
     }
 
     // Seed the MCM settings file with field defaults for any MCM-exposed control it lacks, so the
-    // menu and engine agree. Runs once per session. Without it, a control absent from the MCM file
-    // falls through to the (possibly stale) external INI — so a toggle can read OFF in the menu yet
-    // behave ON until the user toggles it ON then OFF to force an explicit MCM entry.
+    // menu and engine agree. Machine-seeded values are tracked separately from user choices:
+    // when a later build changes a compiled default, an untouched seed migrates with it, while a
+    // value changed by the player loses its seed marker and remains authoritative.
     void Config::SeedMCMDefaultsIfMissing()
     {
         static bool s_seeded = false;
@@ -1140,22 +1413,133 @@ iLogLevel = 4
         mcm.SetUnicode();
         mcm.LoadFile(kMCMSettingsPath);  // ok if absent
 
-        int wrote = 0;
+        constexpr const char* kSeedMetadataSection = "__HeisenbergSeededDefaults";
+        int seeded = 0;
+        int migrated = 0;
+        int released = 0;
+        bool changed = false;
+
+        // One-time migration for the old seeder's unmistakable paired fingerprint:
+        // natural grab OFF plus 14 cm (the historical 10 cm default multiplied by
+        // GAME_UNITS_TO_CM a second time). Requiring both values, and no provenance
+        // marker, avoids treating an arbitrary single user choice as generated state.
+        // Once migrated, the normal metadata path below owns future default changes.
+        const std::string naturalGrabMarker =
+            "ObjectPickup.bEnableNaturalGrab";
+        const std::string naturalDistanceMarker =
+            "ObjectPickup.fNaturalGrabDistance";
+        const char* legacyNaturalGrab =
+            mcm.GetValue("ObjectPickup", "bEnableNaturalGrab", nullptr);
+        const char* legacyNaturalDistance =
+            mcm.GetValue("ObjectPickup", "fNaturalGrabDistance", nullptr);
+        const bool legacyFingerprintUnmarked =
+            legacyNaturalGrab &&
+            legacyNaturalDistance &&
+            !mcm.GetBoolValue("ObjectPickup", "bEnableNaturalGrab", true) &&
+            std::abs(
+                mcm.GetDoubleValue(
+                    "ObjectPickup",
+                    "fNaturalGrabDistance",
+                    0.0) -
+                14.0) < 0.0001 &&
+            !mcm.GetValue(
+                kSeedMetadataSection,
+                naturalGrabMarker.c_str(),
+                nullptr) &&
+            !mcm.GetValue(
+                kSeedMetadataSection,
+                naturalDistanceMarker.c_str(),
+                nullptr);
+        if (legacyFingerprintUnmarked) {
+            std::string naturalGrabDefault =
+                defIni.GetValue(
+                    "ObjectPickup",
+                    "bEnableNaturalGrab",
+                    "true");
+            if (naturalGrabDefault == "true") naturalGrabDefault = "1";
+            else if (naturalGrabDefault == "false") naturalGrabDefault = "0";
+            const std::string naturalDistanceDefault =
+                defIni.GetValue(
+                    "ObjectPickup",
+                    "fNaturalGrabDistance",
+                    "5.000000");
+
+            mcm.SetValue(
+                "ObjectPickup",
+                "bEnableNaturalGrab",
+                naturalGrabDefault.c_str());
+            mcm.SetValue(
+                "ObjectPickup",
+                "fNaturalGrabDistance",
+                naturalDistanceDefault.c_str());
+            mcm.SetValue(
+                kSeedMetadataSection,
+                naturalGrabMarker.c_str(),
+                naturalGrabDefault.c_str());
+            mcm.SetValue(
+                kSeedMetadataSection,
+                naturalDistanceMarker.c_str(),
+                naturalDistanceDefault.c_str());
+            migrated += 2;
+            changed = true;
+            spdlog::info(
+                "[Config] Migrated legacy generated natural-grab fingerprint "
+                "(enabled=0, distance=14) to this build's defaults");
+        }
+
         for (const auto& [section, key] : mcmKeys) {
-            if (mcm.GetValue(section.c_str(), key.c_str(), nullptr) != nullptr) continue;  // user already set it
             const char* defVal = defIni.GetValue(section.c_str(), key.c_str(), nullptr);
             if (!defVal) continue;  // control id with no matching serialized setting
+
             // MCM stores bools as 1/0, not true/false (SetBoolValue's output) — convert so the
             // menu (and F4SE's GetModSettingBool) reads the seeded default correctly.
             std::string v = defVal;
             if (v == "true") v = "1";
             else if (v == "false") v = "0";
-            mcm.SetValue(section.c_str(), key.c_str(), v.c_str());
-            ++wrote;
+
+            const std::string markerKey = section + "." + key;
+            const char* currentValue =
+                mcm.GetValue(section.c_str(), key.c_str(), nullptr);
+            const char* priorSeed =
+                mcm.GetValue(kSeedMetadataSection, markerKey.c_str(), nullptr);
+
+            if (!currentValue) {
+                mcm.SetValue(section.c_str(), key.c_str(), v.c_str());
+                mcm.SetValue(kSeedMetadataSection, markerKey.c_str(), v.c_str());
+                ++seeded;
+                changed = true;
+                continue;
+            }
+
+            if (!priorSeed) {
+                continue;  // pre-existing/unmarked value belongs to the player
+            }
+
+            if (std::string_view(currentValue) != std::string_view(priorSeed)) {
+                // MCM changed the value since we seeded it. Stop tracking it so future
+                // compiled-default changes never overwrite the player's choice.
+                mcm.Delete(kSeedMetadataSection, markerKey.c_str());
+                ++released;
+                changed = true;
+                continue;
+            }
+
+            if (std::string_view(currentValue) != std::string_view(v)) {
+                mcm.SetValue(section.c_str(), key.c_str(), v.c_str());
+                mcm.SetValue(kSeedMetadataSection, markerKey.c_str(), v.c_str());
+                ++migrated;
+                changed = true;
+            }
         }
-        if (wrote > 0) {
+
+        if (changed) {
             mcm.SaveFile(kMCMSettingsPath);
-            spdlog::info("[Config] Seeded {} missing MCM default(s) into {}", wrote, kMCMSettingsPath);
+            spdlog::info(
+                "[Config] MCM defaults reconciled at {}: seeded={}, migrated={}, userOwned={}",
+                kMCMSettingsPath,
+                seeded,
+                migrated,
+                released);
         }
     }
 

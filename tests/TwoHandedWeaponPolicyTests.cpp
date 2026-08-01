@@ -1,9 +1,13 @@
 #include "physics-interaction/weapon/TwoHandedWeaponPolicy.h"
+#include "physics-interaction/weapon/NativeScopeReentryPolicy.h"
+#include "physics-interaction/weapon/WeaponInteractionProbeFramePolicy.h"
+#include "physics-interaction/contact/SoftContactPolicy.h"
 
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <string_view>
 
 namespace
 {
@@ -52,6 +56,291 @@ namespace
 int main()
 {
     using namespace rock::two_handed_weapon_policy;
+
+    {
+        using rock::weapon_interaction_probe_frame_policy::Source;
+        using rock::weapon_interaction_probe_frame_policy::select;
+
+        Require(
+            select(false, false) == Source::RootFlattened,
+            "ordinary weapon acquisition must preserve the root/proxy hand "
+            "path when no scope-safe frame exists");
+        Require(
+            select(false, true) == Source::RootFlattened,
+            "a cached scope-safe frame must not replace ordinary non-scope "
+            "weapon acquisition");
+        Require(
+            select(true, true) == Source::ScopeSafe,
+            "ScopeMenu weapon acquisition must use the prepared "
+            "driver-reconstructed hand frame");
+        Require(
+            select(true, false) == Source::Unavailable,
+            "ScopeMenu weapon acquisition must defer instead of probing from "
+            "hFRIK's collapsed root");
+    }
+
+    {
+        using rock::native_scope_reentry_policy::filter;
+        using rock::native_scope_reentry_policy::
+            shouldExitForSupportGripTransition;
+
+        Require(
+            !shouldExitForSupportGripTransition(false, true),
+            "acquiring an offhand support grip while scoped must preserve "
+            "ScopeMenu");
+        Require(
+            !shouldExitForSupportGripTransition(true, true),
+            "holding an established support grip must not close ScopeMenu");
+        Require(
+            shouldExitForSupportGripTransition(true, false),
+            "releasing an established offhand support grip must close "
+            "ScopeMenu");
+        Require(
+            !shouldExitForSupportGripTransition(false, false),
+            "an idle support hand must not issue repeated scope exits");
+
+        const auto unblockedInside = filter(false, true);
+        Require(
+            unblockedInside.nativeScopeRequested &&
+                unblockedInside.bypassNativeApproachFade &&
+                !unblockedInside.blockRemainsArmed &&
+                !unblockedInside.rearmedThisFrame,
+            "normal native scope entry must pass through while unblocked");
+
+        const auto blockedInside = filter(true, true);
+        Require(
+            !blockedInside.nativeScopeRequested &&
+                blockedInside.bypassNativeApproachFade &&
+                blockedInside.blockRemainsArmed &&
+                !blockedInside.rearmedThisFrame,
+            "an armed scope close must consume repeated inside-cone entry "
+            "without retaining the native approach blackout");
+
+        const auto firstOutside = filter(true, false);
+        Require(
+            !firstOutside.nativeScopeRequested &&
+                !firstOutside.bypassNativeApproachFade &&
+                !firstOutside.blockRemainsArmed &&
+                firstOutside.rearmedThisFrame,
+            "the first outside-cone sample must rearm without activating");
+
+        const auto laterReentry = filter(
+            firstOutside.blockRemainsArmed,
+            true);
+        Require(
+            laterReentry.nativeScopeRequested &&
+                laterReentry.bypassNativeApproachFade,
+            "scope activation must resume only after leave then re-enter");
+    }
+
+    {
+        using rock::soft_contact_policy::worldContactCorrectionLimit;
+        Require(
+            Near(
+                worldContactCorrectionLimit(
+                    false,
+                    false,
+                    37.0f,
+                    18.0f),
+                18.0f),
+            "fresh wall evidence must retain the acquisition safety cap");
+        Require(
+            Near(
+                worldContactCorrectionLimit(
+                    true,
+                    true,
+                    37.0f,
+                    18.0f),
+                18.0f),
+            "the independent weapon channel must retain its bounded correction");
+        Require(
+            Near(
+                worldContactCorrectionLimit(
+                    true,
+                    false,
+                    37.0f,
+                    18.0f),
+                37.0f),
+            "a validated hand stop plane must not let locomotion ratchet through at 18 gu");
+        Require(
+            Near(
+                worldContactCorrectionLimit(
+                    true,
+                    false,
+                    9.0f,
+                    18.0f),
+                18.0f),
+            "ordinary cached hand contact must preserve the configured acquisition envelope");
+    }
+
+    {
+        using rock::soft_contact_policy::
+            resolveWorldContactChannels;
+        const auto releaseChannels =
+            resolveWorldContactChannels(
+                true,
+                false,
+                true,
+                true,
+                true,
+                false);
+        Require(
+            !releaseChannels.handPushback,
+            "the release gate must disable free-hand wall pushback");
+        Require(
+            releaseChannels.weaponWallCollision,
+            "disabling hand pushback must preserve equipped-weapon wall collision");
+
+        const auto weaponDisabled =
+            resolveWorldContactChannels(
+                true,
+                false,
+                true,
+                false,
+                true,
+                false);
+        Require(
+            !weaponDisabled.anyEnabled(),
+            "weapon wall collision must honor its static-world setting when hand pushback is off");
+
+        const auto menuBlocked =
+            resolveWorldContactChannels(
+                true,
+                true,
+                true,
+                true,
+                true,
+                true);
+        Require(
+            !menuBlocked.anyEnabled(),
+            "a blocking menu must suppress both world-contact channels");
+    }
+
+    {
+        Require(
+            !canUseHandOnlyWeaponWorldContactTransport(
+                false,
+                true,
+                false),
+            "FRIK API v3 must translate the weapon explicitly because the host shim only moves the skinned arm");
+        Require(
+            canUseHandOnlyWeaponWorldContactTransport(
+                false,
+                true,
+                true),
+            "native FRIK visual authority may carry an unowned child weapon with the firing hand");
+        Require(
+            !canUseHandOnlyWeaponWorldContactTransport(
+                true,
+                true,
+                true),
+            "a ROCK-owned weapon always requires explicit weapon transport");
+        Require(
+            !canUseHandOnlyWeaponWorldContactTransport(
+                false,
+                false,
+                true),
+            "hand-only transport requires a valid firing-hand world transform");
+    }
+
+    {
+        Require(
+            shouldPublishPrimaryHandAuthority(false, false),
+            "legacy FRIK must pin the right firing hand to the solved trigger grip");
+        Require(
+            shouldPublishPrimaryHandAuthority(false, true),
+            "legacy FRIK must preserve left-firing hand authority");
+        Require(
+            shouldPublishPrimaryHandAuthority(true, false),
+            "native FRIK visual authority must preserve right-firing hand publication");
+        Require(
+            shouldPublishPrimaryHandAuthority(true, true),
+            "native FRIK visual authority must preserve left-firing hand publication");
+        Require(
+            isPrimaryGripHandAuthorityTag(
+                kPrimaryGripHandAuthorityTag),
+            "the legacy host must recognize the canonical primary-grip writer");
+        Require(
+            !isPrimaryGripHandAuthorityTag(
+                kSupportGripHandAuthorityTag),
+            "the primary same-frame pin must not capture support-grip writers");
+    }
+
+    {
+        Require(
+            usesRigidSupportGripHandAuthority(true, true, false),
+            "a Gripping support hand whose solver owns the weapon must use rigid authority");
+        Require(
+            std::string_view(selectSupportGripHandAuthorityTag(
+                true,
+                true,
+                false)) == kRigidSupportGripHandAuthorityTag,
+            "the full two-hand solver must publish the legacy-FRIK rigid tag");
+
+        Require(
+            !usesRigidSupportGripHandAuthority(true, false, false),
+            "visual-only support must retain free-hand safety");
+        Require(
+            !usesRigidSupportGripHandAuthority(true, true, true),
+            "AttachOnly support must retain free-hand safety");
+        Require(
+            !usesRigidSupportGripHandAuthority(false, true, false),
+            "part-carry and non-Gripping states must retain free-hand safety");
+        Require(
+            std::string_view(selectSupportGripHandAuthorityTag(
+                false,
+                true,
+                false)) == kSupportGripHandAuthorityTag,
+            "part-carry must publish the ordinary support tag");
+
+        // REACHABILITY INVARIANT (Jul 31, replaces the inverted assertion this
+        // slot used to hold). The old rule — "a full-authority sidearm must
+        // retain its contacted support-hand weld" — became unsatisfiable once
+        // sidearms started entering the full two-handed solver: no weapon class
+        // could pass both terms, so the reseat silently became dead code and a
+        // pistol's off-hand stayed welded to whatever mesh triangle it first
+        // touched (measured 19.1gu out), forcing the rendered arm ~40% past
+        // anatomy — the reported "offhand stretches unnaturally long".
+        //
+        // The reseat only rewrites the RENDERED hand (handWeaponLocal) and
+        // clears the source frames; the solver keeps steering from the captured
+        // contacted point (gripLocal, which the reseat never touches — verified
+        // via resolvePartGripWorld -> resolveCurrentSupportAttachmentRoot).
+        // Presentation and steering are therefore genuinely separable, and the
+        // reseat MUST stay reachable in the full-solver case.
+        Require(
+            shouldApplySidearmPresentationReseat(
+                true,
+                true,
+                true,
+                false,
+                true),
+            "the sidearm presentation reseat must stay reachable while the support grip owns the weapon");
+        Require(
+            shouldApplySidearmPresentationReseat(
+                true,
+                true,
+                false,
+                false,
+                true),
+            "a visual-only sidearm may use the presentation cup/reseat");
+        Require(
+            !shouldApplySidearmPresentationReseat(
+                true,
+                false,
+                false,
+                false,
+                true),
+            "a long gun must never use the sidearm presentation reseat");
+        Require(
+            !shouldApplySidearmPresentationReseat(
+                true,
+                true,
+                false,
+                true,
+                true),
+            "AttachOnly support must retain its provider-authored frame");
+    }
 
     {
         Transform weapon{};
@@ -214,6 +503,97 @@ int main()
             "an inverted window must fail open to full authority");
         Require(Near(supportSteeringAuthorityWeight(18.0f, 18.0f, 18.0f), 1.0f),
             "a zero-width window must fail open to full authority");
+
+        Require(Near(
+                    effectiveSupportSteeringWeight(
+                        13.3f,
+                        15.0f,
+                        22.0f,
+                        0.35f),
+                    0.35f),
+            "a pistol-length lever must retain the configured authority floor");
+        Require(Near(
+                    effectiveSupportSteeringWeight(
+                        18.5f,
+                        15.0f,
+                        22.0f,
+                        0.35f),
+                    0.5f),
+            "the authority floor must not reduce a larger smoothstep weight");
+        Require(Near(
+                    effectiveSupportSteeringWeight(
+                        13.3f,
+                        15.0f,
+                        22.0f,
+                        0.0f),
+                    0.0f),
+            "an explicit zero floor must preserve the opt-out contract");
+        Require(Near(
+                    effectiveSupportSteeringWeight(
+                        13.3f,
+                        15.0f,
+                        22.0f,
+                        1.0f),
+                    1.0f),
+            "the MCM maximum must give a short weapon full off-hand steering authority");
+    }
+
+    {
+        Transform weld{};
+        weld.rotate = Yaw90();
+        weld.translate = Vec3{ 12.0f, 34.0f, 56.0f };
+        Transform controller{};
+        controller.rotate.entry[0][0] = 1.0f;
+        controller.rotate.entry[1][1] = 1.0f;
+        controller.rotate.entry[2][2] = 1.0f;
+        controller.translate = Vec3{ -2.0f, -4.0f, -6.0f };
+
+        const Transform controllerWrist =
+            blendFiringWristTowardController(weld, controller, 0.0f);
+        Require(
+            Near(controllerWrist.rotate.entry[0][0], 1.0f) &&
+                Near(controllerWrist.rotate.entry[0][1], 0.0f) &&
+                Near(controllerWrist.translate.x, weld.translate.x),
+            "zero wrist follow must keep controller orientation but preserve weld translation");
+
+        const Transform rigidWrist =
+            blendFiringWristTowardController(weld, controller, 1.0f);
+        Require(
+            Near(rigidWrist.rotate.entry[0][1], weld.rotate.entry[0][1]) &&
+                Near(rigidWrist.translate.y, weld.translate.y),
+            "full wrist follow must preserve the rigid weld exactly");
+
+        Require(
+            shouldBlendFiringWristFromLiveHand(true, true),
+            "an exact full-authority acquisition must still honor firing-wrist follow");
+        Require(
+            !shouldBlendFiringWristFromLiveHand(false, false),
+            "firing-wrist follow requires a live primary-hand frame");
+    }
+
+    {
+        // Jul 30 regression guard: the firing hand must keep the rigid weld on
+        // long guns even when the configured follow factor is 0.
+        Require(Near(firingWristFollowFactorForLeverArm(0.0f, 22.0f, 15.0f, 22.0f), 1.0f),
+            "a long-gun grip separation at the full lever arm must restore the rigid wrist weld");
+        Require(Near(firingWristFollowFactorForLeverArm(0.0f, 38.6f, 15.0f, 22.0f), 1.0f),
+            "a wide long-gun grip must keep the full wrist weld");
+        Require(Near(firingWristFollowFactorForLeverArm(0.0f, 13.3f, 15.0f, 22.0f), 0.0f),
+            "a sidearm cup under the minimum lever arm must keep the controller wrist (Jul 27)");
+        Require(Near(firingWristFollowFactorForLeverArm(0.0f, 15.0f, 15.0f, 22.0f), 0.0f),
+            "the minimum lever arm itself must still protect the sidearm wrist");
+        Require(Near(firingWristFollowFactorForLeverArm(0.0f, 18.5f, 15.0f, 22.0f), 0.5f),
+            "the transition band must blend the weld smoothly");
+        Require(Near(firingWristFollowFactorForLeverArm(0.8f, 13.3f, 15.0f, 22.0f), 0.8f),
+            "an explicit configured follow factor must act as a global minimum");
+        Require(Near(firingWristFollowFactorForLeverArm(
+                    std::numeric_limits<float>::quiet_NaN(), 30.0f, 15.0f, 22.0f),
+                    1.0f),
+            "a non-finite configured factor must defer to the lever gate");
+        Require(Near(firingWristFollowFactorForLeverArm(
+                    0.0f, std::numeric_limits<float>::quiet_NaN(), 15.0f, 22.0f),
+                    1.0f),
+            "a non-finite grip separation must fail open to the weld (safe for long guns)");
     }
 
     {

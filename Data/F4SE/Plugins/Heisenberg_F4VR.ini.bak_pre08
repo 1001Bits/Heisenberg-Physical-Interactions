@@ -1,0 +1,287 @@
+; ============================================================================
+; Heisenberg F4VR Configuration
+; ============================================================================
+; This file allows customization of object pickup, activation, and storage behavior.
+; Delete this file to reset all settings to defaults.
+; All distances are in centimeters.
+; ============================================================================
+
+[ObjectPickup]
+; Allow picking up owned items
+bAllowGrabbingOwnedItems = true
+
+; Enable hand collision with world objects (EXPERIMENTAL)
+; When enabled, creates actual physics bodies for hands that can push objects
+; Requires PlayerCharacterProxyListener to prevent player pushback
+bEnableHandCollision = false
+
+; Use physics-based hand bodies for collision (EXPERIMENTAL)
+; When enabled, creates actual Havok physics bodies for hands
+; Allows hands to physically interact with objects (push, trigger collision)
+; Enabled - required for real physical hand collision and contact response
+bUsePhysicsHandBodies = true
+
+; Hand Push Method (HIGGS Skyrim style collision response)
+; Collision is detected via the actual physics HAND BODY (not radius-based)
+; When hand body collides with world objects, Havok fires CONTACT_STARTED events
+; We then apply push impulse to the OTHER body (the world object)
+;
+; 0 = Sphere-sphere proximity only (fallback for when physics bodies crash)
+; 1 = Native CONTACT_STARTED events only (Havok detects, we push) [RECOMMENDED]
+; 2 = Hybrid (native events + sphere-sphere backup)
+iHandPushMethod = 1
+
+; Mass-based impulse calculation for realistic push behavior
+; When enabled, lighter objects fly farther, heavier objects resist more
+bUseMassBasedPush = true
+
+; Base impulse strength for push (game units/s)
+fPushImpulseBase = 150.0
+
+; Mass clamping for push calculation
+fPushImpulseMinMass = 1.0
+fPushImpulseMaxMass = 50.0
+
+; Push direction control
+; When enabled, uses contact point normal blended with hand velocity
+bUsePushDirectionFromContact = true
+
+; Blend weight for push direction (0=contact normal only, 1=hand velocity only)
+fPushDirectionHandVelWeight = 0.5
+
+; Sticky Pickup: Press grip once to pick up, press again to release
+; When disabled (default), you must hold grip to keep holding objects
+bEnableStickyGrab = false
+
+; Grab backend for held objects
+; 0 = Keyframe (always original backend)
+; 1/2 = Legacy constraint fallback
+; 3 = Post-physics/HeldBody wrapper
+; 4 = MouseSpring
+iGrabMode = 0
+
+; Use game's ViewCaster crosshair target for selection (ENABLED for testing)
+; When enabled, the "Press X to activate" crosshair target takes priority
+bUseViewCasterSelection = true
+
+; Weapon Equip Mode: How weapons are equipped when picked up
+; 0 = Disabled - weapons treated as normal clutter
+; 1 = Zone-based - drop weapon on hand to equip immediately
+; 2 = VirtualHolsters - move weapon to VH holster zone (shoulder/hip) to holster directly
+;     Requires VirtualHolsters mod. Haptic feedback when entering holster zones.
+iWeaponEquipMode = 2
+
+; Max pickup distance (in centimeters)
+; Objects beyond this distance cannot be picked up (200cm = 2m default)
+fMaxGrabDistance = 200.0
+
+; Natural pickup distance threshold (in centimeters)
+; Objects within this distance use natural pickup (picked up at touch point)
+fNaturalGrabDistance = 7.0
+
+; Extended natural pickup distance for items without an exact offset match
+; Items matched by fuzzy/partial matching (not FormID or exact name) use this
+; Higher value prevents potentially bad offsets from being applied
+fNaturalGrabDistanceNoMatch = 10.0
+
+; Palm Snap: When enabled, mid-range objects snap to palm center
+; When disabled, all objects use natural pickup regardless of distance
+bEnablePalmSnap = true
+
+; Use geometry-based placement/curling while staying on the keyframed backend
+bEnableAutomaticHandPlacement = true
+bEnableAutomaticFingerCurls = true
+
+; Auto-save natural pickup positions as item offsets
+; When true, the first time you pick up an item naturally (close range),
+; the position is saved so future pickups use the same offset
+bSaveNaturalGrabAsOffset = false
+
+[HeldBody]
+; Use HIGGS-style HeldBody grabbing
+; Object remains DYNAMIC while a KEYFRAMED hand body drives either a spring or a constraint
+bUseHeldBodyGrab = true
+
+; HeldBody runtime mode
+; 0 = dynamic spring held mode
+; 1 = custom 6-DOF constraint
+; 2 = native ragdoll constraint
+iHeldBodyMode = 0
+
+; Legacy fallback if iHeldBodyMode is absent
+bUseNativeRagdollConstraint = false
+
+; Use Bethesda CreateInstance path for the HeldBody hand body
+bUseSimpleHandBodyCreation = true
+
+; Tau ramps in quickly so pulls feel like HIGGS instead of a loose spring
+fTauLerpTime = 0.3
+fTauLerpStartRatio = 0.1
+
+; Angular motor tuning
+fAngularTau = 0.8
+fAngularDamping = 1.0
+fAngularMaxForce = 50.0
+
+; Linear motor settings are kept for compatibility/state reporting
+fLinearTau = 0.8
+fLinearDamping = 1.0
+fLinearMaxForce = 500.0
+fAngularToLinearForceRatio = 10.0
+
+[ItemPositioning]
+; Enable Item Positioning Mode (allows adjusting how items are held)
+bEnableItemPositioning = false
+
+; Shortcut to enter Item Positioning Mode while holding an item
+; 0 = Left Thumbstick Click (long press)
+; 1 = Right Thumbstick Click (long press)
+; 2 = Long Press A Button
+; Press B to save position, use shortcut again to exit without saving
+iItemPositioningShortcut = 0
+
+
+[ItemStorage]
+; Enable item storage zone system
+bEnableItemStorageZones = true
+
+; Radius of storage zone (in cm)
+fItemStorageZoneRadius = 19.0
+
+; Storage zone position relative to HMD
+; X = left(+) / right(-), Y = forward(+) / behind(-), Z = up(+) / down(-)
+; Default: behind and below head
+; With radius 19 and Y=-20, front edge is at -1cm (just behind HMD)
+fStorageZoneOffsetX = 0.0
+fStorageZoneOffsetY = -20.0
+fStorageZoneOffsetZ = -5.0
+
+; Auto-storage delay - how long to hold item in storage zone before it's stored
+; Item automatically stores after this many seconds in the zone (no grip release needed)
+fStorageZoneHoldTime = 0.5
+
+[Consumables]
+; Activation zone for consumables (where to bring items to use them)
+; 0 = Disabled (no quick-consume feature)
+; 1 = Mouth/Face area
+iConsumableActivationZone = 1
+
+; Radius of the mouth zone for consuming items (in cm)
+; Default: 11.0 (matches HIGGS Skyrim)
+fMouthRadius = 11.0
+
+; Mouth zone offset from HMD (in cm, HMD-relative)
+; X = left(-)/right(+), Y = forward(-)/back(+), Z = up(+)/down(-)
+; Defaults match HIGGS Skyrim exactly
+fMouthOffsetX = 0.0
+fMouthOffsetY = 10.0
+fMouthOffsetZ = -9.0
+
+; Max hand speed to consume items (m/s) - must be moving slower than this
+; Prevents accidental consumes when quickly moving hand through zone
+; Default: 2.0
+fMouthVelocityThreshold = 2.0
+
+[DropToHand]
+; Drop to Hand: Items dropped from inventory spawn in your hand instead of falling
+; If you drop another item while holding one, the held item drops first
+bEnableDropToHand = true
+
+; Loot to Hand Mode: How items looted from containers/quickloot are handled
+; 0 = Off (native behavior - items go directly to inventory)
+; 1 = Hybrid (items go to hand, if blocked go to inventory)
+; 2 = Immersive (items go to hand, if blocked drop on floor)
+; "Blocked" means: hand occupied or holding a weapon
+iLootToHandMode = 2
+
+; Preferred hand for dropped items
+; 0 = Left hand
+; 1 = Right hand
+; 2 = Free hand (whichever is not holding something)
+iDropToHandPreferredHand = 2
+
+[Activators]
+; Enable discovery mode (log node tree, enable node capture with left thumbstick hold)
+bActivatorDiscoveryMode = true
+
+; Enable touch-based button/switch activation
+bEnableInteractiveActivators = true
+
+; Distance to start pointing pose (game units, ~25 = 25cm)
+fActivatorPointingRadius = 25.0
+
+; Distance to trigger activation (game units, ~8 = 8cm)  
+fActivatorActivationRadius = 8.0
+
+; Cooldown between activations (milliseconds)
+fActivatorCooldownMs = 1000.0
+
+[Whitelist]
+; Buttons and elevator controls - format: Description = HexFormID
+PowerLiftButton01 = 000EEFBD
+RedR_ButtonBox = 0005815F
+ElevatorCallButtonUtility = 000A2784
+DLC04_RideButton = 060503BB
+ElevatorCallButtonHiTech = 000F7C7B
+ConButtonStand01 = 0006D13B
+DLC04GZ_VaultTecButton = 06029629
+ElevatorCallButtonPublic = 000E8D88
+LoadElevatorCallButtonUtility = 0009DC99
+LoadElevatorCallButtonHiTech = 000F7C5C
+LoadElevatorCallButtonPublic = 000E8DC9
+ToggleButton = 00194FB3
+ElevatorCallButtonVault = 00183353
+DLC04GZ_StarportNukaElevatorButton = 0603269D
+ConButtonStand01_NoActivate = 00230F00
+RedR_ButtonBoxNoPost = 0019C656
+LoadElevatorCallButtonVault = 0013FECE
+
+[SmartGrab]
+; Enable context-aware item retrieval from inventory
+; Grip behind head to pull appropriate item based on player needs:
+; - Low health = Stimpak
+; - High rads = RadAway
+; - In combat = Combat chems (Psycho, Jet)
+; - Disease = Antibiotics
+; - Addiction = Addictol
+; - Hungry (survival) = Food
+; - Thirsty (survival) = Drinks
+; - Weapon drawn + low ammo = Matching ammo
+bEnableSmartGrab = true
+
+; Health threshold for stimpak retrieval (0.5 = 50% health)
+fHealthThreshold = 0.5
+
+; Radiation threshold for RadAway retrieval (0.25 = 25% of max rads)
+fRadsThreshold = 0.25
+
+; =====================================================================
+; SMARTGRAB CATEGORY TOGGLES
+; Control which item types are included in smart retrieval
+; =====================================================================
+
+; Include stimpaks and other healing items
+bIncludeHealth = true
+
+; Include food and drinks
+bIncludeFood = true
+
+; Include combat chems (Psycho, Jet, Buffout, etc.)
+bIncludeCombatChems = true
+
+; Include antibiotics and disease cures
+bIncludeAntibiotics = true
+
+; Include carry weight boost items (Buffout, Grilled Radstag)
+bIncludeCarryWeight = true
+
+; Include heavy junk items for companion drops
+bIncludeHeavyJunk = true
+
+[Debug]
+; Enable verbose debug logging (shows all grab/physics operations)
+bDebugLogging = true
+
+; Log level: 0=trace, 1=debug, 2=info, 3=warn, 4=error
+; Only used if bDebugLogging=false
+iLogLevel = 2

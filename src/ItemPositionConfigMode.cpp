@@ -39,20 +39,9 @@ namespace heisenberg
             f4cf::f4vr::SetActorRestrained(player, !enabled);
         }
         
-        // Disable/enable native game controls (ABXY, VATS, Menu, etc.)
-        auto* inputManager = RE::BSInputEnableManager::GetSingleton();
-        if (inputManager) {
-            // User event flags: MainFour (ABXY), VATS, Activate, Menu
-            // NOTE: kFighting intentionally excluded — always suppressed to prevent unarmed
-            using UEFlag = RE::UserEvents::USER_EVENT_FLAG;
-            UEFlag flagsToControl = UEFlag::kMainFour | UEFlag::kVATS | UEFlag::kActivate | UEFlag::kMenu;
-            inputManager->ForceUserEventEnabled(flagsToControl, enabled);
-            
-            // Other event flags: VATS, Activation, Favorites (needed for VR)
-            using OEFlag = RE::OtherInputEvents::OTHER_EVENT_FLAG;
-            OEFlag otherFlags = OEFlag::kVATS | OEFlag::kActivation | OEFlag::kFavorites;
-            inputManager->ForceOtherEventEnabledVR(otherFlags, enabled);
-        }
+        Heisenberg::GetSingleton().SetInputSuppression(
+            InputSuppressionReason::ItemPositionConfig,
+            !enabled);
     }
 
     ItemPositionConfigMode::~ItemPositionConfigMode()

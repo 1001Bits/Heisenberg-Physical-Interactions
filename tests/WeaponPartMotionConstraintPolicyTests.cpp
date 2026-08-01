@@ -85,5 +85,49 @@ int main()
     Require(Near(beyondMaximum.translate.y, maxBoltY),
         "bolt travel must clamp at the authored maximum position");
 
+    // F4VR/NiTransform uses row vectors (world = local * parent). Sweeping the
+    // hand +90 degrees from +X to +Y around +Z must therefore rotate the
+    // part's pivot offset to +Y and post-compose the sweep onto its authored
+    // local rotation. A non-identity authored rotation makes the multiplication
+    // order observable instead of allowing either order to pass.
+    Axis rotationalAxis{};
+    rotationalAxis.direction = RE::NiPoint3{ 0.0f, 0.0f, 1.0f };
+    rotationalAxis.minValue = -180.0f;
+    rotationalAxis.maxValue = 180.0f;
+
+    GrabReference rotationalReference{};
+    rotationalReference.handPositionAtGrab = RE::NiPoint3{ 1.0f, 0.0f, 0.0f };
+    rotationalReference.partLocalAtGrab.translate = RE::NiPoint3{ 2.0f, 0.0f, 0.0f };
+    // Row-vector +90 degrees around +X.
+    rotationalReference.partLocalAtGrab.rotate.entry[0][0] = 1.0f;
+    rotationalReference.partLocalAtGrab.rotate.entry[0][1] = 0.0f;
+    rotationalReference.partLocalAtGrab.rotate.entry[0][2] = 0.0f;
+    rotationalReference.partLocalAtGrab.rotate.entry[1][0] = 0.0f;
+    rotationalReference.partLocalAtGrab.rotate.entry[1][1] = 0.0f;
+    rotationalReference.partLocalAtGrab.rotate.entry[1][2] = 1.0f;
+    rotationalReference.partLocalAtGrab.rotate.entry[2][0] = 0.0f;
+    rotationalReference.partLocalAtGrab.rotate.entry[2][1] = -1.0f;
+    rotationalReference.partLocalAtGrab.rotate.entry[2][2] = 0.0f;
+
+    const RE::NiTransform sweptPositiveNinety = projectHandOntoConstraint(
+        ConstraintKind::Rotational,
+        rotationalAxis,
+        rotationalReference,
+        RE::NiPoint3{ 0.0f, 1.0f, 0.0f });
+    Require(Near(sweptPositiveNinety.translate.x, 0.0f) &&
+            Near(sweptPositiveNinety.translate.y, 2.0f) &&
+            Near(sweptPositiveNinety.translate.z, 0.0f),
+        "+90 hand sweep must move the part through the +Z pivot arc from +X to +Y");
+    Require(Near(sweptPositiveNinety.rotate.entry[0][0], 0.0f) &&
+            Near(sweptPositiveNinety.rotate.entry[0][1], 1.0f) &&
+            Near(sweptPositiveNinety.rotate.entry[0][2], 0.0f) &&
+            Near(sweptPositiveNinety.rotate.entry[1][0], 0.0f) &&
+            Near(sweptPositiveNinety.rotate.entry[1][1], 0.0f) &&
+            Near(sweptPositiveNinety.rotate.entry[1][2], 1.0f) &&
+            Near(sweptPositiveNinety.rotate.entry[2][0], 1.0f) &&
+            Near(sweptPositiveNinety.rotate.entry[2][1], 0.0f) &&
+            Near(sweptPositiveNinety.rotate.entry[2][2], 0.0f),
+        "+90 hand sweep must use row-vector sign and authoredLocal*sweep composition");
+
     return 0;
 }

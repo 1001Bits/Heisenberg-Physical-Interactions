@@ -36,15 +36,69 @@ namespace HeisenbergPluginAPI {
     // Callback storage
     // =========================================================================
     
-    static std::vector<IHeisenbergInterface001::GrabbedCallback> g_grabbedCallbacks;
-    static std::vector<IHeisenbergInterface001::DroppedCallback> g_droppedCallbacks;
-    static std::vector<IHeisenbergInterface001::StashedCallback> g_stashedCallbacks;
-    static std::vector<IHeisenbergInterface001::ConsumedCallback> g_consumedCallbacks;
-    static std::vector<IHeisenbergInterface001::PulledCallback> g_pulledCallbacks;
-    static std::vector<IHeisenbergInterface001::CollisionCallback> g_collisionCallbacks;
-    static std::vector<IHeisenbergInterface001::PrePhysicsCallback> g_prePhysicsCallbacks;
-    static std::vector<IHeisenbergInterface001::PostPhysicsCallback> g_postPhysicsCallbacks;
-    static std::vector<IHeisenbergInterface001::ViewCasterTargetChangedCallback> g_viewCasterCallbacks;
+    /**
+     * Callback registration can race physics/main-thread delivery and a callback
+     * may register another callback from inside its own invocation. Publish an
+     * immutable copy-on-write snapshot so delivery is lock-free and iteration
+     * can never be invalidated by a concurrent registration.
+     */
+    template <class Callback>
+    class CallbackRegistry
+    {
+    public:
+        CallbackRegistry() :
+            _snapshot(std::make_shared<const CallbackList>())
+        {}
+
+        void Add(Callback callback)
+        {
+            if (!callback) {
+                return;
+            }
+
+            std::lock_guard lock(_writeMutex);
+            const auto current = _snapshot.load(std::memory_order_acquire);
+            if (std::find(current->begin(), current->end(), callback) != current->end()) {
+                return;
+            }
+
+            auto next = std::make_shared<CallbackList>(*current);
+            next->push_back(callback);
+            std::shared_ptr<const CallbackList> published = std::move(next);
+            _snapshot.store(std::move(published), std::memory_order_release);
+        }
+
+        template <class... Args>
+        void Invoke(Args&&... args) const noexcept
+        {
+            const auto callbacks = _snapshot.load(std::memory_order_acquire);
+            for (const auto callback : *callbacks) {
+                try {
+                    callback(std::forward<Args>(args)...);
+                } catch (...) {
+                    // A consumer must never unwind through Heisenberg's game or
+                    // Havok callback path.
+                    spdlog::error("[HeisenbergAPI] Consumer callback threw; invocation ignored");
+                }
+            }
+        }
+
+    private:
+        using CallbackList = std::vector<Callback>;
+
+        std::mutex _writeMutex;
+        std::atomic<std::shared_ptr<const CallbackList>> _snapshot;
+    };
+
+    static CallbackRegistry<IHeisenbergInterface001::GrabbedCallback> g_grabbedCallbacks;
+    static CallbackRegistry<IHeisenbergInterface001::DroppedCallback> g_droppedCallbacks;
+    static CallbackRegistry<IHeisenbergInterface001::StashedCallback> g_stashedCallbacks;
+    static CallbackRegistry<IHeisenbergInterface001::ConsumedCallback> g_consumedCallbacks;
+    static CallbackRegistry<IHeisenbergInterface001::PulledCallback> g_pulledCallbacks;
+    static CallbackRegistry<IHeisenbergInterface001::CollisionCallback> g_collisionCallbacks;
+    static CallbackRegistry<IHeisenbergInterface001::PrePhysicsCallback> g_prePhysicsCallbacks;
+    static CallbackRegistry<IHeisenbergInterface001::PostPhysicsCallback> g_postPhysicsCallbacks;
+    static CallbackRegistry<IHeisenbergInterface001::ViewCasterTargetChangedCallback> g_viewCasterCallbacks;
 
     // Per-hand state.
     // Jul 19 (user directive): external disables are plain LATCHES — a feature stays disabled
@@ -53,28 +107,32 @@ namespace HeisenbergPluginAPI {
     // disable-at-start / enable-when-done pattern, and the timer caused features to pop back
     // mid-window. A caller that dies without re-enabling leaves the feature off until relaunch
     // — by design. Timestamps kept (0 = not disabled) for log attribution.
-    static unsigned long long g_leftHandDisabledAtMs = 0;   // 0 = not disabled
-    static unsigned long long g_rightHandDisabledAtMs = 0;
+    static std::atomic_uint64_t g_leftHandDisabledAtMs{ 0 };   // 0 = not disabled
+    static std::atomic_uint64_t g_rightHandDisabledAtMs{ 0 };
 
     static bool IsExternalHandDisableActive(bool isLeft)
     {
-        return (isLeft ? g_leftHandDisabledAtMs : g_rightHandDisabledAtMs) != 0;
+        return (isLeft ? g_leftHandDisabledAtMs : g_rightHandDisabledAtMs)
+                   .load(std::memory_order_acquire) != 0;
     }
 
     // Jul 19 (Virtual Reloads API, latch semantics per user directive — see the hand-disable
     // comment above): weapon-collision disable, off-hand grip block, and per-hand collision
     // disable are plain latches. 0 = not active; non-zero = the GetTickCount64() timestamp of
     // the disable (attribution only).
-    static unsigned long long g_weaponCollisionDisabledAtMs = 0;  // 0 = enabled
-    static unsigned long long g_offhandGripBlockedAtMs = 0;       // 0 = unblocked
-    static unsigned long long g_handCollisionDisabledAtMs[2] = { 0, 0 };  // [0]=Right [1]=Left; 0 = enabled
+    static std::atomic_uint64_t g_weaponCollisionDisabledAtMs{ 0 };  // 0 = enabled
+    static std::atomic_uint64_t g_offhandGripBlockedAtMs{ 0 };       // 0 = unblocked
+    static std::atomic_uint64_t g_handCollisionDisabledAtMs[2] = {
+        std::atomic_uint64_t{ 0 },
+        std::atomic_uint64_t{ 0 }
+    };  // [0]=Right [1]=Left; 0 = enabled
 
     // Jul 24 (user directive: "never use the lease again"): renamed from
     // IsExternalLeaseActive — the 5s-TTL lease is permanently gone and must not come
     // back; this is a plain latch check and the name now says so.
-    static bool IsExternalLatchActive(unsigned long long& ts, bool&, const char*)
+    static bool IsExternalLatchActive(const std::atomic_uint64_t& ts, bool&, const char*)
     {
-        return ts != 0;
+        return ts.load(std::memory_order_acquire) != 0;
     }
     static bool g_unusedLeaseLogFlag = false;  // keeps legacy call sites' signature stable
 
@@ -84,65 +142,47 @@ namespace HeisenbergPluginAPI {
     
     void InvokeGrabbedCallbacks(bool isLeft, RE::TESObjectREFR* refr)
     {
-        for (auto& cb : g_grabbedCallbacks) {
-            if (cb) cb(isLeft, refr);
-        }
+        g_grabbedCallbacks.Invoke(isLeft, refr);
     }
 
     void InvokeDroppedCallbacks(bool isLeft, RE::TESObjectREFR* refr)
     {
-        for (auto& cb : g_droppedCallbacks) {
-            if (cb) cb(isLeft, refr);
-        }
+        g_droppedCallbacks.Invoke(isLeft, refr);
     }
 
     void InvokeStashedCallbacks(bool isLeft, RE::TESForm* form)
     {
-        for (auto& cb : g_stashedCallbacks) {
-            if (cb) cb(isLeft, form);
-        }
+        g_stashedCallbacks.Invoke(isLeft, form);
     }
 
     void InvokeConsumedCallbacks(bool isLeft, RE::TESForm* form)
     {
-        for (auto& cb : g_consumedCallbacks) {
-            if (cb) cb(isLeft, form);
-        }
+        g_consumedCallbacks.Invoke(isLeft, form);
     }
 
     void InvokePulledCallbacks(bool isLeft, RE::TESObjectREFR* refr)
     {
-        for (auto& cb : g_pulledCallbacks) {
-            if (cb) cb(isLeft, refr);
-        }
+        g_pulledCallbacks.Invoke(isLeft, refr);
     }
 
     void InvokeCollisionCallbacks(bool isLeft, float mass, float velocity)
     {
-        for (auto& cb : g_collisionCallbacks) {
-            if (cb) cb(isLeft, mass, velocity);
-        }
+        g_collisionCallbacks.Invoke(isLeft, mass, velocity);
     }
 
     void InvokePrePhysicsCallbacks(void* bhkWorld)
     {
-        for (auto& cb : g_prePhysicsCallbacks) {
-            if (cb) cb(bhkWorld);
-        }
+        g_prePhysicsCallbacks.Invoke(bhkWorld);
     }
 
     void InvokePostPhysicsCallbacks(void* bhkWorld)
     {
-        for (auto& cb : g_postPhysicsCallbacks) {
-            if (cb) cb(bhkWorld);
-        }
+        g_postPhysicsCallbacks.Invoke(bhkWorld);
     }
 
     void InvokeViewCasterTargetChangedCallbacks(bool isLeft, RE::TESObjectREFR* newTarget, RE::TESObjectREFR* oldTarget)
     {
-        for (auto& cb : g_viewCasterCallbacks) {
-            if (cb) cb(isLeft, newTarget, oldTarget);
-        }
+        g_viewCasterCallbacks.Invoke(isLeft, newTarget, oldTarget);
     }
 
     // =========================================================================
@@ -287,9 +327,9 @@ namespace HeisenbergPluginAPI {
         void DisableHand(bool isLeft) override
         {
             if (isLeft) {
-                g_leftHandDisabledAtMs = GetTickCount64();
+                g_leftHandDisabledAtMs.store(GetTickCount64(), std::memory_order_release);
             } else {
-                g_rightHandDisabledAtMs = GetTickCount64();
+                g_rightHandDisabledAtMs.store(GetTickCount64(), std::memory_order_release);
             }
             // Jul 6: identify WHICH plugin disabled the hand — an external mod was disabling the LEFT
             // hand and never re-enabling it, killing left-hand grab. Log the calling module so the
@@ -313,9 +353,9 @@ namespace HeisenbergPluginAPI {
         void EnableHand(bool isLeft) override
         {
             if (isLeft) {
-                g_leftHandDisabledAtMs = 0;
+                g_leftHandDisabledAtMs.store(0, std::memory_order_release);
             } else {
-                g_rightHandDisabledAtMs = 0;
+                g_rightHandDisabledAtMs.store(0, std::memory_order_release);
             }
             spdlog::debug("[HeisenbergAPI] {} hand enabled", isLeft ? "Left" : "Right");
         }
@@ -447,47 +487,47 @@ namespace HeisenbergPluginAPI {
 
         void AddGrabbedCallback(GrabbedCallback callback) override
         {
-            if (callback) g_grabbedCallbacks.push_back(callback);
+            g_grabbedCallbacks.Add(callback);
         }
 
         void AddDroppedCallback(DroppedCallback callback) override
         {
-            if (callback) g_droppedCallbacks.push_back(callback);
+            g_droppedCallbacks.Add(callback);
         }
 
         void AddStashedCallback(StashedCallback callback) override
         {
-            if (callback) g_stashedCallbacks.push_back(callback);
+            g_stashedCallbacks.Add(callback);
         }
 
         void AddConsumedCallback(ConsumedCallback callback) override
         {
-            if (callback) g_consumedCallbacks.push_back(callback);
+            g_consumedCallbacks.Add(callback);
         }
 
         void AddPulledCallback(PulledCallback callback) override
         {
-            if (callback) g_pulledCallbacks.push_back(callback);
+            g_pulledCallbacks.Add(callback);
         }
 
         void AddCollisionCallback(CollisionCallback callback) override
         {
-            if (callback) g_collisionCallbacks.push_back(callback);
+            g_collisionCallbacks.Add(callback);
         }
 
         void AddPrePhysicsCallback(PrePhysicsCallback callback) override
         {
-            if (callback) g_prePhysicsCallbacks.push_back(callback);
+            g_prePhysicsCallbacks.Add(callback);
         }
 
         void AddPostPhysicsCallback(PostPhysicsCallback callback) override
         {
-            if (callback) g_postPhysicsCallbacks.push_back(callback);
+            g_postPhysicsCallbacks.Add(callback);
         }
 
         void AddViewCasterTargetChangedCallback(ViewCasterTargetChangedCallback callback) override
         {
-            if (callback) g_viewCasterCallbacks.push_back(callback);
+            g_viewCasterCallbacks.Add(callback);
         }
 
         // =====================================================================
@@ -496,19 +536,12 @@ namespace HeisenbergPluginAPI {
 
         bool GetSettingDouble(const char* name, double& out) override
         {
-            // TODO: Implement setting lookup from Config
-            // For now, just return false
-            (void)name;
-            (void)out;
-            return false;
+            return heisenberg::g_config.GetNumericSetting(name, out);
         }
 
         bool SetSettingDouble(const char* name, double val) override
         {
-            // TODO: Implement setting modification
-            (void)name;
-            (void)val;
-            return false;
+            return heisenberg::g_config.SetNumericSetting(name, val);
         }
 
         // =====================================================================
@@ -554,15 +587,15 @@ namespace HeisenbergPluginAPI {
         void EnableWeaponCollision(bool enable) override
         {
             if (enable) {
-                if (g_weaponCollisionDisabledAtMs != 0) {
+                if (g_weaponCollisionDisabledAtMs.exchange(0, std::memory_order_acq_rel) != 0) {
                     spdlog::info("[HeisenbergAPI] weapon collision RE-ENABLED by external module");
                 }
-                g_weaponCollisionDisabledAtMs = 0;
             } else {
-                if (g_weaponCollisionDisabledAtMs == 0) {
+                const auto previous = g_weaponCollisionDisabledAtMs.exchange(
+                    GetTickCount64(), std::memory_order_acq_rel);
+                if (previous == 0) {
                     spdlog::info("[HeisenbergAPI] weapon collision DISABLED by external module (latched until it calls EnableWeaponCollision(true))");
                 }
-                g_weaponCollisionDisabledAtMs = GetTickCount64();
             }
         }
 
@@ -574,16 +607,16 @@ namespace HeisenbergPluginAPI {
         void BlockOffHandWeaponGripping(const char* tag, bool block) override
         {
             if (block) {
-                if (g_offhandGripBlockedAtMs == 0) {
+                const auto previous = g_offhandGripBlockedAtMs.exchange(
+                    GetTickCount64(), std::memory_order_acq_rel);
+                if (previous == 0) {
                     spdlog::info("[HeisenbergAPI] off-hand weapon gripping BLOCKED by '{}' (latched until unblocked)",
                                  tag ? tag : "(null)");
                 }
-                g_offhandGripBlockedAtMs = GetTickCount64();
             } else {
-                if (g_offhandGripBlockedAtMs != 0) {
+                if (g_offhandGripBlockedAtMs.exchange(0, std::memory_order_acq_rel) != 0) {
                     spdlog::info("[HeisenbergAPI] off-hand weapon gripping UNBLOCKED by '{}'", tag ? tag : "(null)");
                 }
-                g_offhandGripBlockedAtMs = 0;
             }
         }
 
@@ -607,21 +640,20 @@ namespace HeisenbergPluginAPI {
 
         void DisableHandCollision(bool isLeft) override
         {
-            unsigned long long& ts = g_handCollisionDisabledAtMs[isLeft ? 1 : 0];
-            if (ts == 0) {
+            auto& ts = g_handCollisionDisabledAtMs[isLeft ? 1 : 0];
+            const auto previous = ts.exchange(GetTickCount64(), std::memory_order_acq_rel);
+            if (previous == 0) {
                 spdlog::info("[HeisenbergAPI] {} hand collision DISABLED by external module (latched until it calls EnableHandCollision)",
                              isLeft ? "Left" : "Right");
             }
-            ts = GetTickCount64();
         }
 
         void EnableHandCollision(bool isLeft) override
         {
-            unsigned long long& ts = g_handCollisionDisabledAtMs[isLeft ? 1 : 0];
-            if (ts != 0) {
+            auto& ts = g_handCollisionDisabledAtMs[isLeft ? 1 : 0];
+            if (ts.exchange(0, std::memory_order_acq_rel) != 0) {
                 spdlog::info("[HeisenbergAPI] {} hand collision RE-ENABLED by external module", isLeft ? "Left" : "Right");
             }
-            ts = 0;
         }
 
         bool IsHandCollisionDisabled(bool isLeft) override
@@ -693,13 +725,28 @@ namespace HeisenbergPluginAPI {
      * 
      * @param message The HeisenbergMessage struct from the dispatch
      */
-    void HandleInterfaceRequest(HeisenbergMessage* message)
+    void HandleInterfaceRequest(HeisenbergMessage* message, std::size_t messageSize)
     {
-        if (message)
-        {
-            message->GetApiFunction = &GetApi;
-            spdlog::info("[HeisenbergAPI] Interface request handled, callback set");
+        constexpr auto kLegacyMessageSize = offsetof(HeisenbergMessage, structSize);
+        if (!message || messageSize < kLegacyMessageSize) {
+            spdlog::warn(
+                "[HeisenbergAPI] Rejected undersized interface request ({} bytes, need at least {})",
+                messageSize,
+                kLegacyMessageSize);
+            return;
         }
+
+        message->GetApiFunction = &GetApi;
+        if (messageSize >= offsetof(HeisenbergMessage, structSize) + sizeof(message->structSize)) {
+            message->structSize = static_cast<std::uint32_t>(sizeof(HeisenbergMessage));
+        }
+        if (messageSize >= offsetof(HeisenbergMessage, abiVersion) + sizeof(message->abiVersion)) {
+            message->abiVersion = HeisenbergMessage::kMessageAbiVersion;
+        }
+        if (messageSize >= offsetof(HeisenbergMessage, interfaceBuild) + sizeof(message->interfaceBuild)) {
+            message->interfaceBuild = HEISENBERG_BUILD_NUMBER;
+        }
+        spdlog::info("[HeisenbergAPI] Interface request handled, callback set");
     }
 
     // =========================================================================
@@ -710,10 +757,10 @@ namespace HeisenbergPluginAPI {
         const F4SE::PluginHandle& pluginHandle,
         F4SE::MessagingInterface* messagingInterface)
     {
-        // If already fetched, return cached pointer
+        static std::mutex s_cacheMutex;
         static IHeisenbergInterface001* s_cachedInterface = nullptr;
-        if (s_cachedInterface)
-        {
+        std::lock_guard cacheLock(s_cacheMutex);
+        if (s_cachedInterface) {
             return s_cachedInterface;
         }
 
@@ -725,6 +772,8 @@ namespace HeisenbergPluginAPI {
 
         // Dispatch message to Heisenberg to get the API callback
         HeisenbergMessage msg{};
+        msg.structSize = static_cast<std::uint32_t>(sizeof(msg));
+        msg.abiVersion = HeisenbergMessage::kMessageAbiVersion;
         bool dispatched = messagingInterface->Dispatch(
             HeisenbergMessage::kMessage_GetInterface,
             &msg,

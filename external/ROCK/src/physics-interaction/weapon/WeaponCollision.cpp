@@ -6,14 +6,21 @@
 #include "physics-interaction/native/HavokCompoundShapeBuilder.h"
 #include "physics-interaction/native/HavokConvexShapeBuilder.h"
 #include "physics-interaction/native/HavokOffsets.h"
-#include "physics-interaction/native/PhysicsUtils.h"
+#include "physics-interaction/native/NativeNiNodeFactory.h"
+#include "physics-interaction/native/NativeMemory.h"
 #include "physics-interaction/grab/MeshGrab.h"
 #include "RockConfig.h"
 #include "physics-interaction/performance/PerformanceProfiler.h"
 #include "physics-interaction/weapon/WeaponGeometry.h"
+#include "physics-interaction/weapon/ManualScopeTargetPolicy.h"
+#include "physics-interaction/weapon/WeaponAccessoryPartKindPolicy.h"
+#include "physics-interaction/weapon/WeaponEffectGeometryPolicy.h"
+#include "physics-interaction/weapon/WeaponEmitterPolicy.h"
+#include "physics-interaction/weapon/WeaponOmodAuditPolicy.h"
 #include "physics-interaction/weapon/WeaponPartRecordIdentityPolicy.h"
 #include "physics-interaction/weapon/WeaponSemantics.h"
 #include "physics-interaction/weapon/WeaponAuthority.h"
+#include "physics-interaction/TransformMath.h"
 
 #include <intrin.h>
 
@@ -27,9 +34,7 @@
 #include "RE/Havok/hknpCapsuleShape.h"
 #include "RE/Havok/hknpMotion.h"
 
-#include "f4vr/PlayerNodes.h"
-#include "f4vr/F4VRUtils.h"
-// f4sevr/Forms.h removed: equip data migrated to the b46b8dd commonlib API.
+#include "rock_support/Fo4VrRuntime.h"
 
 #include <algorithm>
 #include <array>
@@ -55,108 +60,6 @@ namespace rock
         constexpr float MIN_HULL_DIAGONAL_GAME_UNITS = 0.5f;
         constexpr std::size_t MAX_GENERATED_CHILD_CONVEXES_PER_SOURCE = 16;
         constexpr std::size_t GENERATED_WEAPON_BODY_CREATION_BATCH = 8;
-
-        float pointDot(const RE::NiPoint3& lhs, const RE::NiPoint3& rhs)
-        {
-            return lhs.x * rhs.x + lhs.y * rhs.y + lhs.z * rhs.z;
-        }
-
-        RE::NiPoint3 pointSub(const RE::NiPoint3& lhs, const RE::NiPoint3& rhs)
-        {
-            return RE::NiPoint3{
-                lhs.x - rhs.x,
-                lhs.y - rhs.y,
-                lhs.z - rhs.z,
-            };
-        }
-
-        RE::NiPoint3 pointAddScaled(const RE::NiPoint3& origin, const RE::NiPoint3& direction, float scale)
-        {
-            return RE::NiPoint3{
-                origin.x + direction.x * scale,
-                origin.y + direction.y * scale,
-                origin.z + direction.z * scale,
-            };
-        }
-
-        float pointDistanceSquared(const RE::NiPoint3& lhs, const RE::NiPoint3& rhs)
-        {
-            const RE::NiPoint3 delta = pointSub(lhs, rhs);
-            return pointDot(delta, delta);
-        }
-
-        /*
-         * Real-Time Collision Detection, closest point on triangle. Keeping
-         * the test on the extracted mesh triangles avoids the broad AABB
-         * bleed that originally let a barrel satisfy a nearby bolt target.
-         */
-        RE::NiPoint3 closestPointOnTriangle(const RE::NiPoint3& point, const TriangleData& triangle)
-        {
-            const RE::NiPoint3& a = triangle.v0;
-            const RE::NiPoint3& b = triangle.v1;
-            const RE::NiPoint3& c = triangle.v2;
-            const RE::NiPoint3 ab = pointSub(b, a);
-            const RE::NiPoint3 ac = pointSub(c, a);
-            const RE::NiPoint3 ap = pointSub(point, a);
-            const float d1 = pointDot(ab, ap);
-            const float d2 = pointDot(ac, ap);
-            if (d1 <= 0.0f && d2 <= 0.0f) {
-                return a;
-            }
-
-            const RE::NiPoint3 bp = pointSub(point, b);
-            const float d3 = pointDot(ab, bp);
-            const float d4 = pointDot(ac, bp);
-            if (d3 >= 0.0f && d4 <= d3) {
-                return b;
-            }
-
-            const float vc = d1 * d4 - d3 * d2;
-            if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {
-                const float denominator = d1 - d3;
-                return std::abs(denominator) > 1.0e-8f ?
-                    pointAddScaled(a, ab, d1 / denominator) :
-                    a;
-            }
-
-            const RE::NiPoint3 cp = pointSub(point, c);
-            const float d5 = pointDot(ab, cp);
-            const float d6 = pointDot(ac, cp);
-            if (d6 >= 0.0f && d5 <= d6) {
-                return c;
-            }
-
-            const float vb = d5 * d2 - d1 * d6;
-            if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {
-                const float denominator = d2 - d6;
-                return std::abs(denominator) > 1.0e-8f ?
-                    pointAddScaled(a, ac, d2 / denominator) :
-                    a;
-            }
-
-            const float va = d3 * d6 - d5 * d4;
-            if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) {
-                const RE::NiPoint3 bc = pointSub(c, b);
-                const float numerator = d4 - d3;
-                const float denominator = numerator + (d5 - d6);
-                return std::abs(denominator) > 1.0e-8f ?
-                    pointAddScaled(b, bc, numerator / denominator) :
-                    b;
-            }
-
-            const float denominator = va + vb + vc;
-            if (std::abs(denominator) <= 1.0e-8f) {
-                return a;
-            }
-            const float inverse = 1.0f / denominator;
-            const float v = vb * inverse;
-            const float w = vc * inverse;
-            return RE::NiPoint3{
-                a.x + ab.x * v + ac.x * w,
-                a.y + ab.y * v + ac.y * w,
-                a.z + ab.z * v + ac.z * w,
-            };
-        }
 
         struct QuantizedPointKey
         {
@@ -284,7 +187,7 @@ namespace rock
         constexpr int WEAPON_ANIM_NODE_DUMP_MAX_FLATTENED_TRANSFORMS = 768;
 
         bool weaponVisualNodeVisible(const RE::NiAVObject* node);
-        const char* safeNodeName(RE::NiAVObject* node);
+        const char* safeNodeName(const RE::NiAVObject* node);
 
         const char* generatedWeaponPartKindName(WeaponPartKind kind)
         {
@@ -334,8 +237,22 @@ namespace rock
             case WeaponPartKind::CosmeticAmmo:
                 return "CosmeticAmmo";
             case WeaponPartKind::Other:
-            default:
                 return "Other";
+            case WeaponPartKind::LaserSight:
+                return "LaserSight";
+            case WeaponPartKind::Flashlight:
+                return "Flashlight";
+            case WeaponPartKind::LaserFlashlightCombo:
+                return "LaserFlashlightCombo";
+            case WeaponPartKind::Scope:
+                return "Scope";
+            case WeaponPartKind::MuzzleDevice:
+                return "MuzzleDevice";
+            case WeaponPartKind::Bipod:
+                return "Bipod";
+            case WeaponPartKind::Count:
+            default:
+                return "Invalid";
             }
         }
 
@@ -704,7 +621,7 @@ namespace rock
         std::string generatedWeaponSemanticMaskNames(std::uint32_t mask)
         {
             std::string result;
-            for (std::uint32_t i = 0; i <= static_cast<std::uint32_t>(WeaponPartKind::Other); ++i) {
+            for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(WeaponPartKind::Count); ++i) {
                 const auto bit = std::uint32_t{ 1 } << i;
                 if ((mask & bit) == 0) {
                     continue;
@@ -809,9 +726,10 @@ namespace rock
             return dx * dx + dy * dy + dz * dz;
         }
 
-        bool pointCloudCanBuildHull(const std::vector<RE::NiPoint3>& points)
+        bool pointCloudCanBuildHull(const std::vector<RE::NiPoint3>& points, float sourceScale = 1.0f)
         {
-            return points.size() >= 4 && pointCloudDiagonalSquared(points) >= (MIN_HULL_DIAGONAL_GAME_UNITS * MIN_HULL_DIAGONAL_GAME_UNITS);
+            return points.size() >= 4 && weapon_collision_geometry_math::scaledHullDiagonalCanBuild(
+                                             pointCloudDiagonalSquared(points), sourceScale, MIN_HULL_DIAGONAL_GAME_UNITS);
         }
 
         bool compressGeneratedChildClustersForBudget(
@@ -1012,24 +930,294 @@ namespace rock
         }
 
         const RE::BGSObjectInstanceExtra* findEquippedWeaponObjectInstanceExtra(
-            const RE::PlayerCharacter* /*player*/,
-            const RE::TESForm* /*weaponForm*/,
-            const RE::TBO_InstanceData* /*instanceData*/)
+            const RE::PlayerCharacter* player,
+            const RE::TESForm* weaponForm,
+            const RE::TBO_InstanceData* instanceData)
         {
-            /*
-             * TODO_RE: the original scans the private-SDK ActorEquipData slots for the
-             * equipped weapon's BGSObjectInstanceExtra (attachment list). Until the
-             * equivalent b46b8dd inventory walk is implemented, the instance CONTENT key
-             * still mixes instanceData (keywords/enchants/material swaps/weight), so
-             * weapon-mod changes that alter instance data keep triggering hull rebuilds;
-             * only pure attachment-index changes are missed.
-             */
-            return nullptr;
+            if (!player || !weaponForm) {
+                return nullptr;
+            }
+
+            auto scanBiped = [&](const RE::BipedAnim* biped) -> const RE::BGSObjectInstanceExtra* {
+                if (!biped) {
+                    return nullptr;
+                }
+                for (std::uint32_t slotIndex = 0;
+                     slotIndex < static_cast<std::uint32_t>(std::to_underlying(RE::BIPED_OBJECT::kTotal));
+                     ++slotIndex) {
+                    const auto& slot = biped->object[slotIndex];
+                    if (slot.parent.object != weaponForm) {
+                        continue;
+                    }
+                    if (instanceData && slot.parent.instanceData && slot.parent.instanceData.get() != instanceData) {
+                        continue;
+                    }
+                    if (slot.modExtra) {
+                        return slot.modExtra;
+                    }
+                }
+                return nullptr;
+            };
+
+            if (const auto* firstPersonExtra = scanBiped(player->firstPersonBipedAnim.get())) {
+                return firstPersonExtra;
+            }
+            return scanBiped(player->biped.get());
+        }
+
+        [[nodiscard]] bool startsWithAsciiInsensitive(std::string_view value, std::string_view prefix)
+        {
+            if (value.size() < prefix.size()) {
+                return false;
+            }
+            for (std::size_t i = 0; i < prefix.size(); ++i) {
+                const auto lowerAscii = [](const char c) {
+                    return c >= 'A' && c <= 'Z' ? static_cast<char>(c + ('a' - 'A')) : c;
+                };
+                if (lowerAscii(value[i]) != lowerAscii(prefix[i])) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        RE::NiPointer<RE::NiNode> loadOmodModelTemplate(
+            const std::string& modelPath,
+            const std::uint8_t modelDemandFlags)
+        {
+            if (modelPath.empty()) {
+                return nullptr;
+            }
+
+            std::string resourcePath;
+            if (startsWithAsciiInsensitive(modelPath, "Data\\") || startsWithAsciiInsensitive(modelPath, "Data/")) {
+                resourcePath = modelPath;
+            } else if (startsWithAsciiInsensitive(modelPath, "Meshes\\") || startsWithAsciiInsensitive(modelPath, "Meshes/")) {
+                resourcePath = "Data/" + modelPath;
+            } else {
+                resourcePath = "Data/Meshes/" + modelPath;
+            }
+
+            std::uint64_t loadFlags[2]{ 0, modelDemandFlags };
+            std::uint64_t loadedRoot = 0;
+            const int result = f4vr::loadNif(
+                reinterpret_cast<std::uint64_t>(resourcePath.c_str()),
+                reinterpret_cast<std::uint64_t>(&loadedRoot),
+                reinterpret_cast<std::uint64_t>(&loadFlags));
+            if (result != 0 || loadedRoot == 0) {
+                return nullptr;
+            }
+
+            RE::NiPointer<RE::NiNode> root;
+            root.reset(reinterpret_cast<RE::NiNode*>(loadedRoot));
+            return root;
+        }
+
+        /*
+         * BSModelDB's ordinary OMOD demand uses flag 0x2D and may return only
+         * the currently selected controller branch. Loading through the same
+         * native entry with 0xED preserves the complete model hierarchy. This
+         * is required to see durable housings which are absent from the active
+         * branch (the SR-25 magazine shell is the concrete witness).
+         */
+        RE::NiPointer<RE::NiNode> loadCompleteOmodModelTemplate(const std::string& modelPath)
+        {
+            return loadOmodModelTemplate(modelPath, 0xED);
+        }
+
+        /*
+         * Fallout4VR.exe 1.2.72 uses BSModelDB flag 0x20 in the geometry-query
+         * path at 0x1402824B0. Unlike an ordinary attachment demand, this path
+         * does not run the 0x08 model postprocessor which can consume display
+         * geometry owned by a bhkNPCollisionObject. It is used only as a
+         * read/clone template after the guarded receiver-specific comparison
+         * below; native attachment continues to use the engine's own 0x2D
+         * path.
+         */
+        RE::NiPointer<RE::NiNode> loadGeometryInspectionOmodModelTemplate(const std::string& modelPath)
+        {
+            return loadOmodModelTemplate(modelPath, 0x20);
+        }
+
+        void collectManualScopeStructuralMarkers(
+            RE::NiAVObject* node,
+            manual_scope_target_policy::StructuralMarkerEvidence& evidence,
+            std::size_t& visited,
+            const int depth = 0)
+        {
+            if (!node || depth > 16 || visited >= 512 ||
+                manual_scope_target_policy::hasMagnifiedScopeStructure(evidence)) {
+                return;
+            }
+
+            ++visited;
+            const char* name = node->name.c_str();
+            manual_scope_target_policy::observeStructuralNodeName(evidence, name ? name : "");
+            auto* niNode = node->IsNode();
+            if (!niNode) {
+                return;
+            }
+            const auto& children = niNode->children;
+            for (auto i = decltype(children.size()){ 0 }; i < children.size(); ++i) {
+                collectManualScopeStructuralMarkers(children[i].get(), evidence, visited, depth + 1);
+            }
+        }
+
+        struct EquippedManualScopeTarget
+        {
+            bool directTransitionRequired{ false };
+            bool overlayValid{ false };
+            std::uint32_t overlayIndex{ 0 };
+        };
+
+        std::unordered_map<std::uint32_t, std::uint32_t> readEquippedOmodsByAttachPointFormId(
+            WeaponCollision::WeaponCompositionSnapshot* outComposition = nullptr)
+        {
+            std::unordered_map<std::uint32_t, std::uint32_t> result;
+            if (outComposition) {
+                *outComposition = {};
+            }
+            auto* player = f4vr::getPlayer();
+            auto* equipData = f4vr::getEquippedItem();
+            auto* weaponForm = equipData ? equipData->item.object : nullptr;
+            auto* instanceData = equipData ? equipData->item.instanceData.get() : nullptr;
+            const RE::BGSObjectInstanceExtra* objectInstanceExtra =
+                weaponForm ? findEquippedWeaponObjectInstanceExtra(player, weaponForm, instanceData) : nullptr;
+            if (!objectInstanceExtra || !objectInstanceExtra->values) {
+                return result;
+            }
+
+            const auto indexData = objectInstanceExtra->GetIndexData();
+            result.reserve(indexData.size());
+            std::uint32_t stableIndex = 0;
+            for (const auto& modIndex : indexData) {
+                auto* omod = RE::TESForm::GetFormByID<RE::BGSMod::Attachment::Mod>(modIndex.objectID);
+                const RE::BGSKeyword* attachPointKeyword =
+                    omod ? RE::BGSKeyword::GetTypedKeywordByIndex(
+                               RE::KeywordType::kAttachPoint,
+                               omod->attachPoint.keywordIndex) :
+                           nullptr;
+                if (!modIndex.disabled && attachPointKeyword && omod) {
+                    result.emplace(attachPointKeyword->formID, omod->formID);
+                }
+                if (outComposition &&
+                    outComposition->entryCount <
+                        outComposition->entries.size()) {
+                    auto& entry = outComposition->entries[
+                        outComposition->entryCount++];
+                    entry.omodFormId = omod ? omod->formID : modIndex.objectID;
+                    entry.attachPointFormId =
+                        attachPointKeyword ? attachPointKeyword->formID : 0;
+                    entry.stableIndex = stableIndex;
+                    entry.flags = modIndex.disabled ? (1u << 1) : (1u << 0);
+                    if (attachPointKeyword) {
+                        entry.flags |= 1u << 2;
+                    }
+                }
+                ++stableIndex;
+            }
+            return result;
+        }
+
+        [[nodiscard]] bool attachmentModHasNativeScopeOverlayTarget(std::uint32_t omodFormId)
+        {
+            constexpr std::uint8_t kBgsModPropertyBlockId = 1;
+            constexpr std::uint32_t kNativeScopeOverlayTarget = 48;
+            using PropertyMod = RE::BGSMod::Property::Mod;
+
+            auto* omod = RE::TESForm::GetFormByID<RE::BGSMod::Attachment::Mod>(omodFormId);
+            if (!omod) {
+                return false;
+            }
+            for (const auto& property : omod->GetBuffer<PropertyMod>(kBgsModPropertyBlockId)) {
+                if (property.target == kNativeScopeOverlayTarget) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        [[nodiscard]] EquippedManualScopeTarget resolveEquippedManualScopeTarget(RE::NiAVObject* assembledWeaponRoot)
+        {
+            EquippedManualScopeTarget target{};
+            auto* player = f4vr::getPlayer();
+            auto* equipData = f4vr::getEquippedItem();
+            auto* weaponForm = equipData ? equipData->item.object : nullptr;
+            auto* equippedInstanceData = equipData ? equipData->item.instanceData.get() : nullptr;
+            const RE::BGSObjectInstanceExtra* objectInstanceExtra =
+                weaponForm ? findEquippedWeaponObjectInstanceExtra(player, weaponForm, equippedInstanceData) : nullptr;
+            if (!objectInstanceExtra || !objectInstanceExtra->values) {
+                return target;
+            }
+
+            auto* weapon = weaponForm ? weaponForm->As<RE::TESObjectWEAP>() : nullptr;
+            auto* instanceData = weapon && equippedInstanceData ?
+                static_cast<RE::TESObjectWEAP::InstanceData*>(equippedInstanceData) :
+                nullptr;
+            RE::BGSZoomData* zoomData = instanceData ? instanceData->zoomData : nullptr;
+            if (!zoomData && weapon) {
+                zoomData = weapon->weaponData.zoomData;
+            }
+            if (zoomData) {
+                target.overlayIndex = zoomData->zoomData.overlay;
+                target.overlayValid = manual_scope_target_policy::isValidNativeOverlayIndex(target.overlayIndex);
+            }
+
+            bool nativeScopeMetadataAuthored = instanceData && instanceData->flags.all(RE::WEAPON_FLAGS::kHasScope);
+            if (!nativeScopeMetadataAuthored && weapon) {
+                nativeScopeMetadataAuthored = weapon->weaponData.flags.all(RE::WEAPON_FLAGS::kHasScope);
+            }
+            bool explicitScopeModelInstalled = false;
+            manual_scope_target_policy::StructuralMarkerEvidence structuralEvidence{};
+            std::size_t structuralVisited = 0;
+            collectManualScopeStructuralMarkers(assembledWeaponRoot, structuralEvidence, structuralVisited);
+
+            for (const auto& modIndex : objectInstanceExtra->GetIndexData()) {
+                if (modIndex.disabled) {
+                    continue;
+                }
+                auto* omod = RE::TESForm::GetFormByID<RE::BGSMod::Attachment::Mod>(modIndex.objectID);
+                if (!omod) {
+                    continue;
+                }
+                nativeScopeMetadataAuthored = nativeScopeMetadataAuthored || attachmentModHasNativeScopeOverlayTarget(omod->formID);
+                explicitScopeModelInstalled = explicitScopeModelInstalled ||
+                    manual_scope_target_policy::hasExplicitScopeIdentity(
+                        omod->fullName.c_str() ? omod->fullName.c_str() : "",
+                        omod->model.c_str() ? omod->model.c_str() : "");
+
+                if (!manual_scope_target_policy::hasMagnifiedScopeStructure(structuralEvidence)) {
+                    const RE::BGSKeyword* attachPointKeyword =
+                        RE::BGSKeyword::GetTypedKeywordByIndex(RE::KeywordType::kAttachPoint, omod->attachPoint.keywordIndex);
+                    const std::string_view recordName = omod->fullName.c_str() ? omod->fullName.c_str() : "";
+                    const std::string modelPath = omod->model.c_str() ? omod->model.c_str() : "";
+                    const bool opticalCandidate =
+                        (attachPointKeyword && attachPointKeyword->formID == weapon_part_record_identity_policy::kAttachPointSight) ||
+                        weapon_effect_geometry_policy::containsAsciiInsensitive(recordName, "optic") ||
+                        weapon_effect_geometry_policy::containsAsciiInsensitive(recordName, "sight") ||
+                        weapon_effect_geometry_policy::containsAsciiInsensitive(recordName, "scope") ||
+                        weapon_effect_geometry_policy::containsAsciiInsensitive(modelPath, "optic") ||
+                        weapon_effect_geometry_policy::containsAsciiInsensitive(modelPath, "sight") ||
+                        weapon_effect_geometry_policy::containsAsciiInsensitive(modelPath, "scope");
+                    if (opticalCandidate) {
+                        auto templateRoot = loadCompleteOmodModelTemplate(modelPath);
+                        std::size_t templateVisited = 0;
+                        collectManualScopeStructuralMarkers(templateRoot.get(), structuralEvidence, templateVisited);
+                    }
+                }
+            }
+
+            target.directTransitionRequired = manual_scope_target_policy::requiresDirectNativeTransition(
+                nativeScopeMetadataAuthored,
+                explicitScopeModelInstalled,
+                manual_scope_target_policy::hasMagnifiedScopeStructure(structuralEvidence),
+                target.overlayValid);
+            return target;
         }
 
         const RE::TESObjectWEAP* asEquippedWeaponForm(const RE::TESForm* form)
         {
-            if (!form || form->GetFormType() != RE::ENUM_FORM_ID::kWEAP) {
+            if (!form || form->formType != RE::ENUM_FORM_ID::kWEAP) {
                 return nullptr;
             }
 
@@ -1248,32 +1436,25 @@ namespace rock
         {
             weapon_generation_identity_policy::EquippedWeaponGenerationIdentity identity{};
 
-            // b46b8dd commonlib: equipped item via currentProcess->middleHigh->equippedItems;
-            // EquippedWeaponData via the framework helper.
             auto* player = f4vr::getPlayer();
-            auto* process = player ? player->currentProcess : nullptr;
-            auto* middleHigh = process ? process->middleHigh : nullptr;
-            RE::TESForm* weaponForm = (middleHigh && !middleHigh->equippedItems.empty())
-                ? static_cast<RE::TESForm*>(middleHigh->equippedItems.front().item.object)
-                : nullptr;
-            RE::TBO_InstanceData* weaponInstanceData = (middleHigh && !middleHigh->equippedItems.empty())
-                ? middleHigh->equippedItems.front().item.instanceData.get()
-                : nullptr;
-            if (!weaponForm || weaponForm->GetFormType() != RE::ENUM_FORM_ID::kWEAP) {
+            auto* equipData = f4vr::getEquippedItem();
+            auto* weaponForm = equipData ? equipData->item.object : nullptr;
+            auto* instanceData = equipData ? equipData->item.instanceData.get() : nullptr;
+            if (!weaponForm || weaponForm->formType != RE::ENUM_FORM_ID::kWEAP) {
                 return identity;
             }
-
-            auto* equippedWeaponData = f4vr::getEquippedWeaponData();
 
             identity.hasEquippedWeapon = true;
             identity.formID = weaponForm->formID;
             identity.formAddress = reinterpret_cast<std::uintptr_t>(weaponForm);
-            identity.instanceDataAddress = reinterpret_cast<std::uintptr_t>(weaponInstanceData);
+            identity.instanceDataAddress = reinterpret_cast<std::uintptr_t>(instanceData);
             identity.instanceKeywordDataAddress = reinterpret_cast<std::uintptr_t>(
-                weaponInstanceData ? weaponInstanceData->GetKeywordData() : nullptr);
+                instanceData ? instanceData->GetKeywordData() : nullptr);
+            auto* equippedWeaponData = equipData->data ? static_cast<RE::EquippedWeaponData*>(equipData->data.get()) : nullptr;
             identity.equippedDataAddress = reinterpret_cast<std::uintptr_t>(equippedWeaponData);
-            identity.equippedObjectAddress = reinterpret_cast<std::uintptr_t>(equippedWeaponData);
-            const auto* objectInstanceExtra = findEquippedWeaponObjectInstanceExtra(player, weaponForm, weaponInstanceData);
+            identity.equippedObjectAddress = reinterpret_cast<std::uintptr_t>(
+                equippedWeaponData ? equippedWeaponData->fireNode : nullptr);
+            const auto* objectInstanceExtra = findEquippedWeaponObjectInstanceExtra(player, weaponForm, instanceData);
             const auto objectInstanceWitness = makeObjectInstanceExtraWitness(objectInstanceExtra);
             identity.objectInstanceExtraAddress = reinterpret_cast<std::uintptr_t>(objectInstanceExtra);
             identity.objectIndexDataSignature = objectInstanceWitness.signature;
@@ -1281,8 +1462,8 @@ namespace rock
             identity.activeModCount = objectInstanceWitness.activeCount;
             identity.disabledModCount = objectInstanceWitness.disabledCount;
             if (const auto* weapon = asEquippedWeaponForm(weaponForm)) {
-                identity.instanceContentKey = makeEquippedWeaponInstanceContentKey(weapon, weaponInstanceData, objectInstanceExtra);
-                float weightGame = weaponInstanceData ? weaponInstanceData->GetWeight() : -1.0f;
+                identity.instanceContentKey = makeEquippedWeaponInstanceContentKey(weapon, instanceData, objectInstanceExtra);
+                float weightGame = instanceData ? instanceData->GetWeight() : -1.0f;
                 if (weightGame < 0.0f) {
                     weightGame = weapon->weaponData.weight;
                 }
@@ -1291,7 +1472,7 @@ namespace rock
                 identity.classificationSource = classification.source;
                 identity.keywordFlags = classification.keywordFlags;
             } else {
-                identity.instanceContentKey = makeEquippedWeaponInstanceContentKey(nullptr, weaponInstanceData, objectInstanceExtra);
+                identity.instanceContentKey = makeEquippedWeaponInstanceContentKey(nullptr, instanceData, objectInstanceExtra);
             }
             const auto fullName = RE::TESFullName::GetFullName(*weaponForm);
             if (!fullName.empty()) {
@@ -1358,6 +1539,8 @@ namespace rock
             case WeaponPartKind::Receiver:
                 return { HullCoverageReceiver, semantic.priority, semantic.cosmetic, "receiver/body" };
             case WeaponPartKind::Barrel:
+            case WeaponPartKind::MuzzleDevice:
+            case WeaponPartKind::Bipod:
             case WeaponPartKind::Handguard:
             case WeaponPartKind::Foregrip:
             case WeaponPartKind::Pump:
@@ -1367,6 +1550,10 @@ namespace rock
                 return { HullCoverageMagazine, semantic.priority, semantic.cosmetic, "magazine/socket" };
             case WeaponPartKind::Sight:
             case WeaponPartKind::Accessory:
+            case WeaponPartKind::LaserSight:
+            case WeaponPartKind::Flashlight:
+            case WeaponPartKind::LaserFlashlightCombo:
+            case WeaponPartKind::Scope:
                 return { HullCoverageTopAccessory, semantic.priority, semantic.cosmetic, "top/accessory" };
             case WeaponPartKind::Bolt:
             case WeaponPartKind::Slide:
@@ -1382,20 +1569,16 @@ namespace rock
             case WeaponPartKind::CosmeticAmmo:
                 return { HullCoverageCosmeticAmmo, semantic.priority, true, "cosmetic-ammo" };
             case WeaponPartKind::Other:
+            case WeaponPartKind::Count:
             default:
                 return { HullCoverageOther, semantic.priority, semantic.cosmetic, "other" };
             }
         }
 
-        GeneratedHullCoverageInfo classifyGeneratedHull(std::string_view sourceName)
-        {
-            return classifyGeneratedHullSemantic(classifyWeaponPartName(sourceName));
-        }
-
         weapon_collision_geometry_math::HullSelectionInput makeHullSelectionInput(const RE::NiPoint3& localCenterGame, const RE::NiPoint3& localMinGame,
-            const RE::NiPoint3& localMaxGame, std::size_t pointCount, std::string_view sourceName)
+            const RE::NiPoint3& localMaxGame, std::size_t pointCount, const WeaponPartClassification& semantic)
         {
-            const auto coverage = classifyGeneratedHull(sourceName);
+            const auto coverage = classifyGeneratedHullSemantic(semantic);
             return weapon_collision_geometry_math::HullSelectionInput{
                 pointToArray(localCenterGame),
                 pointToArray(localMinGame),
@@ -1442,6 +1625,46 @@ namespace rock
             return candidates;
         }
 
+        template <class Visitor>
+        void visitGeneratedWeaponMeshRootCandidates(RE::NiAVObject* updateWeaponNode, Visitor&& visitor)
+        {
+            std::array<WeaponMeshRootCandidate, 4> candidates{};
+            std::size_t count = 0;
+            const auto addUnique = [&](RE::NiAVObject* root, const char* label) {
+                if (!root) {
+                    return;
+                }
+                for (std::size_t i = 0; i < count; ++i) {
+                    if (candidates[i].root == root) {
+                        return;
+                    }
+                }
+                if (count < candidates.size()) {
+                    candidates[count++] = WeaponMeshRootCandidate{ root, label };
+                }
+            };
+
+            addUnique(f4vr::getWeaponNode(), "firstPersonSkeleton:Weapon");
+            if (auto* playerNodes = f4vr::getPlayerNodes()) {
+                addUnique(playerNodes->primaryWeapontoWeaponNode, "PlayerNodes.primaryWeapontoWeaponNode");
+                addUnique(playerNodes->primaryWeaponOffsetNOde, "PlayerNodes.primaryWeaponOffsetNode");
+            }
+            addUnique(updateWeaponNode, "updateWeaponNode");
+
+            for (std::size_t i = 0; i < count; ++i) {
+                visitor(candidates[i]);
+            }
+        }
+
+        std::uint64_t makeWeaponEmitterRootSetKey(RE::NiAVObject* updateWeaponNode)
+        {
+            std::uint64_t key = weapon_visual_composition_policy::kWeaponVisualCompositionOffset;
+            visitGeneratedWeaponMeshRootCandidates(updateWeaponNode, [&](const WeaponMeshRootCandidate& candidate) {
+                mixWeaponVisualKey(key, reinterpret_cast<std::uintptr_t>(candidate.root));
+            });
+            return key;
+        }
+
         /*
          * sourceScale re-bakes a source NiNode's own NiTransform::scale into
          * the point cloud before Havok conversion. It must be 1.0 for points
@@ -1464,13 +1687,59 @@ namespace rock
             return result;
         }
 
-        const char* safeNodeName(RE::NiAVObject* node)
+        const char* safeNodeName(const RE::NiAVObject* node)
         {
             if (!node) {
                 return "(null)";
             }
             const char* name = node->name.c_str();
             return name ? name : "(null)";
+        }
+
+        [[nodiscard]] bool niObjectRttiChainContains(const RE::NiObject* object, const char* typeName)
+        {
+            const RE::NiRTTI* rtti = object && typeName ? object->GetRTTI() : nullptr;
+            for (int depth = 0; rtti && depth < 16; ++depth, rtti = rtti->GetBaseRTTI()) {
+                const char* rttiName = rtti->GetName();
+                if (rttiName && std::strcmp(rttiName, typeName) == 0) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        [[nodiscard]] bool generatedWeaponShapeHasEffectShaderProperty(const RE::BSTriShape* triShape)
+        {
+            if (!triShape) {
+                return false;
+            }
+            for (const auto& property : triShape->GetRuntimeData().properties) {
+                if (niObjectRttiChainContains(property.get(), "BSEffectShaderProperty")) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        [[nodiscard]] bool generatedWeaponShapeHasBillboardAncestor(const RE::NiAVObject* node)
+        {
+            // Parent links are frame-scoped engine references; nothing from this walk is retained.
+            for (auto* ancestor = node ? node->parent : nullptr; ancestor; ancestor = ancestor->parent) {
+                if (niObjectRttiChainContains(ancestor, "NiBillboardNode")) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        [[nodiscard]] weapon_effect_geometry_policy::ExclusionReason classifyGeneratedWeaponEffectGeometry(
+            const RE::BSTriShape* triShape)
+        {
+            return weapon_effect_geometry_policy::classify({
+                .hasEffectShaderProperty = generatedWeaponShapeHasEffectShaderProperty(triShape),
+                .hasBillboardAncestor = generatedWeaponShapeHasBillboardAncestor(triShape),
+                .geometryName = safeNodeName(triShape),
+            });
         }
 
         bool weaponVisualNodeVisible(const RE::NiAVObject* node)
@@ -1534,6 +1803,20 @@ namespace rock
                 return;
             }
 
+            /*
+             * Effect-only geometry cannot create collision and therefore must
+             * not make flashlight/laser/reticle visibility toggle the weapon's
+             * collision generation key. A billboard subtree is effect-only by
+             * construction; other effect shapes are filtered by shader/name.
+             */
+            if (niObjectRttiChainContains(node, "NiBillboardNode")) {
+                return;
+            }
+            if (auto* triShape = node->IsTriShape();
+                triShape && classifyGeneratedWeaponEffectGeometry(triShape) != weapon_effect_geometry_policy::ExclusionReason::None) {
+                return;
+            }
+
             const bool visible = weaponVisualNodeVisible(node);
             ++stats.nodeCount;
             if (!visible) {
@@ -1570,6 +1853,386 @@ namespace rock
             for (std::uint16_t i = 0; i < kids.size(); ++i) {
                 auto* kid = kids[i].get();
                 accumulateWeaponVisualKey(kid, node, i, depth + 1, key, stats);
+            }
+        }
+
+        [[nodiscard]] bool weaponEmitterNodeEffectivelyVisible(const RE::NiAVObject* node)
+        {
+            int step = 0;
+            for (auto* current = node; current && step < 32; current = current->parent, ++step) {
+                if (!weaponVisualNodeVisible(current)) {
+                    return false;
+                }
+            }
+            return node != nullptr && step < 32;
+        }
+
+        template <class Predicate>
+        [[nodiscard]] bool weaponEmitterAncestorMatches(const RE::NiAVObject* node, Predicate&& predicate)
+        {
+            int step = 0;
+            for (auto* ancestor = node ? node->parent : nullptr; ancestor && step < 32; ancestor = ancestor->parent, ++step) {
+                if (predicate(std::string_view{ safeNodeName(ancestor) })) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        template <class Predicate>
+        [[nodiscard]] bool weaponEmitterImmediateSiblingMatches(const RE::NiAVObject* node, Predicate&& predicate)
+        {
+            auto* parent = node && node->parent ? node->parent->IsNode() : nullptr;
+            if (!parent) {
+                return false;
+            }
+            const auto& children = parent->GetRuntimeData().children;
+            const std::uint16_t count = (std::min)(children.size(), static_cast<std::uint16_t>(64));
+            for (std::uint16_t i = 0; i < count; ++i) {
+                const auto* sibling = children[i].get();
+                if (sibling && sibling != node && predicate(std::string_view{ safeNodeName(sibling) })) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        struct WeaponEmitterStructuralContext
+        {
+            weapon_part_record_identity_policy::StructureAnchor anchor{ weapon_part_record_identity_policy::StructureAnchor::None };
+            RE::NiAVObject* ownerRoot{ nullptr };
+            bool ownerRootStructural{ false };
+        };
+
+        [[nodiscard]] bool isWeaponAttachmentPointNode(std::string_view name)
+        {
+            return name.starts_with("P-");
+        }
+
+        [[nodiscard]] WeaponEmitterStructuralContext resolveWeaponEmitterStructuralContext(
+            RE::NiAVObject* node,
+            RE::NiAVObject* candidateRoot)
+        {
+            WeaponEmitterStructuralContext result{};
+            RE::NiAVObject* childBelowAncestor = node;
+            int step = 0;
+            for (auto* ancestor = node ? node->parent : nullptr; ancestor && step < 32; ancestor = ancestor->parent, ++step) {
+                const std::string_view ancestorName{ safeNodeName(ancestor) };
+                const auto anchor = weapon_part_record_identity_policy::resolveStructureAnchor(ancestorName);
+                if (anchor != weapon_part_record_identity_policy::StructureAnchor::None) {
+                    result.anchor = anchor;
+                    result.ownerRoot = childBelowAncestor;
+                    result.ownerRootStructural = true;
+                    return result;
+                }
+                /*
+                 * Mod-added attachment slots do not have a vanilla attach-point
+                 * FormID mapping, but their P-* boundary still gives us a safe
+                 * physical owner subtree. Stop here instead of walking upward
+                 * and incorrectly assigning the emitter to P-Receiver/barrel.
+                 */
+                if (isWeaponAttachmentPointNode(ancestorName)) {
+                    result.ownerRoot = childBelowAncestor;
+                    result.ownerRootStructural = true;
+                    return result;
+                }
+                childBelowAncestor = ancestor;
+            }
+            result.ownerRoot = candidateRoot;
+            return result;
+        }
+
+        [[nodiscard]] bool weaponEmitterTransformFinite(const RE::NiTransform& transform)
+        {
+            if (!std::isfinite(transform.translate.x) || !std::isfinite(transform.translate.y) ||
+                !std::isfinite(transform.translate.z) || !std::isfinite(transform.scale)) {
+                return false;
+            }
+            for (int row = 0; row < 3; ++row) {
+                for (int column = 0; column < 3; ++column) {
+                    if (!std::isfinite(transform.rotate.entry[row][column])) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+
+        bool updateWeaponEmitterTransform(
+            WeaponEmitterDescriptor& descriptor,
+            const RE::NiAVObject* transformNode,
+            const RE::NiAVObject* weaponRoot)
+        {
+            if (!transformNode || !weaponRoot || !weaponEmitterTransformFinite(transformNode->world) ||
+                !weaponEmitterTransformFinite(weaponRoot->world) || std::abs(weaponRoot->world.scale) <= 0.000001f) {
+                return false;
+            }
+
+            const RE::NiTransform weaponLocal = transform_math::composeTransforms(
+                transform_math::invertTransform(weaponRoot->world),
+                transformNode->world);
+            if (!weaponEmitterTransformFinite(weaponLocal)) {
+                return false;
+            }
+
+            for (int row = 0; row < 3; ++row) {
+                for (int column = 0; column < 3; ++column) {
+                    descriptor.rotate[static_cast<std::size_t>(row * 3 + column)] = weaponLocal.rotate.entry[row][column];
+                }
+            }
+            descriptor.translate = { weaponLocal.translate.x, weaponLocal.translate.y, weaponLocal.translate.z };
+            descriptor.scale = weaponLocal.scale;
+
+            // Weapon attachment effects in FO4 NIFs emit along their local +Y axis.
+            RE::NiPoint3 forward{
+                weaponLocal.rotate.entry[1][0],
+                weaponLocal.rotate.entry[1][1],
+                weaponLocal.rotate.entry[1][2],
+            };
+            const float length = forward.Length();
+            if (!std::isfinite(length) || length <= 0.000001f) {
+                return false;
+            }
+            forward /= length;
+            descriptor.forwardWeaponLocal = { forward.x, forward.y, forward.z };
+            return true;
+        }
+
+        void copyWeaponEmitterSourceName(WeaponEmitterDescriptor& descriptor, std::string_view name)
+        {
+            descriptor.sourceName.fill('\0');
+            const std::size_t copyCount = (std::min)(name.size(), descriptor.sourceName.size() - 1);
+            if (copyCount != 0) {
+                std::memcpy(descriptor.sourceName.data(), name.data(), copyCount);
+            }
+        }
+
+        [[nodiscard]] bool weaponEmitterDescriptorsShareOwner(
+            const WeaponEmitterDescriptor& lhs,
+            const WeaponEmitterDescriptor& rhs)
+        {
+            if (lhs.kind != rhs.kind) {
+                return false;
+            }
+            if (lhs.transformNodeAddress != 0 && lhs.transformNodeAddress == rhs.transformNodeAddress) {
+                return true;
+            }
+            if (lhs.omodFormId != 0 && rhs.omodFormId != 0) {
+                return lhs.omodFormId == rhs.omodFormId;
+            }
+            if (lhs.attachPointFormId != 0 && rhs.attachPointFormId != 0) {
+                return lhs.attachPointFormId == rhs.attachPointFormId;
+            }
+            return lhs.ownerRootAddress != 0 && lhs.ownerRootAddress == rhs.ownerRootAddress;
+        }
+
+        void mergeWeaponEmitterDescriptor(WeaponEmitterSnapshot& snapshot, const WeaponEmitterDescriptor& candidate)
+        {
+            WeaponEmitterDescriptor* destination = nullptr;
+            for (std::size_t i = 0; i < snapshot.count; ++i) {
+                if (weaponEmitterDescriptorsShareOwner(snapshot.emitters[i], candidate)) {
+                    destination = &snapshot.emitters[i];
+                    break;
+                }
+            }
+            if (!destination) {
+                if (snapshot.count >= snapshot.emitters.size()) {
+                    return;
+                }
+                destination = &snapshot.emitters[snapshot.count++];
+                *destination = candidate;
+                return;
+            }
+
+            destination->active = destination->active || candidate.active;
+            destination->effectStateKnown = destination->effectStateKnown || candidate.effectStateKnown;
+            if (candidate.effectStateKnown && destination->effectNodeAddress == 0) {
+                destination->effectNodeAddress = candidate.effectNodeAddress;
+            }
+            if (candidate.hasAddOnNodeValue) {
+                destination->hasAddOnNodeValue = true;
+                destination->addOnNodeValue = candidate.addOnNodeValue;
+            }
+            if (destination->omodFormId == 0) {
+                destination->omodFormId = candidate.omodFormId;
+            }
+            if (destination->attachPointFormId == 0) {
+                destination->attachPointFormId = candidate.attachPointFormId;
+            }
+            if (candidate.transformPriority > destination->transformPriority) {
+                const bool active = destination->active;
+                const bool effectStateKnown = destination->effectStateKnown;
+                const std::uintptr_t effectNodeAddress = destination->effectNodeAddress;
+                const bool hasAddOnNodeValue = destination->hasAddOnNodeValue;
+                const std::uint32_t addOnNodeValue = destination->addOnNodeValue;
+                const std::uint32_t omodFormId = destination->omodFormId;
+                const std::uint32_t attachPointFormId = destination->attachPointFormId;
+                *destination = candidate;
+                destination->active = active;
+                destination->effectStateKnown = effectStateKnown;
+                destination->effectNodeAddress = effectNodeAddress;
+                destination->hasAddOnNodeValue = hasAddOnNodeValue;
+                destination->addOnNodeValue = addOnNodeValue;
+                destination->omodFormId = omodFormId;
+                destination->attachPointFormId = attachPointFormId;
+            }
+        }
+
+        void collectWeaponEmittersRecursive(
+            RE::NiAVObject* node,
+            RE::NiAVObject* candidateRoot,
+            RE::NiAVObject* weaponRoot,
+            const std::unordered_map<std::uint32_t, std::uint32_t>& omodByAttachPointFormId,
+            std::uint64_t weaponGenerationKey,
+            int depth,
+            std::uint32_t& visitedNodes,
+            WeaponEmitterSnapshot& snapshot)
+        {
+            if (!node || depth > 15 || visitedNodes >= 512) {
+                return;
+            }
+            ++visitedNodes;
+
+            const bool valueNode = niObjectRttiChainContains(node, "BSValueNode");
+            auto* triShape = node->IsTriShape();
+            const bool effectGeometry = triShape &&
+                classifyGeneratedWeaponEffectGeometry(triShape) != weapon_effect_geometry_policy::ExclusionReason::None;
+            if (valueNode || effectGeometry) {
+                const auto structural = resolveWeaponEmitterStructuralContext(node, candidateRoot);
+                const auto hasLaserName = [](std::string_view name) { return weapon_emitter_policy::hasLaserRoleName(name); };
+                const auto hasFlashlightName = [](std::string_view name) { return weapon_emitter_policy::hasFlashlightRoleName(name); };
+                const bool laserContext = weaponEmitterAncestorMatches(node, hasLaserName) ||
+                    (valueNode && weaponEmitterImmediateSiblingMatches(node, hasLaserName));
+                const bool flashlightContext = weaponEmitterAncestorMatches(node, hasFlashlightName) ||
+                    (valueNode && weaponEmitterImmediateSiblingMatches(node, hasFlashlightName));
+                const bool sightContext = structural.anchor == weapon_part_record_identity_policy::StructureAnchor::SlotSight ||
+                    weaponEmitterAncestorMatches(node, [](std::string_view name) {
+                        return weapon_effect_geometry_policy::containsAsciiInsensitive(name, "scope") ||
+                               weapon_effect_geometry_policy::containsAsciiInsensitive(name, "sight") ||
+                               weapon_effect_geometry_policy::containsAsciiInsensitive(name, "optic");
+                    });
+                const auto kind = weapon_emitter_policy::classify({
+                    .nodeName = safeNodeName(node),
+                    .effectGeometry = effectGeometry,
+                    .valueNode = valueNode,
+                    .laserContext = laserContext,
+                    .flashlightContext = flashlightContext,
+                    .sightContext = sightContext,
+                });
+                if (kind != weapon_emitter_policy::Kind::Unknown) {
+                    WeaponEmitterDescriptor descriptor{};
+                    descriptor.valid = true;
+                    descriptor.active = effectGeometry && weaponEmitterNodeEffectivelyVisible(node);
+                    descriptor.visible = weaponEmitterNodeEffectivelyVisible(node);
+                    descriptor.effectStateKnown = effectGeometry;
+                    descriptor.kind = static_cast<std::uint32_t>(kind);
+                    const auto source = valueNode ? weapon_emitter_policy::Source::AddOnNode : weapon_emitter_policy::Source::EffectGeometry;
+                    descriptor.source = static_cast<std::uint32_t>(source);
+                    descriptor.transformPriority = weapon_emitter_policy::transformPriority(kind, source, safeNodeName(node));
+                    descriptor.weaponGenerationKey = weaponGenerationKey;
+                    descriptor.transformNodeAddress = reinterpret_cast<std::uintptr_t>(node);
+                    descriptor.effectNodeAddress = effectGeometry ? reinterpret_cast<std::uintptr_t>(node) : 0;
+                    descriptor.ownerRootAddress = reinterpret_cast<std::uintptr_t>(structural.ownerRoot);
+                    descriptor.ownerRootStructural = structural.ownerRootStructural;
+                    descriptor.attachPointFormId = weapon_part_record_identity_policy::attachPointFormIdForAnchor(structural.anchor);
+                    if (descriptor.attachPointFormId != 0) {
+                        const auto omod = omodByAttachPointFormId.find(descriptor.attachPointFormId);
+                        if (omod != omodByAttachPointFormId.end()) {
+                            descriptor.omodFormId = omod->second;
+                        }
+                    }
+                    if (valueNode) {
+                        const auto value = weapon_emitter_policy::parseAddOnNodeValue(safeNodeName(node));
+                        descriptor.hasAddOnNodeValue = value.valid;
+                        descriptor.addOnNodeValue = value.value;
+                    }
+                    copyWeaponEmitterSourceName(descriptor, safeNodeName(node));
+                    if (updateWeaponEmitterTransform(descriptor, node, weaponRoot)) {
+                        mergeWeaponEmitterDescriptor(snapshot, descriptor);
+                    }
+                }
+            }
+
+            auto* niNode = node->IsNode();
+            if (!niNode) {
+                return;
+            }
+            const auto& children = niNode->GetRuntimeData().children;
+            for (std::uint16_t i = 0; i < children.size(); ++i) {
+                collectWeaponEmittersRecursive(
+                    children[i].get(),
+                    candidateRoot,
+                    weaponRoot,
+                    omodByAttachPointFormId,
+                    weaponGenerationKey,
+                    depth + 1,
+                    visitedNodes,
+                    snapshot);
+            }
+        }
+
+        [[nodiscard]] WeaponEmitterSnapshot collectWeaponEmitterSnapshot(
+            RE::NiAVObject* weaponNode,
+            const std::unordered_map<std::uint32_t, std::uint32_t>& omodByAttachPointFormId,
+            std::uint64_t equippedWeaponKey,
+            std::uint64_t weaponGenerationKey,
+            std::uint64_t rootSetKey)
+        {
+            WeaponEmitterSnapshot snapshot{};
+            if (!weaponNode || equippedWeaponKey == 0 || weaponGenerationKey == 0) {
+                return snapshot;
+            }
+
+            snapshot.weaponGenerationKey = weaponGenerationKey;
+            snapshot.equippedWeaponKey = equippedWeaponKey;
+            snapshot.rootSetKey = rootSetKey;
+            snapshot.weaponRootAddress = reinterpret_cast<std::uintptr_t>(weaponNode);
+            visitGeneratedWeaponMeshRootCandidates(weaponNode, [&](const WeaponMeshRootCandidate& candidate) {
+                std::uint32_t visitedNodes = 0;
+                collectWeaponEmittersRecursive(
+                    candidate.root,
+                    candidate.root,
+                    weaponNode,
+                    omodByAttachPointFormId,
+                    weaponGenerationKey,
+                    0,
+                    visitedNodes,
+                    snapshot);
+            });
+            return snapshot;
+        }
+
+        void refreshWeaponEmittersRecursive(
+            RE::NiAVObject* node,
+            RE::NiAVObject* weaponRoot,
+            int depth,
+            std::uint32_t& visitedNodes,
+            WeaponEmitterSnapshot& snapshot)
+        {
+            if (!node || depth > 15 || visitedNodes >= 512) {
+                return;
+            }
+            ++visitedNodes;
+
+            const auto address = reinterpret_cast<std::uintptr_t>(node);
+            for (std::size_t i = 0; i < snapshot.count; ++i) {
+                auto& descriptor = snapshot.emitters[i];
+                if (descriptor.transformNodeAddress == address) {
+                    descriptor.visible = weaponEmitterNodeEffectivelyVisible(node);
+                    (void)updateWeaponEmitterTransform(descriptor, node, weaponRoot);
+                }
+                if (descriptor.effectNodeAddress == address) {
+                    descriptor.active = weaponEmitterNodeEffectivelyVisible(node);
+                }
+            }
+
+            auto* niNode = node->IsNode();
+            if (!niNode) {
+                return;
+            }
+            const auto& children = niNode->GetRuntimeData().children;
+            for (std::uint16_t i = 0; i < children.size(); ++i) {
+                refreshWeaponEmittersRecursive(children[i].get(), weaponRoot, depth + 1, visitedNodes, snapshot);
             }
         }
 
@@ -1867,6 +2530,9 @@ namespace rock
 
     void WeaponCollision::clearPendingGeneratedWeaponBuild(RE::hknpWorld* world, bool destroyTargetBank)
     {
+        auto structuralMutation = destroyTargetBank && _physicsCallbackGate ?
+            _physicsCallbackGate->pauseForMutation() :
+            PhysicsCallbackQuiescenceGate::MutationLease{};
         if (_pendingGeneratedWeaponBuild.active && destroyTargetBank) {
             destroyWeaponBodyBank(_pendingGeneratedWeaponBuild.replacingExisting ? inactiveWeaponBodies() : activeWeaponBodies(), true);
         }
@@ -1877,6 +2543,8 @@ namespace rock
     bool WeaponCollision::beginPendingGeneratedWeaponBuild(std::uint64_t equippedKey,
         std::uint64_t visualKey,
         std::uint64_t identityKey,
+        std::uint64_t ownershipKey,
+        std::uint32_t weaponFormID,
         const WeaponVisualKeyStats& visualKeyStats,
         bool replacingExisting,
         bool settingsChanged,
@@ -1884,7 +2552,7 @@ namespace rock
         std::vector<GeneratedHullSource> sources,
         const weapon_generated_source_completeness_policy::GeneratedSourceCompleteness& summary)
     {
-        if (equippedKey == 0 || sources.empty() || summary.signature == 0) {
+        if (equippedKey == 0 || ownershipKey == 0 || weaponFormID == 0 || sources.empty() || summary.signature == 0) {
             return false;
         }
 
@@ -1896,6 +2564,8 @@ namespace rock
         _pendingGeneratedWeaponBuild.equippedKey = equippedKey;
         _pendingGeneratedWeaponBuild.visualKey = visualKey;
         _pendingGeneratedWeaponBuild.identityKey = identityKey;
+        _pendingGeneratedWeaponBuild.ownershipKey = ownershipKey;
+        _pendingGeneratedWeaponBuild.weaponFormID = weaponFormID;
         _pendingGeneratedWeaponBuild.visualRootCount = visualKeyStats.rootCount;
         _pendingGeneratedWeaponBuild.visibleTriShapeCount = visualKeyStats.visibleTriShapeCount;
         _pendingGeneratedWeaponBuild.convexRadius = g_rockConfig.rockWeaponCollisionConvexRadius;
@@ -1907,10 +2577,15 @@ namespace rock
         return true;
     }
 
-    bool WeaponCollision::pendingGeneratedWeaponBuildMatches(std::uint64_t equippedKey) const
+    bool WeaponCollision::pendingGeneratedWeaponBuildMatches(
+        std::uint64_t equippedKey,
+        std::uint64_t ownershipKey,
+        std::uint32_t weaponFormID) const
     {
         return _pendingGeneratedWeaponBuild.active &&
                _pendingGeneratedWeaponBuild.equippedKey == equippedKey &&
+               _pendingGeneratedWeaponBuild.ownershipKey == ownershipKey &&
+               _pendingGeneratedWeaponBuild.weaponFormID == weaponFormID &&
                std::abs(_pendingGeneratedWeaponBuild.convexRadius - g_rockConfig.rockWeaponCollisionConvexRadius) <= 0.00001f &&
                std::abs(_pendingGeneratedWeaponBuild.pointDedupGrid - g_rockConfig.rockWeaponCollisionPointDedupGrid) <= 0.00001f &&
                _pendingGeneratedWeaponBuild.supportFitTargetPoints == g_rockConfig.rockWeaponCollisionSupportFitTargetPoints &&
@@ -1963,6 +2638,8 @@ namespace rock
                 _cachedWeaponKey = 0;
                 _cachedWeaponVisualKey = 0;
                 _cachedWeaponIdentityKey = 0;
+                _cachedWeaponOwnershipKey = 0;
+                _cachedWeaponFormID = 0;
                 clearGeneratedSourceCompletenessTracking();
                 clearPendingWeaponVisualRebuild();
                 clearAtomicBodyIds();
@@ -1980,6 +2657,12 @@ namespace rock
         const bool settingsChanged = pending.settingsChanged;
         const bool driveRequestedRebuild = pending.driveRequestedRebuild;
         const auto summary = pending.summary;
+        const auto ownershipKey = pending.ownershipKey;
+        const auto weaponFormID = pending.weaponFormID;
+
+        auto structuralMutation = _physicsCallbackGate ?
+            _physicsCallbackGate->pauseForMutation() :
+            PhysicsCallbackQuiescenceGate::MutationLease{};
 
         if (replacingExisting) {
             ROCK_LOG_INFO(Weapon,
@@ -2008,6 +2691,8 @@ namespace rock
         _cachedWeaponKey = equippedKey;
         _cachedWeaponVisualKey = pending.visualKey;
         _cachedWeaponIdentityKey = pending.identityKey;
+        _cachedWeaponOwnershipKey = ownershipKey;
+        _cachedWeaponFormID = weaponFormID;
         _cachedGeneratedSourceCompleteness = summary;
         clearPendingWeaponVisualRebuild();
         publishWeaponBodySetGeneration(summary);
@@ -2064,6 +2749,84 @@ namespace rock
     std::uint32_t WeaponCollision::getWeaponBodyCount() const
     {
         return _weaponBodyCountAtomic.load(std::memory_order_acquire);
+    }
+
+    WeaponCollision::ReleaseGeometrySnapshot WeaponCollision::getCurrentWeaponReleaseGeometry(
+        const RE::NiPoint3& gripWorldPoint,
+        const RE::NiTransform& capturedWeaponWorld) const
+    {
+        ReleaseGeometrySnapshot result{};
+        bool capturedTransformFinite =
+            std::isfinite(capturedWeaponWorld.translate.x) &&
+            std::isfinite(capturedWeaponWorld.translate.y) &&
+            std::isfinite(capturedWeaponWorld.translate.z) &&
+            std::isfinite(capturedWeaponWorld.scale) &&
+            std::abs(capturedWeaponWorld.scale) > 0.0001f;
+        for (int row = 0; capturedTransformFinite && row < 3; ++row) {
+            for (int column = 0; capturedTransformFinite && column < 3; ++column) {
+                capturedTransformFinite = std::isfinite(capturedWeaponWorld.rotate.entry[row][column]);
+            }
+        }
+        if (!capturedTransformFinite) {
+            return result;
+        }
+        result.hasCapturedWeaponWorld = true;
+        result.capturedWeaponWorld = capturedWeaponWorld;
+        if (!std::isfinite(gripWorldPoint.x) || !std::isfinite(gripWorldPoint.y) || !std::isfinite(gripWorldPoint.z)) {
+            return result;
+        }
+
+        const auto& bank = activeWeaponBodies();
+        float maxDistanceSquared = 0.0f;
+        bool sampledPoint = false;
+        auto sampleLocalPoint = [&](const RE::NiPoint3& localPoint) {
+            if (!std::isfinite(localPoint.x) || !std::isfinite(localPoint.y) || !std::isfinite(localPoint.z)) {
+                return;
+            }
+            const auto worldPoint = weapon_collision_geometry_math::localPointToWorld(
+                capturedWeaponWorld.rotate,
+                capturedWeaponWorld.translate,
+                capturedWeaponWorld.scale,
+                localPoint);
+            const float dx = worldPoint.x - gripWorldPoint.x;
+            const float dy = worldPoint.y - gripWorldPoint.y;
+            const float dz = worldPoint.z - gripWorldPoint.z;
+            const float distanceSquared = dx * dx + dy * dy + dz * dz;
+            if (!std::isfinite(distanceSquared) || distanceSquared < 0.0f) {
+                return;
+            }
+            maxDistanceSquared = (std::max)(maxDistanceSquared, distanceSquared);
+            sampledPoint = true;
+        };
+
+        for (const auto& instance : bank) {
+            if (!instance.body.isValid()) {
+                continue;
+            }
+            if (!instance.generatedLocalPointsGame.empty()) {
+                for (const auto& point : instance.generatedLocalPointsGame) {
+                    sampleLocalPoint(point);
+                }
+                continue;
+            }
+
+            // Bounds remain a safe release-only fallback for a generated body
+            // whose reduced hull point cache is unexpectedly empty.
+            for (int x = 0; x < 2; ++x) {
+                for (int y = 0; y < 2; ++y) {
+                    for (int z = 0; z < 2; ++z) {
+                        sampleLocalPoint(RE::NiPoint3{
+                            x == 0 ? instance.generatedLocalMinGame.x : instance.generatedLocalMaxGame.x,
+                            y == 0 ? instance.generatedLocalMinGame.y : instance.generatedLocalMaxGame.y,
+                            z == 0 ? instance.generatedLocalMinGame.z : instance.generatedLocalMaxGame.z,
+                        });
+                    }
+                }
+            }
+        }
+
+        result.leverGameUnits = sampledPoint ? std::sqrt(maxDistanceSquared) : 0.0f;
+        return result;
     }
 
     RE::hknpBodyId WeaponCollision::getWeaponBodyId() const
@@ -2259,12 +3022,12 @@ namespace rock
         return false;
     }
 
-    bool WeaponCollision::tryBuildSupportGripEvidenceTriangles(
+    bool WeaponCollision::tryGetSupportGripEvidenceView(
         std::uint32_t bodyId,
         const RE::NiAVObject* currentWeaponRoot,
-        std::vector<TriangleData>& outTriangles) const
+        SupportGripEvidenceView& outView) const
     {
-        outTriangles.clear();
+        outView = {};
         if (bodyId == INVALID_BODY_ID) {
             return false;
         }
@@ -2283,20 +3046,23 @@ namespace rock
             const auto& localTriangles = sourceNodeCurrent && !instance.generatedSourceLocalTrianglesGame.empty() ?
                 instance.generatedSourceLocalTrianglesGame :
                 instance.generatedLocalTrianglesGame;
-            outTriangles.reserve(localTriangles.size());
-            const RE::NiTransform driveWorld = driveRoot->world;
-            for (const auto& localTriangle : localTriangles) {
-                TriangleData worldTriangle = localTriangle;
-                worldTriangle.applyTransform(driveWorld);
-                outTriangles.push_back(worldTriangle);
+            if (localTriangles.empty() || !std::isfinite(driveRoot->world.scale) || std::abs(driveRoot->world.scale) <= 0.000001f) {
+                continue;
             }
-            return !outTriangles.empty();
+
+            outView.localTriangles = std::span<const TriangleData>(localTriangles.data(), localTriangles.size());
+            outView.localToWorld = driveRoot->world;
+            outView.weaponGenerationKey = getCurrentWeaponGenerationKey();
+            outView.sourceNodeCurrent = sourceNodeCurrent;
+            return outView.weaponGenerationKey != 0;
         }
 
         return false;
     }
 
-    std::vector<WeaponCollisionProfileEvidenceDescriptor> WeaponCollision::buildProfileEvidenceSnapshot(const WeaponBodyBank& bank) const
+    std::vector<WeaponCollisionProfileEvidenceDescriptor> WeaponCollision::buildProfileEvidenceSnapshot(
+        const WeaponBodyBank& bank,
+        WeaponCompositionSnapshot& outComposition) const
     {
         std::vector<WeaponCollisionProfileEvidenceDescriptor> descriptors;
         descriptors.reserve(bankWeaponBodyCount(bank));
@@ -2307,35 +3073,10 @@ namespace rock
          * them by attach-point keyword FormID. Runs once per publication on
          * the main thread; ~a dozen form lookups.
          */
-        std::unordered_map<std::uint32_t, std::uint32_t> omodByAttachPointFormId;
-        {
-            auto* player = f4vr::getPlayer();
-            // b46b8dd commonlib: equipped item via currentProcess->middleHigh->equippedItems
-            // (the old F4SEVR middleProcess->unk08->equipData chain was renamed).
-            auto* process = player ? player->currentProcess : nullptr;
-            auto* middleHigh = process ? process->middleHigh : nullptr;
-            const bool hasEquippedItem = middleHigh && !middleHigh->equippedItems.empty();
-            RE::TESForm* weaponForm = hasEquippedItem ? static_cast<RE::TESForm*>(middleHigh->equippedItems.front().item.object) : nullptr;
-            RE::TBO_InstanceData* equippedInstanceData = hasEquippedItem ? middleHigh->equippedItems.front().item.instanceData.get() : nullptr;
-            const RE::BGSObjectInstanceExtra* objectInstanceExtra =
-                weaponForm ? findEquippedWeaponObjectInstanceExtra(player, weaponForm, equippedInstanceData) : nullptr;
-            if (objectInstanceExtra && objectInstanceExtra->values) {
-                for (const auto& modIndex : objectInstanceExtra->GetIndexData()) {
-                    if (modIndex.disabled) {
-                        continue;
-                    }
-                    auto* omod = RE::TESForm::GetFormByID<RE::BGSMod::Attachment::Mod>(modIndex.objectID);
-                    if (!omod) {
-                        continue;
-                    }
-                    const RE::BGSKeyword* attachPointKeyword =
-                        RE::BGSKeyword::GetTypedKeywordByIndex(RE::KeywordType::kAttachPoint, omod->attachPoint.keywordIndex);
-                    if (attachPointKeyword) {
-                        omodByAttachPointFormId.emplace(attachPointKeyword->formID, omod->formID);
-                    }
-                }
-            }
-        }
+        const auto omodByAttachPointFormId =
+            readEquippedOmodsByAttachPointFormId(&outComposition);
+        outComposition.weaponGenerationKey = _cachedWeaponBodySetKey;
+        outComposition.weaponFormId = _cachedWeaponFormID;
 
         auto copyLocalPoints = [](const std::vector<RE::NiPoint3>& points) {
             std::vector<WeaponEvidencePoint3> result;
@@ -2376,10 +3117,194 @@ namespace rock
                     descriptor.omodFormId = omodIt->second;
                 }
             }
+            const auto partValue = static_cast<std::uint32_t>(
+                instance.semantic.partKind);
+            if (partValue < 64) {
+                const auto coverageBit = 1ull << partValue;
+                outComposition.semanticCoverageMask |= coverageBit;
+                for (std::uint32_t compositionIndex = 0;
+                     compositionIndex < outComposition.entryCount;
+                     ++compositionIndex) {
+                    auto& entry = outComposition.entries[compositionIndex];
+                    if ((descriptor.omodFormId != 0 &&
+                            entry.omodFormId == descriptor.omodFormId) ||
+                        (instance.semantic.attachPointFormId != 0 &&
+                            entry.attachPointFormId ==
+                                instance.semantic.attachPointFormId)) {
+                        entry.semanticCoverageMask |= coverageBit;
+                        entry.flags |= 1u << 3;
+                    }
+                }
+            }
             descriptors.push_back(std::move(descriptor));
         }
 
+        constexpr std::uint64_t kFnvOffset = 1469598103934665603ull;
+        constexpr std::uint64_t kFnvPrime = 1099511628211ull;
+        auto signature = kFnvOffset;
+        for (std::uint32_t i = 0; i < outComposition.entryCount; ++i) {
+            const auto& entry = outComposition.entries[i];
+            for (const auto value : {
+                     entry.omodFormId,
+                     entry.attachPointFormId,
+                     entry.stableIndex,
+                     entry.flags }) {
+                signature ^= value;
+                signature *= kFnvPrime;
+            }
+            if ((entry.flags & (1u << 0)) != 0 &&
+                entry.semanticCoverageMask == 0 && i < 64) {
+                outComposition.missingCoverageMask |= 1ull << i;
+            }
+        }
+        outComposition.compositionSignature =
+            outComposition.entryCount != 0 ? signature : 0;
+
         return descriptors;
+    }
+
+    WeaponEmitterSnapshot WeaponCollision::buildWeaponEmitterSnapshot(
+        RE::NiAVObject* weaponNode,
+        std::uint64_t equippedWeaponKey,
+        std::uint64_t weaponGenerationKey,
+        std::uint64_t rootSetKey) const
+    {
+        const auto omodByAttachPointFormId = readEquippedOmodsByAttachPointFormId();
+        auto snapshot = collectWeaponEmitterSnapshot(
+            weaponNode,
+            omodByAttachPointFormId,
+            equippedWeaponKey,
+            weaponGenerationKey,
+            rootSetKey);
+
+        ROCK_LOG_DEBUG(Weapon,
+            "Weapon emitter snapshot discovered generation={:016X} emitters={} roots={:016X}",
+            weaponGenerationKey,
+            snapshot.count,
+            rootSetKey);
+        return snapshot;
+    }
+
+    void WeaponCollision::updateWeaponEmitterSnapshot(RE::NiAVObject* weaponNode, std::uint64_t equippedWeaponKey)
+    {
+        const std::uint64_t weaponGenerationKey = getCurrentWeaponGenerationKey();
+        if (!weaponNode || equippedWeaponKey == 0 || weaponGenerationKey == 0 || _cachedWeaponKey != equippedWeaponKey) {
+            clearWeaponEmitterSnapshot();
+            return;
+        }
+
+        const std::uint64_t rootSetKey = makeWeaponEmitterRootSetKey(weaponNode);
+        WeaponEmitterSnapshot snapshot{};
+        {
+            std::scoped_lock lock(_weaponEvidenceSnapshotMutex);
+            snapshot = _weaponEmitterSnapshot;
+        }
+
+        const bool discoveryRequired = snapshot.weaponGenerationKey != weaponGenerationKey ||
+            snapshot.equippedWeaponKey != equippedWeaponKey ||
+            snapshot.rootSetKey != rootSetKey ||
+            snapshot.weaponRootAddress != reinterpret_cast<std::uintptr_t>(weaponNode);
+        if (discoveryRequired) {
+            snapshot = buildWeaponEmitterSnapshot(weaponNode, equippedWeaponKey, weaponGenerationKey, rootSetKey);
+        } else {
+            for (std::size_t i = 0; i < snapshot.count; ++i) {
+                snapshot.emitters[i].active = false;
+                snapshot.emitters[i].visible = false;
+            }
+            visitGeneratedWeaponMeshRootCandidates(weaponNode, [&](const WeaponMeshRootCandidate& candidate) {
+                std::uint32_t visitedNodes = 0;
+                refreshWeaponEmittersRecursive(candidate.root, weaponNode, 0, visitedNodes, snapshot);
+            });
+        }
+
+        std::scoped_lock lock(_weaponEvidenceSnapshotMutex);
+        _weaponEmitterSnapshot = snapshot;
+    }
+
+    void WeaponCollision::clearWeaponEmitterSnapshot()
+    {
+        std::scoped_lock lock(_weaponEvidenceSnapshotMutex);
+        _weaponEmitterSnapshot = {};
+    }
+
+    namespace
+    {
+        bool isFiniteOrderedEvidenceBounds(const WeaponEvidenceBounds3& bounds)
+        {
+            return bounds.valid && std::isfinite(bounds.min.x) && std::isfinite(bounds.min.y) && std::isfinite(bounds.min.z) && std::isfinite(bounds.max.x) &&
+                std::isfinite(bounds.max.y) && std::isfinite(bounds.max.z) && bounds.min.x <= bounds.max.x && bounds.min.y <= bounds.max.y && bounds.min.z <= bounds.max.z;
+        }
+
+        WeaponCollision::NativeScopeSightAnchorSnapshot buildNativeScopeSightAnchorSnapshot(
+            std::uint64_t weaponGenerationKey,
+            std::uint64_t equippedWeaponOwnershipKey,
+            std::uint32_t weaponFormID,
+            const std::vector<WeaponCollisionProfileEvidenceDescriptor>& descriptors)
+        {
+            WeaponCollision::NativeScopeSightAnchorSnapshot snapshot{};
+            snapshot.weaponGenerationKey = weaponGenerationKey;
+            snapshot.equippedWeaponOwnershipKey = equippedWeaponOwnershipKey;
+            snapshot.weaponFormID = weaponFormID;
+
+            bool hasSightBounds = false;
+            RE::NiPoint3 sightBoundsMin{};
+            RE::NiPoint3 sightBoundsMax{};
+            const auto accumulatePartKind = [&](WeaponPartKind partKind) {
+                for (const auto& descriptor : descriptors) {
+                    if (!descriptor.valid || descriptor.weaponGenerationKey != weaponGenerationKey || descriptor.semantic.partKind != partKind ||
+                        !isFiniteOrderedEvidenceBounds(descriptor.localBoundsGame)) {
+                        continue;
+                    }
+
+                    const RE::NiPoint3 candidateMin{
+                        descriptor.localBoundsGame.min.x,
+                        descriptor.localBoundsGame.min.y,
+                        descriptor.localBoundsGame.min.z,
+                    };
+                    const RE::NiPoint3 candidateMax{
+                        descriptor.localBoundsGame.max.x,
+                        descriptor.localBoundsGame.max.y,
+                        descriptor.localBoundsGame.max.z,
+                    };
+                    if (!hasSightBounds) {
+                        sightBoundsMin = candidateMin;
+                        sightBoundsMax = candidateMax;
+                        hasSightBounds = true;
+                    } else {
+                        sightBoundsMin.x = (std::min)(sightBoundsMin.x, candidateMin.x);
+                        sightBoundsMin.y = (std::min)(sightBoundsMin.y, candidateMin.y);
+                        sightBoundsMin.z = (std::min)(sightBoundsMin.z, candidateMin.z);
+                        sightBoundsMax.x = (std::max)(sightBoundsMax.x, candidateMax.x);
+                        sightBoundsMax.y = (std::max)(sightBoundsMax.y, candidateMax.y);
+                        sightBoundsMax.z = (std::max)(sightBoundsMax.z, candidateMax.z);
+                    }
+                    ++snapshot.sightBodyCount;
+                }
+            };
+
+            // Native-overlay OMOD evidence isolates the actual scope. Retain
+            // Sight as a compatibility fallback when record pairing is absent.
+            accumulatePartKind(WeaponPartKind::Scope);
+            if (!hasSightBounds) {
+                accumulatePartKind(WeaponPartKind::Sight);
+            }
+
+            if (!hasSightBounds) {
+                return snapshot;
+            }
+
+            const RE::NiPoint3 anchor = native_scope_camera_follow_math::rearPlaneCenterFromSightBounds(sightBoundsMin, sightBoundsMax);
+            if (!std::isfinite(anchor.x) || !std::isfinite(anchor.y) || !std::isfinite(anchor.z)) {
+                snapshot.sightBodyCount = 0;
+                return snapshot;
+            }
+
+            snapshot.anchorWeaponLocal = anchor;
+            snapshot.sightBoundsMinWeaponLocal = sightBoundsMin;
+            snapshot.sightBoundsMaxWeaponLocal = sightBoundsMax;
+            snapshot.valid = true;
+            return snapshot;
+        }
     }
 
     std::vector<WeaponCollisionProfileEvidenceDescriptor> WeaponCollision::getProfileEvidenceDescriptors() const
@@ -2392,7 +3317,7 @@ namespace rock
 
             std::vector<WeaponCollisionProfileEvidenceDescriptor> descriptors;
             {
-                std::scoped_lock lock(_profileEvidenceSnapshotMutex);
+                std::scoped_lock lock(_weaponEvidenceSnapshotMutex);
                 descriptors = _profileEvidenceSnapshot;
             }
 
@@ -2402,6 +3327,58 @@ namespace rock
             }
         }
 
+        return {};
+    }
+
+    WeaponEmitterSnapshot WeaponCollision::getWeaponEmitterSnapshot() const
+    {
+        std::scoped_lock lock(_weaponEvidenceSnapshotMutex);
+        return _weaponEmitterSnapshot;
+    }
+
+    WeaponCollision::NativeScopeSightAnchorSnapshot WeaponCollision::getNativeScopeSightAnchorSnapshot() const
+    {
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            const std::uint64_t startVersion = _weaponBodyPublicationVersion.load(std::memory_order_acquire);
+            if ((startVersion & 1u) != 0) {
+                continue;
+            }
+
+            NativeScopeSightAnchorSnapshot snapshot{};
+            {
+                std::scoped_lock lock(_weaponEvidenceSnapshotMutex);
+                snapshot = _nativeScopeSightAnchorSnapshot;
+            }
+
+            const std::uint64_t endVersion = _weaponBodyPublicationVersion.load(std::memory_order_acquire);
+            if (startVersion == endVersion && (endVersion & 1u) == 0) {
+                return snapshot;
+            }
+        }
+
+        return {};
+    }
+
+    WeaponCollision::WeaponCompositionSnapshot
+    WeaponCollision::getWeaponCompositionSnapshot() const
+    {
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            const auto startVersion =
+                _weaponBodyPublicationVersion.load(std::memory_order_acquire);
+            if ((startVersion & 1u) != 0) {
+                continue;
+            }
+            WeaponCompositionSnapshot snapshot{};
+            {
+                std::scoped_lock lock(_weaponEvidenceSnapshotMutex);
+                snapshot = _weaponCompositionSnapshot;
+            }
+            const auto endVersion =
+                _weaponBodyPublicationVersion.load(std::memory_order_acquire);
+            if (startVersion == endVersion && (endVersion & 1u) == 0) {
+                return snapshot;
+            }
+        }
         return {};
     }
 
@@ -2425,6 +3402,270 @@ namespace rock
             outDescriptor = descriptor;
             outSourceNode = reinterpret_cast<RE::NiAVObject*>(descriptor.sourceRootAddress);
             return true;
+        }
+
+        return false;
+    }
+
+    std::uint32_t WeaponCollision::copyInteractionCollisionSamples(
+        const RE::NiAVObject* weaponNode,
+        RE::NiPoint3* outWorldPoints,
+        float* outRadiiGame,
+        std::uint32_t maxSamples) const
+    {
+        if (!weaponNode || !outWorldPoints || !outRadiiGame || maxSamples == 0 ||
+            getCurrentWeaponGenerationKey() == 0) {
+            return 0;
+        }
+
+        const auto& bodies = activeWeaponBodies();
+        const RE::NiAVObject* packageDriveRoot =
+            resolvePackageDriveNode(bodies, const_cast<RE::NiAVObject*>(weaponNode));
+        if (!packageDriveRoot) {
+            return 0;
+        }
+
+        std::uint32_t bodyCount = 0;
+        for (const auto& instance : bodies) {
+            if (instance.body.isValid() &&
+                (!instance.generatedSourceLocalPointsGame.empty() ||
+                 !instance.generatedLocalPointsGame.empty())) {
+                ++bodyCount;
+            }
+        }
+        if (bodyCount == 0) {
+            return 0;
+        }
+
+        const float convexRadiusGame =
+            (std::max)(0.0f, g_rockConfig.rockWeaponCollisionConvexRadius) *
+            havokToGameScale();
+        std::uint32_t count = 0;
+        std::uint32_t remainingBodies = bodyCount;
+
+        for (const auto& instance : bodies) {
+            if (!instance.body.isValid() || count >= maxSamples) {
+                continue;
+            }
+
+            const bool sourceNodeCurrent =
+                instance.sourceNode &&
+                actor_equipment_grab::nodeContainsNode(
+                    const_cast<RE::NiAVObject*>(packageDriveRoot),
+                    instance.sourceNode,
+                    64);
+            const bool useSourceLocal =
+                sourceNodeCurrent && !instance.generatedSourceLocalPointsGame.empty();
+            const RE::NiAVObject* sampleRoot =
+                useSourceLocal ? instance.sourceNode : packageDriveRoot;
+            const auto& localPoints =
+                useSourceLocal
+                    ? instance.generatedSourceLocalPointsGame
+                    : instance.generatedLocalPointsGame;
+            if (!sampleRoot || localPoints.empty()) {
+                continue;
+            }
+
+            // Every generated weapon body gets a fair share of the bounded host
+            // buffer. This prevents a large receiver point cloud from consuming
+            // every slot and hiding the barrel/muzzle that is actually touching
+            // the Pip-Boy tray.
+            const std::uint32_t remainingSlots = maxSamples - count;
+            const std::uint32_t quota =
+                (std::max)(1u, remainingSlots / (std::max)(1u, remainingBodies));
+            const std::size_t sampleCount =
+                (std::min)(localPoints.size(), static_cast<std::size_t>(quota));
+
+            for (std::size_t sampleIndex = 0; sampleIndex < sampleCount && count < maxSamples; ++sampleIndex) {
+                const std::size_t pointIndex =
+                    (sampleIndex * localPoints.size()) / sampleCount;
+                outWorldPoints[count] = weapon_collision_geometry_math::localPointToWorld(
+                    sampleRoot->world.rotate,
+                    sampleRoot->world.translate,
+                    sampleRoot->world.scale,
+                    localPoints[pointIndex]);
+                outRadiiGame[count] = convexRadiusGame;
+                ++count;
+            }
+            --remainingBodies;
+        }
+
+        return count;
+    }
+
+    bool WeaponCollision::tryCaptureInteractionCollisionProbeAnchor(
+        const RE::NiAVObject* weaponNode,
+        std::uint32_t sourceBodyId,
+        const RE::NiPoint3& contactPointWorld,
+        RE::NiPoint3& outAnchorLocal,
+        bool& outUsesSourceLocal,
+        RE::NiPoint3& outProbeWorld,
+        float& outRadiusGame) const
+    {
+        outAnchorLocal = {};
+        outUsesSourceLocal = false;
+        outProbeWorld = {};
+        outRadiusGame = 0.0f;
+        if (!weaponNode ||
+            sourceBodyId == INVALID_BODY_ID ||
+            getCurrentWeaponGenerationKey() == 0 ||
+            !std::isfinite(contactPointWorld.x) ||
+            !std::isfinite(contactPointWorld.y) ||
+            !std::isfinite(contactPointWorld.z)) {
+            return false;
+        }
+
+        const auto& bodies = activeWeaponBodies();
+        const RE::NiAVObject* packageDriveRoot =
+            resolvePackageDriveNode(
+                bodies,
+                const_cast<RE::NiAVObject*>(weaponNode));
+        if (!packageDriveRoot) {
+            return false;
+        }
+
+        for (const auto& instance : bodies) {
+            if (!instance.body.isValid() ||
+                instance.body.getBodyId().value != sourceBodyId) {
+                continue;
+            }
+
+            const bool sourceNodeCurrent =
+                instance.sourceNode &&
+                actor_equipment_grab::nodeContainsNode(
+                    const_cast<RE::NiAVObject*>(packageDriveRoot),
+                    instance.sourceNode,
+                    64);
+            const bool useSourceLocal =
+                sourceNodeCurrent &&
+                !instance.generatedSourceLocalPointsGame.empty();
+            const RE::NiAVObject* sampleRoot =
+                useSourceLocal ? instance.sourceNode : packageDriveRoot;
+            const auto& localPoints =
+                useSourceLocal
+                    ? instance.generatedSourceLocalPointsGame
+                    : instance.generatedLocalPointsGame;
+            if (!sampleRoot ||
+                localPoints.empty() ||
+                !std::isfinite(sampleRoot->world.scale) ||
+                std::abs(sampleRoot->world.scale) <= 0.000001f) {
+                return false;
+            }
+
+            const RE::NiPoint3 contactLocal =
+                weapon_collision_geometry_math::worldPointToLocal(
+                    sampleRoot->world.rotate,
+                    sampleRoot->world.translate,
+                    sampleRoot->world.scale,
+                    contactPointWorld);
+            if (!std::isfinite(contactLocal.x) ||
+                !std::isfinite(contactLocal.y) ||
+                !std::isfinite(contactLocal.z)) {
+                return false;
+            }
+
+            // The native callback already identified this exact generated
+            // body and its real contact point. Keep that point in the body's
+            // driving local frame. Snapping to the nearest reduced convex-hull
+            // seed is both unnecessary and incorrect on a broad face: hull
+            // seeds can be many game units from a face-center contact, causing
+            // the point/plane solver to reject genuine barrel or receiver
+            // contact despite the exact sourceBodyId witness.
+            outAnchorLocal = contactLocal;
+            outUsesSourceLocal = useSourceLocal;
+            outProbeWorld =
+                weapon_collision_geometry_math::localPointToWorld(
+                    sampleRoot->world.rotate,
+                    sampleRoot->world.translate,
+                    sampleRoot->world.scale,
+                    outAnchorLocal);
+            outRadiusGame =
+                (std::max)(
+                    0.0f,
+                    g_rockConfig.rockWeaponCollisionConvexRadius) *
+                havokToGameScale();
+            return std::isfinite(outProbeWorld.x) &&
+                   std::isfinite(outProbeWorld.y) &&
+                   std::isfinite(outProbeWorld.z) &&
+                   std::isfinite(outRadiusGame);
+        }
+
+        return false;
+    }
+
+    bool WeaponCollision::tryResolveInteractionCollisionProbeAnchor(
+        const RE::NiAVObject* weaponNode,
+        std::uint32_t sourceBodyId,
+        const RE::NiPoint3& anchorLocal,
+        bool usesSourceLocal,
+        RE::NiPoint3& outProbeWorld,
+        float& outRadiusGame) const
+    {
+        outProbeWorld = {};
+        outRadiusGame = 0.0f;
+        if (!weaponNode ||
+            sourceBodyId == INVALID_BODY_ID ||
+            getCurrentWeaponGenerationKey() == 0 ||
+            !std::isfinite(anchorLocal.x) ||
+            !std::isfinite(anchorLocal.y) ||
+            !std::isfinite(anchorLocal.z)) {
+            return false;
+        }
+
+        const auto& bodies = activeWeaponBodies();
+        const RE::NiAVObject* packageDriveRoot =
+            resolvePackageDriveNode(
+                bodies,
+                const_cast<RE::NiAVObject*>(weaponNode));
+        if (!packageDriveRoot) {
+            return false;
+        }
+
+        for (const auto& instance : bodies) {
+            if (!instance.body.isValid() ||
+                instance.body.getBodyId().value != sourceBodyId) {
+                continue;
+            }
+
+            const bool sourceNodeCurrent =
+                instance.sourceNode &&
+                actor_equipment_grab::nodeContainsNode(
+                    const_cast<RE::NiAVObject*>(packageDriveRoot),
+                    instance.sourceNode,
+                    64);
+            if (usesSourceLocal &&
+                (!sourceNodeCurrent ||
+                 instance.generatedSourceLocalPointsGame.empty())) {
+                return false;
+            }
+            if (!usesSourceLocal &&
+                instance.generatedLocalPointsGame.empty()) {
+                return false;
+            }
+
+            const RE::NiAVObject* sampleRoot =
+                usesSourceLocal ? instance.sourceNode : packageDriveRoot;
+            if (!sampleRoot ||
+                !std::isfinite(sampleRoot->world.scale) ||
+                std::abs(sampleRoot->world.scale) <= 0.000001f) {
+                return false;
+            }
+
+            outProbeWorld =
+                weapon_collision_geometry_math::localPointToWorld(
+                    sampleRoot->world.rotate,
+                    sampleRoot->world.translate,
+                    sampleRoot->world.scale,
+                    anchorLocal);
+            outRadiusGame =
+                (std::max)(
+                    0.0f,
+                    g_rockConfig.rockWeaponCollisionConvexRadius) *
+                havokToGameScale();
+            return std::isfinite(outProbeWorld.x) &&
+                   std::isfinite(outProbeWorld.y) &&
+                   std::isfinite(outProbeWorld.z) &&
+                   std::isfinite(outRadiusGame);
         }
 
         return false;
@@ -2526,48 +3767,75 @@ namespace rock
         WeaponInteractionContact& outContact) const
     {
         outContact = {};
+        const std::uint64_t generationKey = getCurrentWeaponGenerationKey();
         if (!weaponNode ||
             bodyId == INVALID_BODY_ID ||
             !sampleWorldPoints ||
             !sampleRadiiGame ||
             sampleCount == 0 ||
-            getCurrentWeaponGenerationKey() == 0) {
+            generationKey == 0) {
             return false;
         }
 
-        std::vector<TriangleData> worldTriangles;
-        if (!tryBuildSupportGripEvidenceTriangles(bodyId, weaponNode, worldTriangles) ||
-            worldTriangles.empty()) {
+        SupportGripEvidenceView evidence{};
+        if (!tryGetSupportGripEvidenceView(bodyId, weaponNode, evidence) ||
+            evidence.weaponGenerationKey != generationKey ||
+            evidence.localTriangles.empty()) {
             return false;
         }
 
-        const float tolerance = std::isfinite(contactToleranceGame) ?
-            (std::max)(0.0f, contactToleranceGame) :
-            0.0f;
-        float bestSurfaceDistanceSquared = (std::numeric_limits<float>::max)();
+        const float worldScale = std::abs(evidence.localToWorld.scale);
+        if (!std::isfinite(worldScale) || worldScale <= 0.000001f) {
+            return false;
+        }
+
+        const float toleranceWorld =
+            std::isfinite(contactToleranceGame) ?
+                (std::max)(0.0f, contactToleranceGame) :
+                0.0f;
+        float bestSurfaceDistanceSquaredLocal =
+            (std::numeric_limits<float>::max)();
         bool overlaps = false;
 
-        for (std::uint32_t sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex) {
-            const auto& sample = sampleWorldPoints[sampleIndex];
-            if (!std::isfinite(sample.x) ||
-                !std::isfinite(sample.y) ||
-                !std::isfinite(sample.z)) {
+        for (std::uint32_t sampleIndex = 0;
+             sampleIndex < sampleCount;
+             ++sampleIndex) {
+            const auto& sampleWorld = sampleWorldPoints[sampleIndex];
+            if (!std::isfinite(sampleWorld.x) ||
+                !std::isfinite(sampleWorld.y) ||
+                !std::isfinite(sampleWorld.z)) {
                 continue;
             }
-            const float sampleRadius = std::isfinite(sampleRadiiGame[sampleIndex]) ?
-                (std::max)(0.0f, sampleRadiiGame[sampleIndex]) :
-                0.0f;
-            const float allowedDistance = sampleRadius + tolerance;
-            const float allowedDistanceSquared = allowedDistance * allowedDistance;
 
-            for (const auto& triangle : worldTriangles) {
-                const RE::NiPoint3 closest = closestPointOnTriangle(sample, triangle);
-                const float distanceSquared = pointDistanceSquared(sample, closest);
-                if (!std::isfinite(distanceSquared)) {
+            const float sampleRadiusWorld =
+                std::isfinite(sampleRadiiGame[sampleIndex]) ?
+                    (std::max)(0.0f, sampleRadiiGame[sampleIndex]) :
+                    0.0f;
+            const float allowedDistanceLocal =
+                (sampleRadiusWorld + toleranceWorld) / worldScale;
+            const float allowedDistanceSquaredLocal =
+                allowedDistanceLocal * allowedDistanceLocal;
+            const RE::NiPoint3 sampleLocal =
+                transform_math::worldPointToLocal(
+                    evidence.localToWorld,
+                    sampleWorld);
+
+            for (const auto& triangle : evidence.localTriangles) {
+                float distanceSquaredLocal =
+                    (std::numeric_limits<float>::max)();
+                (void)closestPointOnTriangleToPoint(
+                    sampleLocal,
+                    triangle,
+                    distanceSquaredLocal);
+                if (!std::isfinite(distanceSquaredLocal)) {
                     continue;
                 }
-                bestSurfaceDistanceSquared = (std::min)(bestSurfaceDistanceSquared, distanceSquared);
-                if (distanceSquared <= allowedDistanceSquared) {
+                bestSurfaceDistanceSquaredLocal =
+                    (std::min)(
+                        bestSurfaceDistanceSquaredLocal,
+                        distanceSquaredLocal);
+                if (distanceSquaredLocal <=
+                    allowedDistanceSquaredLocal) {
                     overlaps = true;
                     break;
                 }
@@ -2577,99 +3845,22 @@ namespace rock
             }
         }
 
-        if (!overlaps || !tryGetWeaponContactAtomic(bodyId, outContact) || !outContact.valid) {
+        if (!overlaps ||
+            getCurrentWeaponGenerationKey() != generationKey ||
+            !tryGetWeaponContactAtomic(bodyId, outContact) ||
+            !outContact.valid ||
+            outContact.weaponGenerationKey != generationKey) {
             outContact = {};
             return false;
         }
 
-        outContact.probeDistanceGame = std::sqrt((std::max)(0.0f, bestSurfaceDistanceSquared));
+        outContact.probeDistanceGame =
+            std::sqrt(
+                (std::max)(
+                    0.0f,
+                    bestSurfaceDistanceSquaredLocal)) *
+            worldScale;
         return true;
-    }
-
-    std::uint32_t WeaponCollision::copyInteractionCollisionSamples(
-        const RE::NiAVObject* weaponNode,
-        RE::NiPoint3* outWorldPoints,
-        float* outRadiiGame,
-        std::uint32_t maxSamples) const
-    {
-        if (!weaponNode || !outWorldPoints || !outRadiiGame || maxSamples == 0 ||
-            getCurrentWeaponGenerationKey() == 0) {
-            return 0;
-        }
-
-        const auto& bodies = activeWeaponBodies();
-        const RE::NiAVObject* packageDriveRoot =
-            resolvePackageDriveNode(bodies, const_cast<RE::NiAVObject*>(weaponNode));
-        if (!packageDriveRoot) {
-            return 0;
-        }
-
-        std::uint32_t bodyCount = 0;
-        for (const auto& instance : bodies) {
-            if (instance.body.isValid() &&
-                (!instance.generatedSourceLocalPointsGame.empty() ||
-                 !instance.generatedLocalPointsGame.empty())) {
-                ++bodyCount;
-            }
-        }
-        if (bodyCount == 0) {
-            return 0;
-        }
-
-        const float convexRadiusGame =
-            (std::max)(0.0f, g_rockConfig.rockWeaponCollisionConvexRadius) *
-            havokToGameScale();
-        std::uint32_t count = 0;
-        std::uint32_t remainingBodies = bodyCount;
-
-        for (const auto& instance : bodies) {
-            if (!instance.body.isValid() || count >= maxSamples) {
-                continue;
-            }
-
-            const bool sourceNodeCurrent =
-                instance.sourceNode &&
-                actor_equipment_grab::nodeContainsNode(
-                    const_cast<RE::NiAVObject*>(packageDriveRoot),
-                    instance.sourceNode,
-                    64);
-            const bool useSourceLocal =
-                sourceNodeCurrent && !instance.generatedSourceLocalPointsGame.empty();
-            const RE::NiAVObject* sampleRoot =
-                useSourceLocal ? instance.sourceNode : packageDriveRoot;
-            const auto& localPoints =
-                useSourceLocal
-                    ? instance.generatedSourceLocalPointsGame
-                    : instance.generatedLocalPointsGame;
-            if (!sampleRoot || localPoints.empty()) {
-                continue;
-            }
-
-            // Every generated weapon body gets a fair share of the bounded host
-            // buffer. This prevents a large receiver point cloud from consuming
-            // every slot and hiding the barrel/muzzle that is actually touching
-            // the Pip-Boy tray.
-            const std::uint32_t remainingSlots = maxSamples - count;
-            const std::uint32_t quota =
-                (std::max)(1u, remainingSlots / (std::max)(1u, remainingBodies));
-            const std::size_t sampleCount =
-                (std::min)(localPoints.size(), static_cast<std::size_t>(quota));
-
-            for (std::size_t sampleIndex = 0; sampleIndex < sampleCount && count < maxSamples; ++sampleIndex) {
-                const std::size_t pointIndex =
-                    (sampleIndex * localPoints.size()) / sampleCount;
-                outWorldPoints[count] = weapon_collision_geometry_math::localPointToWorld(
-                    sampleRoot->world.rotate,
-                    sampleRoot->world.translate,
-                    sampleRoot->world.scale,
-                    localPoints[pointIndex]);
-                outRadiiGame[count] = convexRadiusGame;
-                ++count;
-            }
-            --remainingBodies;
-        }
-
-        return count;
     }
 
     BethesdaPhysicsBody& WeaponCollision::getWeaponBody()
@@ -2692,6 +3883,13 @@ namespace rock
         _cachedWeaponKey = 0;
         _cachedWeaponVisualKey = 0;
         _cachedWeaponIdentityKey = 0;
+        _cachedWeaponOwnershipKey = 0;
+        _cachedWeaponFormID = 0;
+        _observedEquippedWeaponIdentityKey = 0;
+        _observedEquippedWeaponOwnershipKey = 0;
+        _observedEquippedWeaponFormID = 0;
+        _omodPrebuildAuditEquippedKey = 0;
+        _omodPrebuildAuditRoot = nullptr;
         resetWeaponBodySetGeneration();
         _weaponBodySetEpoch = 0;
         clearGeneratedSourceCompletenessTracking();
@@ -2725,6 +3923,13 @@ namespace rock
         _cachedWeaponKey = 0;
         _cachedWeaponVisualKey = 0;
         _cachedWeaponIdentityKey = 0;
+        _cachedWeaponOwnershipKey = 0;
+        _cachedWeaponFormID = 0;
+        _observedEquippedWeaponIdentityKey = 0;
+        _observedEquippedWeaponOwnershipKey = 0;
+        _observedEquippedWeaponFormID = 0;
+        _omodPrebuildAuditEquippedKey = 0;
+        _omodPrebuildAuditRoot = nullptr;
         resetWeaponBodySetGeneration();
         _weaponBodySetEpoch = 0;
         clearGeneratedSourceCompletenessTracking();
@@ -2740,8 +3945,30 @@ namespace rock
         resetWeaponCollisionSettingsCache();
         _weaponAnimNodeDumpFrameCounter = 0;
         _lastWeaponAnimNodeDumpKey = 0;
+        clearWeaponEmitterSnapshot();
 
         ROCK_LOG_INFO(Weapon, "WeaponCollision shutdown");
+    }
+
+    void WeaponCollision::abandonHavokStateAfterWorldLoss()
+    {
+        auto structuralMutation = _physicsCallbackGate ?
+            _physicsCallbackGate->pauseForMutation() :
+            PhysicsCallbackQuiescenceGate::MutationLease{};
+
+        clearAtomicBodyIds();
+        resetWeaponBodySetGeneration();
+        for (auto& instance : _weaponBodies) {
+            clearWeaponBodyInstance(instance, true);
+        }
+        for (auto& instance : _weaponReplacementBodies) {
+            clearWeaponBodyInstance(instance, true);
+        }
+        _pendingGeneratedWeaponBuild = {};
+        _usingReplacementWeaponBodies = false;
+        _cachedWorld = nullptr;
+        _cachedBhkWorld = nullptr;
+        ROCK_LOG_INFO(Weapon, "Weapon collision wrappers abandoned after Havok world loss");
     }
 
     void WeaponCollision::requestWorkbenchExitRebuild()
@@ -2765,6 +3992,11 @@ namespace rock
             _cachedWeaponKey = 0;
             _cachedWeaponVisualKey = 0;
             _cachedWeaponIdentityKey = 0;
+            _cachedWeaponOwnershipKey = 0;
+            _cachedWeaponFormID = 0;
+            _observedEquippedWeaponIdentityKey = 0;
+            _observedEquippedWeaponOwnershipKey = 0;
+            _observedEquippedWeaponFormID = 0;
             clearGeneratedSourceCompletenessTracking();
             clearPendingWeaponVisualRebuild();
             clearGeneratedSourceCache();
@@ -2775,6 +4007,9 @@ namespace rock
             _driveRebuildRequested.store(false, std::memory_order_release);
             _workbenchExitRebuildRequested.store(false, std::memory_order_release);
             _driveFailureCount.store(0, std::memory_order_release);
+            _omodPrebuildAuditEquippedKey = 0;
+            _omodPrebuildAuditRoot = nullptr;
+            clearWeaponEmitterSnapshot();
         };
 
         if (!g_rockConfig.rockWeaponCollisionEnabled) {
@@ -2811,8 +4046,10 @@ namespace rock
         }
 
         std::uint64_t observedIdentityKey = 0;
+        std::uint64_t observedOwnershipKey = 0;
+        std::uint32_t observedFormID = 0;
         WeaponSizeClass observedSizeClass{ WeaponSizeClass::Rifle };
-        const std::uint64_t observedKey = getEquippedWeaponIdentityKey(&observedIdentityKey, &observedSizeClass);
+        const std::uint64_t observedKey = getEquippedWeaponIdentityKey(&observedIdentityKey, &observedOwnershipKey, &observedSizeClass, &observedFormID);
         if (observedKey == 0) {
             if (hasWeaponBody()) {
                 ROCK_LOG_INFO(Weapon, "Weapon identity unavailable - destroying generated weapon bodies");
@@ -2821,6 +4058,10 @@ namespace rock
             clearCurrentWeaponState();
             return;
         }
+        _observedEquippedWeaponIdentityKey = observedIdentityKey;
+        _observedEquippedWeaponOwnershipKey = observedOwnershipKey;
+        _observedEquippedWeaponFormID = observedFormID;
+        updateWeaponEmitterSnapshot(weaponNode, observedKey);
 
         const bool settingsChanged = weaponCollisionSettingsChanged();
         const bool driveRequestedRebuild = _driveRebuildRequested.exchange(false, std::memory_order_acq_rel);
@@ -2857,8 +4098,6 @@ namespace rock
         };
 
         maybeDumpWeaponAnimNodeDiagnostics(weaponNode, observedKey);
-        maybeFireWorkbenchWeaponReattach();
-
         if (driveRequestedRebuild) {
             ROCK_LOG_WARN(Weapon,
                 "Generated weapon collision drive failure requested rebuild cachedKey={:016X} observedKey={:016X}",
@@ -2873,7 +4112,8 @@ namespace rock
         }
 
         if (_pendingGeneratedWeaponBuild.active) {
-            const bool pendingInvalidated = driveRequestedRebuild || workbenchExitRequested || !pendingGeneratedWeaponBuildMatches(observedKey);
+            const bool pendingInvalidated = driveRequestedRebuild || workbenchExitRequested ||
+                !pendingGeneratedWeaponBuildMatches(observedKey, observedOwnershipKey, observedFormID);
             if (pendingInvalidated) {
                 ROCK_LOG_INFO(Weapon,
                     "Generated weapon staged create cancelled: pendingKey={:016X} observedKey={:016X} pendingVisual={:016X} driveRebuild={} workbenchExit={}",
@@ -2929,6 +4169,31 @@ namespace rock
             const std::uint64_t observedVisualKey = getWeaponVisualCompositionKey(weaponNode, visualKeyStats);
             const bool visualKeyChanged = observedVisualKey != 0 && observedVisualKey != _cachedWeaponVisualKey;
             const bool generationDrivenRebuild = keyChanged || missingBodies;
+            const bool omodPrebuildAuditCurrent =
+                _omodPrebuildAuditEquippedKey == observedKey && _omodPrebuildAuditRoot == weaponNode;
+            if (generationDrivenRebuild && !omodPrebuildAuditCurrent &&
+                g_rockConfig.rockDebugWeaponOmodCoverageAudit && g_rockConfig.rockDebugWeaponOmodSelfHeal) {
+                const auto auditResult = maybeRunWeaponOmodCoverageAudit(weaponNode, observedKey, true);
+                if (auditResult.sceneEnriched) {
+                    /*
+                     * TryAttach3DRecurse mutates the assembled tree. Let the
+                     * engine settle transforms once, then run the unchanged
+                     * full visual witness and collider builder.
+                     */
+                    clearPendingWeaponVisualRebuild();
+                    ROCK_LOG_INFO(Weapon,
+                        "Generated weapon collision pre-build OMOD enrichment completed key={:016X}; deferring source capture one frame",
+                        observedKey);
+                    return;
+                }
+                if (auditResult.ran) {
+                    // Cache only a non-mutating pass. A successful attachment
+                    // must be followed by another pre-build pass so batches
+                    // larger than the per-audit cap fully converge.
+                    _omodPrebuildAuditEquippedKey = observedKey;
+                    _omodPrebuildAuditRoot = weaponNode;
+                }
+            }
             const int requiredStableFrames = (std::max)(0, g_rockConfig.rockWeaponCollisionVisualStabilizationFrames);
             const bool stabilizeVisualRebuild = generationDrivenRebuild && requiredStableFrames > 0;
 
@@ -3019,7 +4284,7 @@ namespace rock
                 } else {
                     performance_profiler::ScopedTimer profilerTimer(performance_profiler::Scope::WeaponColliderBuild);
                     const float maxGeneratedSourceDistanceGame = resolveMaxGeneratedSourceDistanceGame(observedSizeClass);
-                    generatedCount = findGeneratedWeaponShapeSources(weaponNode, generatedSources, maxGeneratedSourceDistanceGame);
+                    generatedCount = findGeneratedWeaponShapeSources(weaponNode, observedKey, generatedSources, maxGeneratedSourceDistanceGame);
                     generatedSummary = summarizeGeneratedSources(generatedSources);
                 }
 
@@ -3103,6 +4368,8 @@ namespace rock
                     _cachedWeaponKey = 0;
                     _cachedWeaponVisualKey = 0;
                     _cachedWeaponIdentityKey = 0;
+                    _cachedWeaponOwnershipKey = 0;
+                    _cachedWeaponFormID = 0;
                     clearGeneratedSourceCompletenessTracking();
                     clearPendingWeaponVisualRebuild();
                     clearGeneratedSourceCache();
@@ -3127,6 +4394,8 @@ namespace rock
                         observedKey,
                         observedVisualKey,
                         observedIdentityKey,
+                        observedOwnershipKey,
+                        observedFormID,
                         visualKeyStats,
                         replacingExisting,
                         settingsChanged,
@@ -3144,6 +4413,8 @@ namespace rock
                         _cachedWeaponKey = 0;
                         _cachedWeaponVisualKey = 0;
                         _cachedWeaponIdentityKey = 0;
+                        _cachedWeaponOwnershipKey = 0;
+                        _cachedWeaponFormID = 0;
                         clearGeneratedSourceCompletenessTracking();
                     }
                     clearPendingWeaponVisualRebuild();
@@ -3167,7 +4438,7 @@ namespace rock
             }
         }
 
-        maybeRunWeaponOmodCoverageAudit(weaponNode);
+        maybeRunWeaponOmodCoverageAudit(weaponNode, observedKey);
     }
 
 
@@ -3318,15 +4589,25 @@ namespace rock
     }
 
 
-    std::uint64_t WeaponCollision::getEquippedWeaponIdentityKey(std::uint64_t* outIdentityKey, WeaponSizeClass* outSizeClass) const
+    std::uint64_t WeaponCollision::getEquippedWeaponIdentityKey(
+        std::uint64_t* outIdentityKey,
+        std::uint64_t* outOwnershipKey,
+        WeaponSizeClass* outSizeClass,
+        std::uint32_t* outFormID) const
     {
         const auto identity = readEquippedWeaponGenerationIdentity();
         const auto identityKey = weapon_generation_identity_policy::makeEquippedWeaponIdentityKey(identity);
         if (outIdentityKey) {
             *outIdentityKey = identityKey;
         }
+        if (outOwnershipKey) {
+            *outOwnershipKey = weapon_generation_identity_policy::makeEquippedWeaponOwnershipKey(identity);
+        }
         if (outSizeClass) {
             *outSizeClass = identity.sizeClass;
+        }
+        if (outFormID) {
+            *outFormID = identity.formID;
         }
 
         return identityKey;
@@ -3361,7 +4642,11 @@ namespace rock
         return visualKey;
     }
 
-    std::size_t WeaponCollision::findGeneratedWeaponShapeSources(RE::NiAVObject* weaponNode, std::vector<GeneratedHullSource>& outSources, float maxSourceDistanceGame)
+    std::size_t WeaponCollision::findGeneratedWeaponShapeSources(
+        RE::NiAVObject* weaponNode,
+        std::uint64_t equippedWeaponKey,
+        std::vector<GeneratedHullSource>& outSources,
+        float maxSourceDistanceGame)
     {
         outSources.clear();
         if (!weaponNode) {
@@ -3390,6 +4675,7 @@ namespace rock
         std::uint32_t totalVisitedShapes = 0;
         std::uint32_t totalExtractedTriangles = 0;
         std::uint32_t totalCulledForDistance = 0;
+        std::uint32_t totalCulledForEffectGeometry = 0;
         const auto groupingMode = weapon_collision_grouping_policy::sanitizeWeaponCollisionGroupingMode(g_rockConfig.rockWeaponCollisionGroupingMode);
         for (const auto& candidate : candidates) {
             std::vector<GeneratedHullSource> candidateSources;
@@ -3398,6 +4684,7 @@ namespace rock
             std::uint32_t visitedShapes = 0;
             std::uint32_t extractedTriangles = 0;
             std::uint32_t culledForDistance = 0;
+            std::uint32_t culledForEffectGeometry = 0;
             findGeneratedWeaponShapeSourcesRecursive(
                 candidate.root,
                 packageDriveRoot,
@@ -3409,11 +4696,13 @@ namespace rock
                 claimedSourceGroups,
                 candidateExtractedSourceGroups,
                 maxSourceDistanceGame,
-                culledForDistance);
+                culledForDistance,
+                culledForEffectGeometry);
             totalCulledForDistance += culledForDistance;
+            totalCulledForEffectGeometry += culledForEffectGeometry;
 
             ROCK_LOG_DEBUG(Weapon,
-                "Generated weapon mesh candidate: label='{}' root='{}' addr={:x} packageRoot='{}' grouping={} acceptedShapes={} visitedShapes={} triangles={} hulls={}",
+                "Generated weapon mesh candidate: label='{}' root='{}' addr={:x} packageRoot='{}' grouping={} acceptedShapes={} visitedShapes={} triangles={} hulls={} effectShapesCulled={}",
                 candidate.label,
                 safeNodeName(candidate.root),
                 reinterpret_cast<std::uintptr_t>(candidate.root),
@@ -3422,7 +4711,8 @@ namespace rock
                 candidateExtractedSourceGroups.size(),
                 visitedShapes,
                 extractedTriangles,
-                candidateSources.size());
+                candidateSources.size(),
+                culledForEffectGeometry);
             totalVisitedShapes += visitedShapes;
             totalExtractedTriangles += extractedTriangles;
 
@@ -3449,6 +4739,89 @@ namespace rock
         if (outSources.empty()) {
             ROCK_LOG_DEBUG(Weapon, "Generated weapon mesh source scan: all {} candidates produced zero hulls", candidates.size());
             return 0;
+        }
+
+        /*
+         * Refine physical module kinds from the same installed-OMOD and live
+         * emitter evidence that ROCK publishes through the provider API.
+         * Exact OMOD identity is authoritative for standard slots. Mod-added
+         * P-* slots have no vanilla attach-point FormID, so they use only the
+         * bounded owner subtree captured during this same traversal; candidate
+         * root fallbacks are explicitly rejected by ownerRootStructural.
+         */
+        const auto omodByAttachPointFormId = readEquippedOmodsByAttachPointFormId();
+        std::unordered_set<std::uint32_t> nativeScopeOverlayOmods;
+        nativeScopeOverlayOmods.reserve(omodByAttachPointFormId.size());
+        for (const auto& [attachPointFormId, omodFormId] : omodByAttachPointFormId) {
+            (void)attachPointFormId;
+            if (attachmentModHasNativeScopeOverlayTarget(omodFormId)) {
+                nativeScopeOverlayOmods.insert(omodFormId);
+            }
+        }
+
+        const auto emitterSnapshot = collectWeaponEmitterSnapshot(
+            weaponNode,
+            omodByAttachPointFormId,
+            equippedWeaponKey,
+            equippedWeaponKey,
+            makeWeaponEmitterRootSetKey(weaponNode));
+        for (auto& source : outSources) {
+            std::uint32_t sourceOmodFormId = 0;
+            if (source.semantic.attachPointFormId != 0) {
+                const auto omod = omodByAttachPointFormId.find(source.semantic.attachPointFormId);
+                if (omod != omodByAttachPointFormId.end()) {
+                    sourceOmodFormId = omod->second;
+                }
+            }
+
+            weapon_accessory_part_kind_policy::Evidence evidence{};
+            evidence.nativeScopeOverlay =
+                (sourceOmodFormId != 0 && nativeScopeOverlayOmods.contains(sourceOmodFormId)) ||
+                (sourceOmodFormId == 0 && source.semantic.partKind == WeaponPartKind::Sight && nativeScopeOverlayOmods.size() == 1);
+
+            for (std::size_t emitterIndex = 0; emitterIndex < emitterSnapshot.count; ++emitterIndex) {
+                const auto& emitter = emitterSnapshot.emitters[emitterIndex];
+                if (!emitter.valid) {
+                    continue;
+                }
+
+                const bool sameOmod = sourceOmodFormId != 0 && emitter.omodFormId == sourceOmodFormId;
+                bool sameStructuralOwner = false;
+                if (!sameOmod && emitter.ownerRootStructural && emitter.ownerRootAddress != 0 && source.sourceRoot) {
+                    auto* ownerRoot = reinterpret_cast<RE::NiAVObject*>(emitter.ownerRootAddress);
+                    sameStructuralOwner = actor_equipment_grab::nodeContainsNode(ownerRoot, source.sourceRoot, 32);
+                }
+                if (!sameOmod && !sameStructuralOwner) {
+                    continue;
+                }
+
+                switch (static_cast<weapon_emitter_policy::Kind>(emitter.kind)) {
+                case weapon_emitter_policy::Kind::Laser:
+                    evidence.laserEmitter = true;
+                    break;
+                case weapon_emitter_policy::Kind::Flashlight:
+                    evidence.flashlightEmitter = true;
+                    break;
+                case weapon_emitter_policy::Kind::Reticle:
+                case weapon_emitter_policy::Kind::Unknown:
+                default:
+                    break;
+                }
+            }
+
+            const auto baseKind = source.semantic.partKind;
+            source.semantic = weapon_accessory_part_kind_policy::applyAttachmentEvidence(source.semantic, evidence);
+            if (source.semantic.partKind != baseKind) {
+                ROCK_LOG_DEBUG(Weapon,
+                    "Generated weapon part refined by attachment evidence: source='{}' base={} resolved={} omod={:08X} nativeScope={} laser={} flashlight={}",
+                    source.sourceName,
+                    generatedWeaponPartKindName(baseKind),
+                    generatedWeaponPartKindName(source.semantic.partKind),
+                    sourceOmodFormId,
+                    evidence.nativeScopeOverlay,
+                    evidence.laserEmitter,
+                    evidence.flashlightEmitter);
+            }
         }
 
         auto generatedSourceConvexCount = [](const GeneratedHullSource& source) {
@@ -3513,20 +4886,39 @@ namespace rock
 
         if (outSources.size() > MAX_WEAPON_BODIES) {
             logGeneratedSourceInventory("body-capacity-overflow", outSources);
-            const std::size_t droppedCount = outSources.size() - MAX_WEAPON_BODIES;
+            const std::size_t extractedCount = outSources.size();
+            const std::size_t droppedCount = extractedCount - MAX_WEAPON_BODIES;
+            std::vector<weapon_collision_geometry_math::HullSelectionInput> selectionInputs;
+            selectionInputs.reserve(outSources.size());
+            for (const auto& source : outSources) {
+                selectionInputs.push_back(makeHullSelectionInput(
+                    source.localCenterGame,
+                    source.localMinGame,
+                    source.localMaxGame,
+                    source.localPointsGame.size(),
+                    source.semantic));
+            }
+
+            const auto selectedIndices =
+                weapon_collision_geometry_math::selectBalancedHullIndices(selectionInputs, MAX_WEAPON_BODIES);
+            std::vector<GeneratedHullSource> selectedSources;
+            selectedSources.reserve(selectedIndices.size());
+            for (const auto selectedIndex : selectedIndices) {
+                selectedSources.push_back(std::move(outSources[selectedIndex]));
+            }
+            outSources = std::move(selectedSources);
             ROCK_LOG_WARN(Weapon,
-                "Generated weapon mesh body cap reached: extracted={} kept={} dropped={} policy=visible-traversal-order",
+                "Generated weapon mesh body cap reached: extracted={} kept={} dropped={} policy=balanced-semantic-coverage",
+                extractedCount,
                 outSources.size(),
-                MAX_WEAPON_BODIES,
                 droppedCount);
-            outSources.resize(MAX_WEAPON_BODIES);
         } else if (outSources.size() == MAX_WEAPON_BODIES) {
             logGeneratedSourceInventory("body-capacity-exact", outSources);
         }
 
         for (std::size_t i = 0; i < outSources.size(); ++i) {
             const auto& source = outSources[i];
-            const auto coverage = classifyGeneratedHull(source.sourceName);
+            const auto coverage = classifyGeneratedHullSemantic(source.semantic);
             /*
              * The actual Havok hull is built from sourceLocalPoints* (the
              * source NiNode's own local space), not localPoints* (weapon-root
@@ -3588,6 +4980,13 @@ namespace rock
                 safeNodeName(packageDriveRoot));
         }
 
+        if (totalCulledForEffectGeometry > 0) {
+            ROCK_LOG_INFO(Weapon,
+                "Generated weapon effect geometry filter: excluded {} visual-only shape(s) from collision root='{}' policy=effect-shader+billboard+role-name",
+                totalCulledForEffectGeometry,
+                safeNodeName(packageDriveRoot));
+        }
+
         return outSources.size();
     }
 
@@ -3601,9 +5000,17 @@ namespace rock
         const std::unordered_set<std::uintptr_t>& claimedSourceGroups,
         std::unordered_set<std::uintptr_t>& candidateExtractedSourceGroups,
         float maxSourceDistanceGame,
-        std::uint32_t& culledForDistance)
+        std::uint32_t& culledForDistance,
+        std::uint32_t& culledForEffectGeometry)
     {
         if (!node || depth > 15) {
+            return;
+        }
+        if (node->GetAppCulled()) {
+            ROCK_LOG_TRACE(Weapon,
+                "{}generated mesh source branch skipped '{}': ancestor branch is app-culled",
+                std::string(depth * 2, ' '),
+                safeNodeName(node));
             return;
         }
         auto* triShape = node->IsTriShape();
@@ -3615,6 +5022,17 @@ namespace rock
             }
             if (!weaponVisualNodeVisible(node)) {
                 ROCK_LOG_TRACE(Weapon, "{}generated mesh source skipped '{}': TriShape is hidden or locally zero-scale", std::string(depth * 2, ' '), safeNodeName(node));
+                return;
+            }
+
+            const auto effectExclusionReason = classifyGeneratedWeaponEffectGeometry(triShape);
+            if (effectExclusionReason != weapon_effect_geometry_policy::ExclusionReason::None) {
+                ++culledForEffectGeometry;
+                ROCK_LOG_TRACE(Weapon,
+                    "{}generated mesh source skipped '{}': visual effect geometry reason={}",
+                    std::string(depth * 2, ' '),
+                    safeNodeName(node),
+                    weapon_effect_geometry_policy::exclusionReasonName(effectExclusionReason));
                 return;
             }
             ++visitedShapes;
@@ -3681,23 +5099,34 @@ namespace rock
             }
 
             /*
-             * Structure anchors outrank NIF name tokens: the nearest ancestor
-             * that is a connect point (P-*) or an engine rig node decides the
-             * part's slot/function per the record-identity policy. The walk is
-             * bounded and purely upward, so it needs no recursion-state
-             * threading and stays valid for cached sources (the OMOD set is
-             * part of the weapon generation identity).
+             * Structure anchors outrank NIF name tokens. A P-* slot is the
+             * attachment owner and therefore outranks a nearer animation rig
+             * node such as WeaponMagazine; explicit ammunition mesh names are
+             * preserved by the record-identity policy. The walk is bounded and
+             * purely upward, so it needs no recursion-state threading and stays
+             * valid for cached sources (the OMOD set is part of the weapon
+             * generation identity).
              */
             auto sourceSemantic = classifyWeaponPartName(safeNodeName(node));
             {
-                auto structureAnchor = weapon_part_record_identity_policy::StructureAnchor::None;
+                auto slotAnchor = weapon_part_record_identity_policy::StructureAnchor::None;
+                auto rigAnchor = weapon_part_record_identity_policy::StructureAnchor::None;
                 RE::NiAVObject* ancestor = node->parent;
                 for (int step = 0; ancestor && step < 24; ++step, ancestor = ancestor->parent) {
-                    structureAnchor = weapon_part_record_identity_policy::resolveStructureAnchor(safeNodeName(ancestor));
-                    if (structureAnchor != weapon_part_record_identity_policy::StructureAnchor::None) {
+                    const auto candidateAnchor = weapon_part_record_identity_policy::resolveStructureAnchor(safeNodeName(ancestor));
+                    if (candidateAnchor == weapon_part_record_identity_policy::StructureAnchor::RigBolt ||
+                        candidateAnchor == weapon_part_record_identity_policy::StructureAnchor::RigMagazineDisplay) {
+                        if (rigAnchor == weapon_part_record_identity_policy::StructureAnchor::None) {
+                            rigAnchor = candidateAnchor;
+                        }
+                        continue;
+                    }
+                    if (candidateAnchor != weapon_part_record_identity_policy::StructureAnchor::None) {
+                        slotAnchor = candidateAnchor;
                         break;
                     }
                 }
+                const auto structureAnchor = weapon_part_record_identity_policy::chooseStructureAnchor(slotAnchor, rigAnchor);
                 sourceSemantic = weapon_part_record_identity_policy::applyStructureAnchor(sourceSemantic, structureAnchor);
                 if (sourceSemantic.classificationSource != WeaponPartClassificationSource::NameToken) {
                     ROCK_LOG_DEBUG(Weapon,
@@ -3789,7 +5218,8 @@ namespace rock
                         claimedSourceGroups,
                         candidateExtractedSourceGroups,
                         maxSourceDistanceGame,
-                        culledForDistance);
+                        culledForDistance,
+                        culledForEffectGeometry);
                 }
             }
         }
@@ -3917,8 +5347,17 @@ namespace rock
             const std::size_t sourceIndex = nextSourceIndex++;
             ++attemptedThisFrame;
             const auto& source = sources[sourceIndex];
-            const auto& shapePoints = source.sourceLocalPointsGame.empty() ? source.localPointsGame : source.sourceLocalPointsGame;
-            if (!pointCloudCanBuildHull(shapePoints)) {
+            const bool useSourceLocal = !source.sourceLocalPointsGame.empty();
+            const auto& shapePoints = useSourceLocal ? source.sourceLocalPointsGame : source.localPointsGame;
+            const float shapePointScale = useSourceLocal ? source.sourceNodeScale : 1.0f;
+            if (!pointCloudCanBuildHull(shapePoints, shapePointScale)) {
+                ROCK_LOG_DEBUG(Weapon,
+                    "Generated weapon mesh hull '{}' rejected before native shape build: points={} sourceLocal={} sourceScale={:.4f} effective hull diagonal below {:.2f} game units",
+                    source.sourceName,
+                    shapePoints.size(),
+                    useSourceLocal,
+                    shapePointScale,
+                    MIN_HULL_DIAGONAL_GAME_UNITS);
                 continue;
             }
 
@@ -3961,20 +5400,8 @@ namespace rock
             }
 
             instance.body.createNiNode("ROCK_WeaponMeshCollision");
-            // instance.sourceNode (== source.sourceRoot) was captured during the scan
-            // frame, potentially several frames before this staged-creation batch runs
-            // (GENERATED_WEAPON_BODY_CREATION_BATCH sources/frame). The engine/FRIK can
-            // rebuild the fp Weapon subtree in between (ADS/scope toggle, anim-graph
-            // reload, 1st/3rd switch) and free the old TriShape nodes. Revalidate against
-            // the LIVE weapon root before dereferencing - same nodeContainsNode liveness
-            // pattern already used for this exact staleness class elsewhere in this file
-            // (tryBuildSupportGripEvidenceTriangles, resolveSupportGripDriveRoot).
-            RE::NiAVObject* liveWeaponRoot = f4vr::getWeaponNode();
-            const bool sourceNodeCurrent = instance.sourceNode && liveWeaponRoot &&
-                actor_equipment_grab::nodeContainsNode(liveWeaponRoot, instance.sourceNode, 64);
-            const RE::NiAVObject* driveRootNode = sourceNodeCurrent ? instance.sourceNode : (liveWeaponRoot ? liveWeaponRoot : instance.driveNode);
-            const RE::NiTransform driveRootTransform = driveRootNode ? driveRootNode->world : makeIdentityTransform();
-            const RE::NiPoint3 initialCenterGame = sourceNodeCurrent ? source.sourceLocalCenterGame : source.localCenterGame;
+            const RE::NiTransform driveRootTransform = instance.sourceNode ? instance.sourceNode->world : (instance.driveNode ? instance.driveNode->world : makeIdentityTransform());
+            const RE::NiPoint3 initialCenterGame = instance.sourceNode ? source.sourceLocalCenterGame : source.localCenterGame;
             const RE::NiTransform initialTransform = makeGeneratedBodyWorldTransform(driveRootTransform, initialCenterGame);
             if (!placeGeneratedKeyframedBodyImmediately(world, instance.body, initialTransform)) {
                 ROCK_LOG_ERROR(Weapon,
@@ -4008,6 +5435,9 @@ namespace rock
 
     void WeaponCollision::destroyWeaponBody(RE::hknpWorld* world)
     {
+        auto structuralMutation = _physicsCallbackGate ?
+            _physicsCallbackGate->pauseForMutation() :
+            PhysicsCallbackQuiescenceGate::MutationLease{};
         if (!bankHasWeaponBody(_weaponBodies) && !bankHasWeaponBody(_weaponReplacementBodies)) {
             clearGeneratedSourceCompletenessTracking();
             clearPendingWeaponVisualRebuild();
@@ -4051,6 +5481,13 @@ namespace rock
         _cachedWeaponKey = 0;
         _cachedWeaponVisualKey = 0;
         _cachedWeaponIdentityKey = 0;
+        _cachedWeaponOwnershipKey = 0;
+        _cachedWeaponFormID = 0;
+        _observedEquippedWeaponIdentityKey = 0;
+        _observedEquippedWeaponOwnershipKey = 0;
+        _observedEquippedWeaponFormID = 0;
+        _omodPrebuildAuditEquippedKey = 0;
+        _omodPrebuildAuditRoot = nullptr;
         clearGeneratedSourceCompletenessTracking();
         clearPendingWeaponVisualRebuild();
         clearGeneratedSourceCache();
@@ -4095,18 +5532,21 @@ namespace rock
             return;
         }
 
-        std::scoped_lock lock(_retiredWeaponBodyPayloadMutex);
-        for (auto& retired : _retiredWeaponBodyPayloads) {
+        std::scoped_lock lock(s_retiredWeaponBodyPayloadMutex);
+        for (auto& retired : s_retiredWeaponBodyPayloads) {
             if (!retired.occupied()) {
                 retired.bodyPayload = payload;
                 retired.remainingPhysicsSteps = RETIRED_GENERATED_WEAPON_BODY_GRACE_STEPS;
-                ++_retiredWeaponBodyPayloadCount;
+                ++s_retiredWeaponBodyPayloadCount;
+                s_hasRetiredWeaponBodyPayloads.store(
+                    true,
+                    std::memory_order_release);
                 ROCK_LOG_SAMPLE_DEBUG(Weapon,
                     1000,
                     "Generated weapon body {} payload retired for {} physics steps activeRetired={}",
                     payload.bodyId,
                     RETIRED_GENERATED_WEAPON_BODY_GRACE_STEPS,
-                    _retiredWeaponBodyPayloadCount);
+                    s_retiredWeaponBodyPayloadCount);
                 payload = {};
                 return;
             }
@@ -4224,8 +5664,11 @@ namespace rock
             value.store(0, std::memory_order_release);
         }
         {
-            std::scoped_lock lock(_profileEvidenceSnapshotMutex);
+            std::scoped_lock lock(_weaponEvidenceSnapshotMutex);
             _profileEvidenceSnapshot.clear();
+            _weaponEmitterSnapshot = {};
+            _nativeScopeSightAnchorSnapshot = {};
+            _weaponCompositionSnapshot = {};
         }
         endWeaponBodyPublication();
     }
@@ -4237,7 +5680,23 @@ namespace rock
 
     void WeaponCollision::publishAtomicBodyIds(WeaponBodyBank& bank)
     {
-        auto evidenceSnapshot = buildProfileEvidenceSnapshot(bank);
+        WeaponCompositionSnapshot weaponCompositionSnapshot{};
+        auto evidenceSnapshot = buildProfileEvidenceSnapshot(
+            bank,
+            weaponCompositionSnapshot);
+        weaponCompositionSnapshot.publicationSequence =
+            ++_weaponCompositionPublicationSequence;
+        RE::NiAVObject* packageDriveNode = resolvePackageDriveNode(bank, nullptr);
+        NativeScopeSightAnchorSnapshot nativeScopeSightAnchorSnapshot = buildNativeScopeSightAnchorSnapshot(
+            _cachedWeaponBodySetKey,
+            _cachedWeaponOwnershipKey,
+            _cachedWeaponFormID,
+            evidenceSnapshot);
+        const auto manualScopeTarget = resolveEquippedManualScopeTarget(packageDriveNode);
+        nativeScopeSightAnchorSnapshot.nativeScopeOverlayValid = manualScopeTarget.overlayValid;
+        nativeScopeSightAnchorSnapshot.nativeScopeOverlayIndex = manualScopeTarget.overlayIndex;
+        nativeScopeSightAnchorSnapshot.manualDirectTransitionRequired =
+            nativeScopeSightAnchorSnapshot.valid && manualScopeTarget.directTransitionRequired;
         std::uint32_t count = 0;
         beginWeaponBodyPublication();
         _weaponBodyCountAtomic.store(0, std::memory_order_release);
@@ -4249,10 +5708,11 @@ namespace rock
         }
         _weaponBodySetKeyAtomic.store(_cachedWeaponBodySetKey, std::memory_order_release);
         {
-            std::scoped_lock lock(_profileEvidenceSnapshotMutex);
+            std::scoped_lock lock(_weaponEvidenceSnapshotMutex);
             _profileEvidenceSnapshot = std::move(evidenceSnapshot);
+            _nativeScopeSightAnchorSnapshot = nativeScopeSightAnchorSnapshot;
+            _weaponCompositionSnapshot = weaponCompositionSnapshot;
         }
-        RE::NiAVObject* packageDriveNode = resolvePackageDriveNode(bank, nullptr);
         for (auto& instance : bank) {
             if (instance.body.isValid() && count < MAX_WEAPON_BODIES) {
                 instance.publicationIndex = count;
@@ -4336,18 +5796,14 @@ namespace rock
         _lastOmodDumpGenerationKey = _cachedWeaponBodySetKey;
 
         auto* player = f4vr::getPlayer();
-        // b46b8dd commonlib: equipped item via currentProcess->middleHigh->equippedItems
-        // (the old F4SEVR middleProcess->unk08->equipData chain was renamed).
-        auto* process = player ? player->currentProcess : nullptr;
-        auto* middleHigh = process ? process->middleHigh : nullptr;
-        const bool hasEquippedItem = middleHigh && !middleHigh->equippedItems.empty();
-        RE::TESForm* weaponForm = hasEquippedItem ? static_cast<RE::TESForm*>(middleHigh->equippedItems.front().item.object) : nullptr;
-        RE::TBO_InstanceData* equippedInstanceData = hasEquippedItem ? middleHigh->equippedItems.front().item.instanceData.get() : nullptr;
+        auto* equipData = f4vr::getEquippedItem();
+        auto* weaponForm = equipData ? equipData->item.object : nullptr;
+        auto* equippedInstanceData = equipData ? equipData->item.instanceData.get() : nullptr;
         ROCK_LOG_INFO(Weapon,
             "OMOD-DUMP begin generation={:016X} weapon={:08X} '{}'",
             _cachedWeaponBodySetKey,
             weaponForm ? weaponForm->formID : 0u,
-            weaponForm ? std::string(RE::TESFullName::GetFullName(*weaponForm)) : std::string());
+            weaponForm ? RE::TESFullName::GetFullName(*weaponForm) : std::string_view{});
 
         const RE::BGSObjectInstanceExtra* objectInstanceExtra =
             weaponForm ? findEquippedWeaponObjectInstanceExtra(player, weaponForm, equippedInstanceData) : nullptr;
@@ -4679,6 +6135,927 @@ namespace rock
             }
             return count;
         }
+
+        struct OmodPhysicalTemplateSignature
+        {
+            std::vector<std::string> meshNames;
+            std::string durableAnchorName;
+            std::uint32_t durableAnchorTriangles{ 0 };
+        };
+
+        void collectOmodPhysicalTemplateSignatureRecursive(
+            RE::NiAVObject* node,
+            OmodPhysicalTemplateSignature& signature,
+            std::size_t& visited,
+            const int depth = 0)
+        {
+            if (!node || depth > 16 || visited >= 512 || signature.meshNames.size() >= 96) {
+                return;
+            }
+            ++visited;
+
+            if (auto* triShape = node->IsTriShape()) {
+                if (classifyGeneratedWeaponEffectGeometry(triShape) != weapon_effect_geometry_policy::ExclusionReason::None) {
+                    return;
+                }
+
+                const char* rawName = node->name.c_str();
+                if (!rawName || rawName[0] == '\0') {
+                    return;
+                }
+                const auto duplicate = std::find_if(signature.meshNames.begin(), signature.meshNames.end(), [rawName](const std::string& existing) {
+                    return _stricmp(existing.c_str(), rawName) == 0;
+                });
+                if (duplicate == signature.meshNames.end()) {
+                    signature.meshNames.emplace_back(rawName);
+                }
+
+                std::uint32_t triangleCount = 0;
+                if (native_memory::tryReadField(triShape, VROffset::numTriangles, triangleCount) &&
+                    triangleCount > signature.durableAnchorTriangles) {
+                    signature.durableAnchorTriangles = triangleCount;
+                    signature.durableAnchorName = rawName;
+                }
+                return;
+            }
+
+            auto* niNode = node->IsNode();
+            if (!niNode) {
+                return;
+            }
+            const auto& children = niNode->children;
+            for (auto i = decltype(children.size()){ 0 }; i < children.size(); ++i) {
+                collectOmodPhysicalTemplateSignatureRecursive(children[i].get(), signature, visited, depth + 1);
+            }
+        }
+
+        OmodPhysicalTemplateSignature collectOmodPhysicalTemplateSignature(RE::NiNode* root)
+        {
+            OmodPhysicalTemplateSignature signature{};
+            signature.meshNames.reserve(32);
+            std::size_t visited = 0;
+            collectOmodPhysicalTemplateSignatureRecursive(root, signature, visited);
+            return signature;
+        }
+
+        [[nodiscard]] bool physicalTemplateSignatureCovers(
+            const OmodPhysicalTemplateSignature& candidate,
+            const OmodPhysicalTemplateSignature& required)
+        {
+            return std::all_of(required.meshNames.begin(), required.meshNames.end(), [&candidate](const std::string& name) {
+                return std::any_of(candidate.meshNames.begin(), candidate.meshNames.end(), [&name](const std::string& candidateName) {
+                    return _stricmp(candidateName.c_str(), name.c_str()) == 0;
+                });
+            });
+        }
+
+        bool templateContainsNativeCollisionObjectRecursive(
+            RE::NiAVObject* object,
+            std::size_t& visited,
+            const int depth = 0)
+        {
+            if (!object || depth > 16 || visited >= 512) {
+                return false;
+            }
+            ++visited;
+
+            if (auto* collisionObject = object->collisionObject.get();
+                collisionObject && niObjectRttiChainContains(collisionObject, "bhkNPCollisionObject")) {
+                return true;
+            }
+
+            auto* node = object->IsNode();
+            if (!node) {
+                return false;
+            }
+            const auto& children = node->children;
+            for (auto index = decltype(children.size()){ 0 }; index < children.size(); ++index) {
+                if (templateContainsNativeCollisionObjectRecursive(children[index].get(), visited, depth + 1)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        RE::NiNode* resolveOmodPhysicalCoverageRoot(
+            RE::NiNode* weaponRoot,
+            const std::uint32_t attachPointFormId)
+        {
+            if (!weaponRoot) {
+                return nullptr;
+            }
+            const std::string_view connectPoint =
+                weapon_part_record_identity_policy::canonicalConnectPointForAttachPoint(attachPointFormId);
+            if (connectPoint.empty()) {
+                return weaponRoot;
+            }
+
+            const std::string connectPointName{ connectPoint };
+            const auto matches = collectWeaponAnimNodeMatches(weaponRoot, connectPointName.c_str());
+            for (const auto& match : matches) {
+                if (auto* node = match.node ? match.node->IsNode() : nullptr) {
+                    return node;
+                }
+            }
+            return weaponRoot;
+        }
+
+        std::size_t countPresentOmodPhysicalSignatureNames(
+            RE::NiAVObject* coverageRoot,
+            const OmodPhysicalTemplateSignature& signature,
+            const char*& outFirstMatchedName)
+        {
+            outFirstMatchedName = nullptr;
+            std::size_t matched = 0;
+            for (const auto& meshName : signature.meshNames) {
+                if (!collectWeaponAnimNodeMatches(coverageRoot, meshName.c_str()).empty()) {
+                    ++matched;
+                    if (!outFirstMatchedName) {
+                        outFirstMatchedName = meshName.c_str();
+                    }
+                }
+            }
+            return matched;
+        }
+
+        constexpr std::string_view kRockOmodEnrichmentPrefix = "ROCK-OMOD-Enrichment-";
+
+        [[nodiscard]] bool tryParseRockOmodEnrichmentFormId(
+            const std::string_view nodeName,
+            std::uint32_t& outFormId) noexcept
+        {
+            outFormId = 0;
+            constexpr std::size_t kFormIdHexDigits = 8;
+            if (!nodeName.starts_with(kRockOmodEnrichmentPrefix) ||
+                nodeName.size() != kRockOmodEnrichmentPrefix.size() + kFormIdHexDigits) {
+                return false;
+            }
+
+            std::uint32_t formId = 0;
+            for (const char c : nodeName.substr(kRockOmodEnrichmentPrefix.size())) {
+                std::uint32_t digit = 0;
+                if (c >= '0' && c <= '9') {
+                    digit = static_cast<std::uint32_t>(c - '0');
+                } else if (c >= 'A' && c <= 'F') {
+                    digit = static_cast<std::uint32_t>(c - 'A' + 10);
+                } else if (c >= 'a' && c <= 'f') {
+                    digit = static_cast<std::uint32_t>(c - 'a' + 10);
+                } else {
+                    return false;
+                }
+                formId = (formId << 4) | digit;
+            }
+
+            outFormId = formId;
+            return formId != 0;
+        }
+
+        void collectRockOmodEnrichmentContainersRecursive(
+            RE::NiAVObject* node,
+            std::vector<RE::NiNode*>& outContainers,
+            std::size_t& visited,
+            const int depth = 0)
+        {
+            if (!node || depth > 24 || visited >= WEAPON_ANIM_NODE_DUMP_MAX_SUBTREE_NODES) {
+                return;
+            }
+            ++visited;
+
+            auto* niNode = node->IsNode();
+            if (!niNode) {
+                return;
+            }
+            std::uint32_t formId = 0;
+            const char* rawName = niNode->name.c_str();
+            if (rawName && tryParseRockOmodEnrichmentFormId(rawName, formId)) {
+                outContainers.push_back(niNode);
+                return;
+            }
+
+            const auto& children = niNode->children;
+            for (auto i = decltype(children.size()){ 0 }; i < children.size(); ++i) {
+                collectRockOmodEnrichmentContainersRecursive(children[i].get(), outContainers, visited, depth + 1);
+            }
+        }
+
+        std::size_t removeStaleRockOmodEnrichmentContainers(
+            RE::NiAVObject* weaponRoot,
+            const std::unordered_set<std::uint32_t>& activeOmodFormIds)
+        {
+            std::vector<RE::NiNode*> containers;
+            containers.reserve(8);
+            std::size_t visited = 0;
+            collectRockOmodEnrichmentContainersRecursive(weaponRoot, containers, visited);
+
+            std::size_t removed = 0;
+            for (auto* container : containers) {
+                std::uint32_t formId = 0;
+                const char* rawName = container ? container->name.c_str() : nullptr;
+                if (!rawName || !tryParseRockOmodEnrichmentFormId(rawName, formId) ||
+                    activeOmodFormIds.contains(formId)) {
+                    continue;
+                }
+
+                auto* parent = container->parent ? container->parent->IsNode() : nullptr;
+                if (!parent) {
+                    continue;
+                }
+                RE::NiPointer<RE::NiAVObject> detached;
+                parent->DetachChild(container, detached);
+                if (!detached) {
+                    continue;
+                }
+                f4vr::updateTransformsDown(parent, true);
+                ++removed;
+                ROCK_LOG_INFO(Weapon,
+                    "OMOD-HEAL removed stale owned enrichment '{}' for inactive omod={:08X}",
+                    rawName,
+                    formId);
+            }
+            return removed;
+        }
+
+        /*
+         * Fallout4VR.exe 1.2.72 BSConnectPoint::Parents layout. The layout is
+         * independently corroborated by the local F4SEVR 0.6.21
+         * NiExtraData.h definition and the Ghidra-verified
+         * BSConnectPoint::DoAttach/Parent::ConnectChild chain at
+         * 0x141DF1200/0x141DEF8A0. These are read-only, frame-scoped views of
+         * extra data owned by a loaded OMOD template.
+         */
+        struct NativeConnectPointParentLayout
+        {
+            std::uint64_t referenceState;
+            RE::BSFixedString parentNodeName;
+            RE::BSFixedString connectPointName;
+            RE::NiQuaternion rotation;
+            RE::NiPoint3 translation;
+            float scale;
+        };
+        static_assert(offsetof(NativeConnectPointParentLayout, parentNodeName) == 0x08);
+        static_assert(offsetof(NativeConnectPointParentLayout, connectPointName) == 0x10);
+        static_assert(offsetof(NativeConnectPointParentLayout, rotation) == 0x18);
+        static_assert(offsetof(NativeConnectPointParentLayout, translation) == 0x28);
+        static_assert(sizeof(NativeConnectPointParentLayout) == 0x38);
+
+        struct NativeConnectPointParentArrayLayout
+        {
+            NativeConnectPointParentLayout** entries;
+            std::uint32_t capacity;
+            std::uint32_t pad0C;
+            std::uint32_t count;
+            std::uint32_t pad14;
+        };
+        static_assert(sizeof(NativeConnectPointParentArrayLayout) == 0x18);
+
+        struct AuthoredConnectPointParentMatch
+        {
+            RE::NiNode* metadataOwner{ nullptr };
+            const NativeConnectPointParentLayout* parent{ nullptr };
+        };
+
+        bool findAuthoredConnectPointParentRecursive(
+            RE::NiAVObject* object,
+            const RE::BSFixedString& cpaKey,
+            const char* targetConnectPointName,
+            AuthoredConnectPointParentMatch& outMatch,
+            std::size_t& visited,
+            const int depth = 0)
+        {
+            constexpr std::uint32_t kMaxParentRecords = 64;
+            if (!object || !targetConnectPointName || depth > 16 || visited >= 512) {
+                return false;
+            }
+            ++visited;
+
+            auto* node = object->IsNode();
+            if (!node) {
+                return false;
+            }
+
+            auto* extraData = node->GetExtraData(cpaKey);
+            if (extraData && niObjectRttiChainContains(extraData, "BSConnectPoint::Parents")) {
+                NativeConnectPointParentArrayLayout points{};
+                if (native_memory::guardedCopyFromMemory(
+                        reinterpret_cast<const char*>(extraData) + sizeof(RE::NiExtraData),
+                        &points,
+                        sizeof(points)) &&
+                    points.count <= points.capacity && points.count <= kMaxParentRecords &&
+                    (points.count == 0 || native_memory::pointerRangeLooksReadable(
+                        points.entries, sizeof(*points.entries) * points.count))) {
+                    for (std::uint32_t index = 0; index < points.count; ++index) {
+                        NativeConnectPointParentLayout* parent = nullptr;
+                        if (!native_memory::tryReadValue(points.entries + index, parent) ||
+                            !native_memory::pointerRangeLooksReadable(parent, sizeof(*parent))) {
+                            continue;
+                        }
+                        const char* authoredName = parent->connectPointName.c_str();
+                        if (authoredName && _stricmp(authoredName, targetConnectPointName) == 0) {
+                            outMatch = { .metadataOwner = node, .parent = parent };
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            const auto& children = node->children;
+            for (auto index = decltype(children.size()){ 0 }; index < children.size(); ++index) {
+                if (findAuthoredConnectPointParentRecursive(
+                        children[index].get(), cpaKey, targetConnectPointName, outMatch, visited, depth + 1)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        [[nodiscard]] bool finiteAuthoredNodeTransform(const RE::NiTransform& transform) noexcept
+        {
+            if (!std::isfinite(transform.translate.x) || !std::isfinite(transform.translate.y) ||
+                !std::isfinite(transform.translate.z) || !std::isfinite(transform.scale) ||
+                std::abs(transform.scale) <= 0.0001f) {
+                return false;
+            }
+            for (int row = 0; row < 3; ++row) {
+                for (int column = 0; column < 3; ++column) {
+                    if (!std::isfinite(transform.rotate.entry[row][column])) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+
+        std::string materializeOmodRankSuffix(std::string_view authoredName, std::string_view rankSuffix)
+        {
+            if (rankSuffix.empty()) {
+                return std::string(authoredName);
+            }
+            const auto separator = authoredName.find_last_of('|');
+            if (separator == std::string_view::npos || separator + 1 >= authoredName.size() ||
+                authoredName[separator + 1] != '0') {
+                return std::string(authoredName);
+            }
+            std::string result(authoredName.substr(0, separator + 1));
+            result.append(rankSuffix);
+            return result;
+        }
+
+        enum class AuthoredOmodParentPathStage : std::uint8_t
+        {
+            NotAttempted,
+            UnsupportedAttachPoint,
+            ExistingParent,
+            ExistingOwnedPath,
+            ExistingOwnedPathInvalid,
+            ProviderMetadataMissing,
+            ProviderUsesRoot,
+            ProviderParentNodeMissing,
+            ProviderParentNodeAmbiguous,
+            LiveAncestorMissing,
+            DynamicPathNode,
+            InvalidPathTransform,
+            ContainerCreateFailed,
+            PathNodeCreateFailed,
+            AttachVerificationFailed,
+            Prepared,
+        };
+
+        const char* authoredOmodParentPathStageName(const AuthoredOmodParentPathStage stage)
+        {
+            switch (stage) {
+            case AuthoredOmodParentPathStage::NotAttempted:
+                return "not-attempted";
+            case AuthoredOmodParentPathStage::UnsupportedAttachPoint:
+                return "unsupported-attach-point";
+            case AuthoredOmodParentPathStage::ExistingParent:
+                return "existing-parent";
+            case AuthoredOmodParentPathStage::ExistingOwnedPath:
+                return "existing-owned-path";
+            case AuthoredOmodParentPathStage::ExistingOwnedPathInvalid:
+                return "existing-owned-path-invalid";
+            case AuthoredOmodParentPathStage::ProviderMetadataMissing:
+                return "provider-metadata-missing";
+            case AuthoredOmodParentPathStage::ProviderUsesRoot:
+                return "provider-uses-root";
+            case AuthoredOmodParentPathStage::ProviderParentNodeMissing:
+                return "provider-parent-node-missing";
+            case AuthoredOmodParentPathStage::ProviderParentNodeAmbiguous:
+                return "provider-parent-node-ambiguous";
+            case AuthoredOmodParentPathStage::LiveAncestorMissing:
+                return "live-ancestor-missing";
+            case AuthoredOmodParentPathStage::DynamicPathNode:
+                return "dynamic-path-node";
+            case AuthoredOmodParentPathStage::InvalidPathTransform:
+                return "invalid-path-transform";
+            case AuthoredOmodParentPathStage::ContainerCreateFailed:
+                return "container-create-failed";
+            case AuthoredOmodParentPathStage::PathNodeCreateFailed:
+                return "path-node-create-failed";
+            case AuthoredOmodParentPathStage::AttachVerificationFailed:
+                return "attach-verification-failed";
+            case AuthoredOmodParentPathStage::Prepared:
+                return "prepared";
+            default:
+                return "unknown";
+            }
+        }
+
+        struct OmodRecoveryTemplate
+        {
+            const OmodAuditRecord* record{ nullptr };
+            RE::NiPointer<RE::NiNode> connectionRoot;
+            RE::NiPointer<RE::NiNode> rawPhysicalRoot;
+            OmodPhysicalTemplateSignature physicalSignature;
+            bool usesRawReceiverGeometry{ false };
+
+            [[nodiscard]] RE::NiNode* physicalRoot() const
+            {
+                return usesRawReceiverGeometry ? rawPhysicalRoot.get() : connectionRoot.get();
+            }
+        };
+
+        struct AuthoredOmodParentPathPreparation
+        {
+            AuthoredOmodParentPathStage stage{ AuthoredOmodParentPathStage::NotAttempted };
+            RE::NiNode* containerParent{ nullptr };
+            RE::NiPointer<RE::NiNode> container;
+            std::uint32_t providerFormId{ 0 };
+            std::string connectPointName;
+            std::string parentNodeName;
+            std::string liveAncestorName;
+        };
+
+        void rollbackAuthoredOmodParentPath(AuthoredOmodParentPathPreparation& preparation)
+        {
+            if (!preparation.containerParent || !preparation.container) {
+                return;
+            }
+            RE::NiPointer<RE::NiAVObject> detached;
+            preparation.containerParent->DetachChild(preparation.container.get(), detached);
+            f4vr::updateTransformsDown(preparation.containerParent, true);
+            preparation.containerParent = nullptr;
+            preparation.container.reset();
+        }
+
+        bool prepareAuthoredOmodParentPath(
+            const OmodAuditRecord& candidate,
+            RE::NiNode* weaponRoot,
+            std::string_view rankSuffix,
+            const std::vector<OmodRecoveryTemplate>& templates,
+            AuthoredOmodParentPathPreparation& outPreparation)
+        {
+            outPreparation = {};
+            if (!weaponRoot) {
+                outPreparation.stage = AuthoredOmodParentPathStage::UnsupportedAttachPoint;
+                return false;
+            }
+
+            const std::string_view canonicalConnectPoint =
+                weapon_part_record_identity_policy::canonicalConnectPointForAttachPoint(candidate.attachPointFormId);
+            const std::uint32_t providerAttachPoint =
+                weapon_part_record_identity_policy::recoveryProviderAttachPointForAttachPoint(candidate.attachPointFormId);
+            if (canonicalConnectPoint.empty() || providerAttachPoint == 0) {
+                outPreparation.stage = AuthoredOmodParentPathStage::UnsupportedAttachPoint;
+                return false;
+            }
+            outPreparation.connectPointName.assign(canonicalConnectPoint);
+
+            const RE::BSFixedString cpaKey{ "CPA" };
+            AuthoredConnectPointParentMatch parentMatch{};
+            const OmodRecoveryTemplate* providerTemplate = nullptr;
+            for (const auto& modelTemplate : templates) {
+                if (!modelTemplate.record || !modelTemplate.connectionRoot ||
+                    modelTemplate.record->attachPointFormId != providerAttachPoint) {
+                    continue;
+                }
+                std::size_t visited = 0;
+                if (findAuthoredConnectPointParentRecursive(
+                        modelTemplate.connectionRoot.get(), cpaKey, outPreparation.connectPointName.c_str(),
+                        parentMatch, visited)) {
+                    providerTemplate = &modelTemplate;
+                    break;
+                }
+            }
+            if (!providerTemplate || !parentMatch.parent) {
+                outPreparation.stage = AuthoredOmodParentPathStage::ProviderMetadataMissing;
+                return false;
+            }
+            outPreparation.providerFormId = providerTemplate->record->formId;
+
+            const char* rawParentNodeName = parentMatch.parent->parentNodeName.c_str();
+            if (!rawParentNodeName || rawParentNodeName[0] == '\0') {
+                outPreparation.stage = AuthoredOmodParentPathStage::ProviderUsesRoot;
+                return false;
+            }
+            outPreparation.parentNodeName = materializeOmodRankSuffix(rawParentNodeName, rankSuffix);
+
+            const auto existingParentMatches =
+                collectWeaponAnimNodeMatches(weaponRoot, outPreparation.parentNodeName.c_str());
+            for (const auto& match : existingParentMatches) {
+                if (match.node && match.node->IsNode()) {
+                    outPreparation.stage = AuthoredOmodParentPathStage::ExistingParent;
+                    return false;
+                }
+            }
+
+            const std::string containerName = fmt::format("{}{:08X}", kRockOmodEnrichmentPrefix, candidate.formId);
+            const auto existingContainers = collectWeaponAnimNodeMatches(weaponRoot, containerName.c_str());
+            if (!existingContainers.empty()) {
+                for (const auto& match : existingContainers) {
+                    if (match.node && !collectWeaponAnimNodeMatches(
+                            match.node, outPreparation.parentNodeName.c_str()).empty()) {
+                        outPreparation.stage = AuthoredOmodParentPathStage::ExistingOwnedPath;
+                        return false;
+                    }
+                }
+                outPreparation.stage = AuthoredOmodParentPathStage::ExistingOwnedPathInvalid;
+                return false;
+            }
+
+            const auto providerParentMatches =
+                collectWeaponAnimNodeMatches(providerTemplate->connectionRoot.get(), rawParentNodeName);
+            RE::NiNode* providerParentNode = nullptr;
+            for (const auto& match : providerParentMatches) {
+                auto* candidateNode = match.node ? match.node->IsNode() : nullptr;
+                if (!candidateNode) {
+                    continue;
+                }
+                if (providerParentNode) {
+                    outPreparation.stage = AuthoredOmodParentPathStage::ProviderParentNodeAmbiguous;
+                    return false;
+                }
+                providerParentNode = candidateNode;
+            }
+            if (!providerParentNode) {
+                outPreparation.stage = AuthoredOmodParentPathStage::ProviderParentNodeMissing;
+                return false;
+            }
+
+            std::vector<RE::NiNode*> providerPath;
+            providerPath.reserve(8);
+            for (auto* cursor = providerParentNode; cursor && providerPath.size() < 16;) {
+                providerPath.push_back(cursor);
+                if (cursor == providerTemplate->connectionRoot.get()) {
+                    break;
+                }
+                cursor = cursor->parent ? cursor->parent->IsNode() : nullptr;
+            }
+            if (providerPath.empty() || providerPath.back() != providerTemplate->connectionRoot.get()) {
+                outPreparation.stage = AuthoredOmodParentPathStage::ProviderParentNodeMissing;
+                return false;
+            }
+
+            RE::NiNode* liveAncestor = nullptr;
+            std::size_t missingPathCount = 0;
+            for (std::size_t pathIndex = 1; pathIndex < providerPath.size(); ++pathIndex) {
+                const char* authoredAncestorName = providerPath[pathIndex]->name.c_str();
+                if (!authoredAncestorName || authoredAncestorName[0] == '\0') {
+                    continue;
+                }
+                const std::string liveName = materializeOmodRankSuffix(authoredAncestorName, rankSuffix);
+                const auto liveMatches = collectWeaponAnimNodeMatches(weaponRoot, liveName.c_str());
+                RE::NiNode* uniqueLiveNode = nullptr;
+                bool ambiguous = false;
+                for (const auto& match : liveMatches) {
+                    auto* liveNode = match.node ? match.node->IsNode() : nullptr;
+                    if (!liveNode) {
+                        continue;
+                    }
+                    if (uniqueLiveNode) {
+                        ambiguous = true;
+                        break;
+                    }
+                    uniqueLiveNode = liveNode;
+                }
+                if (!ambiguous && uniqueLiveNode) {
+                    liveAncestor = uniqueLiveNode;
+                    missingPathCount = pathIndex;
+                    outPreparation.liveAncestorName = liveName;
+                    break;
+                }
+            }
+            if (!liveAncestor || missingPathCount == 0) {
+                outPreparation.stage = AuthoredOmodParentPathStage::LiveAncestorMissing;
+                return false;
+            }
+
+            for (std::size_t pathIndex = 0; pathIndex < missingPathCount; ++pathIndex) {
+                const auto* sourceNode = providerPath[pathIndex];
+                if (sourceNode->controllers || sourceNode->extra || sourceNode->collisionObject || sourceNode->userData != 0) {
+                    outPreparation.stage = AuthoredOmodParentPathStage::DynamicPathNode;
+                    return false;
+                }
+                if (!finiteAuthoredNodeTransform(sourceNode->local)) {
+                    outPreparation.stage = AuthoredOmodParentPathStage::InvalidPathTransform;
+                    return false;
+                }
+            }
+
+            auto container = native_scene::createEngineNiNode(1);
+            if (!container) {
+                outPreparation.stage = AuthoredOmodParentPathStage::ContainerCreateFailed;
+                return false;
+            }
+            container->name = containerName.c_str();
+            container->local = transform_math::makeIdentityTransform<RE::NiTransform>();
+
+            std::vector<RE::NiPointer<RE::NiNode>> pathNodes;
+            pathNodes.reserve(missingPathCount);
+            for (std::size_t pathIndex = missingPathCount; pathIndex-- > 0;) {
+                const auto* sourceNode = providerPath[pathIndex];
+                auto pathNode = native_scene::createEngineNiNode(1);
+                if (!pathNode) {
+                    outPreparation.stage = AuthoredOmodParentPathStage::PathNodeCreateFailed;
+                    return false;
+                }
+                const char* sourceName = sourceNode->name.c_str();
+                const std::string authoredName = materializeOmodRankSuffix(
+                    sourceName ? std::string_view(sourceName) : std::string_view{}, rankSuffix);
+                pathNode->name = authoredName.c_str();
+                pathNode->local = sourceNode->local;
+                pathNode->flags.flags = sourceNode->flags.flags;
+                pathNodes.push_back(std::move(pathNode));
+            }
+
+            RE::NiNode* pathParent = container.get();
+            for (auto& pathNode : pathNodes) {
+                pathParent->AttachChild(pathNode.get(), true);
+                pathParent = pathNode.get();
+            }
+            liveAncestor->AttachChild(container.get(), true);
+            f4vr::updateTransformsDown(liveAncestor, true);
+            if (collectWeaponAnimNodeMatches(container.get(), outPreparation.parentNodeName.c_str()).empty()) {
+                RE::NiPointer<RE::NiAVObject> detached;
+                liveAncestor->DetachChild(container.get(), detached);
+                f4vr::updateTransformsDown(liveAncestor, true);
+                outPreparation.stage = AuthoredOmodParentPathStage::AttachVerificationFailed;
+                return false;
+            }
+
+            outPreparation.stage = AuthoredOmodParentPathStage::Prepared;
+            outPreparation.containerParent = liveAncestor;
+            outPreparation.container = std::move(container);
+            return true;
+        }
+
+        RE::BSTriShape* findTemplatePhysicalShapeByNameRecursive(
+            RE::NiAVObject* node,
+            const char* targetName,
+            std::size_t& visited,
+            const int depth = 0)
+        {
+            if (!node || !targetName || depth > 16 || visited >= 512) {
+                return nullptr;
+            }
+            ++visited;
+            if (auto* triShape = node->IsTriShape()) {
+                const char* rawName = node->name.c_str();
+                if (rawName && _stricmp(rawName, targetName) == 0 &&
+                    classifyGeneratedWeaponEffectGeometry(triShape) == weapon_effect_geometry_policy::ExclusionReason::None) {
+                    return triShape;
+                }
+                return nullptr;
+            }
+            auto* niNode = node->IsNode();
+            if (!niNode) {
+                return nullptr;
+            }
+            const auto& children = niNode->children;
+            for (auto i = decltype(children.size()){ 0 }; i < children.size(); ++i) {
+                if (auto* match = findTemplatePhysicalShapeByNameRecursive(children[i].get(), targetName, visited, depth + 1)) {
+                    return match;
+                }
+            }
+            return nullptr;
+        }
+
+        bool applyEquippedOmodModelCustomization(
+            RE::BGSMod::Attachment::Mod* omod,
+            RE::NiNode* clonedRoot,
+            RE::TBO_InstanceData* instanceData)
+        {
+            if (!omod || !clonedRoot) {
+                return false;
+            }
+
+            static const bool entryValidated = []() {
+                constexpr std::array<std::uint8_t, 12> kExpectedPrefix{
+                    0x48, 0x85, 0xC9, 0x0F, 0x84, 0x16, 0x01, 0x00, 0x00, 0x48, 0x8B, 0xC4
+                };
+                const auto address = REL::Offset(offsets::kFunc_ApplyOmodModelCustomization).address();
+                std::array<std::uint8_t, kExpectedPrefix.size()> actual{};
+                const bool valid = REL::Module::IsVR() &&
+                    REL::Module::get().version() == F4SE::RUNTIME_VR_1_2_72 &&
+                    native_memory::guardedCopyFromMemory(reinterpret_cast<const void*>(address), actual.data(), actual.size()) &&
+                    actual == kExpectedPrefix;
+                if (!valid) {
+                    ROCK_LOG_ERROR(Weapon, "OMOD physical enrichment disabled: model-customization entry validation failed at 0x{:X}", address);
+                }
+                return valid;
+            }();
+            if (!entryValidated) {
+                return false;
+            }
+
+            using ApplyModelCustomization = void (*)(RE::NiAVObject*, RE::BGSModelMaterialSwap*, void*, RE::TBO_InstanceData*, void*);
+            const auto applyCustomization = reinterpret_cast<ApplyModelCustomization>(
+                REL::Offset(offsets::kFunc_ApplyOmodModelCustomization).address());
+            applyCustomization(clonedRoot, static_cast<RE::BGSModelMaterialSwap*>(omod), nullptr, instanceData, nullptr);
+            return true;
+        }
+
+        enum class OmodPhysicalEnrichmentStage : std::uint8_t
+        {
+            NotAttempted,
+            InvalidInput,
+            ExistingContainerVerified,
+            ExistingContainerMissingAnchor,
+            CloneFailed,
+            CustomizationFailed,
+            AnchorLookupFailed,
+            AnchorParentMissing,
+            AnchorSkinUnreadable,
+            AnchorSkinned,
+            AnimatedParentUnnamed,
+            AnimatedParentMissing,
+            AnchorDetachFailed,
+            ContainerCreateFailed,
+            AttachVerificationFailed,
+            Restored,
+        };
+
+        const char* omodPhysicalEnrichmentStageName(const OmodPhysicalEnrichmentStage stage)
+        {
+            switch (stage) {
+            case OmodPhysicalEnrichmentStage::NotAttempted:
+                return "not-attempted";
+            case OmodPhysicalEnrichmentStage::InvalidInput:
+                return "invalid-input";
+            case OmodPhysicalEnrichmentStage::ExistingContainerVerified:
+                return "existing-container-verified";
+            case OmodPhysicalEnrichmentStage::ExistingContainerMissingAnchor:
+                return "existing-container-missing-anchor";
+            case OmodPhysicalEnrichmentStage::CloneFailed:
+                return "clone-failed";
+            case OmodPhysicalEnrichmentStage::CustomizationFailed:
+                return "customization-failed";
+            case OmodPhysicalEnrichmentStage::AnchorLookupFailed:
+                return "anchor-lookup-failed";
+            case OmodPhysicalEnrichmentStage::AnchorParentMissing:
+                return "anchor-parent-missing";
+            case OmodPhysicalEnrichmentStage::AnchorSkinUnreadable:
+                return "anchor-skin-unreadable";
+            case OmodPhysicalEnrichmentStage::AnchorSkinned:
+                return "anchor-skinned";
+            case OmodPhysicalEnrichmentStage::AnimatedParentUnnamed:
+                return "animated-parent-unnamed";
+            case OmodPhysicalEnrichmentStage::AnimatedParentMissing:
+                return "animated-parent-missing";
+            case OmodPhysicalEnrichmentStage::AnchorDetachFailed:
+                return "anchor-detach-failed";
+            case OmodPhysicalEnrichmentStage::ContainerCreateFailed:
+                return "container-create-failed";
+            case OmodPhysicalEnrichmentStage::AttachVerificationFailed:
+                return "attach-verification-failed";
+            case OmodPhysicalEnrichmentStage::Restored:
+                return "restored";
+            default:
+                return "unknown";
+            }
+        }
+
+        bool enrichMissingOmodPhysicalAnchor(
+            RE::BGSMod::Attachment::Mod* omod,
+            RE::NiNode* templateRoot,
+            const OmodPhysicalTemplateSignature& signature,
+            RE::NiNode* coverageRoot,
+            RE::TBO_InstanceData* instanceData,
+            std::string& outTargetParentName,
+            OmodPhysicalEnrichmentStage& outStage)
+        {
+            outTargetParentName.clear();
+            outStage = OmodPhysicalEnrichmentStage::InvalidInput;
+            if (!omod || !templateRoot || !coverageRoot || signature.durableAnchorName.empty()) {
+                return false;
+            }
+
+            const std::string containerName = fmt::format("{}{:08X}", kRockOmodEnrichmentPrefix, omod->formID);
+            if (!collectWeaponAnimNodeMatches(coverageRoot, containerName.c_str()).empty()) {
+                outTargetParentName = containerName;
+                const bool anchorPresent =
+                    !collectWeaponAnimNodeMatches(coverageRoot, signature.durableAnchorName.c_str()).empty();
+                outStage = anchorPresent ?
+                    OmodPhysicalEnrichmentStage::ExistingContainerVerified :
+                    OmodPhysicalEnrichmentStage::ExistingContainerMissingAnchor;
+                return anchorPresent;
+            }
+
+            f4vr::NiCloneProcess cloneProcess{};
+            cloneProcess.unk18 = reinterpret_cast<std::uint64_t*>(f4vr::cloneAddr1.address());
+            cloneProcess.unk48 = reinterpret_cast<std::uint64_t*>(f4vr::cloneAddr2.address());
+            RE::NiPointer<RE::NiNode> clonedRoot;
+            clonedRoot.reset(f4vr::cloneNode(templateRoot, &cloneProcess));
+            if (!clonedRoot) {
+                outStage = OmodPhysicalEnrichmentStage::CloneFailed;
+                return false;
+            }
+            if (!applyEquippedOmodModelCustomization(omod, clonedRoot.get(), instanceData)) {
+                outStage = OmodPhysicalEnrichmentStage::CustomizationFailed;
+                return false;
+            }
+
+            std::size_t anchorVisited = 0;
+            auto* clonedAnchor = findTemplatePhysicalShapeByNameRecursive(
+                clonedRoot.get(), signature.durableAnchorName.c_str(), anchorVisited);
+            if (!clonedAnchor) {
+                outStage = OmodPhysicalEnrichmentStage::AnchorLookupFailed;
+                return false;
+            }
+            auto* clonedParent = clonedAnchor->parent ? clonedAnchor->parent->IsNode() : nullptr;
+            if (!clonedParent) {
+                outStage = OmodPhysicalEnrichmentStage::AnchorParentMissing;
+                return false;
+            }
+
+            void* skinInstance = nullptr;
+            if (!native_memory::tryReadField(clonedAnchor, VROffset::skinInstance, skinInstance)) {
+                outStage = OmodPhysicalEnrichmentStage::AnchorSkinUnreadable;
+                ROCK_LOG_WARN(Weapon,
+                    "OMOD physical enrichment rejected unreadable durable anchor '{}' omod={:08X}",
+                    signature.durableAnchorName,
+                    omod->formID);
+                return false;
+            }
+            if (skinInstance) {
+                outStage = OmodPhysicalEnrichmentStage::AnchorSkinned;
+                ROCK_LOG_WARN(Weapon,
+                    "OMOD physical enrichment rejected skinned durable anchor '{}' omod={:08X}",
+                    signature.durableAnchorName,
+                    omod->formID);
+                return false;
+            }
+
+            RE::NiNode* targetParent = nullptr;
+            const bool anchorIsDirectRootChild = clonedParent == clonedRoot.get();
+            if (!anchorIsDirectRootChild) {
+                const char* parentName = clonedParent->name.c_str();
+                if (!parentName || parentName[0] == '\0') {
+                    outStage = OmodPhysicalEnrichmentStage::AnimatedParentUnnamed;
+                    return false;
+                }
+                const auto parentMatches = collectWeaponAnimNodeMatches(coverageRoot, parentName);
+                for (const auto& match : parentMatches) {
+                    if (auto* candidate = match.node ? match.node->IsNode() : nullptr) {
+                        targetParent = candidate;
+                        break;
+                    }
+                }
+                if (!targetParent) {
+                    outStage = OmodPhysicalEnrichmentStage::AnimatedParentMissing;
+                    ROCK_LOG_WARN(Weapon,
+                        "OMOD physical enrichment could not map animated parent '{}' for anchor '{}' omod={:08X}",
+                        parentName,
+                        signature.durableAnchorName,
+                        omod->formID);
+                    return false;
+                }
+            }
+
+            RE::NiPointer<RE::NiAVObject> recoveredAnchor;
+            clonedParent->DetachChild(clonedAnchor, recoveredAnchor);
+            if (!recoveredAnchor) {
+                outStage = OmodPhysicalEnrichmentStage::AnchorDetachFailed;
+                return false;
+            }
+
+            auto enrichmentContainer = native_scene::createEngineNiNode(1);
+            if (!enrichmentContainer) {
+                outStage = OmodPhysicalEnrichmentStage::ContainerCreateFailed;
+                return false;
+            }
+            enrichmentContainer->name = containerName.c_str();
+            enrichmentContainer->local = transform_math::makeIdentityTransform<RE::NiTransform>();
+            if (!targetParent) {
+                recoveredAnchor->local = transform_math::composeTransforms(clonedRoot->local, recoveredAnchor->local);
+            }
+
+            enrichmentContainer->AttachChild(recoveredAnchor.get(), true);
+            auto* containerParent = targetParent ? targetParent : coverageRoot;
+            containerParent->AttachChild(enrichmentContainer.get(), true);
+            f4vr::updateTransformsDown(containerParent, true);
+            const bool anchorAttached =
+                !collectWeaponAnimNodeMatches(enrichmentContainer.get(), signature.durableAnchorName.c_str()).empty();
+            if (!anchorAttached) {
+                outStage = OmodPhysicalEnrichmentStage::AttachVerificationFailed;
+                containerParent->DetachChild(enrichmentContainer.get());
+                f4vr::updateTransformsDown(containerParent, true);
+                return false;
+            }
+
+            outTargetParentName = fmt::format("{}/{}", safeNodeName(containerParent), containerName);
+            outStage = OmodPhysicalEnrichmentStage::Restored;
+            return true;
+        }
     }
 
     /*
@@ -4696,16 +7073,19 @@ namespace rock
      * with an unchanged body set means geometry arrived or changed after the
      * build and current triggers never rescanned it.
      */
-    void WeaponCollision::maybeRunWeaponOmodCoverageAudit(RE::NiAVObject* weaponNode)
+    WeaponCollision::OmodCoverageAuditResult WeaponCollision::maybeRunWeaponOmodCoverageAudit(
+        RE::NiAVObject* weaponNode, std::uint64_t auditedEquippedKey, bool forceBeforeInitialBuild)
     {
+        OmodCoverageAuditResult result{};
         if (!g_rockConfig.rockDebugWeaponOmodCoverageAudit) {
-            return;
+            return result;
         }
-        if (!weaponNode || !hasWeaponBody() || _cachedWeaponBodySetKey == 0) {
-            return;
+        if (!weaponNode || auditedEquippedKey == 0 ||
+            (!forceBeforeInitialBuild && (!hasWeaponBody() || _cachedWeaponBodySetKey == 0))) {
+            return result;
         }
 
-        if (_omodCoverageAuditBodySetKey != _cachedWeaponBodySetKey) {
+        if (!forceBeforeInitialBuild && _omodCoverageAuditBodySetKey != _cachedWeaponBodySetKey) {
             _omodCoverageAuditBodySetKey = _cachedWeaponBodySetKey;
             _omodCoverageAuditFrameCounter = 0;
             _omodCoverageAuditRunIndex = 0;
@@ -4715,20 +7095,17 @@ namespace rock
         // First audit fires ~1s after publication so late model streaming is
         // observed quickly; later audits repeat at the configured interval.
         const int dueFrames = _omodCoverageAuditRunIndex == 0 ? (std::min)(90, intervalFrames) : intervalFrames;
-        if (++_omodCoverageAuditFrameCounter < dueFrames) {
-            return;
+        if (!forceBeforeInitialBuild && ++_omodCoverageAuditFrameCounter < dueFrames) {
+            return result;
         }
         _omodCoverageAuditFrameCounter = 0;
         const std::uint32_t runIndex = _omodCoverageAuditRunIndex++;
+        result.ran = true;
 
         auto* player = f4vr::getPlayer();
-        // b46b8dd commonlib: equipped item via currentProcess->middleHigh->equippedItems
-        // (the old F4SEVR middleProcess->unk08->equipData chain was renamed).
-        auto* process = player ? player->currentProcess : nullptr;
-        auto* middleHigh = process ? process->middleHigh : nullptr;
-        const bool hasEquippedItem = middleHigh && !middleHigh->equippedItems.empty();
-        RE::TESForm* weaponForm = hasEquippedItem ? static_cast<RE::TESForm*>(middleHigh->equippedItems.front().item.object) : nullptr;
-        RE::TBO_InstanceData* equippedInstanceData = hasEquippedItem ? middleHigh->equippedItems.front().item.instanceData.get() : nullptr;
+        auto* equipData = f4vr::getEquippedItem();
+        auto* weaponForm = equipData ? equipData->item.object : nullptr;
+        auto* equippedInstanceData = equipData ? equipData->item.instanceData.get() : nullptr;
 
         WeaponVisualKeyStats visualStatsNow{};
         const std::uint64_t visualKeyNow = getWeaponVisualCompositionKey(weaponNode, visualStatsNow);
@@ -4741,7 +7118,7 @@ namespace rock
             runIndex,
             _cachedWeaponBodySetKey,
             weaponForm ? weaponForm->formID : 0u,
-            weaponForm ? std::string(RE::TESFullName::GetFullName(*weaponForm)) : std::string(),
+            weaponForm ? RE::TESFullName::GetFullName(*weaponForm) : std::string_view{},
             getWeaponBodyCount(),
             visualKeyNow,
             _cachedWeaponVisualKey,
@@ -4766,16 +7143,31 @@ namespace rock
          */
         std::unordered_set<std::uintptr_t> evidenceSourceAddresses;
         std::unordered_map<std::uint32_t, std::uint32_t> bodiesByAttachPointFormId;
-        for (const auto& instance : activeWeaponBodies()) {
-            if (!instance.body.isValid()) {
-                continue;
+        const bool publishedBodyEvidenceCurrent = weapon_omod_audit_policy::publishedBodyEvidenceMatchesAudit(
+            auditedEquippedKey,
+            _cachedWeaponKey,
+            hasWeaponBody() && _cachedWeaponBodySetKey != 0);
+        if (publishedBodyEvidenceCurrent) {
+            for (const auto& instance : activeWeaponBodies()) {
+                if (!instance.body.isValid()) {
+                    continue;
+                }
+                const bool durableAttachmentEvidence =
+                    !weapon_generated_source_completeness_policy::isTransientReloadPart(instance.semantic.partKind);
+                if (instance.sourceNode && durableAttachmentEvidence) {
+                    evidenceSourceAddresses.insert(reinterpret_cast<std::uintptr_t>(instance.sourceNode));
+                }
+                if (instance.semantic.attachPointFormId != 0 && durableAttachmentEvidence) {
+                    ++bodiesByAttachPointFormId[instance.semantic.attachPointFormId];
+                }
             }
-            if (instance.sourceNode) {
-                evidenceSourceAddresses.insert(reinterpret_cast<std::uintptr_t>(instance.sourceNode));
-            }
-            if (instance.semantic.attachPointFormId != 0) {
-                ++bodiesByAttachPointFormId[instance.semantic.attachPointFormId];
-            }
+        } else if (hasWeaponBody()) {
+            ROCK_LOG_INFO(Weapon,
+                "OMOD-AUDIT run={} ignoring published body evidence from a different equipped generation auditedKey={:016X} publishedKey={:016X} bodySetKey={:016X}",
+                runIndex,
+                auditedEquippedKey,
+                _cachedWeaponKey,
+                _cachedWeaponBodySetKey);
         }
 
         std::vector<OmodAuditRecord> records;
@@ -4804,6 +7196,27 @@ namespace rock
             }
         } else {
             ROCK_LOG_INFO(Weapon, "OMOD-AUDIT run={} no object instance extra available", runIndex);
+        }
+
+        if (g_rockConfig.rockDebugWeaponOmodSelfHeal) {
+            std::unordered_set<std::uint32_t> activeOmodFormIds;
+            activeOmodFormIds.reserve(records.size());
+            for (const auto& record : records) {
+                if (!record.disabled && record.formId != 0) {
+                    activeOmodFormIds.insert(record.formId);
+                }
+            }
+            const std::size_t staleEnrichmentCount =
+                removeStaleRockOmodEnrichmentContainers(weaponNode, activeOmodFormIds);
+            if (staleEnrichmentCount != 0) {
+                ROCK_LOG_INFO(Weapon,
+                    "OMOD-AUDIT run={} removed {} stale ROCK-owned enrichment container(s); requesting collider rebuild",
+                    runIndex,
+                    staleEnrichmentCount);
+                requestWorkbenchExitRebuild();
+                result.sceneEnriched = true;
+                return result;
+            }
         }
 
         std::vector<OmodAuditTokenSlot> tokenSlots(records.size());
@@ -5050,21 +7463,20 @@ namespace rock
                 }
             }
 
-            const char* verdict = nullptr;
-            if (!record.resolved) {
-                verdict = "UNRESOLVED_FORM";
-            } else if (slot.lowerToken.empty()) {
-                verdict = pairedBodies > 0 ? "OK_RECORD_PAIRED" : "NO_MODEL";
-            } else if (evidenceUnderMatches > 0) {
-                verdict = "OK";
-            } else if (pairedBodies > 0) {
-                verdict = "OK_RECORD_PAIRED";
-            } else if (!slot.matches.empty()) {
-                verdict = anyMatchVisible ? "NODE_PRESENT_NO_COLLIDER" : "NODE_HIDDEN_NO_COLLIDER";
-            } else {
-                verdict = "NODE_NOT_FOUND";
+            const auto coverageDecision = weapon_omod_audit_policy::decideCoverage(
+                weapon_omod_audit_policy::CoverageInput{
+                    .disabled = record.disabled,
+                    .resolved = record.resolved,
+                    .hasModelToken = !slot.lowerToken.empty(),
+                    .hasEvidenceUnderMatch = evidenceUnderMatches > 0,
+                    .hasPairedBody = pairedBodies > 0,
+                    .hasNodeMatch = !slot.matches.empty(),
+                    .anyNodeMatchVisible = anyMatchVisible,
+                });
+            if (coverageDecision.selfHealCandidate) {
                 selfHealCandidates.push_back(i);
             }
+            const char* verdict = weapon_omod_audit_policy::coverageVerdictName(coverageDecision.verdict);
 
             ROCK_LOG_INFO(Weapon,
                 "OMOD-AUDIT omod={:08X} '{}' index={} rank={} disabled={} attachPoint={:08X} attachPointIndex={} model='{}' token='{}' pairedBodies={} nodeMatches={} evidenceUnderMatches={} verdict={}",
@@ -5205,15 +7617,21 @@ namespace rock
         /*
          * Self-heal (bDebugWeaponOmodSelfHeal): reattach missing OMOD models
          * with the engine's own primitive. Ghidra-verified (raw disasm +
-         * decompiler + address database, 2026-07-04):
+         * decompiler + address database, refreshed 2026-07-20):
          *   bool BGSMod::Attachment::Mod::TryAttach3DRecurse(
          *       NiNode* root, char* rankSuffix, TBO_InstanceData* instData)
          * at VR offset 0x2D9140. It demands the mod's model, deep-clones it
          * (scale from the root's REFR), applies material swaps with the
-         * instance data, and attaches at the mod NIF's declared connect point
-         * (BSConnectPoint::Parents) or the root as fallback. Fail-closed at
-         * every hop; success requests a collider rebuild so the healed
-         * geometry gets bodies. NODE_NOT_FOUND is the trigger, so the word-set
+         * instance data, and attaches at the mod NIF's declared connect point.
+         * Its bool reports that a BSConnectPoint::Parents record matched, not
+         * that Parent::ConnectChild found the declared scene parent or that
+         * geometry entered the requested subtree. Break Action Laser is the
+         * concrete failure: P-Barrel names CROSSBarrelOffsetNode, which the
+         * assembled receiver drops. ROCK therefore reconstructs only that
+         * authored static parent path before calling the native routine and
+         * verifies actual durable geometry below the owned path afterward.
+         * Successful geometry requests a collider rebuild. NODE_NOT_FOUND is
+         * the trigger, so the word-set
          * matcher above must keep false negatives rare - a heal on a part that
          * exists under an unmatchable name would duplicate its geometry, which
          * the once-per-instance-address guard bounds to a single attempt.
@@ -5248,26 +7666,114 @@ namespace rock
             } else {
                 using TryAttach3DRecurseFn = bool (*)(RE::BGSMod::Attachment::Mod*, RE::NiNode*, const char*, RE::TBO_InstanceData*);
                 static REL::Relocation<TryAttach3DRecurseFn> tryAttach3DRecurse{ REL::Offset(0x2D9140) };
-                /*
-                 * BSModelDB::Demand(char*, NiPointer<NiNode>&, ArgsType&) —
-                 * raw-disasm verified inside TryAttach3DRecurse (0x141d0dee0):
-                 * args are a zeroed 16-byte block with flag byte 0x2D at +8;
-                 * returns 0 on success with the template root in the pointer.
-                 */
-                struct ModelDbDemandArgs
-                {
-                    std::uint64_t unk00{ 0 };
-                    std::uint8_t flags{ 0x2D };
-                    std::uint8_t pad09[7]{};
-                };
-                using DemandModelFn = int (*)(const char*, RE::NiPointer<RE::NiNode>&, ModelDbDemandArgs&);
-                static REL::Relocation<DemandModelFn> demandModel{ REL::Offset(0x1D0DEE0) };
                 constexpr std::size_t OMOD_SELF_HEAL_MAX_PER_AUDIT = 4;
+
+                std::vector<std::size_t> orderedSelfHealCandidates = selfHealCandidates;
+                std::stable_sort(
+                    orderedSelfHealCandidates.begin(),
+                    orderedSelfHealCandidates.end(),
+                    [&records](const std::size_t lhs, const std::size_t rhs) {
+                        return weapon_part_record_identity_policy::recoveryDependencyRank(records[lhs].attachPointFormId) <
+                               weapon_part_record_identity_policy::recoveryDependencyRank(records[rhs].attachPointFormId);
+                    });
+
+                /*
+                 * Parent-path recovery needs the candidate model and only the
+                 * installed provider slot that authors its P-* metadata
+                 * (receiver for top-level parts, barrel for muzzle). Keep all
+                 * loaded roots alive through the bounded recovery pass because
+                 * every parsed connect-point pointer is owned by its root.
+                 */
+                std::unordered_set<std::uint32_t> requestedTemplateFormIds;
+                std::unordered_set<std::uint32_t> requestedProviderAttachPoints;
+                for (const std::size_t candidateIndex : orderedSelfHealCandidates) {
+                    const auto& record = records[candidateIndex];
+                    requestedTemplateFormIds.insert(record.formId);
+                    const auto providerAttachPoint =
+                        weapon_part_record_identity_policy::recoveryProviderAttachPointForAttachPoint(record.attachPointFormId);
+                    if (providerAttachPoint != 0) {
+                        requestedProviderAttachPoints.insert(providerAttachPoint);
+                    }
+                }
+
+                std::vector<OmodRecoveryTemplate> recoveryTemplates;
+                recoveryTemplates.reserve(requestedTemplateFormIds.size() + requestedProviderAttachPoints.size());
+                std::unordered_set<std::uint32_t> loadedTemplateFormIds;
+                const auto appendRecoveryTemplate = [&](const OmodAuditRecord& record) {
+                    if (record.disabled || !record.resolved || record.formId == 0 || record.modelPath.empty() ||
+                        !loadedTemplateFormIds.insert(record.formId).second) {
+                        return;
+                    }
+                    auto connectionRoot = loadCompleteOmodModelTemplate(record.modelPath);
+                    if (!connectionRoot) {
+                        return;
+                    }
+
+                    auto completeSignature = collectOmodPhysicalTemplateSignature(connectionRoot.get());
+                    OmodRecoveryTemplate modelTemplate{
+                        .record = &record,
+                        .connectionRoot = std::move(connectionRoot),
+                        .physicalSignature = std::move(completeSignature),
+                    };
+
+                    const bool recoveryCandidate = requestedTemplateFormIds.contains(record.formId);
+                    if (recoveryCandidate &&
+                        record.attachPointFormId == weapon_part_record_identity_policy::kAttachPointReceiver) {
+                        auto rawPhysicalRoot = loadGeometryInspectionOmodModelTemplate(record.modelPath);
+                        if (rawPhysicalRoot) {
+                            auto rawSignature = collectOmodPhysicalTemplateSignature(rawPhysicalRoot.get());
+                            std::size_t rawCollisionVisited = 0;
+                            std::size_t completeCollisionVisited = 0;
+                            const bool hasNativeCollisionObject =
+                                templateContainsNativeCollisionObjectRecursive(
+                                    rawPhysicalRoot.get(), rawCollisionVisited) ||
+                                templateContainsNativeCollisionObjectRecursive(
+                                    modelTemplate.connectionRoot.get(), completeCollisionVisited);
+                            const bool completeSignatureCoveredByRaw =
+                                physicalTemplateSignatureCovers(rawSignature, modelTemplate.physicalSignature);
+                            if (weapon_omod_audit_policy::shouldPreferRawReceiverGeometryTemplate(
+                                    true,
+                                    hasNativeCollisionObject,
+                                    completeSignatureCoveredByRaw,
+                                    modelTemplate.physicalSignature.meshNames.size(),
+                                    rawSignature.meshNames.size())) {
+                                ROCK_LOG_INFO(Weapon,
+                                    "OMOD-HEAL omod={:08X} '{}' selected raw receiver geometry template: "
+                                    "normalMeshes={} rawMeshes={} nativeCollision=yes",
+                                    record.formId,
+                                    record.name,
+                                    modelTemplate.physicalSignature.meshNames.size(),
+                                    rawSignature.meshNames.size());
+                                modelTemplate.rawPhysicalRoot = std::move(rawPhysicalRoot);
+                                modelTemplate.physicalSignature = std::move(rawSignature);
+                                modelTemplate.usesRawReceiverGeometry = true;
+                            }
+                        }
+                    }
+                    recoveryTemplates.push_back(std::move(modelTemplate));
+                };
+                for (const std::size_t candidateIndex : orderedSelfHealCandidates) {
+                    appendRecoveryTemplate(records[candidateIndex]);
+                }
+                for (const auto& record : records) {
+                    if (requestedProviderAttachPoints.contains(record.attachPointFormId)) {
+                        appendRecoveryTemplate(record);
+                    }
+                }
+
+                const auto findRecoveryTemplate = [&recoveryTemplates](const std::uint32_t formId) -> const OmodRecoveryTemplate* {
+                    for (const auto& modelTemplate : recoveryTemplates) {
+                        if (modelTemplate.record && modelTemplate.record->formId == formId) {
+                            return &modelTemplate;
+                        }
+                    }
+                    return nullptr;
+                };
 
                 if (_omodSelfHealAttempted.size() > 256) {
                     _omodSelfHealAttempted.clear();
                 }
-                for (const std::size_t candidateIndex : selfHealCandidates) {
+                for (const std::size_t candidateIndex : orderedSelfHealCandidates) {
                     if (selfHealAttemptCount >= OMOD_SELF_HEAL_MAX_PER_AUDIT) {
                         break;
                     }
@@ -5277,80 +7783,32 @@ namespace rock
                     if (_omodSelfHealAttempted.contains(attemptKey)) {
                         continue;
                     }
-                    _omodSelfHealAttempted.insert(attemptKey);
 
                     auto* omod = RE::TESForm::GetFormByID<RE::BGSMod::Attachment::Mod>(record.formId);
                     if (!omod) {
+                        _omodSelfHealAttempted.insert(attemptKey);
                         ROCK_LOG_WARN(Weapon, "OMOD-HEAL run={} omod={:08X} skipped: form no longer resolves", runIndex, record.formId);
                         continue;
                     }
 
                     /*
-                     * Truth gate (2026-07-05, AK-104 audit): filename-token
-                     * verdicts produce false NODE_NOT_FOUND for parts whose
-                     * geometry is present under mesh names unrelated to the
-                     * model path (grip/cover/comp on the AK-104; barrel/mag
-                     * on the NZ41) — healing those is what created the
-                     * doubled parts. Root-name matching cannot detect them
-                     * either: the engine attach does NOT preserve template
-                     * root names. What it DOES preserve are the template's
-                     * DESCENDANT names ('Pistol_Grip', 'Comp:0', 'Drum_Mag'
-                     * all appear verbatim in the assembled weapon). So:
-                     * Demand the template, collect its descendant node and
-                     * mesh names (skipping connect points and generic
-                     * helpers), and treat the part as PRESENT if any of them
-                     * already exists in the instance. Only genuinely absent
-                     * parts get attached.
+                     * Filename tokens are only a candidate trigger. The truth
+                     * gate loads the complete 0xED hierarchy, excludes effect
+                     * geometry, and selects its largest physical mesh as the
+                     * durable housing anchor. Physics-bearing receiver OMODs
+                     * may instead use a strict-superset 0x20 geometry view when
+                     * the normal postprocessor consumed their display shell.
+                     * That anchor is authoritative for collider recovery: if it
+                     * already exists, ROCK does not duplicate the model merely
+                     * because cartridges, followers, glass, or other secondary
+                     * pieces differ. A partial branch missing the anchor
+                     * receives only the cloned authored housing.
                      */
-                    RE::NiPointer<RE::NiNode> templateRoot;
-                    ModelDbDemandArgs demandArgs{};
-                    const int demandResult = demandModel(record.modelPath.c_str(), templateRoot, demandArgs);
-                    if (demandResult != 0 || !templateRoot) {
+                    const OmodRecoveryTemplate* recoveryTemplate = findRecoveryTemplate(record.formId);
+                    if (!recoveryTemplate || !recoveryTemplate->physicalRoot()) {
+                        _omodSelfHealAttempted.insert(attemptKey);
                         ROCK_LOG_WARN(Weapon,
-                            "OMOD-HEAL run={} omod={:08X} '{}' skipped: model demand failed result={} model='{}'",
-                            runIndex,
-                            record.formId,
-                            record.name,
-                            demandResult,
-                            record.modelPath);
-                        continue;
-                    }
-
-                    std::vector<const char*> templateContentNames;
-                    templateContentNames.reserve(32);
-                    std::size_t templateNameVisited = 0;
-                    const auto collectTemplateContentNames = [&templateContentNames, &templateNameVisited](
-                                                                 RE::NiAVObject* node, const int depth, const bool isRoot, const auto& self) -> void {
-                        if (!node || depth > 10 || templateNameVisited > 256 || templateContentNames.size() >= 64) {
-                            return;
-                        }
-                        ++templateNameVisited;
-                        // The cloned ROOT is renamed by the engine, so the root
-                        // name is not evidence; connect points (P-*) can
-                        // pre-exist empty in other parts; ProjectileNode is a
-                        // universal helper. Everything else identifies content.
-                        const char* name = node->name.c_str();
-                        if (!isRoot && name && name[0] != '\0' &&
-                            !(name[0] == 'P' && name[1] == '-') && !(name[0] == 'p' && name[1] == '-') &&
-                            _stricmp(name, "ProjectileNode") != 0) {
-                            templateContentNames.push_back(name);
-                        }
-                        auto* niNode = node->IsNode();
-                        if (!niNode) {
-                            return;
-                        }
-                        const auto& children = niNode->children;
-                        for (auto i = decltype(children.size()){ 0 }; i < children.size(); ++i) {
-                            if (auto* child = children[i].get()) {
-                                self(child, depth + 1, false, self);
-                            }
-                        }
-                    };
-                    collectTemplateContentNames(templateRoot.get(), 0, true, collectTemplateContentNames);
-
-                    if (templateContentNames.empty()) {
-                        ROCK_LOG_WARN(Weapon,
-                            "OMOD-HEAL run={} omod={:08X} '{}' skipped: template has no verifiable content names model='{}'",
+                            "OMOD-HEAL run={} omod={:08X} '{}' skipped: complete 0xED model load failed model='{}'",
                             runIndex,
                             record.formId,
                             record.name,
@@ -5358,23 +7816,61 @@ namespace rock
                         continue;
                     }
 
-                    const char* presentName = nullptr;
-                    for (const char* contentName : templateContentNames) {
-                        if (!collectWeaponAnimNodeMatches(healTargetNode, contentName).empty()) {
-                            presentName = contentName;
-                            break;
-                        }
+                    RE::NiNode* signatureRoot = recoveryTemplate->physicalRoot();
+                    const auto& templateSignature = recoveryTemplate->physicalSignature;
+                    if (templateSignature.meshNames.empty() || templateSignature.durableAnchorName.empty()) {
+                        _omodSelfHealAttempted.insert(attemptKey);
+                        ROCK_LOG_WARN(Weapon,
+                            "OMOD-HEAL run={} omod={:08X} '{}' skipped: template has no verifiable physical housing model='{}'",
+                            runIndex,
+                            record.formId,
+                            record.name,
+                            record.modelPath);
+                        continue;
                     }
-                    if (presentName) {
+
+                    RE::NiNode* coverageRoot = resolveOmodPhysicalCoverageRoot(healTargetNode, record.attachPointFormId);
+                    const char* firstMatchedSignatureName = nullptr;
+                    const std::size_t matchedSignatureNameCount = countPresentOmodPhysicalSignatureNames(
+                        coverageRoot,
+                        templateSignature,
+                        firstMatchedSignatureName);
+                    const bool durableAnchorPresent =
+                        !collectWeaponAnimNodeMatches(coverageRoot, templateSignature.durableAnchorName.c_str()).empty();
+                    const std::size_t requiredSignatureNameCount =
+                        weapon_omod_audit_policy::requiredTemplateSignatureMatches(templateSignature.meshNames.size());
+                    const bool coherentPhysicalSignaturePresent =
+                        weapon_omod_audit_policy::physicalTemplateSignatureIsPresent(
+                            matchedSignatureNameCount,
+                            templateSignature.meshNames.size(),
+                            durableAnchorPresent);
+                    if (!weapon_omod_audit_policy::requiresDurableAnchorRecovery(durableAnchorPresent)) {
+                        _omodSelfHealAttempted.insert(attemptKey);
                         ROCK_LOG_INFO(Weapon,
-                            "OMOD-HEAL run={} omod={:08X} '{}' skipped: template content '{}' already present in instance ({} names checked) — token verdict was a false negative",
+                            "OMOD-HEAL run={} omod={:08X} '{}' skipped: durable physical housing already present in slot "
+                            "matches={}/{} required={} coherent={} anchor='{}' example='{}' — no duplicate recovery needed",
                             runIndex,
                             record.formId,
                             record.name,
-                            presentName,
-                            templateContentNames.size());
+                            matchedSignatureNameCount,
+                            templateSignature.meshNames.size(),
+                            requiredSignatureNameCount,
+                            coherentPhysicalSignaturePresent ? "yes" : "no",
+                            templateSignature.durableAnchorName,
+                            firstMatchedSignatureName ? firstMatchedSignatureName : "");
                         continue;
                     }
+
+                    ROCK_LOG_INFO(Weapon,
+                        "OMOD-HEAL run={} omod={:08X} '{}' confirmed incomplete: physical signature matches={}/{} required={} anchor='{}' anchorPresent={} - starting bounded recovery",
+                        runIndex,
+                        record.formId,
+                        record.name,
+                        matchedSignatureNameCount,
+                        templateSignature.meshNames.size(),
+                        requiredSignatureNameCount,
+                        templateSignature.durableAnchorName,
+                        durableAnchorPresent ? "yes" : "no");
 
                     char rankSuffixBuffer[8] = {};
                     const char* rankSuffix = nullptr;
@@ -5386,21 +7882,75 @@ namespace rock
                     }
 
                     /*
-                     * No post-attach hiding: the address-diff hide (5529dd3)
-                     * hid REAL rendered geometry because the engine attach can
-                     * capture/reparent existing nodes into the target. With
-                     * the truth gate above, heals only fire for parts with no
-                     * geometry anywhere in the instance, so a visible healed
-                     * clone is the part appearing — not a double.
+                     * Never post-hide an engine attachment: the address-diff
+                     * experiment hid real rendered geometry after native
+                     * capture/reparenting. Whole-model attach is used when the
+                     * observed names do not form a coherent template signature;
+                     * coherent partial trees preserve their authored animated
+                     * pieces and receive only the missing durable housing below.
+                     * A raw receiver anchor is absent specifically because the
+                     * native postprocessed model consumed it, so repeating that
+                     * native attach cannot restore it and can only duplicate the
+                     * surviving trigger/controller branch. Recover that one
+                     * housing directly from the guarded raw template instead.
                      */
                     const auto beforeStats = summarizeWeaponAnimNodeSubtree(healTargetNode);
+                    _omodSelfHealAttempted.insert(attemptKey);
                     ++selfHealAttemptCount;
-                    const bool attached = tryAttach3DRecurse(omod, healTargetNode, rankSuffix, equippedInstanceData);
-                    const auto afterStats = summarizeWeaponAnimNodeSubtree(healTargetNode);
-                    selfHealSuccessCount += attached ? 1 : 0;
+                    const bool nativeWholeModelEligible = weapon_omod_audit_policy::shouldAttemptWholeModelAttach(
+                        matchedSignatureNameCount,
+                        templateSignature.meshNames.size(),
+                        durableAnchorPresent);
+                    const bool nativeAttachNeeded = nativeWholeModelEligible &&
+                        !recoveryTemplate->usesRawReceiverGeometry;
+                    AuthoredOmodParentPathPreparation parentPathPreparation{};
+                    const bool authoredParentPathPrepared = nativeAttachNeeded &&
+                        prepareAuthoredOmodParentPath(
+                            record,
+                            healTargetNode,
+                            rankSuffix ? std::string_view(rankSuffix) : std::string_view{},
+                            recoveryTemplates,
+                            parentPathPreparation);
+                    bool attached = nativeAttachNeeded &&
+                        tryAttach3DRecurse(omod, healTargetNode, rankSuffix, equippedInstanceData);
+                    auto afterStats = summarizeWeaponAnimNodeSubtree(healTargetNode);
+                    bool anchorPresentAfterNative =
+                        !collectWeaponAnimNodeMatches(coverageRoot, templateSignature.durableAnchorName.c_str()).empty();
+                    bool authoredPathCapturedAnchor = authoredParentPathPrepared && parentPathPreparation.container &&
+                        !collectWeaponAnimNodeMatches(
+                            parentPathPreparation.container.get(), templateSignature.durableAnchorName.c_str()).empty();
+                    if (authoredParentPathPrepared && !authoredPathCapturedAnchor) {
+                        /*
+                         * A true native return only means a CPA record matched;
+                         * FO4VR does not propagate Parent::ConnectChild failure.
+                         * Retain the authored path only when the candidate's
+                         * durable geometry actually landed below its owned
+                         * container. Otherwise remove the entire path before
+                         * the existing bounded housing enrichment runs.
+                         */
+                        rollbackAuthoredOmodParentPath(parentPathPreparation);
+                        afterStats = summarizeWeaponAnimNodeSubtree(healTargetNode);
+                        anchorPresentAfterNative =
+                            !collectWeaponAnimNodeMatches(coverageRoot, templateSignature.durableAnchorName.c_str()).empty();
+                    }
+                    std::string enrichmentParentName;
+                    OmodPhysicalEnrichmentStage enrichmentStage = OmodPhysicalEnrichmentStage::NotAttempted;
+                    const bool physicalAnchorEnriched = !anchorPresentAfterNative &&
+                        enrichMissingOmodPhysicalAnchor(
+                            omod,
+                            signatureRoot,
+                            templateSignature,
+                            coverageRoot,
+                            equippedInstanceData,
+                            enrichmentParentName,
+                            enrichmentStage);
+                    afterStats = summarizeWeaponAnimNodeSubtree(healTargetNode);
+                    const bool geometryAdded = afterStats.triShapeCount > beforeStats.triShapeCount;
+                    const bool durableAnchorRestored = anchorPresentAfterNative || physicalAnchorEnriched;
+                    selfHealSuccessCount += geometryAdded ? 1 : 0;
 
                     ROCK_LOG_INFO(Weapon,
-                        "OMOD-HEAL run={} omod={:08X} '{}' model='{}' suffix='{}' target='{}'/{:x} attached={} subtreeNodes {}->{} triShapes {}->{} visibleTriShapes {}->{}",
+                        "OMOD-HEAL run={} omod={:08X} '{}' model='{}' suffix='{}' target='{}'/{:x} physicalTemplate={} nativeAttachAttempted={} attached={} geometryAdded={} durableAnchor='{}' restored={} authoredPathStage={} authoredPathProvider={:08X} authoredParent='{}' authoredAncestor='{}' authoredPathCapturedAnchor={} enrichmentStage={} enrichmentParent='{}' subtreeNodes {}->{} triShapes {}->{} visibleTriShapes {}->{}",
                         runIndex,
                         record.formId,
                         record.name,
@@ -5408,7 +7958,20 @@ namespace rock
                         rankSuffix ? rankSuffix : "",
                         healTargetRootLabel,
                         reinterpret_cast<std::uintptr_t>(healTargetNode),
+                        recoveryTemplate->usesRawReceiverGeometry ? "raw-receiver-geometry" : "complete-0xED",
+                        nativeAttachNeeded ? "yes" :
+                            (recoveryTemplate->usesRawReceiverGeometry ? "no-raw-receiver-anchor" : "no-coherent-partial-tree"),
                         attached ? "YES" : "no",
+                        geometryAdded ? "YES" : "no",
+                        templateSignature.durableAnchorName,
+                        durableAnchorRestored ? "YES" : "no",
+                        authoredOmodParentPathStageName(parentPathPreparation.stage),
+                        parentPathPreparation.providerFormId,
+                        parentPathPreparation.parentNodeName,
+                        parentPathPreparation.liveAncestorName,
+                        authoredPathCapturedAnchor ? "YES" : "no",
+                        omodPhysicalEnrichmentStageName(enrichmentStage),
+                        enrichmentParentName,
                         beforeStats.nodeCount,
                         afterStats.nodeCount,
                         beforeStats.triShapeCount,
@@ -5424,6 +7987,7 @@ namespace rock
                         selfHealSuccessCount,
                         selfHealAttemptCount);
                     requestWorkbenchExitRebuild();
+                    result.sceneEnriched = true;
                 }
             }
         }
@@ -5439,80 +8003,7 @@ namespace rock
             selfHealCandidates.size(),
             selfHealAttemptCount,
             selfHealSuccessCount);
-    }
-
-    void WeaponCollision::armWorkbenchWeaponReattach()
-    {
-        if (!g_rockConfig.rockDebugWorkbenchWeaponReattach) {
-            return;
-        }
-        // ~1s at 90fps: past the engine's queued full actor 3D reset so the
-        // re-fired attach lands on the settled post-workbench state.
-        _workbenchReattachFramesRemaining.store(90, std::memory_order_release);
-    }
-
-    /*
-     * One-shot post-workbench recovery for the engine-side invisibility
-     * (bDebugWorkbenchWeaponReattach). Diagnostics proved the audited weapon
-     * instances stay fully visible, sanely posed, and in-hand while the
-     * RENDERED copy goes invisible after a workbench mod change until the
-     * player swaps weapons. The swap works because equipping re-fires the
-     * engine's equipped-weapon attach; this does the same directly.
-     *
-     * Ghidra-verified chain (2026-07-04): the WeaponAttach anim event handler
-     * calls 0x140dab8f0(manager = *0x145b279e0, actor, BGSObjectInstance*,
-     * equipIndex) — a wrapper with its own thread marshaling that queues the
-     * type-0x12 attach task (actor vfunc +0x528). Fail-closed on any missing
-     * pointer.
-     */
-    void WeaponCollision::maybeFireWorkbenchWeaponReattach()
-    {
-        if (_workbenchReattachFramesRemaining.load(std::memory_order_acquire) <= 0) {
-            return;
-        }
-        if (!g_rockConfig.rockDebugWorkbenchWeaponReattach) {
-            _workbenchReattachFramesRemaining.store(0, std::memory_order_release);
-            return;
-        }
-        if (_workbenchReattachFramesRemaining.fetch_sub(1, std::memory_order_acq_rel) != 1) {
-            return;
-        }
-
-        auto* player = f4vr::getPlayer();
-        // b46b8dd commonlib: equipped item via currentProcess->middleHigh->equippedItems
-        // (the old F4SEVR middleProcess->unk08->equipData chain was renamed).
-        auto* process = player ? player->currentProcess : nullptr;
-        auto* middleHigh = process ? process->middleHigh : nullptr;
-        const bool hasEquippedItem = middleHigh && !middleHigh->equippedItems.empty();
-        RE::TESForm* weaponForm = hasEquippedItem ? static_cast<RE::TESForm*>(middleHigh->equippedItems.front().item.object) : nullptr;
-        RE::TBO_InstanceData* equippedInstanceData = hasEquippedItem ? middleHigh->equippedItems.front().item.instanceData.get() : nullptr;
-        if (!weaponForm) {
-            ROCK_LOG_WARN(Weapon, "WORKBENCH-REATTACH skipped: no equipped weapon form");
-            return;
-        }
-
-        static REL::Relocation<void**> weaponAttachManager{ REL::Offset(0x5B279E0) };
-        void* manager = *weaponAttachManager;
-        if (!manager) {
-            ROCK_LOG_WARN(Weapon, "WORKBENCH-REATTACH skipped: weapon attach manager singleton is null");
-            return;
-        }
-
-        struct EquippedObjectInstance
-        {
-            RE::TESForm* object{ nullptr };
-            RE::TBO_InstanceData* instanceData{ nullptr };
-        };
-        using QueueEquippedWeaponAttachFn = std::uint64_t (*)(void*, void*, EquippedObjectInstance*, std::uint32_t);
-        static REL::Relocation<QueueEquippedWeaponAttachFn> queueEquippedWeaponAttach{ REL::Offset(0xDAB8F0) };
-
-        EquippedObjectInstance instance{ reinterpret_cast<RE::TESForm*>(weaponForm), equippedInstanceData };
-        const std::uint64_t result = queueEquippedWeaponAttach(manager, player, &instance, 0);
-        ROCK_LOG_INFO(Weapon,
-            "WORKBENCH-REATTACH fired weapon={:08X} '{}' equipIndex=0 result={:#x}",
-            weaponForm->formID,
-            std::string(RE::TESFullName::GetFullName(*weaponForm)),
-            result);
+        return result;
     }
 
     void WeaponCollision::publishSampledVelocityAtomic(std::uint32_t publicationIndex, const GeneratedKeyframedBodyDriveQueueResult& queueResult)
@@ -5612,7 +8103,8 @@ namespace rock
 
     void WeaponCollision::flushPendingPhysicsDrive(RE::hknpWorld* world, const havok_physics_timing::PhysicsTimingSample& timing)
     {
-        if (!world || !hasWeaponBody() || getCurrentWeaponGenerationKey() == 0) {
+        const auto publishedGeneration = getCurrentWeaponGenerationKey();
+        if (!world || publishedGeneration == 0) {
             return;
         }
 
@@ -5643,9 +8135,13 @@ namespace rock
         if (completedPhysicsSteps == 0) {
             return;
         }
+        if (!s_hasRetiredWeaponBodyPayloads.load(
+                std::memory_order_acquire)) {
+            return;
+        }
 
-        std::scoped_lock lock(_retiredWeaponBodyPayloadMutex);
-        for (auto& retired : _retiredWeaponBodyPayloads) {
+        std::scoped_lock lock(s_retiredWeaponBodyPayloadMutex);
+        for (auto& retired : s_retiredWeaponBodyPayloads) {
             if (!retired.occupied()) {
                 continue;
             }
@@ -5659,14 +8155,19 @@ namespace rock
             const auto bodyId = retired.bodyPayload.bodyId;
             BethesdaPhysicsBody::releaseRetiredPayload(retired.bodyPayload);
             retired = {};
-            if (_retiredWeaponBodyPayloadCount > 0) {
-                --_retiredWeaponBodyPayloadCount;
+            if (s_retiredWeaponBodyPayloadCount > 0) {
+                --s_retiredWeaponBodyPayloadCount;
             }
             ROCK_LOG_SAMPLE_DEBUG(Weapon,
                 1000,
                 "Retired generated weapon body {} payload reclaimed activeRetired={}",
                 bodyId,
-                _retiredWeaponBodyPayloadCount);
+                s_retiredWeaponBodyPayloadCount);
+        }
+        if (s_retiredWeaponBodyPayloadCount == 0) {
+            s_hasRetiredWeaponBodyPayloads.store(
+                false,
+                std::memory_order_release);
         }
     }
 

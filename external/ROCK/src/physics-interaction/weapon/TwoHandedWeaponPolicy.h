@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <string_view>
 
 namespace rock::two_handed_weapon_policy
 {
@@ -17,6 +18,150 @@ namespace rock::two_handed_weapon_policy
     // bodies/VR scales; neither the weapon nor the firing-hand pivot moves.
     inline constexpr float kSupportArmLengthScale = 1.40f;
     inline constexpr float kSupportArmReachSafetyMargin = 0.15f;
+
+    /*
+     * Hand-authority writer identities are part of the embedded-ROCK/legacy-FRIK
+     * contract. FRIK 0.77.12's host seam uses the rigid tag to bypass its
+     * free-hand escape envelope and reach projection; the final host-side arm
+     * solve supplies the bounded visual reach allowance without separating the
+     * support palm from the weapon.
+     *
+     * Keep attach-only, visual-only, and part-carry publications on the ordinary
+     * tag. Those paths deliberately do not represent an exact two-hand weld.
+     */
+    inline constexpr char kSupportGripHandAuthorityTag[] =
+        "ROCK_WeaponSupportGrip";
+    inline constexpr char kRigidSupportGripHandAuthorityTag[] =
+        "ROCK_WeaponSupportGripRigid";
+    inline constexpr char kPrimaryGripHandAuthorityTag[] =
+        "ROCK_WeaponPrimaryGrip";
+
+    [[nodiscard]] inline constexpr bool isPrimaryGripHandAuthorityTag(
+        const std::string_view tag)
+    {
+        return tag == kPrimaryGripHandAuthorityTag;
+    }
+
+    [[nodiscard]] inline constexpr bool usesRigidSupportGripHandAuthority(
+        const bool inExactGrippingState,
+        const bool supportGripOwnsWeapon,
+        const bool attachOnly)
+    {
+        return inExactGrippingState &&
+               supportGripOwnsWeapon &&
+               !attachOnly;
+    }
+
+    [[nodiscard]] inline constexpr const char* selectSupportGripHandAuthorityTag(
+        const bool inExactGrippingState,
+        const bool supportGripOwnsWeapon,
+        const bool attachOnly)
+    {
+        return usesRigidSupportGripHandAuthority(
+                   inExactGrippingState,
+                   supportGripOwnsWeapon,
+                   attachOnly) ?
+                   kRigidSupportGripHandAuthorityTag :
+                   kSupportGripHandAuthorityTag;
+    }
+
+    /*
+     * A sidearm cup/reseat is only a presentation substitute for a support
+     * hand that does not steer the weapon. Applying it during full two-hand
+     * authority splits the contract: the solver continues steering from the
+     * contacted part while the rendered hand is moved beside the firing hand.
+     */
+    /*
+     * SIDEARM PRESENTATION RESEAT — reachability restored Jul 31.
+     *
+     * This used to require !supportGripOwnsWeapon, which made it DEAD CODE the
+     * moment sidearms started entering the full two-handed solver: no weapon
+     * class could satisfy both terms, so the reseat never ran once (confirmed
+     * by zero "reseated" lines across a full live session) while the config
+     * echo kept advertising it.
+     *
+     * The reseat is a PRESENTATION concern and is orthogonal to who owns the
+     * weapon transform: the solver keeps steering from the real contacted part,
+     * while the rendered off-hand is re-seated as a rigid offset off the FIRING
+     * hand's own frame. Without it, a pistol's off-hand welds to whatever mesh
+     * triangle it first touched — measured 19.1gu out — and the rendered arm
+     * had to stretch ~40% past anatomy to follow it (the reported "offhand
+     * stretches unnaturally long"). With it, the off-hand sits ~5.7gu from the
+     * firing hand and demands only the player's natural reach.
+     *
+     * Gate on the weapon CLASS and the presentation preconditions only.
+     */
+    [[nodiscard]] inline constexpr bool shouldApplySidearmPresentationReseat(
+        const bool enabled,
+        const bool sidearm,
+        const bool supportGripOwnsWeapon,
+        const bool attachOnly,
+        const bool firingHandFrameAvailable)
+    {
+        (void)supportGripOwnsWeapon;
+        return enabled &&
+               sidearm &&
+               !attachOnly &&
+               firingHandFrameAvailable;
+    }
+
+    // Reachability guard: the reseat MUST remain reachable for a sidearm whose
+    // support grip owns the weapon transform (the full-solver case). This
+    // static_assert is the durable defence — the previous predicate silently
+    // became unsatisfiable and nothing failed until a user reported the stretch.
+    static_assert(
+        shouldApplySidearmPresentationReseat(
+            /*enabled*/ true,
+            /*sidearm*/ true,
+            /*supportGripOwnsWeapon*/ true,
+            /*attachOnly*/ false,
+            /*firingHandFrameAvailable*/ true),
+        "the sidearm presentation reseat must stay reachable while the support grip owns the weapon");
+    static_assert(
+        !shouldApplySidearmPresentationReseat(true, false, true, false, true),
+        "the presentation reseat is sidearm-only: long guns keep their contacted support seat");
+
+    /*
+     * A hand-only wall correction is safe only when FRIK itself consumes the
+     * published visual-authority hand transform and carries its child weapon in
+     * the same frame. Legacy FRIK API v3 exposes no such native authority: the
+     * Heisenberg host shim can move the skinned arm, but its primary-arm pass
+     * deliberately does not consume the latched target because doing so also
+     * feeds the weapon child back into the next solve. In that compatibility
+     * mode ROCK must translate the weapon explicitly.
+     */
+    [[nodiscard]] inline constexpr bool canUseHandOnlyWeaponWorldContactTransport(
+        const bool ownsWeaponTransform,
+        const bool firingHandWorldAvailable,
+        const bool nativeFrikVisualAuthorityAvailable)
+    {
+        return !ownsWeaponTransform &&
+               firingHandWorldAvailable &&
+               nativeFrikVisualAuthorityAvailable;
+    }
+
+    /*
+     * Every full two-hand solve publishes the firing hand as well as the
+     * support hand. Leaving the stock-FRIK right hand on its controller-driven
+     * pose lets the rendered wrist pull out of the captured trigger grip while
+     * the support hand steers the weapon.
+     *
+     * Native FRIK consumes this directly. The legacy host consumes the primary
+     * tag in its post-FRIK same-frame pin and ROCK then republishes the solved
+     * weapon transform, so the weapon's child relationship cannot feed arm
+     * motion back into the solver.
+     *
+     * Keep the parameters for the call-site contract and explicit policy tests;
+     * neither provider generation nor handedness may weaken this invariant.
+     */
+    [[nodiscard]] inline constexpr bool shouldPublishPrimaryHandAuthority(
+        const bool nativeFrikVisualAuthorityAvailable,
+        const bool firingHandIsLeft)
+    {
+        (void)nativeFrikVisualAuthorityAvailable;
+        (void)firingHandIsLeft;
+        return true;
+    }
 
     [[nodiscard]] constexpr float armLengthScale(const bool supportGrip)
     {
@@ -164,6 +309,54 @@ namespace rock::two_handed_weapon_policy
         }
         // Element-wise blending leaves the basis slightly non-orthonormal; callers orthonormalize.
         return result;
+    }
+
+    /*
+     * FIRING-WRIST FOLLOW FLOOR (Jul 30) — long guns must keep the weld.
+     *
+     * With followFactor 0 the published firing wrist keeps pure CONTROLLER
+     * rotation while the off-hand solver rotates the weapon, so on a rifle the
+     * stock/trigger visibly rotate out of the firing palm — reported as "the
+     * gun hand loses its grip on the stock and trigger when the gun is pushed
+     * by the offhand". The firing hand must keep a constant weapon-relative
+     * grip for the whole two-handed hold.
+     *
+     * Pistol cups are the opposite requirement (Jul 27: "gun hand grip on
+     * pistol cannot be disturbed by offhand authority") — their grip
+     * separation measures under the minimum steering lever arm, so scope the
+     * weld by the RAW lever gate: 0 below minLeverArm (pistols keep the
+     * controller wrist), smoothstep between, 1 at/above fullLeverArm (rifles
+     * get the rigid weld back). Deliberately NOT effectiveSupportSteeringWeight:
+     * its minimumAuthority floor is a steering concept and would leak a
+     * partial weld into pistols. The configured factor acts as a global
+     * minimum on top of the gate (raw gate fails open to 1.0 = weld on
+     * non-finite separation, the safe direction for a long gun).
+     */
+    [[nodiscard]] inline float firingWristFollowFactorForLeverArm(
+        const float configuredFollowFactor,
+        const float gripSeparationGameUnits,
+        const float minLeverArm,
+        const float fullLeverArm)
+    {
+        const float leverWeld = supportSteeringAuthorityWeight(
+            gripSeparationGameUnits, minLeverArm, fullLeverArm);
+        if (!std::isfinite(configuredFollowFactor)) {
+            return leverWeld;
+        }
+        return (configuredFollowFactor > leverWeld) ? configuredFollowFactor : leverWeld;
+    }
+
+    /*
+     * Exact acquisition disables only the hand-authority position lerp.  It
+     * must not disable firing-wrist follow: with followFactor=0 the primary
+     * hand keeps the controller rotation even on the first full-authority
+     * frame, while its translation remains welded to the firing grip.
+     */
+    [[nodiscard]] constexpr bool shouldBlendFiringWristFromLiveHand(
+        const bool liveHandAvailable,
+        const bool /*forceExact*/) noexcept
+    {
+        return liveHandAvailable;
     }
 
     /*

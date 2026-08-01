@@ -143,10 +143,14 @@ namespace heisenberg
             // _cachedLeftResult/_cachedRightResult hold a raw pointer into the vector just
             // cleared above (see the matching reset in ScanCellForActivators) - without
             // this, a throttled CheckProximity call right after a save load can return a
-            // pointer into freed vector storage. Also reset the pointing-range latches so
-            // a save load mid-hitbox-shrink doesn't leave player collision disabled.
+            // pointer into freed vector storage. Also reset the pointing-range
+            // latches and logical activator-reach state.
             _cachedLeftResult = ProximityResult{};
             _cachedRightResult = ProximityResult{};
+            // Force the next per-hand call through the full scan immediately
+            // instead of returning an empty cache for up to two frames.
+            _leftProximityFrame = 2;
+            _rightProximityFrame = 2;
             _leftHandInPointingRange = false;
             _rightHandInPointingRange = false;
             UpdateHitboxShrink();
@@ -172,6 +176,7 @@ namespace heisenberg
         
         // Activate the closest activator if in range
         bool TryActivate(const RE::NiPoint3& fingerTipPos, bool isLeftHand);
+        bool TryActivate(const ProximityResult& result);
         
         // =====================================================================
         // NODE CAPTURE MODE
@@ -219,10 +224,16 @@ namespace heisenberg
         // Check if a hand is currently in pointing range of an activator
         bool IsHandInPointingRange(bool isLeft) const { return isLeft ? _leftHandInPointingRange : _rightHandInPointingRange; }
 
-        // HMD Movement Threshold control - shrinks player hitbox when near activators
-        // Call this when hand enters/exits pointing range to let hands reach through hitbox
+        // Logical activator-reach state. It intentionally does not alter the
+        // player's global collision layer.
+        // Call this when a hand enters/exits pointing range.
         void SetHitboxShrinkEnabled(bool enabled);
         bool IsHitboxShrinkEnabled() const { return _hitboxShrinkActive; }
+
+        // Relinquish one hand's pointing-range claim and immediately reconcile
+        // reach mode. Idempotent: clearing one hand preserves the other hand's
+        // live claim, while clearing the last claim exits reach mode.
+        void ClearHandPointingState(bool isLeftHand);
         
         // Update hitbox shrink state based on current hand-in-range tracking
         // Called after CheckProximity to automatically manage hitbox shrink
@@ -247,7 +258,10 @@ namespace heisenberg
         ActivatorType DetermineActivatorType(RE::TESObjectREFR* ref) const;
         
         // Get distance from finger to activator's activation point
-        float GetDistanceToActivator(const RE::NiPoint3& fingerPos, const TrackedActivator& activator) const;
+        float GetDistanceToActivator(
+            const RE::NiPoint3& fingerPos,
+            const TrackedActivator& activator,
+            RE::TESObjectREFR* resolvedRefr = nullptr) const;
         
         // Check if we can activate (cooldown, etc.)
         bool CanActivate(const TrackedActivator& activator) const;

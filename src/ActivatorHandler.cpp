@@ -1,7 +1,7 @@
 #include "ActivatorHandler.h"
+#include "ActivatorHitboxShrinkPolicy.h"
 #include "Config.h"
 #include "Utils.h"
-#include "Physics.h"
 #include "f4vr/F4VRUtils.h"
 #include "SharedUtils.h"
 
@@ -515,6 +515,8 @@ sTargetNode=
         // empty-vector early return never reaches that flag update).
         _cachedLeftResult = ProximityResult{};
         _cachedRightResult = ProximityResult{};
+        _leftProximityFrame = 2;
+        _rightProximityFrame = 2;
         _leftHandInPointingRange = false;
         _rightHandInPointingRange = false;
         UpdateHitboxShrink();
@@ -726,9 +728,13 @@ sTargetNode=
         LogRefNodeTree(ref, "[ActivatorHandler]", /*includeWorldPos=*/false);
     }
 
-    float ActivatorHandler::GetDistanceToActivator(const RE::NiPoint3& fingerPos, const TrackedActivator& activator) const
+    float ActivatorHandler::GetDistanceToActivator(
+        const RE::NiPoint3& fingerPos,
+        const TrackedActivator& activator,
+        RE::TESObjectREFR* resolvedRefr) const
     {
-        RE::TESObjectREFR* actRef = activator.GetRefr();
+        RE::TESObjectREFR* actRef =
+            resolvedRefr ? resolvedRefr : activator.GetRefr();
         if (!actRef) {
             return (std::numeric_limits<float>::max)();
         }
@@ -803,12 +809,16 @@ sTargetNode=
             return result;
         }
 
-        // Throttle: only run full proximity scan every 3 frames per hand
+        // Throttle: only run the full cell-wide proximity scan every 3 frames
+        // per hand. The old condition returned the cache only when it already
+        // named an activator, so the common "nothing nearby" case defeated the
+        // throttle and scanned every tracked activator for both hands on every
+        // frame.
         {
             int& frameCount = isLeftHand ? _leftProximityFrame : _rightProximityFrame;
             ProximityResult& cached = isLeftHand ? _cachedLeftResult : _cachedRightResult;
             frameCount++;
-            if (frameCount % 3 != 0 && cached.activator != nullptr) {
+            if (frameCount % 3 != 0) {
                 return cached;
             }
         }
@@ -832,12 +842,21 @@ sTargetNode=
         TrackedActivator* closestActivator = nullptr;
         
         for (auto& activator : _trackedActivators) {
-            RE::TESObjectREFR* actRef = activator.GetRefr();
+            // Resolve the handle once and retain its NiPointer for the full
+            // distance calculation. The previous path resolved it here and a
+            // second time inside GetDistanceToActivator for every tracked ACTI.
+            RE::NiPointer<RE::TESObjectREFR> actRefPtr =
+                activator.refrHandle.get();
+            RE::TESObjectREFR* actRef = actRefPtr.get();
             if (!actRef || !actRef->Get3D()) {
                 continue;
             }
             
-            float dist = GetDistanceToActivator(fingerTipPos, activator);
+            float dist =
+                GetDistanceToActivator(
+                    fingerTipPos,
+                    activator,
+                    actRef);
             
             // Apply speed-scaled pointing radius for fast-moving hands
             float scaledPointingRadius = activator.pointingRadius * speedFactor;
@@ -883,8 +902,15 @@ sTargetNode=
     
     void ActivatorHandler::UpdateHitboxShrink()
     {
-        // Enable hitbox shrink if EITHER hand is in pointing range
-        bool shouldShrink = _leftHandInPointingRange || _rightHandInPointingRange;
+        // Track activator-reach mode if EITHER hand is in pointing range. This
+        // state still drives the existing pointing/IK flow, but must never alter
+        // the collision layer of the player's whole Havok body.
+        const bool shouldShrink =
+            activator_hitbox_shrink_policy::shouldShrink(
+                activator_hitbox_shrink_policy::PointingState{
+                    _leftHandInPointingRange,
+                    _rightHandInPointingRange,
+                });
         
         // Log state changes
         static bool lastState = false;
@@ -895,6 +921,24 @@ sTargetNode=
         }
         
         SetHitboxShrinkEnabled(shouldShrink);
+    }
+
+    void ActivatorHandler::ClearHandPointingState(const bool isLeftHand)
+    {
+        const auto cleared =
+            activator_hitbox_shrink_policy::clearHand(
+                activator_hitbox_shrink_policy::PointingState{
+                    _leftHandInPointingRange,
+                    _rightHandInPointingRange,
+                },
+                isLeftHand);
+        _leftHandInPointingRange = cleared.left;
+        _rightHandInPointingRange = cleared.right;
+
+        // Always reconcile, even if this latch was already false. This repairs
+        // split-state paths where both latches were clear while the cached reach
+        // mode remained set.
+        UpdateHitboxShrink();
     }
 
     bool ActivatorHandler::CanActivate(const TrackedActivator& activator) const
@@ -946,8 +990,11 @@ sTargetNode=
 
     bool ActivatorHandler::TryActivate(const RE::NiPoint3& fingerTipPos, bool isLeftHand)
     {
-        ProximityResult result = CheckProximity(fingerTipPos, isLeftHand);
-        
+        return TryActivate(CheckProximity(fingerTipPos, isLeftHand));
+    }
+
+    bool ActivatorHandler::TryActivate(const ProximityResult& result)
+    {
         if (result.inActivationRange && result.activator && CanActivate(*result.activator)) {
             ActivateObject(result.activator->GetRefr());
             result.activator->lastActivationTime = std::chrono::steady_clock::now();
@@ -1282,30 +1329,17 @@ sTargetNode=
         if (enabled == _hitboxShrinkActive) {
             return;  // Already in desired state
         }
-        
-        // Disable player collision to let the player body get closer to activatable objects.
-        // This is needed because:
-        // 1. Player collision keeps the body far from walls/objects
-        // 2. When body is far, hand has to reach "too far" from shoulder
-        // 3. FRIK's arm IK has a 2.25x arm length limit and stops updating
-        // 4. Result: visual arm freezes before reaching the button
-        // 
-        // By disabling collision, the body can get closer, arm doesn't stretch as far,
-        // and FRIK arm IK works normally.
-        
-        if (enabled) {
-            // Disable player collision to let body get closer to activators
-            if (Physics::SetPlayerCollisionEnabled(false)) {
-                _hitboxShrinkActive = true;
-                spdlog::debug("[ActivatorHandler] Player collision DISABLED for activator reach");
-            }
-        } else {
-            // Re-enable player collision
-            if (Physics::SetPlayerCollisionEnabled(true)) {
-                _hitboxShrinkActive = false;
-                spdlog::debug("[ActivatorHandler] Player collision ENABLED (normal)");
-            }
-        }
+
+        // This is deliberately only a logical reach/pointing latch. The old
+        // implementation put the complete player collision body on layer 15
+        // whenever either fingertip approached an activator. That made bullets,
+        // melee and world collision miss the player globally. Pointing pose,
+        // activation proximity and arm-goal handling already consume their own
+        // per-hand state and do not require changing the player collision layer.
+        _hitboxShrinkActive = enabled;
+        spdlog::debug(
+            "[ActivatorHandler] Activator reach mode {} (player collision unchanged)",
+            enabled ? "ENABLED" : "DISABLED");
     }
 
     ActivatorHandler::TrackedActivator* ActivatorHandler::GetNearestTerminal(const RE::NiPoint3& pos, float maxRange)

@@ -4,8 +4,9 @@
 #include "physics-interaction/weapon/WeaponPartContactAcquisitionPolicy.h"
 #include "physics-interaction/weapon/WeaponSemantics.h"
 
-#include <cassert>
 #include <cstdint>
+#include <cstdlib>
+#include <iostream>
 #include <limits>
 #include <type_traits>
 
@@ -31,6 +32,14 @@ namespace
     };
 
     using namespace rock::provider;
+
+    void Require(const bool condition, const char* message)
+    {
+        if (!condition) {
+            std::cerr << "FAILED: " << message << '\n';
+            std::exit(1);
+        }
+    }
 }
 
 int main()
@@ -72,18 +81,20 @@ int main()
     RockProviderTransform converted{};
     converted = legacy;
     for (std::size_t index = 0; index < 9; ++index) {
-        assert(converted.rotate[index] == static_cast<float>(index + 1));
+        Require(
+            converted.rotate[index] == static_cast<float>(index + 1),
+            "legacy rotation elements must be copied in order");
     }
-    assert(converted.translate[0] == 10.0f);
-    assert(converted.translate[1] == 11.0f);
-    assert(converted.translate[2] == 12.0f);
-    assert(converted.scale == 1.25f);
+    Require(converted.translate[0] == 10.0f, "legacy translation x must be copied");
+    Require(converted.translate[1] == 11.0f, "legacy translation y must be copied");
+    Require(converted.translate[2] == 12.0f, "legacy translation z must be copied");
+    Require(converted.scale == 1.25f, "legacy scale must be copied");
 
     RockProviderTransform copied{};
     copied = converted;
-    assert(copied.rotate[8] == 9.0f);
-    assert(copied.translate[1] == 11.0f);
-    assert(copied.scale == 1.25f);
+    Require(copied.rotate[8] == 9.0f, "provider transform rotation must remain copyable");
+    Require(copied.translate[1] == 11.0f, "provider transform translation must remain copyable");
+    Require(copied.scale == 1.25f, "provider transform scale must remain copyable");
 
     constexpr std::uint64_t submittedAt = 1'000;
     static_assert(!isPersistent(1));
@@ -110,34 +121,48 @@ int main()
 
     using rock::weapon_part_contact_acquisition_policy::AcquisitionMode;
     const auto exactMode = rock::weapon_part_contact_acquisition_policy::selectMode(true);
-    assert(exactMode == AcquisitionMode::ExactPhysicalContact);
-    assert(!rock::weapon_part_contact_acquisition_policy::mayUseRankedPalmProbe(exactMode));
-    assert(!rock::weapon_part_contact_acquisition_policy::mayAcceptExactPhysicalContact(exactMode, barrelMatched));
-    assert(rock::weapon_part_contact_acquisition_policy::mayAcceptExactPhysicalContact(exactMode, boltMatched));
-    assert(!rock::weapon_part_contact_acquisition_policy::mayRecoverExactTargetMeshContact(
-        exactMode,
-        barrelMatched,
-        true));
-    assert(!rock::weapon_part_contact_acquisition_policy::mayRecoverExactTargetMeshContact(
-        exactMode,
-        boltMatched,
-        false));
-    assert(rock::weapon_part_contact_acquisition_policy::mayRecoverExactTargetMeshContact(
-        exactMode,
-        boltMatched,
-        true));
+    Require(
+        exactMode == AcquisitionMode::ExactPhysicalContact,
+        "an active whitelist must select exact physical contact mode");
+    Require(
+        !rock::weapon_part_contact_acquisition_policy::mayUseRankedPalmProbe(exactMode),
+        "exact mode must reject the ranked palm probe");
+    Require(
+        !rock::weapon_part_contact_acquisition_policy::mayAcceptExactPhysicalContact(
+            exactMode,
+            barrelMatched),
+        "a touched neighboring barrel must not satisfy the exact bolt target");
+    Require(
+        rock::weapon_part_contact_acquisition_policy::mayAcceptExactPhysicalContact(
+            exactMode,
+            boltMatched),
+        "a physical contact on the exact bolt target must be accepted");
+    Require(
+        !rock::weapon_part_contact_acquisition_policy::mayRecoverExactTargetMeshContact(
+            exactMode,
+            barrelMatched,
+            true),
+        "mesh overlap must not recover a non-target barrel");
+    Require(
+        !rock::weapon_part_contact_acquisition_policy::mayRecoverExactTargetMeshContact(
+            exactMode,
+            boltMatched,
+            false),
+        "an exact target without mesh overlap must not be recovered");
+    Require(
+        rock::weapon_part_contact_acquisition_policy::mayRecoverExactTargetMeshContact(
+            exactMode,
+            boltMatched,
+            true),
+        "an overlapping exact target mesh must be recoverable");
 
     const auto normalMode = rock::weapon_part_contact_acquisition_policy::selectMode(false);
-    assert(normalMode == AcquisitionMode::RankedPalmProbe);
-    assert(rock::weapon_part_contact_acquisition_policy::mayUseRankedPalmProbe(normalMode));
-
-    /*
-     * Stock 10 mm evidence must not expose its release button as a second
-     * Bolt. MatchPartKind::Bolt then identifies the moving bolt mesh only.
-     */
-    assert(rock::classifyWeaponPartName("Pistol10mmBolt:0").partKind == rock::WeaponPartKind::Bolt);
-    assert(rock::classifyWeaponPartName("Pistol10mmBoltRelease:0").partKind != rock::WeaponPartKind::Bolt);
-    assert(rock::classifyWeaponPartName("SlideRelease").partKind != rock::WeaponPartKind::Slide);
+    Require(
+        normalMode == AcquisitionMode::RankedPalmProbe,
+        "normal interaction must select ranked palm probe mode");
+    Require(
+        rock::weapon_part_contact_acquisition_policy::mayUseRankedPalmProbe(normalMode),
+        "normal interaction must allow the ranked palm probe");
 
     /*
      * A single hand collider can report barrel and bolt contacts in the same
@@ -146,15 +171,71 @@ int main()
      */
     rock::contact_activity_tracker::ContactActivityTracker contactActivity{};
     constexpr std::uint32_t handBodyId = 50;
-    assert(contactActivity.registerHandContact(true, handBodyId, barrelBodyId).tracked);
-    assert(contactActivity.registerHandContact(true, handBodyId, boltBodyId).tracked);
-    assert(contactActivity.hasFreshHandContactWithTarget(true, barrelBodyId, 0));
-    assert(contactActivity.hasFreshHandContactWithTarget(true, boltBodyId, 0));
-    assert(!contactActivity.hasFreshHandContactWithTarget(false, boltBodyId, 0));
+    const auto barrelRegistration =
+        contactActivity.registerHandContact(
+            true,
+            handBodyId,
+            barrelBodyId);
+    const auto boltRegistration =
+        contactActivity.registerHandContact(
+            true,
+            handBodyId,
+            boltBodyId);
+    Require(
+        barrelRegistration.tracked,
+        "the first left-hand weapon contact must be tracked");
+    Require(
+        boltRegistration.tracked,
+        "a second same-frame left-hand weapon contact must also be tracked");
+    Require(
+        contactActivity.hasFreshHandContactWithTarget(
+            true,
+            barrelBodyId,
+            0),
+        "the same-frame barrel pair must remain queryable");
+    Require(
+        contactActivity.hasFreshHandContactWithTarget(
+            true,
+            boltBodyId,
+            0),
+        "the same-frame bolt pair must not be hidden by another contact");
+    Require(
+        !contactActivity.hasFreshHandContactWithTarget(
+            false,
+            boltBodyId,
+            0),
+        "contact evidence must remain isolated by hand");
 
     contactActivity.advanceFrame();
-    assert(!contactActivity.hasFreshHandContactWithTarget(true, boltBodyId, 0));
-    assert(contactActivity.hasFreshHandContactWithTarget(true, boltBodyId, 1));
+    Require(
+        !contactActivity.hasFreshHandContactWithTarget(
+            true,
+            boltBodyId,
+            0),
+        "zero-age evidence must expire after the frame advances");
+    Require(
+        contactActivity.hasFreshHandContactWithTarget(
+            true,
+            boltBodyId,
+            1),
+        "one-frame exact-contact grace must retain the bolt pair");
+
+    /*
+     * Stock 10 mm evidence must not expose its release button as a second
+     * Bolt. MatchPartKind::Bolt then identifies the moving bolt mesh only.
+     */
+    Require(
+        rock::classifyWeaponPartName("Pistol10mmBolt:0").partKind ==
+            rock::WeaponPartKind::Bolt,
+        "the stock 10 mm moving bolt must classify as Bolt");
+    Require(
+        rock::classifyWeaponPartName("Pistol10mmBoltRelease:0").partKind !=
+            rock::WeaponPartKind::Bolt,
+        "the stock 10 mm bolt release must not classify as Bolt");
+    Require(
+        rock::classifyWeaponPartName("SlideRelease").partKind !=
+            rock::WeaponPartKind::Slide,
+        "a slide release must not classify as the moving Slide");
 
     return 0;
 }

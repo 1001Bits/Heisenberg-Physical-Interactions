@@ -2,6 +2,7 @@
 #include "WandNodeHelper.h"
 #include "FrikArmGoalHook.h"
 #include "../external/ROCK/src/ROCKMain.h"
+#include "physics-interaction/performance/PerformanceProfiler.h"
 #include "physics-interaction/weapon/TwoHandedWeaponPolicy.h"
 #include "common/MatrixUtils.h"
 #include "f4vr/F4VRUtils.h"
@@ -20,12 +21,75 @@
 #include <cmath>
 #include <cstring>
 #include <mutex>
+#include <string_view>
 #include <spdlog/spdlog.h>
 
 namespace heisenberg
 {
     namespace
     {
+        struct AuthorityWriterTagPolicy
+        {
+            bool rigidTarget = false;
+            bool reachLimitedRigidTarget = false;
+            bool sameFrameSupportPin = false;
+            bool sameFramePrimaryPin = false;
+            bool rederiveFromLiveWeapon = false;
+        };
+
+        [[nodiscard]] constexpr AuthorityWriterTagPolicy classifyAuthorityWriterTag(
+            std::string_view tag)
+        {
+            const bool weaponTarget = tag.starts_with("ROCK_Weapon");
+            const bool weaponSupportGrip =
+                tag.starts_with("ROCK_WeaponSupportGrip");
+            const bool reachLimitedWeaponSupport =
+                tag == "ROCK_WeaponSupportGripRigid";
+            const bool weaponPrimaryGrip =
+                rock::two_handed_weapon_policy::
+                    isPrimaryGripHandAuthorityTag(tag);
+            const bool objectCoHold =
+                tag == "Heisenberg_ObjectCoHold";
+            return AuthorityWriterTagPolicy{
+                .rigidTarget = weaponTarget || objectCoHold,
+                .reachLimitedRigidTarget =
+                    reachLimitedWeaponSupport || objectCoHold,
+                .sameFrameSupportPin =
+                    weaponSupportGrip || objectCoHold,
+                .sameFramePrimaryPin = weaponPrimaryGrip,
+                // Object co-hold is already published from the final object
+                // target. The ROCK callback below is weapon-specific.
+                .rederiveFromLiveWeapon = weaponTarget,
+            };
+        }
+
+        static_assert(
+            classifyAuthorityWriterTag(
+                "Heisenberg_ObjectCoHold").rigidTarget);
+        static_assert(
+            classifyAuthorityWriterTag(
+                "Heisenberg_ObjectCoHold").reachLimitedRigidTarget);
+        static_assert(
+            classifyAuthorityWriterTag(
+                "Heisenberg_ObjectCoHold").sameFrameSupportPin);
+        static_assert(
+            !classifyAuthorityWriterTag(
+                "Heisenberg_ObjectCoHold").rederiveFromLiveWeapon);
+        static_assert(
+            classifyAuthorityWriterTag(
+                "ROCK_WeaponSupportGripRigid").rederiveFromLiveWeapon);
+        static_assert(
+            classifyAuthorityWriterTag(
+                "ROCK_WeaponSupportGripRigid").sameFrameSupportPin);
+        static_assert(
+            classifyAuthorityWriterTag(
+                rock::two_handed_weapon_policy::
+                    kPrimaryGripHandAuthorityTag).sameFramePrimaryPin);
+        static_assert(
+            !classifyAuthorityWriterTag(
+                rock::two_handed_weapon_policy::
+                    kPrimaryGripHandAuthorityTag).sameFrameSupportPin);
+
         // ---- small vector/matrix helpers (self-contained; Grab.cpp's are file-static) ----
         inline float vlen(const RE::NiPoint3& v) { return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z); }
         inline float vdot(const RE::NiPoint3& a, const RE::NiPoint3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
@@ -262,9 +326,14 @@ namespace heisenberg
             // ROCK finishes after FRIK, so this target is consumed one frame later. Preserve
             // its exact solved rotation/source frame and transport only by player locomotion.
             bool latchedTracksPlayer = false;
-            // True only for the full two-hand tag whose complete weapon was reach-limited
-            // upstream. Other ROCK_Weapon targets still need the legacy hand safety.
+            // True for complete rigid support solves whose object/weapon relationship
+            // must not be separated by the free-hand escape or reach projection.
             bool latchedReachLimitedRigid = false;
+            // True for writers whose target is already a bounded delta from clean
+            // controller truth (currently ROCK world soft contact). Reprojecting
+            // such a target onto the anatomical shoulder sphere would add a second,
+            // unrelated displacement and violate that bound.
+            bool latchedControllerRelative = false;
             bool latchedPlayerPositionValid = false;
             RE::NiPoint3 latchedPlayerPosition{};
         };
@@ -903,6 +972,9 @@ namespace heisenberg
 
     void HandAuthority::ApplyWinners()
     {
+        rock::performance_profiler::ScopedTimer profilerTimer(
+            rock::performance_profiler::Scope::HostHandAuthorityApply);
+
         FrikArmGoalHook::OnFrame();  // probe + slot self-check (game thread, per frame)
         std::scoped_lock lk(g_mtx);
         const std::uint32_t frame = g_frameCounter;
@@ -926,6 +998,7 @@ namespace heisenberg
                 slot.hasLatched = false;
                 slot.latchedTracksPlayer = false;
                 slot.latchedReachLimitedRigid = false;
+                slot.latchedControllerRelative = false;
                 slot.latchedPlayerPositionValid = false;
                 if (g_armBase[i].valid) {
                     // authority episode ended: put the chain back on its clean base once so
@@ -940,26 +1013,50 @@ namespace heisenberg
                 continue;
             }
 
-            const bool rigidWeaponWinner =
-                std::strncmp(winner->tag, "ROCK_Weapon", 11) == 0;
-            const bool rigidSupportGripWinner =
-                std::strncmp(winner->tag, "ROCK_WeaponSupportGrip", 22) == 0;
-            const bool reachLimitedRigidWeaponWinner =
-                std::strcmp(winner->tag, "ROCK_WeaponSupportGripRigid") == 0;
+            const auto authorityTagPolicy =
+                classifyAuthorityWriterTag(winner->tag);
+            constexpr char kSoftContactWriterPrefix[] = "ROCK_SoftContact_";
+            const bool controllerRelativeWinner =
+                std::strncmp(
+                    winner->tag,
+                    kSoftContactWriterPrefix,
+                    sizeof(kSoftContactWriterPrefix) - 1) == 0;
 
-            // FRIK-GOAL seam active: LATCH the winner for FrikArmGoalHook's shim (consumed
-            // inside FRIK's setArms next frame, where FRIK's own solver carries the arm).
-            // No scene writes from here — single writer is FRIK itself. SELF-HEAL (Jul 19):
-            // if the shim has not polled this hand within the last ~5 frames (FRIK not
-            // solving: loading screens, menus, seam silently bypassed), fall through to the
-            // legacy bone IK below for THIS frame so authority never goes dark.
+            const bool hostedSameFramePrimaryPin =
+                authorityTagPolicy.sameFramePrimaryPin &&
+                heisenberg::IsRockEngineHosted();
+
+            // FRIK-GOAL seam active: ordinarily LATCH the winner for
+            // FrikArmGoalHook's shim (consumed inside FRIK's setArms next frame,
+            // where FRIK's own solver carries the arm). A hosted primary weapon
+            // grip is the deliberate exception: consuming that target before
+            // ROCK's next weapon solve also moves the child weapon and feeds the
+            // previous frame back into the solver. Pin it only at this post-FRIK
+            // tail; ROCK republishes the solved weapon immediately after this
+            // callback.
+            //
+            // SELF-HEAL (Jul 19): if the shim has not polled this hand within
+            // the last ~5 frames (FRIK not solving: loading screens, menus, seam
+            // silently bypassed), fall through to the legacy bone IK below for
+            // THIS frame so authority never goes dark.
             if (FrikArmGoalHook::IsActive()) {
-                slot.latched = winner->world;
-                slot.hasLatched = true;
-                slot.latchedTracksPlayer = rigidWeaponWinner;
-                slot.latchedReachLimitedRigid = reachLimitedRigidWeaponWinner;
-                slot.latchedPlayerPositionValid = slot.latchedTracksPlayer &&
-                    getPlayerWorldPosition(slot.latchedPlayerPosition);
+                if (hostedSameFramePrimaryPin) {
+                    slot.hasLatched = false;
+                    slot.latchedTracksPlayer = false;
+                    slot.latchedReachLimitedRigid = false;
+                    slot.latchedControllerRelative = false;
+                    slot.latchedPlayerPositionValid = false;
+                } else {
+                    slot.latched = winner->world;
+                    slot.hasLatched = true;
+                    slot.latchedTracksPlayer =
+                        authorityTagPolicy.rigidTarget;
+                    slot.latchedReachLimitedRigid =
+                        authorityTagPolicy.reachLimitedRigidTarget;
+                    slot.latchedControllerRelative = controllerRelativeWinner;
+                    slot.latchedPlayerPositionValid = slot.latchedTracksPlayer &&
+                        getPlayerWorldPosition(slot.latchedPlayerPosition);
+                }
 
                 // FRIK deliberately calls hideHands() after its arm pass while
                 // the native ScopeMenu is open (it scales/moves the rendered
@@ -974,22 +1071,25 @@ namespace heisenberg
                 }
 
                 const std::uint32_t sinceConsume = frame - g_lastConsumeFrame[i];
-                // The FRIK seam consumes this latch on the NEXT frame. That remains useful
-                // for carrying the arm through FRIK, but it cannot be the final rendered
-                // support-hand placement: ROCK has just changed the gun at this callback's
-                // tail. Fall through for the hosted rigid support grip and solve it once
-                // more from the final live gun. (Never do this for the primary hand: the
-                // weapon is its child and moving that chain would feed back into the gun.)
-                const bool needsSameFrameSupportPin =
-                    rigidSupportGripWinner &&
-                    heisenberg::IsRockEngineHosted();
-                if (sinceConsume <= 5 && !needsSameFrameSupportPin) {
+                // The FRIK seam consumes an ordinary latch on the NEXT frame.
+                // That remains useful for carrying the arm through FRIK, but it
+                // cannot be the final rendered grip placement: ROCK has just
+                // changed the gun at this callback's tail. Fall through for
+                // hosted support pins and for the primary pin above, solving
+                // once more from the final live weapon. The post-callback
+                // weapon publication makes the primary path feedback-safe.
+                const bool needsSameFramePin =
+                    heisenberg::IsRockEngineHosted() &&
+                    (authorityTagPolicy.sameFrameSupportPin ||
+                        authorityTagPolicy.sameFramePrimaryPin);
+                if (sinceConsume <= 5 && !needsSameFramePin) {
                     continue;
                 }
             } else {
                 slot.hasLatched = false;
                 slot.latchedTracksPlayer = false;
                 slot.latchedReachLimitedRigid = false;
+                slot.latchedControllerRelative = false;
                 slot.latchedPlayerPositionValid = false;
                 // With no goal seam there is still no useful visible hand to
                 // pin in the native optical-scope overlay.  Respect FRIK's
@@ -1010,7 +1110,7 @@ namespace heisenberg
             // the grip in proportion to gun speed (the visible "chewing gum"). Re-derive the
             // target from the weapon node's CURRENT (post-FRIK, this-frame) world.
             RE::NiTransform liveTarget = winner->world;
-            if (rigidWeaponWinner) {
+            if (authorityTagPolicy.rederiveFromLiveWeapon) {
                 RE::NiTransform fresh;
                 if (heisenberg::IsRockEngineHosted() && rock::HostGetLiveGripHandWorld(isLeft, fresh)) {
                     liveTarget = fresh;
@@ -1022,7 +1122,8 @@ namespace heisenberg
             // hand-to-gun relation. The support chain receives only the adaptive,
             // bounded visual allowance needed for the live target; the weapon and
             // trigger-hand pivot remain untouched.
-            if (!rigidWeaponWinner) {
+            if (!authorityTagPolicy.rigidTarget &&
+                !controllerRelativeWinner) {
                 float requestedDistance = 0.0f;
                 float maxReach = 0.0f;
                 if (!constrainTargetToArmReach(arm, liveTarget, &requestedDistance, &maxReach)) {
@@ -1056,11 +1157,54 @@ namespace heisenberg
                 } else {
                     restoreArmBase(arm, base);
                 }
+                /*
+                 * FIRING ARM GETS THE SAME REACH ALLOWANCE AS THE SUPPORT ARM
+                 * (Jul 31). armLengthScale() historically returned 1.40 for the
+                 * support pin but 1.0 for the primary pin, so while the support
+                 * arm was free to stretch to reach the gun, the FIRING arm was
+                 * projected back onto its natural reach sphere — dragging the
+                 * rendered gun hand off the grip it is welded to.
+                 *
+                 * Measured live (two-handed pistol hold): the defect is
+                 * THRESHOLDED, not constant — while the firing target sits
+                 * inside natural reach every sample reads err=0.0 fight=0.0,
+                 * but in the 10 samples where the target exceeded natural reach
+                 * (first at hsLen 39.5 vs reach 38.3) the error and the "fight"
+                 * (|preSolve - postSolve|) are equal to printed precision, up
+                 * to 7.4gu (~10.6cm). Equal means FRIK had already placed the
+                 * hand exactly on the welded target and this re-solve pulled it
+                 * back off — the reported "gun hand loses its position and the
+                 * gun moves forward without it".
+                 *
+                 * The owner requirement is absolute ("the gun hand must never
+                 * lose its grip on the gun when 2 handing"), so the grip wins:
+                 * a welded hand may stretch its arm rather than break the weld.
+                 * This is a VISUAL arm allowance only; it moves no weapon and
+                 * no anchor, so it cannot feed back into the gun (the concern
+                 * recorded against same-frame primary pinning). The ceiling is
+                 * only a ceiling: adaptiveArmLengthScale grants just what the
+                 * target demands, and the target is provably the player's own
+                 * controller, so the arm can never be asked to reach past the
+                 * player's own arm.
+                 *
+                 * Keyed on rigidTarget rather than on the same-frame pin flags:
+                 * pinning is about WHEN the arm is solved, the allowance is
+                 * about WHETHER a welded hand may stretch to stay on its grip.
+                 * They are not the same question, and conflating them made the
+                 * allowance collapse 1.40 -> 1.0 for BOTH hands on the single
+                 * frame a gun touched a wall (the WeaponWorldContact tags
+                 * outrank the grip tags at priority 120 and are neither kind of
+                 * pin), producing a visible one-frame hand snap off the grip.
+                 * rigidTarget covers every ROCK_Weapon* tag plus the object
+                 * co-hold — i.e. exactly the welded-hand cases — so the
+                 * allowance is now continuous across grip/contact transitions.
+                 */
                 applied = solveArmFrik(
                     arm,
                     isLeft,
                     liveTarget,
-                    rock::two_handed_weapon_policy::armLengthScale(rigidSupportGripWinner));
+                    rock::two_handed_weapon_policy::armLengthScale(
+                        authorityTagPolicy.rigidTarget));
             }
             {
                 static std::uint32_t s_pathDbg = 0;
@@ -1093,7 +1237,8 @@ namespace heisenberg
                 solveArmIK(arm, liveTarget);
             }
 
-            if (rigidSupportGripWinner &&
+            if ((authorityTagPolicy.sameFrameSupportPin ||
+                    authorityTagPolicy.sameFramePrimaryPin) &&
                 heisenberg::IsRockEngineHosted() &&
                 Utils::IsPlayerInPowerArmor()) {
                 const bool refreshed =
@@ -1102,7 +1247,7 @@ namespace heisenberg
                 if (!s_loggedPaFinalRefresh || !refreshed) {
                     spdlog::log(
                         refreshed ? spdlog::level::info : spdlog::level::warn,
-                        "[PA-AUTH] Same-frame support pin + final flattened "
+                        "[PA-AUTH] Same-frame grip pin + final flattened "
                         "bone/geometry refresh {}",
                         refreshed ? "active" : "FAILED");
                     s_loggedPaFinalRefresh = refreshed;
@@ -1115,20 +1260,28 @@ namespace heisenberg
     }
 
     bool HandAuthority::TryConsumeLatched(bool isLeft, RE::NiTransform& out,
-        bool* rigidWeaponTarget)
+        bool* reachLimitedRigidTarget,
+        bool* controllerRelativeTarget)
     {
         std::scoped_lock lk(g_mtx);
         auto& slot = g_hands[slotIdx(isLeft)];
         g_lastConsumeFrame[slotIdx(isLeft)] = g_frameCounter;
-        if (rigidWeaponTarget) {
-            *rigidWeaponTarget = false;
+        if (reachLimitedRigidTarget) {
+            *reachLimitedRigidTarget = false;
+        }
+        if (controllerRelativeTarget) {
+            *controllerRelativeTarget = false;
         }
         if (!slot.hasLatched) {
             return false;
         }
         out = slot.latched;
-        if (rigidWeaponTarget) {
-            *rigidWeaponTarget = slot.latchedReachLimitedRigid;
+        if (reachLimitedRigidTarget) {
+            *reachLimitedRigidTarget =
+                slot.latchedReachLimitedRigid;
+        }
+        if (controllerRelativeTarget) {
+            *controllerRelativeTarget = slot.latchedControllerRelative;
         }
         if (slot.latchedTracksPlayer && slot.latchedPlayerPositionValid) {
             RE::NiPoint3 currentPlayerPosition{};
@@ -1237,6 +1390,7 @@ namespace heisenberg
             slot.hasLatched = false;
             slot.latchedTracksPlayer = false;
             slot.latchedReachLimitedRigid = false;
+            slot.latchedControllerRelative = false;
             slot.latchedPlayerPositionValid = false;
             // A reset can coincide with a FRIK skeleton rebuild. Never restore local
             // transforms captured from the retired skeleton in a later authority episode.

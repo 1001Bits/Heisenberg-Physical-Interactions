@@ -22,24 +22,122 @@
 #include "HandCollision.h"
 #include "Physics.h"
 #include "ThrownObjectTracker.h"
+#include "WaterInteraction.h"
 #include "HandAuthority.h"
 #include "FrikArmGoalHook.h"
 #include "../external/ROCK/src/ROCKMain.h"
+#include "../external/ROCK/src/physics-interaction/core/PhysicsHooks.h"
+
+#include <SimpleIni.h>
 
 #include <array>
 #include <atomic>
+#include <cstring>
+#include <intrin.h>
 
 namespace heisenberg::Hooks
 {
     // Controls Config marks only its synthetic semantic grenade lifecycle.
     // Physical WandGrip events still pass through Heisenberg's normal grenade
     // arbitration. Thread-local state preserves the engine call's p3/p4 ABI.
+    // Calls are accepted only from Hooks::Install's game thread, and a leaked
+    // true expires quickly instead of bypassing arbitration for the rest of
+    // the session.
+    // Defined with the MeleeThrow hook further down; consumed by the per-frame
+    // host-API push, which appears earlier in this file.
+    bool IsProjectileLaunchGraceActive();
+
+    static std::atomic<DWORD> g_hooksGameThreadId{ 0 };
     static thread_local bool g_externalSemanticGrenadeDispatch = false;
+    static thread_local ULONGLONG g_externalSemanticGrenadeDispatchDeadline = 0;
+    static constexpr ULONGLONG kExternalGrenadeDispatchLeaseMilliseconds = 250;
+
+    static const char* ResolveCallerModuleName(
+        const void* returnAddress,
+        char (&modulePath)[MAX_PATH]) noexcept
+    {
+        HMODULE module = nullptr;
+        if (!returnAddress ||
+            !GetModuleHandleExA(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCSTR>(returnAddress),
+                &module) ||
+            !module ||
+            GetModuleFileNameA(module, modulePath, MAX_PATH) == 0) {
+            return "<unknown>";
+        }
+
+        const char* slash = std::strrchr(modulePath, '\\');
+        const char* altSlash = std::strrchr(modulePath, '/');
+        if (!slash || (altSlash && altSlash > slash)) {
+            slash = altSlash;
+        }
+        return slash ? slash + 1 : modulePath;
+    }
 
     extern "C" __declspec(dllexport)
     void __cdecl Heisenberg_SetExternalGrenadeDispatch(bool enabled)
     {
+        const void* caller = _ReturnAddress();
+        char modulePath[MAX_PATH]{};
+        const char* moduleName = ResolveCallerModuleName(caller, modulePath);
+        const DWORD currentThreadId = GetCurrentThreadId();
+        const DWORD gameThreadId =
+            g_hooksGameThreadId.load(std::memory_order_acquire);
+
+        if (gameThreadId == 0 || currentThreadId != gameThreadId) {
+            // A wrong-thread clear cannot clear another thread's TLS state, so make
+            // the rejection explicit instead of pretending the request succeeded.
+            g_externalSemanticGrenadeDispatch = false;
+            g_externalSemanticGrenadeDispatchDeadline = 0;
+            spdlog::error(
+                "[GrenadeDispatch] Ignored {} from '{}' on thread {} "
+                "(game thread={}); export is game-thread only",
+                enabled ? "registration" : "clear",
+                moduleName,
+                currentThreadId,
+                gameThreadId);
+            return;
+        }
+
         g_externalSemanticGrenadeDispatch = enabled;
+        g_externalSemanticGrenadeDispatchDeadline =
+            enabled
+                ? GetTickCount64() + kExternalGrenadeDispatchLeaseMilliseconds
+                : 0;
+        spdlog::info(
+            "[GrenadeDispatch] External semantic dispatch {} by '{}' "
+            "on game thread {}{}",
+            enabled ? "registered" : "cleared",
+            moduleName,
+            currentThreadId,
+            enabled ? " (250 ms fail-safe lease)" : "");
+    }
+
+    static bool IsExternalSemanticGrenadeDispatchActive()
+    {
+        if (!g_externalSemanticGrenadeDispatch) {
+            return false;
+        }
+
+        const DWORD currentThreadId = GetCurrentThreadId();
+        const DWORD gameThreadId =
+            g_hooksGameThreadId.load(std::memory_order_acquire);
+        const ULONGLONG now = GetTickCount64();
+        if (currentThreadId != gameThreadId ||
+            g_externalSemanticGrenadeDispatchDeadline == 0 ||
+            now > g_externalSemanticGrenadeDispatchDeadline) {
+            g_externalSemanticGrenadeDispatch = false;
+            g_externalSemanticGrenadeDispatchDeadline = 0;
+            spdlog::error(
+                "[GrenadeDispatch] Cleared leaked/invalid external semantic "
+                "dispatch (thread={}, gameThread={})",
+                currentThreadId,
+                gameThreadId);
+            return false;
+        }
+        return true;
     }
 
     // =========================================================================
@@ -54,6 +152,8 @@ namespace heisenberg::Hooks
     // Cached INI setting pointer for bShowHUDMessages:Interface
     static RE::Setting* g_showHUDMessagesSetting = nullptr;
     static bool g_showHUDMessagesSettingSearched = false;
+    static bool g_hudMessageSuppressionActive = false;
+    static bool g_hudMessagesWereEnabled = true;
     static int g_deferredUnsuppressFrames = 0;  // Deferred HUD unsuppress countdown
     static std::string g_deferredHUDMessage;    // Message to show when deferred unsuppress fires
     
@@ -293,10 +393,49 @@ namespace heisenberg::Hooks
             // the 5s lease TTL is evaluated host-side, so a caller that never re-enables
             // self-heals here.
             if (heisenberg::IsRockEngineHosted()) {
-                rock::HostSetWeaponCollisionSuppressed(HeisenbergPluginAPI::IsWeaponCollisionDisabledByAPI());
+                // Projectile-launch grace: a just-thrown grenade projectile spawns at
+                // the hand on the native weapon layer, which our colliders pair with —
+                // an impact-fused throwable (Molotov) detonated on them instantly.
+                // OR-ing here means expiry self-restores on the next frame's push.
+                const bool projectileGrace = IsProjectileLaunchGraceActive();
+
+                // DIALOGUE POSE-SNAP grace (Jul 31): during a conversation the game
+                // animates the player's third-person body (talking idle / auto-face) —
+                // the bones our colliders keyframe-follow stop tracking the controllers.
+                // On dialogue exit the skeleton snaps back to the controller pose, and
+                // every generated collider (weapon hull, 20 hand bodies, body bodies)
+                // SWEEPS through the arc between the two poses at drive speed, shoving
+                // whatever it crosses — live repro: a beer bottle knocked off a table
+                // BEHIND the player at DialogueMenu close with a drawn Baseball Bat
+                // (17.8u hull). The snap arc (~50-100u/frame) sails under the drive's
+                // 1000u teleport threshold, so it resolves as a fast swept push.
+                // Suppress our colliders for the whole dialogue plus a settle window.
+                static ULONGLONG s_dialoguePoseGraceUntil = 0;
+                static bool s_dialoguePoseGraceLogged = false;
+                if (MenuChecker::GetSingleton().IsDialogueOpen()) {
+                    s_dialoguePoseGraceUntil = GetTickCount64() + 600;
+                    if (!s_dialoguePoseGraceLogged) {
+                        s_dialoguePoseGraceLogged = true;
+                        spdlog::info(
+                            "[MenuPoseGrace] Dialogue open — suppressing generated colliders "
+                            "until 600ms after close (pose-snap sweep guard)");
+                    }
+                } else if (GetTickCount64() >= s_dialoguePoseGraceUntil) {
+                    // Re-arm the one-shot log for the next conversation.
+                    s_dialoguePoseGraceLogged = false;
+                }
+                const bool dialoguePoseGrace =
+                    GetTickCount64() < s_dialoguePoseGraceUntil;
+                const bool colliderGrace = projectileGrace || dialoguePoseGrace;
+                rock::HostSetWeaponCollisionSuppressed(
+                    HeisenbergPluginAPI::IsWeaponCollisionDisabledByAPI() || colliderGrace);
                 rock::HostSetTwoHandedGripBlocked(HeisenbergPluginAPI::IsOffHandGripBlockedByAPI());
-                rock::HostSetHandCollisionSuppressed(true, HeisenbergPluginAPI::IsHandCollisionDisabledByAPI(true));
-                rock::HostSetHandCollisionSuppressed(false, HeisenbergPluginAPI::IsHandCollisionDisabledByAPI(false));
+                rock::HostSetTwoHandedFingerPoseMode(
+                    heisenberg::g_config.twoHandedFingerPoseMode);
+                rock::HostSetHandCollisionSuppressed(true,
+                    HeisenbergPluginAPI::IsHandCollisionDisabledByAPI(true) || colliderGrace);
+                rock::HostSetHandCollisionSuppressed(false,
+                    HeisenbergPluginAPI::IsHandCollisionDisabledByAPI(false) || colliderGrace);
                 rock::HostSetHandHoldingObject(true, heisenberg::GrabManager::GetSingleton().IsGrabbing(true));
                 rock::HostSetHandHoldingObject(false, heisenberg::GrabManager::GetSingleton().IsGrabbing(false));
                 // MCM-tunable collider padding lives in Heisenberg's config, but the ACTIVE
@@ -304,6 +443,11 @@ namespace heisenberg::Hooks
                 // HandBoneColliderSet module is disabled in the embed profile) — bridge the
                 // value in so the slider actually reaches the physics bodies.
                 rock::HostSetHandColliderRadiusPadding(heisenberg::g_config.handColliderRadiusPadding);
+                // MCM is merged into Heisenberg's config rather than ROCK's standalone
+                // [PhysicsInteraction] config, so support-hand authority needs the same
+                // per-frame host bridge to participate in MCM hot reload.
+                rock::HostSetTwoHandedMinSteeringAuthority(
+                    heisenberg::g_config.offHandSteeringAuthority);
             }
 
             // Two-handed support-hand finger pose (Jul 19): drive FRIK's base finger API
@@ -327,6 +471,8 @@ namespace heisenberg::Hooks
             g_vrInput.Update();
             GrabManager::GetSingleton().PostPhysicsGrabUpdate();
             g_heisenberg.OnInputUpdate();
+            WaterInteraction::GetSingleton().SetEnabled(
+                g_config.enableWaterInteraction);
             g_heisenberg.OnGrabUpdate();
 
             // Plugin-side hand authority (Jul 19 frame-order audit): when the embedded ROCK
@@ -413,47 +559,65 @@ namespace heisenberg::Hooks
             // ROCK integration — AUTOMATIC hand-collision ownership:
             //   * External ROCK present AND actually running its physics (IsRunning) -> ROCK
             //     owns hands; Heisenberg's hand collision is OFF (return here).
-            //   * Embedded ROCK -> its real hand/arm collider bodies remain the sole physics
-            //     bodies, but Heisenberg's body-less proximity/depenetration push may coexist
-            //     when bEnableHandCollision is on.
+            //   * Embedded ROCK with an initialized PhysicsInteraction -> ROCK's
+            //     real hand/arm collider bodies and DynamicPushAssist are the
+            //     sole collision path. Running Heisenberg's body-less swept
+            //     proximity pass as well duplicated finger lookup, radius casts,
+            //     object scans, haptics, and impulses every frame.
             //   * ROCK present but DISABLED / torn down at runtime -> Heisenberg reclaims
             //     hands automatically (fall through to the proximity push below). No INI
             //     change needed — this is the "turn ROCK off, get our push back" case.
             //   * ROCK absent -> Heisenberg owns hands.
             // Heisenberg never creates its own physics hand bodies (two-scenario cleanup);
             // the proximity push creates no bodies and is safe during ROCK's startup window.
-            auto& rock = heisenberg::RockBridge::GetSingleton();
+            auto& rockBridge =
+                heisenberg::RockBridge::GetSingleton();
             const bool embeddedRockHosted = heisenberg::IsRockEngineHosted();
-            const bool useEmbeddedBodylessProximity =
+            const bool embeddedRockOperational =
                 embeddedRockHosted &&
-                heisenberg::g_config.enableHandCollision;
+                rock::HostIsPhysicsInteractionReady();
+            const bool embeddedRockBenchmarkBaseline =
+                embeddedRockHosted &&
+                rock::HostIsPerformanceBenchmarkBaseline();
 
-            // Tell only the embedded engine to stand down its scripted HAND push while the
-            // old proximity path supplies that impulse. ROCK's actual collision bodies,
-            // semantic contacts, haptics, and weapon DynamicPushAssist all stay enabled.
+            // A previous configuration could leave this host suppression set
+            // while the legacy proximity pass supplied the impulse. ROCK is now
+            // the sole active path whenever it is operational, so explicitly
+            // restore its native hand DynamicPushAssist.
             if (embeddedRockHosted) {
-                rock::HostSetHandDynamicPushAssistSuppressed(useEmbeddedBodylessProximity);
+                rock::HostSetHandDynamicPushAssistSuppressed(false);
             }
 
             const bool rockOwnsHandPhysics =
-                rock.IsRunning() ||
-                (embeddedRockHosted && !useEmbeddedBodylessProximity);
+                rockBridge.IsRunning() ||
+                embeddedRockOperational ||
+                embeddedRockBenchmarkBaseline;
             if (rockOwnsHandPhysics) {
                 static bool loggedRock = false;
                 if (!loggedRock) {
-                    spdlog::info("[HOOKS] ROCK owns hand physics ({}) — built-in hand collision disabled.",
-                                 rock.IsRunning() ? "external ROCK.dll" : "embedded ROCK engine");
+                    const char* owner =
+                        rockBridge.IsRunning()
+                            ? "external ROCK.dll"
+                            : (embeddedRockBenchmarkBaseline
+                                   ? "embedded ROCK benchmark baseline"
+                                   : "embedded ROCK engine");
+                    spdlog::info(
+                        "[HOOKS] ROCK owns hand physics ({}) — built-in "
+                        "hand collision disabled.",
+                        owner);
                     loggedRock = true;
                 }
                 return;
             }
 
-            if (useEmbeddedBodylessProximity) {
-                static bool loggedCoexistence = false;
-                if (!loggedCoexistence) {
-                    spdlog::info("[HOOKS] Embedded ROCK collision bodies active; enabling body-less "
-                                 "Heisenberg hand proximity push (ROCK hand DynamicPushAssist suppressed).");
-                    loggedCoexistence = true;
+            if (embeddedRockHosted && !embeddedRockOperational) {
+                static bool loggedEmbeddedFallback = false;
+                if (!loggedEmbeddedFallback) {
+                    spdlog::info(
+                        "[HOOKS] Embedded ROCK physics interaction is not "
+                        "operational - using Heisenberg body-less hand "
+                        "collision fallback.");
+                    loggedEmbeddedFallback = true;
                 }
             }
 
@@ -597,6 +761,7 @@ namespace heisenberg::Hooks
 
     void Install()
     {
+        g_hooksGameThreadId.store(GetCurrentThreadId(), std::memory_order_release);
         spdlog::info("Installing Heisenberg hooks...");
 
         // ===============================================================
@@ -712,9 +877,45 @@ namespace heisenberg::Hooks
         // Also install when drop-to-hand is on: the hook tells a consumable USE apart from a DROP
         // (only a USE goes through EquipObject), so DropToHand can skip consumes — needed even when
         // consume-to-hand itself is off.
-        if (g_config.consumableToHand || g_config.favoritesToHand || g_config.holotapeToHand
-            || g_config.dropToHandMode > 0) {
+        //
+        // ORDER NOTE (2026-07-28): Install() runs from F4SEPlugin_Load, which is BEFORE
+        // g_config.Load() (that happens on kGameLoaded, Heisenberg.cpp). The four flags below
+        // therefore hold their compile-time defaults here, not the user's INI values — and with
+        // today's defaults (holotapeToHand=true, dropToHandMode=1) this gate is always true. It is
+        // kept as the documented statement of intent; the fifth term is the one that can change.
+        //
+        // FIFTH TERM — GRENADE ARBITRATION. This detour is now also the ONLY entry point for the
+        // embedded ROCK engine's loose-grenade equip interception (rock::HostTryInterceptEquipObject
+        // in HookEquipObject below). Only ONE raw entry detour can exist at 0xE6FEA0 and this one
+        // owns it, so skipping the install leaves ROCK's grenade feature with nothing to be called
+        // from. The master toggle is read straight from the INI here — exactly as Heisenberg::Load
+        // does before rock::HostLoad — because g_config is not populated yet at this point.
+        bool rockEngineRequested = false;
+        {
+            CSimpleIniA bootIni;
+            bootIni.SetUnicode();
+            bootIni.LoadFile("Data/F4SE/Plugins/Heisenberg_F4VR.ini");
+            rockEngineRequested = bootIni.GetBoolValue("RockEngine", "bUseRockEngineArchitecture", false);
+        }
+        const bool hostFeaturesWantEquipHook = g_config.consumableToHand || g_config.favoritesToHand
+            || g_config.holotapeToHand || g_config.dropToHandMode > 0;
+        if (hostFeaturesWantEquipHook || rockEngineRequested) {
             InstallEquipObjectHook();
+        } else {
+            // Report the finding and the consequence for BOTH owners of this entry. Naming the
+            // exact keys matters: this is the only thing that can silently switch off both
+            // consumable/holotape-to-hand AND the embedded engine's grenade interception.
+            // ERROR, not warn: at this point in startup the log level is still err (Heisenberg.cpp
+            // holds it there until Config::Load), so anything quieter would never reach the log —
+            // and this branch silently switches off two separate user-visible features.
+            spdlog::error("[EquipHook] Hook NOT installed: bConsumableToHand=0, bFavoritesToHand=0, "
+                          "bHolotapeToHand=0 and iDropToHandMode=0, and [RockEngine]bUseRockEngineArchitecture=0. "
+                          "Consequence: consumables/holotapes are used natively instead of dropping to hand, and the "
+                          "embedded ROCK engine's loose-grenade equip interception has no entry point and stays off.");
+            rock::HostSetEquipObjectDetourInstalled(false,
+                "Heisenberg did not install its ActorEquipManager::EquipObject detour: bConsumableToHand, "
+                "bFavoritesToHand, bHolotapeToHand and iDropToHandMode are all off and "
+                "[RockEngine]bUseRockEngineArchitecture=0, so the hook that would call ROCK was never installed");
         }
 
         // ActivateRef hook - blocks activation of recently-dropped items (Grip>A anti-reactivation)
@@ -745,19 +946,19 @@ namespace heisenberg::Hooks
             }
         }
 
-        // Patch 2: VR CreateMouseSpring equivalent → xor eax,eax; ret (return 0)
-        // Callers check return value: 0 = no spring created (safe skip)
+        // Patch 2: VR CreateMouseSpring equivalent. The shared ROCK routine is
+        // the sole writer for RVA 0xF19250: it validates the complete Fallout4VR
+        // 1.2.72 prologue and atomically installs xor eax,eax; ret. Calling it
+        // here preserves host-only Heisenberg behavior; the later embedded-ROCK
+        // initialization call is idempotent and only verifies the final state.
         {
-            REL::Relocation<std::uintptr_t> addr{ REL::Offset(0x0f19250) };
-            auto* p = reinterpret_cast<uint8_t*>(addr.address());
-            DWORD oldProtect;
-            if (VirtualProtect(p, 3, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-                spdlog::info("[NativeTelekinesis] Patching VR CreateMouseSpring at {:X}: {:#04x} {:#04x} {:#04x} -> xor eax,eax; ret",
-                            addr.address(), p[0], p[1], p[2]);
-                p[0] = 0x31;  // xor eax, eax
-                p[1] = 0xC0;
-                p[2] = 0xC3;  // ret
-                VirtualProtect(p, 3, oldProtect, &oldProtect);
+            const bool suppressed = rock::installNativeGrabHook();
+            if (suppressed) {
+                spdlog::info("[NativeTelekinesis] VR CreateMouseSpring at module+0xF19250 is verified DISABLED "
+                             "by the shared validate-before-write owner");
+            } else {
+                spdlog::error("[NativeTelekinesis] VR CreateMouseSpring at module+0xF19250 was NOT modified: "
+                              "the shared owner could not verify a safe suppressed final state");
             }
         }
 
@@ -877,13 +1078,25 @@ namespace heisenberg::Hooks
         }
         
         if (suppress) {
-            // Disable HUD messages
+            // Preserve the user's actual setting. Repeated suppression calls
+            // extend the same lease instead of replacing the saved value with
+            // our own temporary false.
+            if (!g_hudMessageSuppressionActive) {
+                g_hudMessagesWereEnabled =
+                    g_showHUDMessagesSetting->GetBinary();
+                g_hudMessageSuppressionActive = true;
+            }
             g_showHUDMessagesSetting->SetBinary(false);
             spdlog::debug("[HUD] Suppressing HUD messages via INI setting");
         } else {
-            // Re-enable HUD messages
-            g_showHUDMessagesSetting->SetBinary(true);
-            spdlog::debug("[HUD] Restored HUD messages via INI setting");
+            if (g_hudMessageSuppressionActive) {
+                g_showHUDMessagesSetting->SetBinary(
+                    g_hudMessagesWereEnabled);
+                g_hudMessageSuppressionActive = false;
+                spdlog::debug(
+                    "[HUD] Restored HUD messages via INI setting (original={})",
+                    g_hudMessagesWereEnabled);
+            }
         }
     }
     
@@ -899,10 +1112,7 @@ namespace heisenberg::Hooks
         if (g_deferredUnsuppressFrames > 0) {
             g_deferredUnsuppressFrames--;
             if (g_deferredUnsuppressFrames == 0) {
-                if (g_showHUDMessagesSetting) {
-                    g_showHUDMessagesSetting->SetBinary(true);
-                    spdlog::debug("[HUD] Deferred unsuppress complete - HUD messages restored");
-                }
+                SetSuppressHUDMessages(false);
                 // Show queued message now that native messages have been discarded
                 if (!g_deferredHUDMessage.empty()) {
                     ShowHUDMessage_VR(g_deferredHUDMessage.c_str(), nullptr, false, false);
@@ -1088,8 +1298,45 @@ namespace heisenberg::Hooks
         }
     }
 
+    // PROJECTILE LAUNCH GRACE (Jul 31). A thrown grenade's live projectile
+    // reuses the WEAP world model, whose collision is authored on the native
+    // weapon layer (5) — NOT the projectile layer (6) our collider masks
+    // already exclude. All three ROCK collider sets (hand=43, weapon=44,
+    // body=47) pair with layer 5, and the projectile spawns AT the throwing
+    // hand, inside the hand hull and — with a melee weapon drawn — inside the
+    // generated weapon hull too. The game's shooter-exclusion covers the
+    // player's own ragdoll, not our generated bodies, so an impact-fused
+    // throwable (Molotov) detonated in the player's face the moment it spawned.
+    // Suppress our colliders for a short window around the throw; the flags are
+    // OR-ed into the per-frame host push below, so expiry self-restores.
+    static std::atomic<ULONGLONG> g_projectileLaunchGraceUntil{ 0 };
+    constexpr ULONGLONG kProjectileLaunchGraceMs = 400;
+
+    bool IsProjectileLaunchGraceActive()
+    {
+        const ULONGLONG until = g_projectileLaunchGraceUntil.load(std::memory_order_acquire);
+        return until != 0 && GetTickCount64() < until;
+    }
+
     void HookMeleeThrowOnButtonEvent(void* thisPtr, RE::ButtonEvent* a_event, void* p3, void* p4)
     {
+        // Throw detection for the grace window: the handler throws on the grip
+        // RELEASE after a >=0.3s ready hold. Detect it regardless of the
+        // grenade-ready gating below — a blocked ready never throws, so the
+        // only cost of a false positive is 0.4s without generated collision.
+        if (a_event &&
+            a_event->value == 0.0f &&
+            a_event->heldDownSecs >= 0.30f &&
+            PlayerHasThrowableEquipped()) {
+            g_projectileLaunchGraceUntil.store(
+                GetTickCount64() + kProjectileLaunchGraceMs,
+                std::memory_order_release);
+            spdlog::info(
+                "[GrenadeThrow] Throwable released after {:.2f}s hold — suppressing generated "
+                "hand/weapon/body colliders for {}ms so the projectile cannot impact-fuse on them",
+                a_event->heldDownSecs,
+                kProjectileLaunchGraceMs);
+        }
         // The block mechanism (below) caps the event's held-duration just under the 0.3s throw
         // delay. That is intentionally NON-destructive to the sub-0.3 path: a grip held <0.3s
         // still does its normal thing (power attack / nothing), only the >=0.3s ready/throw/draw
@@ -1097,7 +1344,7 @@ namespace heisenberg::Hooks
         // game / VirtualHolsters. Power attacks are AttackBlockHandler (own timer) — untouched.
         bool blockReady = false;
         if (a_event &&
-            !g_externalSemanticGrenadeDispatch &&
+            !IsExternalSemanticGrenadeDispatchActive() &&
             heisenberg::g_config.useGrenadeReadyHook &&
             heisenberg::g_config.enableGrenadeHandling) {
             auto& mod = heisenberg::Heisenberg::GetSingleton();
@@ -1789,6 +2036,20 @@ namespace heisenberg::Hooks
     static constexpr std::size_t kMaxPendingHolotapeRedirects = 4;
     static std::array<RedirectedNoteEntry, kMaxPendingHolotapeRedirects> s_redirectedNotes{};
 
+    // ── EMBEDDED ROCK RE-ENTRY BRACKET ───────────────────────────────────────────────────
+    // Held across every call this detour makes to the ORIGINAL EquipObject, so an equip the
+    // game issues from inside that call is not offered to ROCK a second time. This reproduces
+    // exactly the guard ROCK's own (now removed) detour used to hold across its pass-through.
+    // The two seams are thread-local counter ops with no engine dependency, so they are safe
+    // and effectively free when the engine is dormant.
+    struct RockEquipPassThroughGuard
+    {
+        RockEquipPassThroughGuard() noexcept { rock::HostEquipObjectPassThroughBegin(); }
+        ~RockEquipPassThroughGuard() noexcept { rock::HostEquipObjectPassThroughEnd(); }
+        RockEquipPassThroughGuard(const RockEquipPassThroughGuard&) = delete;
+        RockEquipPassThroughGuard& operator=(const RockEquipPassThroughGuard&) = delete;
+    };
+
     bool HookEquipObject(RE::ActorEquipManager* equipManager,
                           RE::Actor* actor,
                           RE::BGSObjectInstance* instance,
@@ -1806,6 +2067,7 @@ namespace heisenberg::Hooks
         // and our redirect logic must not run before the world/menus settle.
         if (MenuChecker::GetSingleton().IsLoading()) {
             if (g_originalEquipObject) {
+                const RockEquipPassThroughGuard passThroughGuard;
                 return g_originalEquipObject(equipManager, actor, instance, stackID, number,
                                               slot, queueEquip, forceEquip, playSounds, applyNow, locked);
             }
@@ -2058,6 +2320,32 @@ namespace heisenberg::Hooks
             }
         }
 
+        // ── EMBEDDED ROCK: loose-grenade equip interception ──────────────────────────────
+        // ROCK does not patch 0xE6FEA0 — THIS detour owns the entry, and an entry can hold
+        // exactly one raw detour. ROCK's interception is therefore called, not hooked. It runs
+        // here, deliberately:
+        //   * AFTER every Heisenberg path above, so none of them change behaviour. Grenades are
+        //     kWEAP forms and nothing above claims a kWEAP except the storage-zone auto-equip
+        //     block, which is an explicit host feature and rightly wins.
+        //   * BEFORE the fall-through, so a consumed call never reaches the native function.
+        // Historically ROCK installed a second detour here, memcmp'd the prologue this hook had
+        // already overwritten, failed, and latched itself off — which is why grenade interception
+        // had never once run ("grenades drop at my feet").
+        if (heisenberg::IsRockEngineHosted()) {
+            switch (rock::HostTryInterceptEquipObject(actor, instance, stackID, number)) {
+            case rock::HostEquipInterception::ConsumedEquipped:
+                // ROCK queued the grenade transaction; the native equip must not also run.
+                return true;
+            case rock::HostEquipInterception::ConsumedBlocked:
+                // It IS a grenade, but its projectile/explosion/fuse data would not resolve.
+                // ROCK refuses the equip rather than let it run half-configured.
+                return false;
+            case rock::HostEquipInterception::NotIntercepted:
+            default:
+                break;  // fall through to Heisenberg's normal pass-through below
+            }
+        }
+
         // Not intercepted - call original
         if (g_originalEquipObject) {
             // Debug: log non-intercepted player equips to diagnose PA sound issue
@@ -2069,6 +2357,7 @@ namespace heisenberg::Hooks
                         playSounds, queueEquip, forceEquip);
                 }
             }
+            const RockEquipPassThroughGuard passThroughGuard;
             return g_originalEquipObject(equipManager, actor, instance, stackID, number,
                                           slot, queueEquip, forceEquip, playSounds, applyNow, locked);
         }
@@ -2111,8 +2400,18 @@ namespace heisenberg::Hooks
         // Same pattern as the GripWeaponDraw hook.
         // We read the first N bytes of prologue, verify them, then install
         // an absolute jump to our hook function.
+        //
+        // SOLE OWNER OF THIS ENTRY (2026-07-28). The embedded ROCK engine used to
+        // install a second raw detour here and always failed, because this one is
+        // installed first (Hooks::Install runs before rock::HostLoad) and ROCK then
+        // memcmp'd a prologue we had already replaced. ROCK's loose-grenade equip
+        // interception is now CALLED from HookEquipObject instead. Consequently every
+        // exit from this function must report its outcome through
+        // rock::HostSetEquipObjectDetourInstalled — that flag is the gate on ROCK's
+        // whole pending-grenade-equip queue, and a queue nothing can feed has to be
+        // latched off rather than left waiting for a request that can never arrive.
         // =====================================================================
-        
+
         REL::Relocation<std::uintptr_t> equipObjectFunc{ REL::Offset(0xe6fea0) };
         uintptr_t targetAddr = equipObjectFunc.address();
         
@@ -2162,8 +2461,14 @@ namespace heisenberg::Hooks
         }
         
         if (stolenBytes == 0) {
-            spdlog::error("[EquipHook] Unknown prologue pattern! First bytes: {:02X} {:02X} {:02X}. Hook NOT installed.",
+            spdlog::error("[EquipHook] Unknown prologue pattern! First bytes: {:02X} {:02X} {:02X}. Hook NOT installed. "
+                          "Consequence: consumable/holotape/drop-to-hand redirection is off, and the embedded ROCK engine's "
+                          "loose-grenade equip interception has no entry point.",
                 origBytes[0], origBytes[1], origBytes[2]);
+            rock::HostSetEquipObjectDetourInstalled(false,
+                "Heisenberg's ActorEquipManager::EquipObject detour was NOT installed: the first prologue bytes at "
+                "0xE6FEA0 matched none of the known entry patterns (see the [EquipHook] Prologue line above for the "
+                "20 bytes actually found there)");
             return;
         }
         
@@ -2216,8 +2521,14 @@ namespace heisenberg::Hooks
                 pos += 2;  // lea reg, [reg]        (opcode + ModRM, no disp)
             }
             else {
-                spdlog::error("[EquipHook] Unknown instruction at offset {} (byte {:02X}). Cannot determine safe boundary. Hook NOT installed.",
+                spdlog::error("[EquipHook] Unknown instruction at offset {} (byte {:02X}). Cannot determine safe boundary. Hook NOT installed. "
+                              "Consequence: consumable/holotape/drop-to-hand redirection is off, and the embedded ROCK engine's "
+                              "loose-grenade equip interception has no entry point.",
                     pos, b);
+                rock::HostSetEquipObjectDetourInstalled(false,
+                    "Heisenberg's ActorEquipManager::EquipObject detour was NOT installed: instruction-length decoding of the "
+                    "0xE6FEA0 prologue could not reach a safe 14-byte boundary (see the [EquipHook] Prologue line above for the "
+                    "20 bytes actually found there)");
                 return;
             }
         }
@@ -2227,7 +2538,13 @@ namespace heisenberg::Hooks
         // Allocate executable memory for trampoline
         void* hookMemory = VirtualAlloc(nullptr, 128, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
         if (!hookMemory) {
-            spdlog::error("[EquipHook] VirtualAlloc failed! Hook NOT installed.");
+            spdlog::error("[EquipHook] VirtualAlloc failed (GetLastError={})! Hook NOT installed. "
+                          "Consequence: consumable/holotape/drop-to-hand redirection is off, and the embedded ROCK engine's "
+                          "loose-grenade equip interception has no entry point.",
+                GetLastError());
+            rock::HostSetEquipObjectDetourInstalled(false,
+                "Heisenberg's ActorEquipManager::EquipObject detour was NOT installed: VirtualAlloc for its 128-byte "
+                "trampoline failed");
             return;
         }
         
@@ -2270,6 +2587,13 @@ namespace heisenberg::Hooks
         spdlog::info("[EquipHook] === EquipObject Hook Ready ===");
         spdlog::info("[EquipHook] consumableToHand={}, favoritesToHand={}, holotapeToHand={}",
             g_config.consumableToHand, g_config.favoritesToHand, g_config.holotapeToHand);
+
+        // Tell the embedded ROCK engine its grenade interception now has a live entry point.
+        // Read back later by rock::loose_grenade_runtime::installEquipHook() during HostLoad,
+        // which runs after this. Harmless when the engine is dormant.
+        rock::HostSetEquipObjectDetourInstalled(true, nullptr);
+        spdlog::info("[EquipHook] Detour owns 0x{:X}; embedded ROCK loose-grenade interception will be called from it "
+                     "(ROCK installs no hook of its own there).", targetAddr);
     }
 
     // =========================================================================
@@ -2298,6 +2622,22 @@ namespace heisenberg::Hooks
         uintptr_t activateText = 0;
         uintptr_t secondaryText = 0;
         uint8_t   playFlag = 0;
+
+        // Which fields this pass actually wrote (kWrote* bits) and the values written.
+        // The restore is ALL-OR-NOTHING: if ANY written field no longer holds the value we
+        // wrote, the producer ran during the render window - its state is authoritative and
+        // refcount-correct, so we restore none of it. Per-field compares are not enough: the
+        // byte value space of playFlag collides (0==0 proves nothing), so one field's mismatch
+        // must veto every restore.
+        static constexpr uint8_t kWroteItemName  = 1 << 0;
+        static constexpr uint8_t kWroteActivate  = 1 << 1;
+        static constexpr uint8_t kWroteSecondary = 1 << 2;
+        static constexpr uint8_t kWrotePlayFlag  = 1 << 3;
+        uint8_t   wroteMask = 0;
+        uintptr_t wroteItemName = 0;
+        uintptr_t wroteActivateText = 0;
+        uintptr_t wroteSecondaryText = 0;
+        uint8_t   wrotePlayFlag = 0;
     };
     static thread_local RolloverSaveState _savedLeft;
     static thread_local RolloverSaveState _savedRight;
@@ -2308,23 +2648,222 @@ namespace heisenberg::Hooks
     static uintptr_t g_holotapeHintEntry = 0;
     static uintptr_t g_touchHintEntry = 0;
 
-    // Check if the ref the wand is pointing at is a tracked activator or terminal
-    static bool IsWandTargetTrackedActivator(bool isLeft)
-    {
-        RE::ObjectRefHandle handle = heisenberg::GetVRWandTargetHandle(isLeft);
-        if (!handle) return false;
+    // -------------------------------------------------------------------------
+    // ShowRolloverParameters is SHARED state, not private scratch space.
+    //
+    // Ghidra (F4VR 1.2.72) — the fields we edit are one BSTOptional<ShowRolloverParameters>
+    // whose base is instance+0x608, and every engine access to it is wrapped in the
+    // BSSpinLock at +0x648. The producer FUN_140abf6e0 (BSTValueEventSink<HUDRolloverStateEvent>
+    // ::ProcessEvent) confirms the layout exactly: lock +0x40, itemName +0x08, activateText
+    // +0x10, secondaryText +0x18, has-value +0x30, show-latch +0x38, lockCount +0x44 — i.e.
+    // +0x648 / +0x610 / +0x618 / +0x620 / +0x638 / +0x640 / +0x64C on the instance.
+    //
+    // Both producer paths RELEASE whatever entry is sitting in those three fields: the update
+    // path via ShowRolloverParameters::operator= (0xABC640 → BSFixedString::operator= x3) and
+    // the clear path via ~BSFixedString x3. So a raw pointer parked in one of them without a
+    // matching addref is a live grenade. If the producer runs while our substitute is in place
+    // it releases OUR static entry; if it runs while we are inside the original, our restore
+    // re-parks a pointer whose refcount the producer already dropped. Either way an entry can
+    // reach refcount zero, and BSFixedString::~BSFixedString (0x1BC1770) then unlinks it from
+    // the BSStringPool bucket chain and Frees it — corrupting the pool that every string in the
+    // game shares. That is why the damage surfaces as unrelated item names going blank for a
+    // while and then coming back once the string gets re-interned.
+    //
+    // The fix has three parts, and deliberately does NOT hold the lock across the render:
+    //
+    //  1. Both edit and restore happen inside a SHORT critical section under the engine's own
+    //     BSSpinLock (0x24E10, re-entrant via an _owningThread == GetCurrentThreadId() check).
+    //     That makes the reference handoff on the displaced entry atomic against the producer.
+    //     The lock is released before calling the original — mirroring vf004 itself, which locks,
+    //     snapshots, unlocks, and only then does Scaleform work. Holding it across the render
+    //     would risk an AB/BA against the model lock the producer already holds when it fires the
+    //     HUDRolloverStateEvent, and BSSpinLock::Lock spins 10000 times before it starts sleeping.
+    //     Note this matters most on a DEFAULT install: hideWandHUD defaults to true, so that
+    //     branch substitutes on every vf004 for both wands.
+    //
+    //  2. Our two substitute entries are made immortal, so a producer assignment that lands while
+    //     one is parked can no longer drive it to zero.
+    //
+    //  3. Restores are compare-and-restore, so we never write a stale pointer over an entry the
+    //     producer assigned while we were rendering.
+    //
+    // Worst case is then a bounded refcount leak on a displaced entry (it keeps the reference the
+    // field used to own) — never an over-release, never a dangling pointer, never pool corruption.
+    // -------------------------------------------------------------------------
+    using BSSpinLockLockFunc = uint32_t(__fastcall*)(void*, const char*);
 
-        RE::NiPointer<RE::TESObjectREFR> refr = handle.get();
-        if (!refr) return false;
+    static constexpr uintptr_t kRolloverParamsLockOffset = 0x648;
+
+    // Witnesses. All are ATOMICS ONLY on the hook path - no logging happens on the render
+    // thread, and certainly not while holding the engine's spinlock (spdlog formats, takes the
+    // sink mutex, and this codebase flushes on warn - a synchronous file write). They are
+    // drained and logged one-shot from the main thread in RefreshWandActivatorTargets.
+    //
+    // Interpreting them: the AUTHORITATIVE concurrency witness is the restore-decline counter -
+    // it fires whenever the producer wrote during the render window, which is the precondition
+    // for the old corruption. The lock-contention sample is only a lucky catch: it samples the
+    // lock words for one instant ~2x/frame while the producer's critical section is
+    // sub-microsecond, so its silence proves nothing.
+    static std::atomic<uint32_t> g_rolloverLockContended{ 0 };
+    static std::atomic<uint32_t> g_rolloverContendedOwner{ 0 };
+    static std::atomic<uint32_t> g_rolloverRestoreDeclines{ 0 };
+    static std::atomic<uint64_t> g_rolloverDeclineDetail{ 0 };   // (wrote<<32)|found, low dwords
+    static std::atomic<uint32_t> g_rolloverOrigFaults{ 0 };
+    static std::atomic<uint32_t> g_rolloverOrigFaultCode{ 0 };
+    static std::atomic<uint32_t> g_rolloverLockRepairs{ 0 };
+
+    class RolloverParamsLock
+    {
+    public:
+        explicit RolloverParamsLock(void* thisPtr)
+            : _lock(reinterpret_cast<uintptr_t>(thisPtr) + kRolloverParamsLockOffset)
+        {
+            const DWORD selfThread  = GetCurrentThreadId();
+            const DWORD ownerBefore = *reinterpret_cast<volatile DWORD*>(_lock);
+            const LONG  countBefore = *reinterpret_cast<volatile LONG*>(_lock + 4);
+            if (countBefore != 0 && ownerBefore != 0 && ownerBefore != selfThread) {
+                g_rolloverLockContended.fetch_add(1, std::memory_order_relaxed);
+                g_rolloverContendedOwner.store(ownerBefore, std::memory_order_relaxed);
+            }
+
+            static const auto lockFn =
+                reinterpret_cast<BSSpinLockLockFunc>(REL::Offset(0x24e10).address());
+            lockFn(reinterpret_cast<void*>(_lock), nullptr);
+        }
+
+        ~RolloverParamsLock() { unlock(); }
+
+        // Mirrors the unlock the engine inlines at the top of vf004: drop the owning thread
+        // only on the outermost release, otherwise just decrement the recursion count.
+        void unlock()
+        {
+            if (!_held) return;
+            _held = false;
+            auto* owningThread = reinterpret_cast<volatile LONG*>(_lock);
+            auto* lockCount    = reinterpret_cast<volatile LONG*>(_lock + 4);
+            if (*lockCount == 1) {
+                *owningThread = 0;
+                InterlockedCompareExchange(lockCount, 0, 1);
+            } else {
+                InterlockedDecrement(lockCount);
+            }
+        }
+
+        RolloverParamsLock(const RolloverParamsLock&) = delete;
+        RolloverParamsLock& operator=(const RolloverParamsLock&) = delete;
+
+    private:
+        uintptr_t _lock;
+        bool      _held = true;
+    };
+
+    // A BSFixedString entry whose masked refcount reaches 0x3FFF is immortal: the destructor
+    // (0x1BC1770) breaks out without decrementing once (refCount & 0x3FFF) > 0x3FFE, and the
+    // copy ctor likewise stops incrementing there. Pinning our two substitute entries means a
+    // producer assignment landing on a field where we parked one is a no-op instead of an
+    // unbalanced release. The upper bits — the wide-string flag at bit 14 and the bucket index at
+    // 16..22, both of which the destructor reads — are preserved.
+    static void ImmortalizeStringEntry(uintptr_t entry)
+    {
+        if (!entry) return;
+        auto* refCount = reinterpret_cast<volatile LONG*>(entry + 8);
+        for (;;) {
+            const LONG cur = *refCount;
+            if ((cur & 0x3fff) == 0x3fff) return;
+            const LONG want = static_cast<LONG>((static_cast<ULONG>(cur) & ~0x3fffu) | 0x3fffu);
+            if (InterlockedCompareExchange(refCount, want, cur) == cur) return;
+        }
+    }
+
+    // Whether each WAND (not physical hand) is currently pointing at a tracked activator or
+    // terminal. Indexed by wand identity to match the vtable thunks that consume it:
+    // [0] = PRIMARY wand rollover (HookShowRolloverRight), [1] = SECONDARY (HookShowRolloverLeft).
+    //
+    // This is answered on the MAIN thread (not in the vtable hook) so the hook never walks
+    // ActivatorHandler's vectors while the main thread clears and rebuilds them on a cell scan;
+    // the hook reads one atomic.
+    static std::atomic<bool> g_wandOnTrackedActivator[2] = { false, false };
+
+    // One-shot drain of the render-thread witnesses. Runs on the MAIN thread, never under any
+    // engine lock, which is the only place logging is allowed for this hook family.
+    static void DrainRolloverWitnesses()
+    {
+        static bool contentionLogged = false;
+        static bool declineLogged = false;
+        static bool faultLogged = false;
+
+        if (!contentionLogged && g_rolloverLockContended.load(std::memory_order_relaxed) > 0) {
+            contentionLogged = true;
+            spdlog::warn("[HUDRollover] Rollover params lock was observed held by another thread "
+                         "(owner={} n={}) - producer and render hook are concurrent. (Lucky-catch "
+                         "sample; the decline counter is the authoritative witness.)",
+                         g_rolloverContendedOwner.load(std::memory_order_relaxed),
+                         g_rolloverLockContended.load(std::memory_order_relaxed));
+        }
+        if (!declineLogged && g_rolloverRestoreDeclines.load(std::memory_order_relaxed) > 0) {
+            declineLogged = true;
+            const uint64_t detail = g_rolloverDeclineDetail.load(std::memory_order_relaxed);
+            spdlog::warn("[HUDRollover] Producer wrote the rollover params during a render window; "
+                         "restore declined all fields (wrote={:X} found={:X} n={}). This CONFIRMS "
+                         "producer/render concurrency - the pre-fix unlocked edit could corrupt "
+                         "the string pool on this machine.",
+                         static_cast<uint32_t>(detail >> 32), static_cast<uint32_t>(detail),
+                         g_rolloverRestoreDeclines.load(std::memory_order_relaxed));
+        }
+        if (!faultLogged && g_rolloverOrigFaults.load(std::memory_order_relaxed) > 0) {
+            faultLogged = true;
+            spdlog::error("[HUDRollover] Native ShowRollover faulted and was contained "
+                          "(code={:#X} n={} lockRepairs={}). Each fault leaks up to 3 snapshot "
+                          "refs; a growing count means the HUD is faulting every frame.",
+                          g_rolloverOrigFaultCode.load(std::memory_order_relaxed),
+                          g_rolloverOrigFaults.load(std::memory_order_relaxed),
+                          g_rolloverLockRepairs.load(std::memory_order_relaxed));
+        }
+    }
+
+    void RefreshWandActivatorTargets()
+    {
+        // Main-thread drain point for the hook witnesses - runs even when the activator
+        // feature is off, so keep this call unconditional in the main loop.
+        DrainRolloverWitnesses();
+
+        if (!g_config.enableInteractiveActivators) {
+            // Feature off (possibly toggled off mid-session via MCM reload): the snapshot must
+            // not stay latched at its last value, or the hook keeps rewriting prompts forever.
+            g_wandOnTrackedActivator[0].store(false, std::memory_order_relaxed);
+            g_wandOnTrackedActivator[1].store(false, std::memory_order_relaxed);
+            return;
+        }
 
         auto& actHandler = heisenberg::ActivatorHandler::GetSingleton();
-        for (const auto& tracked : actHandler.GetTrackedActivators()) {
-            if (tracked.formID == refr->formID) return true;
+
+        // GetVRWandTargetHandle takes a PHYSICAL hand and swaps viewcasters in left-handed
+        // mode; our consumers are keyed by WAND identity (vtable). Map wand->physical here so
+        // slot 0 always describes the PRIMARY wand's target and slot 1 the SECONDARY's,
+        // in both handedness modes.
+        const bool isLH = VRInput::GetSingleton().IsLeftHandedMode();
+
+        for (int wand = 0; wand < 2; ++wand) {
+            const bool physicalIsLeft = (wand == 0) ? isLH : !isLH;
+            bool onTracked = false;
+
+            RE::ObjectRefHandle handle = heisenberg::GetVRWandTargetHandle(physicalIsLeft);
+            if (handle) {
+                RE::NiPointer<RE::TESObjectREFR> refr = handle.get();
+                if (refr) {
+                    for (const auto& tracked : actHandler.GetTrackedActivators()) {
+                        if (tracked.formID == refr->formID) { onTracked = true; break; }
+                    }
+                    if (!onTracked) {
+                        for (const auto& tracked : actHandler.GetTrackedTerminals()) {
+                            if (tracked.formID == refr->formID) { onTracked = true; break; }
+                        }
+                    }
+                }
+            }
+
+            g_wandOnTrackedActivator[wand].store(onTracked, std::memory_order_relaxed);
         }
-        for (const auto& tracked : actHandler.GetTrackedTerminals()) {
-            if (tracked.formID == refr->formID) return true;
-        }
-        return false;
     }
 
     // Hide wand button prompts while preserving item name display.
@@ -2346,6 +2885,12 @@ namespace heisenberg::Hooks
         *activateText  = 0;
         *secondaryText = 0;
         *playFlag      = 0;
+
+        save.wroteMask = RolloverSaveState::kWroteActivate | RolloverSaveState::kWroteSecondary |
+                         RolloverSaveState::kWrotePlayFlag;
+        save.wroteActivateText  = 0;
+        save.wroteSecondaryText = 0;
+        save.wrotePlayFlag      = 0;
     }
 
     // Null ALL rollover fields including item name (for hideAllWandHUD)
@@ -2366,11 +2911,20 @@ namespace heisenberg::Hooks
         *activateText  = 0;
         *secondaryText = 0;
         *playFlag      = 0;
+
+        save.wroteMask = RolloverSaveState::kWroteItemName | RolloverSaveState::kWroteActivate |
+                         RolloverSaveState::kWroteSecondary | RolloverSaveState::kWrotePlayFlag;
+        save.wroteItemName      = 0;
+        save.wroteActivateText  = 0;
+        save.wroteSecondaryText = 0;
+        save.wrotePlayFlag      = 0;
     }
 
     // Replace prompts for tracked activators and holotapes (hideWandHUD = OFF).
     // Returns true if any replacement was made (caller must RestoreRolloverButtons after).
-    static bool ReplaceRolloverPrompts(void* thisPtr, bool isLeft, RolloverSaveState& save)
+    // `onTrackedActivator` is the main-thread snapshot from RefreshWandActivatorTargets — this
+    // runs with the params spinlock held, so it must not walk containers or resolve handles.
+    static bool ReplaceRolloverPrompts(void* thisPtr, bool onTrackedActivator, RolloverSaveState& save)
     {
         auto base = reinterpret_cast<uintptr_t>(thisPtr);
         auto* activateText  = reinterpret_cast<uintptr_t*>(base + 0x618);
@@ -2386,87 +2940,188 @@ namespace heisenberg::Hooks
             *activateText  = 0;
             *playFlag      = 0;
             *secondaryText = g_holotapeHintEntry;
+
+            save.wroteMask = RolloverSaveState::kWroteActivate | RolloverSaveState::kWroteSecondary |
+                             RolloverSaveState::kWrotePlayFlag;
+            save.wroteActivateText  = 0;
+            save.wroteSecondaryText = g_holotapeHintEntry;
+            save.wrotePlayFlag      = 0;
             return true;
         }
 
-        // Tracked activator: replace "[A] Activate" with "[A] Touch"
-        if (*activateText != 0 && IsWandTargetTrackedActivator(isLeft)) {
-            save.activateText  = *activateText;
-            save.secondaryText = *secondaryText;
-            save.playFlag      = *playFlag;
+        // Tracked activator: replace "[A] Activate" with "[A] Touch".
+        // Only activateText is written, so only activateText is tracked/restored - pass-through
+        // fields must not participate in the mismatch veto (they would false-positive).
+        if (*activateText != 0 && onTrackedActivator) {
+            save.activateText = *activateText;
+            *activateText     = g_touchHintEntry;
 
-            *activateText = g_touchHintEntry;
+            save.wroteMask         = RolloverSaveState::kWroteActivate;
+            save.wroteActivateText = g_touchHintEntry;
             return true;
         }
 
         return false;
     }
 
-    static void RestoreRolloverButtons(void* thisPtr, const RolloverSaveState& save)
+    // All-or-nothing restore. First a verify pass: every field we wrote must still hold exactly
+    // the value we wrote. Any mismatch proves the producer ran during the render window, and its
+    // state - the whole ShowRolloverParameters, written under one lock - is authoritative and
+    // refcount-correct, so we put back NOTHING. (A per-field compare cannot make that call:
+    // playFlag's byte space collides, and a producer write can leave individual fields
+    // bit-identical. One field's mismatch is proof for all of them.)
+    //
+    // Leak bound when we decline: the displaced saved entries keep the one reference each that
+    // their field used to own - at most 3 refs per raced producer event (hideAll), 2 (hideButtons
+    // / holotape), 1 (activator); the immortal substitutes leak nothing. Bounded per event,
+    // race-gated, and only ever pins entries that were already live.
+    //
+    // Residual (accepted): a producer write that leaves every written field bit-identical is
+    // indistinguishable from "untouched", so stale values can be re-parked for at most one
+    // producer event. In the hide branches that is invisible (the next frame re-nulls before
+    // render); in the replace branches it requires the producer to assign the identical interned
+    // string entry our substitute uses.
+    static void RestoreRolloverState(void* thisPtr, const RolloverSaveState& save)
     {
+        if (!save.wroteMask) return;
+
         auto base = reinterpret_cast<uintptr_t>(thisPtr);
-        *reinterpret_cast<uintptr_t*>(base + 0x618) = save.activateText;
-        *reinterpret_cast<uintptr_t*>(base + 0x620) = save.secondaryText;
-        *reinterpret_cast<uint8_t*>(base + 0x62A)   = save.playFlag;
+        auto* itemName      = reinterpret_cast<uintptr_t*>(base + 0x610);
+        auto* activateText  = reinterpret_cast<uintptr_t*>(base + 0x618);
+        auto* secondaryText = reinterpret_cast<uintptr_t*>(base + 0x620);
+        auto* playFlag      = reinterpret_cast<uint8_t*>(base + 0x62A);
+
+        uintptr_t wrote = 0, found = 0;
+        bool intact = true;
+        if ((save.wroteMask & RolloverSaveState::kWroteItemName) && *itemName != save.wroteItemName) {
+            intact = false; wrote = save.wroteItemName; found = *itemName;
+        }
+        if ((save.wroteMask & RolloverSaveState::kWroteActivate) && *activateText != save.wroteActivateText) {
+            intact = false; wrote = save.wroteActivateText; found = *activateText;
+        }
+        if ((save.wroteMask & RolloverSaveState::kWroteSecondary) && *secondaryText != save.wroteSecondaryText) {
+            intact = false; wrote = save.wroteSecondaryText; found = *secondaryText;
+        }
+        if ((save.wroteMask & RolloverSaveState::kWrotePlayFlag) && *playFlag != save.wrotePlayFlag) {
+            intact = false; wrote = save.wrotePlayFlag; found = *playFlag;
+        }
+
+        if (!intact) {
+            g_rolloverRestoreDeclines.fetch_add(1, std::memory_order_relaxed);
+            g_rolloverDeclineDetail.store((static_cast<uint64_t>(wrote & 0xFFFFFFFFu) << 32) |
+                                          (found & 0xFFFFFFFFu), std::memory_order_relaxed);
+            return;
+        }
+
+        if (save.wroteMask & RolloverSaveState::kWroteItemName)  *itemName      = save.itemName;
+        if (save.wroteMask & RolloverSaveState::kWroteActivate)  *activateText  = save.activateText;
+        if (save.wroteMask & RolloverSaveState::kWroteSecondary) *secondaryText = save.secondaryText;
+        if (save.wroteMask & RolloverSaveState::kWrotePlayFlag)  *playFlag      = save.playFlag;
     }
 
-    static void RestoreAllRolloverFields(void* thisPtr, const RolloverSaveState& save)
+    // Both wands share one body. The primary and secondary vf004 are byte-identical in the
+    // engine, and every past bug in this hook came from the two copies drifting apart, so there
+    // is deliberately only one copy to drift.
+    // SEH only — a function using __try may not hold C++ objects with destructors, so the lock
+    // scopes live in the caller. The original is known to be able to fault (the sibling
+    // HideRollover is SEH-wrapped in PipboyInteraction for exactly that reason), and if it
+    // unwound past us our substitute would stay parked in the engine's live parameters for the
+    // rest of the session — so the restore must run no matter how the original exits.
+    // Returns 0 on success, else the swallowed exception code. STATUS_STACK_OVERFLOW is NOT
+    // swallowed: continuing after one leaves the guard page unarmed, so the next exhaustion
+    // would kill the process with no exception dispatch at all (no Buffout dump, no minidump) -
+    // letting it crash here instead produces a usable dump.
+    static DWORD CallOrigRolloverGuarded(ShowRolloverFunc orig, void* thisPtr)
     {
-        auto base = reinterpret_cast<uintptr_t>(thisPtr);
-        *reinterpret_cast<uintptr_t*>(base + 0x610) = save.itemName;
-        *reinterpret_cast<uintptr_t*>(base + 0x618) = save.activateText;
-        *reinterpret_cast<uintptr_t*>(base + 0x620) = save.secondaryText;
-        *reinterpret_cast<uint8_t*>(base + 0x62A)   = save.playFlag;
+        if (!orig) return 0;
+        __try {
+            orig(thisPtr);
+        } __except (GetExceptionCode() == EXCEPTION_STACK_OVERFLOW
+                        ? EXCEPTION_CONTINUE_SEARCH
+                        : EXCEPTION_EXECUTE_HANDLER) {
+            return GetExceptionCode();
+        }
+        return 0;
+    }
+
+    // If the original faulted inside one of its three inlined spinlock windows, SEH unwinds
+    // past the inline unlock (it is straight-line code, not a funclet) and the lock stays
+    // owner=render-thread / count>0 forever. That is silent and fatal-at-a-distance: the render
+    // thread keeps re-entering happily while the producer thread spins on it for the rest of
+    // the session. Repairable precisely because the orphan is OURS to detect: owner == this
+    // thread with a nonzero count, observed from OUTSIDE any lock scope of ours, can only be
+    // vf004's abandoned acquisition. vf004's three locks: params +0x648/+0x64C, warn-color
+    // +0x65C/+0x660, refresh-flag +0x54C/+0x550.
+    static void RepairOrphanedRolloverLocks(void* thisPtr)
+    {
+        const DWORD self = GetCurrentThreadId();
+        const auto base  = reinterpret_cast<uintptr_t>(thisPtr);
+        static constexpr uintptr_t kLockPairs[][2] = {
+            { 0x648, 0x64C }, { 0x65C, 0x660 }, { 0x54C, 0x550 },
+        };
+        for (const auto& pair : kLockPairs) {
+            auto* owner = reinterpret_cast<volatile DWORD*>(base + pair[0]);
+            auto* count = reinterpret_cast<volatile LONG*>(base + pair[1]);
+            if (*owner == self && *count > 0) {
+                // Engine unlock order: clear owner, then count. No other thread can touch
+                // count while it is nonzero, so plain writes + one interlocked store suffice.
+                *owner = 0;
+                InterlockedExchange(count, 0);
+                g_rolloverLockRepairs.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    static void RunRolloverHook(void* thisPtr, bool isLeft, ShowRolloverFunc orig, RolloverSaveState& save)
+    {
+        // When a blocking menu (PauseMenu, LoadingMenu, etc.) is open, skip entirely —
+        // Scaleform state may be torn down/invalid, calling the original crashes.
+        if (!thisPtr || MenuChecker::GetSingleton().IsGameStopped()) {
+            return;
+        }
+
+        // Read before the lock is taken — see RefreshWandActivatorTargets.
+        const bool onTrackedActivator =
+            g_wandOnTrackedActivator[isLeft ? 1 : 0].load(std::memory_order_relaxed);
+
+        save.wroteMask = 0;
+
+        {
+            RolloverParamsLock paramsLock(thisPtr);
+            if (g_config.hideAllWandHUD) {
+                NullAllRolloverFields(thisPtr, save);
+            } else if (g_config.hideWandHUD) {
+                HideWandButtons(thisPtr, save);
+            } else {
+                ReplaceRolloverPrompts(thisPtr, onTrackedActivator, save);
+            }
+        }
+
+        // Lock released: the original snapshots the parameters under its own lock and then
+        // renders without it, exactly as it would unhooked.
+        const DWORD faultCode = CallOrigRolloverGuarded(orig, thisPtr);
+        if (faultCode != 0) {
+            g_rolloverOrigFaults.fetch_add(1, std::memory_order_relaxed);
+            g_rolloverOrigFaultCode.store(faultCode, std::memory_order_relaxed);
+            // Must run BEFORE our restore lock: a lock orphaned by the fault would otherwise be
+            // silently re-entered (same thread) and never returned to zero.
+            RepairOrphanedRolloverLocks(thisPtr);
+        }
+
+        if (!save.wroteMask) return;
+
+        RolloverParamsLock paramsLock(thisPtr);
+        RestoreRolloverState(thisPtr, save);
     }
 
     static void __fastcall HookShowRolloverLeft(void* thisPtr)
     {
-        // When a blocking menu (PauseMenu, LoadingMenu, etc.) is open, skip entirely —
-        // Scaleform state may be torn down/invalid, calling the original crashes.
-        if (!thisPtr || MenuChecker::GetSingleton().IsGameStopped()) {
-            return;
-        }
-
-        if (g_config.hideAllWandHUD) {
-            NullAllRolloverFields(thisPtr, _savedLeft);
-            if (g_origShowRolloverLeft) g_origShowRolloverLeft(thisPtr);
-            RestoreAllRolloverFields(thisPtr, _savedLeft);
-            return;
-        }
-        if (g_config.hideWandHUD) {
-            HideWandButtons(thisPtr, _savedLeft);
-            if (g_origShowRolloverLeft) g_origShowRolloverLeft(thisPtr);
-            RestoreRolloverButtons(thisPtr, _savedLeft);
-            return;
-        }
-        bool replaced = ReplaceRolloverPrompts(thisPtr, true, _savedLeft);
-        if (g_origShowRolloverLeft) g_origShowRolloverLeft(thisPtr);
-        if (replaced) RestoreRolloverButtons(thisPtr, _savedLeft);
+        RunRolloverHook(thisPtr, true, g_origShowRolloverLeft, _savedLeft);
     }
 
     static void __fastcall HookShowRolloverRight(void* thisPtr)
     {
-        // When a blocking menu (PauseMenu, LoadingMenu, etc.) is open, skip entirely —
-        // Scaleform state may be torn down/invalid, calling the original crashes.
-        if (!thisPtr || MenuChecker::GetSingleton().IsGameStopped()) {
-            return;
-        }
-
-        if (g_config.hideAllWandHUD) {
-            NullAllRolloverFields(thisPtr, _savedRight);
-            if (g_origShowRolloverRight) g_origShowRolloverRight(thisPtr);
-            RestoreAllRolloverFields(thisPtr, _savedRight);
-            return;
-        }
-        if (g_config.hideWandHUD) {
-            HideWandButtons(thisPtr, _savedRight);
-            if (g_origShowRolloverRight) g_origShowRolloverRight(thisPtr);
-            RestoreRolloverButtons(thisPtr, _savedRight);
-            return;
-        }
-        bool replaced = ReplaceRolloverPrompts(thisPtr, false, _savedRight);
-        if (g_origShowRolloverRight) g_origShowRolloverRight(thisPtr);
-        if (replaced) RestoreRolloverButtons(thisPtr, _savedRight);
+        RunRolloverHook(thisPtr, false, g_origShowRolloverRight, _savedRight);
     }
 
     // =========================================================================
@@ -2504,6 +3159,11 @@ namespace heisenberg::Hooks
         g_holotapeHintEntry = *reinterpret_cast<uintptr_t*>(&sHolotape);
         static RE::BSFixedString sTouch("Touch");
         g_touchHintEntry = *reinterpret_cast<uintptr_t*>(&sTouch);
+
+        // We hand these raw pointers to the engine without an addref, so they must not be
+        // freeable — see ImmortalizeStringEntry.
+        ImmortalizeStringEntry(g_holotapeHintEntry);
+        ImmortalizeStringEntry(g_touchHintEntry);
     }
 
     void InstallHUDRolloverHook()

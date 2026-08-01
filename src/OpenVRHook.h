@@ -15,6 +15,7 @@ namespace heisenberg
     // Return a bitmask to AND with ulButtonPressed/ulButtonTouched
     // Return 0xFFFFFFFFFFFFFFFF to allow all buttons, return 0 to block all
     using ControllerStateCallback = std::function<uint64_t(bool isLeft, vr::VRControllerState_t* state)>;
+    using ControllerStateCallbackList = std::vector<ControllerStateCallback>;
 
     /**
      * Wrapper class for IVRSystem that intercepts GetControllerState calls
@@ -149,10 +150,14 @@ namespace heisenberg
      * Handles IAT patching and interface wrapping
      *
      * Thread safety:
-     *   - m_callbacks: protected by m_callbackMutex (copy-under-lock pattern for iteration)
+     *   - m_callbackSnapshot: immutable copy-on-write publication; polling
+     *     threads take an atomic shared_ptr snapshot without the callback-list
+     *     mutex or any per-poll allocation
      *   - g_leftControllerIndex/g_rightControllerIndex: std::atomic (OpenVR thread + main thread)
-     *   - RegisterControllerStateCallback: main-thread only (during init)
-     *   - GetControllerState/WithPose: called from OpenVR thread, iterates callback copy
+     *   - RegisterControllerStateCallback: main-thread only (during init);
+     *     m_callbackMutex serializes the rare copy-on-write publication
+     *   - GetControllerState/WithPose: called from OpenVR thread, iterates the
+     *     immutable published snapshot
      *   - GetControllerStateUnfiltered: bypasses all hooks, safe from any thread
      */
     class OpenVRHook
@@ -192,6 +197,10 @@ namespace heisenberg
         bool IsHooked() const { return m_isHooked.load(std::memory_order_acquire); }
         bool IsVtableHooked() const { return m_vtableHooked.load(std::memory_order_acquire); }
         std::uint32_t GetBackendStatusFlags() const;
+        void SetSuppressThumbstickTouch(bool suppress)
+        {
+            m_suppressThumbstickTouch.store(suppress, std::memory_order_release);
+        }
         
         // Apply callbacks to a controller state (used by vtable hooks)
         void ApplyCallbacksToState(controller_bridge::ControllerRole role,
@@ -222,11 +231,12 @@ namespace heisenberg
         std::atomic<bool> m_iatHooked{false};
         std::atomic<bool> m_fo4vrToolsCallbackRegistered{false};
         std::atomic<bool> m_shuttingDown{false};
+        std::atomic<bool> m_suppressThumbstickTouch{false};
         std::unique_ptr<VRSystemWrapper> m_vrSystemWrapper;
         mutable std::mutex m_installMutex;
         
         // Callbacks for button filtering
-        std::vector<ControllerStateCallback> m_callbacks;
+        std::atomic<std::shared_ptr<const ControllerStateCallbackList>> m_callbackSnapshot;
         std::mutex m_callbackMutex;
         
         // Cached controller indices for vtable hook

@@ -34,6 +34,12 @@ namespace heisenberg
         std::uint32_t physicalTouchBodyId = 0x7FFF'FFFFu;
         std::uint32_t physicalTouchAgeFrames = 0xFFFF'FFFFu;
         bool hasPhysicalTouchPoint = false;
+        // Set only by Hand::TryStartGrab after an exact closest-point query
+        // confirms that the receiving hand is within the held object's
+        // five-unit visible-mesh envelope. StartGrab must honor this same
+        // decision instead of recomputing eligibility from a differently
+        // offset palm frame and intermittently rejecting a valid handoff.
+        bool isHeldObjectTransferContact = false;
 
         void Clear()
         {
@@ -47,6 +53,7 @@ namespace heisenberg
             physicalTouchBodyId = 0x7FFF'FFFFu;
             physicalTouchAgeFrames = 0xFFFF'FFFFu;
             hasPhysicalTouchPoint = false;
+            isHeldObjectTransferContact = false;
         }
 
         /**

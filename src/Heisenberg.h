@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <mutex>
 #include <Version.h>
 #include "Hand.h"
 #include "FingerAnimator.h"
@@ -17,10 +18,23 @@ namespace heisenberg
     // RockBridge::IsRunning() is structurally always false in the embed. Defined in Heisenberg.cpp.
     bool IsRockEngineHosted();
 
-    // BetterScopesVR bridge (Jul 19): track its looking-through-scope broadcast (msg 15) and
-    // exit scope mode (toggle msg 16) when the two-handed support grip releases while zoomed.
+    // BetterScopesVR bridge: close BetterScopes/native FO4VR scope
+    // presentation when an established support grip is released. Acquiring
+    // the support grip while scoped preserves the active scope. A release
+    // close also arms native re-entry suppression until the optic leaves the
+    // activation cone.
     void SetLookingThroughScope(bool a_looking);
     void ExitScopeModeOnGripRelease();
+
+    enum class InputSuppressionReason : std::uint32_t
+    {
+        PostGrabFighting = 1u << 0,
+        HeldObjectFighting = 1u << 1,
+        NativeZKey = 1u << 2,
+        HeldObjectActivation = 1u << 3,
+        ItemPositionConfig = 1u << 4,
+        StorageZoneConfig = 1u << 5,
+    };
 
     /**
      * Main Heisenberg mod class for Fallout 4 VR.
@@ -77,6 +91,10 @@ namespace heisenberg
 
         // Input suppression - prevents native F4VR from also responding to grip
         void UpdateInputSuppression();
+        // Update only Heisenberg's named BSInputEnableManager layer. Multiple in-mod
+        // owners compose through a reason mask, so one feature cannot globally
+        // re-enable controls that another feature still owns.
+        void SetInputSuppression(InputSuppressionReason reason, bool suppressed);
 
         // Chest pocket zone - enables native grenades when hand is near chest
         void UpdateChestPocketZone();
@@ -103,7 +121,7 @@ namespace heisenberg
         // Arm a just-unholstered throwable immediately (skip the hold-to-arm delay).
         // Called from the VH-unholster message handler. Injects synthetic grip for a
         // few frames; no-op unless a throwable is actually in hand.
-        void ForceArmThrowable() { _cb_forceArmThrowableFrames.store(8, std::memory_order_relaxed); }
+        void ForceArmThrowable();
 
         // Check if Virtual Holsters mod is detected (for compatibility mode)
         bool IsVirtualHolstersActive() const { return _virtualHolstersDetected; }
@@ -143,6 +161,12 @@ namespace heisenberg
         {
             if (_leftHand) _leftHand->ClearState();
             if (_rightHand) _rightHand->ClearState();
+            _inputSuppressionReasons = 0;
+            _inputSuppressed = false;
+            _postGrabFightingSuppressed = false;
+            _holdFightingSuppressed = false;
+            _zKeySuppressed = false;
+            RefreshOwnedInputLayer();
             spdlog::info("Cleared hand states on load");
         }
 
@@ -155,6 +179,8 @@ namespace heisenberg
 
         void InitHands();
         void UpdateHands();
+        void RefreshOwnedInputLayer();
+        void PublishControllerPolicy();
 
         // F4SE interfaces
         const F4SE::MessagingInterface* _messaging = nullptr;
@@ -245,6 +271,7 @@ namespace heisenberg
         RE::BSTSmartPointer<RE::BSInputEnableLayer> _inputLayer;  // Our layer for disabling fighting
         std::uint32_t _inputLayerID = 0;  // Layer ID for EnableUserEvent calls
         bool _inputLayerInitialized = false;
+        std::uint32_t _inputSuppressionReasons = 0;
 
         // Virtual Holsters compatibility - detected at startup
         bool _virtualHolstersDetected = false;  // True if VirtualHolsters.dll is loaded
@@ -264,9 +291,13 @@ namespace heisenberg
         // =====================================================================
         // THREAD-SAFE OPENVR CALLBACK STATE
         // These replace static locals in the OpenVR controller state callback.
-        // All times stored as double (seconds since start via Utils::GetTime()).
-        // All accessed with std::memory_order_relaxed (no ordering requirements).
+        // All times are double seconds since start via Utils::GetTime().
+        // OpenVR can poll a hand concurrently from multiple consumers, so each
+        // hand's multi-field edge state is serialized as one transaction.
         // =====================================================================
+
+        std::mutex _controllerCallbackMutexLeft;
+        std::mutex _controllerCallbackMutexRight;
 
         // Right-hand kFighting toggle state
         std::atomic<bool>   _cb_lastGripRight{false};
@@ -298,20 +329,56 @@ namespace heisenberg
         // normal throwableHoldDuration hold. Frame countdown: the throwable timer
         // forces the grip-injection while > 0, holding it a few frames so the arm
         // reliably triggers, then decrements to 0.
-        std::atomic<int>    _cb_forceArmThrowableFrames{0};
+        std::atomic<std::uint64_t> _cb_forceArmThrowableUntil{0};
 
-        // A/X grab hold-timing state (per hand)
-        // Blocks A/X from game while pressed; injects tap on quick release
+        // A/X grab hold-timing state (per hand). Synthetic taps are held until
+        // a monotonic deadline, rather than being consumed by an arbitrary
+        // number of OpenVR polling calls.
         // Left hand:
         std::atomic<double> _cb_axGrabPressTimeL{0.0};
         std::atomic<bool>   _cb_axGrabWasPressedL{false};
         std::atomic<bool>   _cb_axGrabHeldLongL{false};
-        std::atomic<int>    _cb_axGrabInjectTapL{0};  // >0 = frames to inject tap
+        std::atomic<bool>   _cb_axGrabInterceptedL{false};
+        std::atomic<std::uint64_t> _cb_axGrabInjectUntilL{0};
         // Right hand:
         std::atomic<double> _cb_axGrabPressTimeR{0.0};
         std::atomic<bool>   _cb_axGrabWasPressedR{false};
         std::atomic<bool>   _cb_axGrabHeldLongR{false};
-        std::atomic<int>    _cb_axGrabInjectTapR{0};  // >0 = frames to inject tap
+        std::atomic<bool>   _cb_axGrabInterceptedR{false};
+        std::atomic<std::uint64_t> _cb_axGrabInjectUntilR{0};
+
+        std::atomic<bool> _cb_wasGrabbingLeft{false};
+        std::atomic<bool> _cb_wasGrabbingRight{false};
+        std::atomic<std::uint64_t> _cb_postDropBlockUntilLeft{0};
+        std::atomic<std::uint64_t> _cb_postDropBlockUntilRight{0};
+        std::atomic<bool> _cb_hasAnalogGripLeft{false};
+        std::atomic<bool> _cb_hasAnalogGripRight{false};
+
+        enum ControllerPolicyFlag : std::uint32_t
+        {
+            kPolicyInitialized = 1u << 0,
+            kPolicyLeftHanded = 1u << 1,
+            kPolicyMenuOpen = 1u << 2,
+            kPolicyChestZone = 1u << 3,
+            kPolicyGrabbingLeft = 1u << 4,
+            kPolicyGrabbingRight = 1u << 5,
+            kPolicyStickyLeft = 1u << 6,
+            kPolicyStickyRight = 1u << 7,
+            kPolicyProgramSWF = 1u << 8,
+            kPolicyUseXForLeftGrab = 1u << 9,
+            kPolicyUseAForRightGrab = 1u << 10,
+            kPolicyGrenadeHandling = 1u << 11,
+            kPolicyGrenadeRemapToA = 1u << 12,
+            kPolicyGrenadeZoneDisabled = 1u << 13,
+        };
+        std::atomic<std::uint32_t> _controllerPolicyFlags{0};
+        std::atomic<float> _controllerThrowableHoldSeconds{0.35f};
+
+        // Real elapsed time shared by the pre/post-physics updates. This keeps
+        // cooldowns and animation timing correct at 72/80/90/120 Hz and during
+        // frame drops instead of assuming 1/90 s everywhere.
+        std::chrono::steady_clock::time_point _lastFrameTick{};
+        float _frameDeltaSeconds = 1.0f / 90.0f;
 
     public:
         // THREAD SAFETY: Hand has a grabbable object selected (main thread writes, callback reads)

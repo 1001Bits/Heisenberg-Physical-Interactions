@@ -1616,19 +1616,6 @@ namespace heisenberg::Physics
             }
         }
 
-        // SIZE CEILING (car fix, #219/#220). Deliberately placed after the name
-        // blacklist and BEFORE the world lock: it is a pure form-data read, so it must
-        // not pay for the Havok lock, and it covers every grabbable form type rather
-        // than only kMSTT. This is the guard behind src/Hand.cpp:600 (ViewCaster) and
-        // src/Hand.cpp:989 (physical touch).
-        {
-            float maxAxis = 0.0f;
-            if (IsOversizedForPlayerGrab(refr, &maxAxis)) {
-                spdlog::debug("[PHYSICS] ref {:08X}: not grabbable — oversized ({:.0f} game units)", refr->formID, maxAxis);
-                return false;
-            }
-        }
-
         // Now do physics checks (more expensive) — acquire world read lock
         // to prevent torn reads while Havok physics thread is updating
         auto* player = RE::PlayerCharacter::GetSingleton();
@@ -1840,9 +1827,12 @@ namespace heisenberg::Physics
     // Thread safety: accessed from physics thread and main thread
     static std::atomic<std::uint32_t> g_savedPlayerCollisionFilterInfo{0};
     static std::atomic<void*> g_savedPlayerCollisionFilterInfoWorld{nullptr};  // hknpWorld the saved value belongs to
+    static std::atomic<std::uint32_t> g_savedPlayerCollisionBodyId{INVALID_BODY_ID};
     static std::atomic<bool> g_playerCollisionModified{false};
     static std::atomic<std::uint32_t> g_playerBodyId{INVALID_BODY_ID};  // Cached player body ID
     static std::atomic<void*> g_playerBodyIdWorld{nullptr};  // hknpWorld the cached id belongs to
+    static constexpr std::uint32_t kPlayerCollisionLayer = 31u;
+    static constexpr std::uint32_t kNonCollidableLayer = 15u;
 
     bool TryFindPlayerBodyAlternative(void* bhkWorld, void* hknpWorld, std::uint32_t& outBodyId);
     bool TryReadBodyFilterInfo(void* hknpWorld, std::uint32_t bodyId, std::uint32_t& outFilterInfo);
@@ -2060,13 +2050,23 @@ namespace heisenberg::Physics
         // A cache hit requires ALL THREE: the id readable in the CURRENT world (a body
         // index readable does not mean it's still OUR body - hknp recycles indices
         // after a world rebuild), the cache belonging to this exact world (not just
-        // "a" world - bodyId alone carries no world identity), and layer==31 (the
-        // player's own layer; a recycled slot now holding an unrelated body would
-        // read a different layer). Any mismatch invalidates and falls through to
-        // full re-resolution below.
-        if (hknpWorld && cachedWorld == hknpWorld && !IsInvalidBodyId(cachedBodyId) &&
-            TryReadBodyFilterInfo(hknpWorld, cachedBodyId, cachedFilterInfo) && (cachedFilterInfo & 0x7Fu) == 31u) {
-            return cachedBodyId;
+        // "a" world - bodyId alone carries no world identity), and either the native
+        // player layer or layer 15 owned by THIS module's exact body/world suppression
+        // snapshot. Accepting arbitrary layer-15 bodies would make a recycled ID look
+        // like the player; rejecting our own layer-15 body strands enable(), because
+        // the cache is the only stable identity after we deliberately change its layer.
+        if (hknpWorld && cachedWorld == hknpWorld &&
+            !IsInvalidBodyId(cachedBodyId) &&
+            TryReadBodyFilterInfo(hknpWorld, cachedBodyId, cachedFilterInfo)) {
+            const std::uint32_t cachedLayer = cachedFilterInfo & 0x7Fu;
+            const bool ownsDisabledLayer =
+                cachedLayer == kNonCollidableLayer &&
+                g_playerCollisionModified.load(std::memory_order_acquire) &&
+                g_savedPlayerCollisionFilterInfoWorld.load(std::memory_order_acquire) == hknpWorld &&
+                g_savedPlayerCollisionBodyId.load(std::memory_order_acquire) == cachedBodyId;
+            if (cachedLayer == kPlayerCollisionLayer || ownsDisabledLayer) {
+                return cachedBodyId;
+            }
         }
         if (!IsInvalidBodyId(cachedBodyId)) {
             g_playerBodyId = INVALID_BODY_ID;
@@ -2251,9 +2251,15 @@ namespace heisenberg::Physics
     // SEH rule: REL::Relocation has a constructor, so it cannot live inside the __try below.
     static void SetBodyCollisionFilterInfoNative(void* hknpWorld, std::uint32_t bodyId, std::uint32_t filterInfo)
     {
-        using SetFilter_t = void (*)(void*, std::uint32_t, std::uint32_t);
+        // F4VR's hknpBSWorld::setBodyCollisionFilterInfo takes a fourth
+        // RebuildCachesMode argument.  Calling it through the old three-argument
+        // prototype left R9 undefined; in the play-session log that made every
+        // player-proxy filter write fault even though the same body was readable.
+        // Mode 0 is the engine's rebuild path, so existing collision pairs observe
+        // the new filter immediately.
+        using SetFilter_t = void (*)(void*, std::uint32_t, std::uint32_t, std::uint32_t);
         static REL::Relocation<SetFilter_t> s_setFilter{ REL::Offset(0x1DF5B80) };  // hknpBSWorld::setBodyCollisionFilterInfo
-        s_setFilter(hknpWorld, bodyId, filterInfo);
+        s_setFilter(hknpWorld, bodyId, filterInfo, 0u);
     }
 
     bool TryWriteBodyFilterInfo(void* hknpWorld, std::uint32_t bodyId, std::uint32_t filterInfo)
@@ -2889,13 +2895,22 @@ namespace heisenberg::Physics
             return false;
         }
         
-        if (IsInvalidBodyId(bodyId)) {
-            return false;
-        }
-        
         // Re-validate cell hasn't changed since function entry (guards against zone transition)
         if (player->GetParentCell() != cell) {
             spdlog::warn("[PHYSICS] SetPlayerCollisionEnabled: cell changed during operation");
+            return false;
+        }
+
+        WorldWriteLock lock(bhkWorld);
+        if (!lock.IsLocked()) {
+            spdlog::warn("[PHYSICS] SetPlayerCollisionEnabled: could not acquire world write lock");
+            return false;
+        }
+        if (player->GetParentCell() != cell ||
+            GetHknpWorldFromBhk(bhkWorld) != hknpWorld) {
+            spdlog::warn(
+                "[PHYSICS] SetPlayerCollisionEnabled: world changed while "
+                "acquiring write lock");
             return false;
         }
 
@@ -2927,16 +2942,35 @@ namespace heisenberg::Physics
         }
         (void)bodyBuffer; (void)hknpBody_Offsets::collisionFilterInfo;
 
-        WorldWriteLock lock(bhkWorld);
-
         if (!enabled) {
-            // Disable collision - save original and set to kNonCollidable (15)
-            if (!g_playerCollisionModified) {
-                g_savedPlayerCollisionFilterInfo = currentFilterInfo;
-                g_savedPlayerCollisionFilterInfoWorld = hknpWorld;
-                g_playerCollisionModified = true;
-                spdlog::info("[PHYSICS] Saved player collision filter: 0x{:08X} (layer {})",
-                            g_savedPlayerCollisionFilterInfo.load(), g_savedPlayerCollisionFilterInfo.load() & 0x7F);
+            // A prior suppression snapshot can survive a world/body generation change.
+            // Reuse it only when BOTH identities still match and the live body remains
+            // on our disabled layer. Otherwise capture the current live body's filter.
+            const bool snapshotMatchesLiveBody =
+                g_playerCollisionModified.load(std::memory_order_acquire) &&
+                g_savedPlayerCollisionFilterInfoWorld.load(std::memory_order_acquire) == hknpWorld &&
+                g_savedPlayerCollisionBodyId.load(std::memory_order_acquire) == bodyId;
+            const std::uint32_t currentLayer = currentFilterInfo & 0x7Fu;
+
+            std::uint32_t originalFilterInfo =
+                snapshotMatchesLiveBody && currentLayer == kNonCollidableLayer
+                    ? g_savedPlayerCollisionFilterInfo.load(std::memory_order_acquire)
+                    : currentFilterInfo;
+
+            // If an earlier interrupted/world-transition path already stranded the
+            // live player body on layer 15 but no exact snapshot owns it, preserving
+            // 15 as the "original" would make enable() restore 15 forever. The player
+            // controller's native layer is 31; preserve every non-layer bit.
+            if (!snapshotMatchesLiveBody && currentLayer == kNonCollidableLayer) {
+                originalFilterInfo =
+                    (currentFilterInfo & ~0x7Fu) | kPlayerCollisionLayer;
+                spdlog::warn(
+                    "[PHYSICS] SetPlayerCollisionEnabled: recapturing orphaned live "
+                    "layer-15 player body 0x{:08X} in world {:p}; inferred restore "
+                    "filter 0x{:08X}",
+                    bodyId,
+                    hknpWorld,
+                    originalFilterInfo);
             }
 
             // Set layer to kNonCollidable (15), preserve other bits. Route through the
@@ -2946,44 +2980,95 @@ namespace heisenberg::Physics
             // (e.g. while standing inside the hitbox-shrink volume) keeps its cached
             // no-collide verdict even after this filter is restored (same hknp pair-cache
             // staleness class fixed at the Jul 18 site referenced below).
-            std::uint32_t newFilterInfo = (g_savedPlayerCollisionFilterInfo & ~0x7F) | 15;
-            if (!TryWriteBodyFilterInfo(hknpWorld, bodyId, newFilterInfo)) {
+            const std::uint32_t newFilterInfo =
+                (originalFilterInfo & ~0x7Fu) | kNonCollidableLayer;
+            if (newFilterInfo != currentFilterInfo &&
+                !TryWriteBodyFilterInfo(hknpWorld, bodyId, newFilterInfo)) {
                 spdlog::warn("[PHYSICS] SetPlayerCollisionEnabled: filter write failed (bodyId=0x{:08X})", bodyId);
                 return false;
             }
-            spdlog::info("[PHYSICS] Player collision DISABLED (filter -> 0x{:08X}, layer 15)", newFilterInfo);
+
+            // Publish the snapshot only after the live write succeeds (or the body was
+            // already at the desired value), so a failed disable cannot manufacture a
+            // restoration obligation.
+            g_savedPlayerCollisionFilterInfo.store(originalFilterInfo, std::memory_order_release);
+            g_savedPlayerCollisionFilterInfoWorld.store(hknpWorld, std::memory_order_release);
+            g_savedPlayerCollisionBodyId.store(bodyId, std::memory_order_release);
+            g_playerCollisionModified.store(true, std::memory_order_release);
+            spdlog::info(
+                "[PHYSICS] Player collision DISABLED body=0x{:08X} world={:p} "
+                "filter 0x{:08X}->0x{:08X} (restore=0x{:08X})",
+                bodyId,
+                hknpWorld,
+                currentFilterInfo,
+                newFilterInfo,
+                originalFilterInfo);
         } else {
-            // Re-enable collision - restore original
-            if (g_playerCollisionModified) {
-                // BUGFIX (Jul 21): if the Havok world has changed since the disable was
-                // captured (a cell/worldspace transition, fast travel, etc. - ROCK fully
-                // reinitializes on this; see ROCKMain.cpp's "bhkWorld changed" path), the
-                // saved filter value belongs to a body/world generation that no longer
-                // exists. Blindly writing it onto whatever body GetPlayerBodyId() resolves
-                // in the NEW world was rejected by TryWriteBodyFilterInfo every single time
-                // - permanently, since a world-identity mismatch can never resolve itself -
-                // and the only caller (ActivatorHandler::SetHitboxShrinkEnabled) has no path
-                // back to "not modified" other than a successful restore, so it retried this
-                // identical doomed write forever (observed live: 6000+ consecutive failures
-                // over several minutes, player collision left disabled the entire time). A
-                // new world already starts every body with normal, un-suppressed collision -
-                // there is nothing left to restore, so treat the mismatch as success instead
-                // of retrying a write that can never succeed.
-                if (g_savedPlayerCollisionFilterInfoWorld.load() != hknpWorld) {
-                    spdlog::info(
-                        "[PHYSICS] SetPlayerCollisionEnabled: world changed since disable (saved={:p} current={:p}) - saved filter is stale, treating as already restored",
-                        g_savedPlayerCollisionFilterInfoWorld.load(), hknpWorld);
-                    g_playerCollisionModified = false;
-                    return true;
-                }
-                if (!TryWriteBodyFilterInfo(hknpWorld, bodyId, g_savedPlayerCollisionFilterInfo)) {
-                    spdlog::warn("[PHYSICS] SetPlayerCollisionEnabled: restore filter write failed (bodyId=0x{:08X})", bodyId);
-                    return false;
-                }
-                g_playerCollisionModified = false;
-                spdlog::info("[PHYSICS] Player collision ENABLED (filter -> 0x{:08X}, layer {})",
-                            g_savedPlayerCollisionFilterInfo.load(), g_savedPlayerCollisionFilterInfo.load() & 0x7F);
+            const bool hadSnapshot =
+                g_playerCollisionModified.load(std::memory_order_acquire);
+            const void* savedWorld =
+                g_savedPlayerCollisionFilterInfoWorld.load(std::memory_order_acquire);
+            const std::uint32_t savedBodyId =
+                g_savedPlayerCollisionBodyId.load(std::memory_order_acquire);
+            const bool snapshotMatchesLiveBody =
+                hadSnapshot && savedWorld == hknpWorld && savedBodyId == bodyId;
+            const std::uint32_t currentLayer = currentFilterInfo & 0x7Fu;
+
+            if (!hadSnapshot && currentLayer != kNonCollidableLayer) {
+                return true;  // already enabled; keep the steady-state path quiet
             }
+
+            std::uint32_t restoreFilterInfo = currentFilterInfo;
+            if (snapshotMatchesLiveBody) {
+                restoreFilterInfo =
+                    g_savedPlayerCollisionFilterInfo.load(std::memory_order_acquire);
+                if ((restoreFilterInfo & 0x7Fu) == kNonCollidableLayer) {
+                    // Defensive recovery from snapshots produced by the old
+                    // recapture logic: never "restore" the player to disabled.
+                    restoreFilterInfo =
+                        (restoreFilterInfo & ~0x7Fu) | kPlayerCollisionLayer;
+                    spdlog::warn(
+                        "[PHYSICS] SetPlayerCollisionEnabled: saved restore filter "
+                        "was layer 15; normalizing body 0x{:08X} to layer 31",
+                        bodyId);
+                }
+            } else if (currentLayer == kNonCollidableLayer) {
+                // A world transition invalidated the old snapshot, but the newly
+                // resolved live player body is still disabled. Repair that body
+                // instead of declaring the stale snapshot "already restored".
+                restoreFilterInfo =
+                    (currentFilterInfo & ~0x7Fu) | kPlayerCollisionLayer;
+                spdlog::warn(
+                    "[PHYSICS] SetPlayerCollisionEnabled: stale/missing snapshot "
+                    "(saved body=0x{:08X} world={:p}, live body=0x{:08X} world={:p}); "
+                    "repairing live layer 15 to layer 31",
+                    savedBodyId,
+                    savedWorld,
+                    bodyId,
+                    hknpWorld);
+            }
+
+            if (restoreFilterInfo != currentFilterInfo &&
+                !TryWriteBodyFilterInfo(hknpWorld, bodyId, restoreFilterInfo)) {
+                spdlog::warn(
+                    "[PHYSICS] SetPlayerCollisionEnabled: restore filter write "
+                    "failed (bodyId=0x{:08X})",
+                    bodyId);
+                return false;
+            }
+
+            g_playerCollisionModified.store(false, std::memory_order_release);
+            g_savedPlayerCollisionFilterInfo.store(0, std::memory_order_release);
+            g_savedPlayerCollisionFilterInfoWorld.store(nullptr, std::memory_order_release);
+            g_savedPlayerCollisionBodyId.store(INVALID_BODY_ID, std::memory_order_release);
+            spdlog::info(
+                "[PHYSICS] Player collision ENABLED body=0x{:08X} world={:p} "
+                "filter 0x{:08X}->0x{:08X} (layer {})",
+                bodyId,
+                hknpWorld,
+                currentFilterInfo,
+                restoreFilterInfo,
+                restoreFilterInfo & 0x7Fu);
         }
 
         return true;

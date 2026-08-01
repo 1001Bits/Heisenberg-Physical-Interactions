@@ -87,28 +87,46 @@ namespace heisenberg
         bool physicalTouchGrab = false; // Selection came from ROCK's exact native hand/body contact
         std::uint32_t physicalTouchBodyId = 0x7FFF'FFFFu;
         bool coHeldSecondary = false;  // two-handed grab: this hand is the secondary aim hand (no physics drive)
-        bool heldPlayerFilterApplied = false; // ROCK-style suppression bit applied (bit 14 of body filter info)
+        // True two-point co-hold state lives on the primary holder. Both
+        // anchors are captured on the visible mesh in object-local space; the
+        // secondary rendered-hand frame is captured in the same space so the
+        // hand stays on that exact spot while the object follows both tracked
+        // palms.
+        bool coHoldAnchorsValid = false;
+        RE::NiPoint3 coHoldPrimaryAnchorObjectLocal;
+        RE::NiPoint3 coHoldSecondaryAnchorObjectLocal;
+        RE::NiTransform coHoldSecondaryHandObjectLocal;
+        bool heldPlayerFilterApplied = false; // temporary BIPED_NO_CC held-body layer applied
         int  heldPlayerFilterFrames = 0;      // frame counter for periodic re-application
-        std::uint32_t heldOriginalFilterInfo = 0; // body's filter info before suppression bit set (for restore)
-        bool heldHadSuppressionBitOriginally = false; // true if bit 14 was already set before we ORed it (don't clear on release)
+        std::uint32_t heldOriginalFilterInfo = 0; // exact body filter before the temporary layer (for restore)
+        // Exact (hknpWorld*, bodyId) publication consumed by ROCK's native
+        // character-controller hook. Unlike heldPlayerFilterApplied, this is
+        // level-triggered and records the hand slot that currently owns the
+        // registry snapshot so a two-hand promotion can publish the destination
+        // before clearing the source.
+        bool externalHeldBodiesPublished = false;
+        bool externalHeldBodiesPublishedForLeft = false;
 
-        // A Bethesda physics system can contain several wrappers, including
-        // mutually exclusive visual variants (10mmAmmo has AmmoSingle and
-        // AmmoMultiple). The rendered wrapper remains placement authority, but
-        // every body in the shared reference subtree must be keyframed and
-        // driven through its authored owner frame. Otherwise an unselected
-        // dynamic wrapper can write the reference root back to its old pose
-        // every physics step while the visible wrapper is being held.
-        static constexpr std::size_t kMaxCapturedHeldBodies = 16;
+        // A Bethesda reference can contain several visible collision wrappers
+        // (the Assault Rifle has seven) as well as mutually exclusive visual
+        // variants sharing one physics system (10mmAmmo has AmmoSingle and
+        // AmmoMultiple). Keep one record per BODY for byte-exact filter/cache
+        // restore, but drive only one representative per shared MOTION.
+        static constexpr std::size_t kMaxCapturedHeldBodies = 64;
         struct CapturedHeldBody
         {
             std::uint32_t bodyId = 0x7FFF'FFFFu;
             std::uint32_t motionId = 0xFFFF'FFFFu;
             std::uint32_t originalFilterInfo = 0;
-            // True when this body belongs to the wrapper that won grab acquisition
-            // (the visible mesh variant). Alternate/hidden wrapper bodies are dragged
-            // along invisibly and are made non-collidable for the capture lifetime.
+            // Acquisition authority and rendered visibility are separate:
+            // multipart objects can have several simultaneously visible wrappers,
+            // while hidden variants can share a visible wrapper's physics system.
             bool isActiveWrapper = false;
+            bool isVisibleWrapper = false;
+            // hknp bodies can share one motion. Transform/velocity writes are
+            // motion-level operations, so exactly one body in each motion group
+            // is selected after the complete body set has been captured.
+            bool isMotionRepresentative = false;
             // A bhkPhysicsSystem can contain bodies owned by different
             // bhkNPCollisionObject wrappers/nodes (10mmAmmo is the concrete
             // example: 10mmAmmo + AmmoMultiple). The body backpointer must be
@@ -129,6 +147,24 @@ namespace heisenberg
         };
         std::array<CapturedHeldBody, kMaxCapturedHeldBodies> capturedHeldBodies{};
         std::uint32_t capturedHeldBodyCount = 0;
+        // False means the body records are retained only as a byte-exact filter
+        // restoration ledger. Transform/velocity authority then falls back to
+        // the selected wrapper without losing obligations for bodies that may
+        // become readable again before release.
+        bool capturedHeldBodySetValid = false;
+        // hknp body IDs are meaningful only inside one exact world/generation.
+        // A held object can survive a cell transition while its old body IDs do
+        // not, so every captured set carries the world that produced it.
+        void* capturedHeldBodiesWorld = nullptr;
+        // Records the motion scope that was actually changed to KEYFRAMED.
+        // This deliberately survives capture/filter invalidation so release
+        // always restores the same recursive-vs-selected scope to DYNAMIC.
+        bool heldMotionScopeIsReferenceSubtree = false;
+        bool heldScalarFilterApplied = false;
+        // Instant DropToHand placement captures body frames before moving the
+        // scene graph. Setup must reuse that set (or fail to selected-wrapper
+        // scope) rather than recapturing the artificial visual/body gap.
+        bool instantPreTeleportBodyCaptureAttempted = false;
         bool capturedHeldBodiesExcludeAlternateWrappers = false;
         bool capturedHeldBodiesIncludeAlternateWrappers = false;
 
@@ -222,6 +258,11 @@ namespace heisenberg
             0.6f, 0.6f, 0.6f,
             0.6f, 0.6f, 0.6f
         };
+        // ROCK's rich pose includes splay, pad-probe corrections, thumb-lane
+        // selection, and local joint transforms that cannot be represented by
+        // the legacy 15-curl array. Once published through the 0.77.12 host
+        // bridge, scalar re-application must stand down until release.
+        bool rockRichFingerPosePublished = false;
 
         // Sticky grab mode for config - keeps item grabbed even without grip held
         bool stickyGrab = false;            // True if in sticky grab mode (for repositioning)
@@ -260,6 +301,7 @@ namespace heisenberg
         
         // Behind-ear storage timer (item stored when held behind head for 2+ seconds)
         float behindEarTimer = 0.0f;  // Accumulates time spent in storage zone
+        float faceReadTimer = 0.0f;   // Dwell while a note/magazine mesh is in front of the HMD
         float lastStoragePulseTime = 0.0f;  // Per-hand: last time haptic pulse fired in storage zone
         bool isInStorageZone = false; // True if hand is currently in a storage zone
         bool bookStoreBlockedHinted = false; // One-shot: hinted that a magazine can't be stashed behind head (read at face)
@@ -267,6 +309,12 @@ namespace heisenberg
         // Equip zone tracking (equips armor/weapons on grip release when in body zone)
         bool isInEquipZone = false; // True if held armor/weapon is in equip zone
         const char* currentZoneName = ""; // Zone name for HUD messages (HEAD, CHEST, LEGS)
+        // Fingertip weapon-equip must be EDGE-triggered: a drop-to-hand catch
+        // materializes the weapon at the Pip-Boy, centimeters from the weapon-hand
+        // fingertip, so a level-triggered check latches "equip on release" on the
+        // very first frame. The zone stays disarmed until the held weapon has been
+        // measured OUTSIDE the equip radius once (with the Pip-Boy closed).
+        bool weaponEquipZoneArmed = false;
         
         // VirtualHolsters zone tracking (holsters weapons on grip release in VH zone)
         bool isInVHZone = false;           // True if hand is in a VirtualHolsters holster zone
@@ -436,12 +484,24 @@ namespace heisenberg
             physicalTouchGrab = false;
             physicalTouchBodyId = 0x7FFF'FFFFu;
             coHeldSecondary = false;
+            coHoldAnchorsValid = false;
+            coHoldPrimaryAnchorObjectLocal = RE::NiPoint3();
+            coHoldSecondaryAnchorObjectLocal = RE::NiPoint3();
+            coHoldSecondaryHandObjectLocal = RE::NiTransform();
+            coHoldSecondaryHandObjectLocal.rotate.MakeIdentity();
+            coHoldSecondaryHandObjectLocal.scale = 1.0f;
             heldPlayerFilterApplied = false;
             heldPlayerFilterFrames = 0;
             heldOriginalFilterInfo = 0;
-            heldHadSuppressionBitOriginally = false;
+            externalHeldBodiesPublished = false;
+            externalHeldBodiesPublishedForLeft = false;
             capturedHeldBodies = {};
             capturedHeldBodyCount = 0;
+            capturedHeldBodySetValid = false;
+            capturedHeldBodiesWorld = nullptr;
+            heldMotionScopeIsReferenceSubtree = false;
+            heldScalarFilterApplied = false;
+            instantPreTeleportBodyCaptureAttempted = false;
             capturedHeldBodiesExcludeAlternateWrappers = false;
             capturedHeldBodiesIncludeAlternateWrappers = false;
             pendingVisibleRootRebase = false;
@@ -453,6 +513,7 @@ namespace heisenberg
             node.reset();
             physicsNode.reset();
             collisionObject = nullptr;
+            lastSyncedBhkWorld = nullptr;
             originalParent.reset();
             // wandNode removed - was causing crashes by holding ref to player skeleton
             grabOffsetLocal = RE::NiPoint3();
@@ -467,6 +528,7 @@ namespace heisenberg
             ClearRuntimeHandPlacement();
             ClearRigidRenderedHandPlacement();
             ClearRuntimeFingerCurls();
+            rockRichFingerPosePublished = false;
             stickyGrab = false;
             savedState = SavedPhysicsState();
             keyframedHelper = KeyframedPhysicsHelper();  // Reset helper
@@ -477,10 +539,12 @@ namespace heisenberg
             lastHandPos = RE::NiPoint3();
             handSpeed = 0.0f;
             behindEarTimer = 0.0f;
+            faceReadTimer = 0.0f;
             lastStoragePulseTime = 0.0f;
             isInStorageZone = false;
             bookStoreBlockedHinted = false;
             isInEquipZone = false;
+            weaponEquipZoneArmed = false;
             isInVHZone = false;
             vhHolsterSlot = 0;
             vhHandModeSwitched = false;
@@ -719,8 +783,8 @@ namespace heisenberg
         PendingHolsterRequest _pendingHolster;
     };
 
-    // Two-handed support-hand finger pose driver (Jul 19): drives FRIK's base finger API
-    // from ROCK's grip pose (iTwoHandedFingerPoseMode=1) or the HIGGS geometry solver vs
-    // the weapon mesh (=2) while a support grip is engaged. Called from HookPostPhysics.
+    // Two-handed support-hand finger pose driver (Jul 19): mode 1 is owned by
+    // ROCK's rich native-v5/stock-v3 bridge; mode 2 publishes the separate
+    // HIGGS whole-weapon solve. Called from HookPostPhysics.
     void UpdateTwoHandedSupportFingerPose();
 }

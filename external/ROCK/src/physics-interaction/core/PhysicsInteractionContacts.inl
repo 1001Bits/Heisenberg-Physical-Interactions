@@ -66,6 +66,10 @@
         auto processHeldImpact = [&](Hand& hand,
                                      bool isLeft,
                                      std::atomic<std::uint64_t>& pairAtomic) {
+            if (pairAtomic.load(std::memory_order_acquire) ==
+                kInvalidHeldImpactPair) {
+                return;
+            }
             std::uint32_t heldBody = kInvalidAtomicBodyId;
             std::uint32_t otherBody = kInvalidAtomicBodyId;
             const auto packedPair = pairAtomic.exchange(kInvalidHeldImpactPair, std::memory_order_acq_rel);
@@ -107,7 +111,18 @@
         if (::rock::provider::isExternalBodyDynamicPushSuppressed(targetBodyId)) {
             ROCK_LOG_SAMPLE_DEBUG(Hand,
                 g_rockConfig.rockLogSampleMilliseconds,
-                "{} dynamic push skipped: target body {} is registered as external suppressing ROCK dynamic push",
+                // Observed fact, not a guess: the body is in the provider's external-body
+                // registry with its suppressesRockDynamicPush flag set. Name the registry,
+                // not a presumed owner - we do not know which provider registered it here.
+                "{} dynamic push skipped: target body {} is in the provider external-body registry with dynamic-push suppression requested",
+                sourceName,
+                targetBodyId);
+            return;
+        }
+        if (HostIsExternalHeldBody(hknp, targetBodyId)) {
+            ROCK_LOG_SAMPLE_DEBUG(Hand,
+                g_rockConfig.rockLogSampleMilliseconds,
+                "{} dynamic push skipped: target body {} is held by the embedded host",
                 sourceName,
                 targetBodyId);
             return;
@@ -126,19 +141,18 @@
             ROCK_LOG_SAMPLE_DEBUG(Hand, g_rockConfig.rockLogSampleMilliseconds, "{} dynamic push skipped: target body {} has no valid ref", sourceName, targetBodyId);
             return;
         }
+        // Host recent-release guard: the host just released this ref and its collision
+        // restore/pair-cache rebuild is still in flight, so the object can legitimately
+        // still be inside the open hand's colliders. Pushing it here is the documented
+        // "shove-on-release" symptom. Native Havok collision stays enabled throughout.
         for (std::size_t handIndex = 0; handIndex < 2; ++handIndex) {
-            const auto remainingFrames =
-                _hostRecentReleaseFrames[handIndex].load(std::memory_order_acquire);
-            const auto recentFormId =
-                _hostRecentReleaseFormId[handIndex].load(std::memory_order_acquire);
-            if (remainingFrames > 0 &&
-                recentFormId != 0 &&
-                targetRef->GetFormID() == recentFormId) {
+            const auto remainingFrames = _hostRecentReleaseFrames[handIndex].load(std::memory_order_acquire);
+            const auto recentFormId = _hostRecentReleaseFormId[handIndex].load(std::memory_order_acquire);
+            if (remainingFrames > 0 && recentFormId != 0 && targetRef->GetFormID() == recentFormId) {
                 ROCK_LOG_SAMPLE_DEBUG(Hand,
                     g_rockConfig.rockLogSampleMilliseconds,
-                    "{} dynamic push skipped: target body {} formID={:08X} "
-                    "was just released by host ({} guard frames remain; "
-                    "native collision stays active)",
+                    "{} dynamic push skipped: target body {} formID={:08X} was just released by host "
+                    "({} guard frames remain; native collision stays active)",
                     sourceName,
                     targetBodyId,
                     recentFormId,
@@ -146,159 +160,13 @@
                 return;
             }
         }
-
-        /*
-         * [TOUCH-DIAG] Root-caused and fixed 2026-07-22 (PhysicsScale.h fallback
-         * constant mismatch - see PhysicsScale.h's own comment). This block was
-         * built for that investigation and is no longer needed by default, but is
-         * kept (gated, not deleted) in case a related symptom resurfaces - it is
-         * the only place that cross-checks source/target body position against
-         * several independent visual references (native ref, node, FRIK) in one
-         * shot. Gated behind rockDebugVerboseLogging so the extra Havok/FRIK reads
-         * this block performs are skipped entirely during normal play, not just
-         * the log line.
-         */
-        if (g_rockConfig.rockDebugVerboseLogging) {
-            RE::NiTransform sourceBodyWorld{};
-            RE::NiTransform targetBodyWorld{};
-            const bool haveSourceBody = havok_runtime::tryResolveLiveBodyWorldTransform(hknp, RE::hknpBodyId{ sourceBodyId }, sourceBodyWorld);
-            const bool haveTargetBody = havok_runtime::tryResolveLiveBodyWorldTransform(hknp, RE::hknpBodyId{ targetBodyId }, targetBodyWorld);
-
-            const RE::NiPoint3 targetRefVisualPos = targetRef->GetPosition();
-            auto* targetNode = targetRef->Get3D();
-            const RE::NiPoint3 targetNodeVisualPos = targetNode ? targetNode->world.translate : targetRefVisualPos;
-
-            // [TOUCH-DIAG] The one comparison still missing: the SOURCE's (gun/hand's)
-            // own raw Havok body position against ITS own true visual position - the
-            // user's report (Jul 22) is a fixed, perfectly repeatable per-DIRECTION
-            // offset that is the SAME for every different target object, which points
-            // at the SOURCE's own collision geometry/placement, not the target's (the
-            // target-vs-visual gap was already proven tight and identical in both
-            // locations - this checks the other half of the pair). Weapon: the real
-            // live weapon NiNode (f4vr::getWeaponNode(), same accessor WeaponCollision.cpp
-            // itself uses to place the weapon's own generated bodies). Hand: the exact
-            // ground-truth transform ROCK's own keyframe-drive code is fed each frame
-            // (getInteractionHandTransform) - mirrors the already-working hand origin
-            // sample from earlier, just inlined here so it is guaranteed to fire on
-            // every touch instead of depending on that separate periodic sample's own
-            // gate (which did not fire for this weapon at all in the last test).
-            RE::NiPoint3 sourceVisualPos{};
-            bool haveSourceVisual = false;
-            const char* sourceVisualKind = "none";
-            if (sourceIsWeapon) {
-                if (auto* weaponNode = f4vr::getWeaponNode()) {
-                    sourceVisualPos = weaponNode->world.translate;
-                    haveSourceVisual = true;
-                    sourceVisualKind = "weaponNode";
-                }
-            } else if (sourceHand) {
-                const bool sourceIsLeftHand = (sourceHand == &_leftHand);
-                sourceVisualPos = getInteractionHandTransform(sourceIsLeftHand).translate;
-                haveSourceVisual = true;
-                sourceVisualKind = sourceIsLeftHand ? "handTransform-left" : "handTransform-right";
-            }
-
-            // [TOUCH-DIAG] The comparison above (getInteractionHandTransform) came back
-            // showing a ~10-13 unit gap in BOTH Diamond City and Red Rocket - proving
-            // that transform is the wrong reference: it is ROCK's own internal
-            // "root-flattened" abstraction (HandFrameResolver's own doc comment: "Scene
-            // nodes from another tree are not returned as authority"), not the actual
-            // rendered hand mesh the player sees. frik_visual_authority::getHandWorldTransform
-            // is FRIK's real, live-rendered hand transform - the same API this file's own
-            // sampleHandTransformParity() already uses for exactly this kind of
-            // internal-vs-real comparison. This is the one that should actually answer
-            // "is the collision body offset from the visible hand mesh."
-            RE::NiPoint3 sourceFrikVisualPos{};
-            bool haveSourceFrikVisual = false;
-            if (!sourceIsWeapon && sourceHand && frik_visual_authority::isAvailable()) {
-                const bool sourceIsLeftHand = (sourceHand == &_leftHand);
-                sourceFrikVisualPos = frik_visual_authority::getHandWorldTransform(
-                    sourceIsLeftHand ? frik_visual_authority::Hand::Left : frik_visual_authority::Hand::Right).translate;
-                haveSourceFrikVisual = true;
-            }
-
-            auto dist3 = [](const RE::NiPoint3& a, const RE::NiPoint3& b) {
-                const float dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
-                return std::sqrt(dx * dx + dy * dy + dz * dz);
-            };
-
-            const float sourceTargetBodyDist = (haveSourceBody && haveTargetBody) ? dist3(sourceBodyWorld.translate, targetBodyWorld.translate) : -1.0f;
-            const float targetBodyVsRefPosDist = haveTargetBody ? dist3(targetBodyWorld.translate, targetRefVisualPos) : -1.0f;
-            const float targetBodyVsNodeDist = haveTargetBody ? dist3(targetBodyWorld.translate, targetNodeVisualPos) : -1.0f;
-            const float sourceBodyVsVisualDist = (haveSourceBody && haveSourceVisual) ? dist3(sourceBodyWorld.translate, sourceVisualPos) : -1.0f;
-            const float sourceBodyVsFrikDist = (haveSourceBody && haveSourceFrikVisual) ? dist3(sourceBodyWorld.translate, sourceFrikVisualPos) : -1.0f;
-
-            auto* playerCell = RE::PlayerCharacter::GetSingleton() ? RE::PlayerCharacter::GetSingleton()->GetParentCell() : nullptr;
-            const auto scaleSnapshot = physics_scale::current();
-
-            ROCK_LOG_DEBUG(Hand,
-                "[TOUCH-DIAG] {} sourceBody={} targetBody={} sourceIsWeapon={} | sourceBodyPos=({:.3f},{:.3f},{:.3f}) haveSourceBody={} | "
-                "sourceVisualPos=({:.3f},{:.3f},{:.3f}) sourceVisualKind={} haveSourceVisual={} sourceBodyVsVisualDist={:.4f} | "
-                "sourceFrikVisualPos=({:.3f},{:.3f},{:.3f}) haveSourceFrikVisual={} sourceBodyVsFrikDist={:.4f} | "
-                "targetBodyPos=({:.3f},{:.3f},{:.3f}) haveTargetBody={} | targetRefVisualPos=({:.3f},{:.3f},{:.3f}) targetNodeVisualPos=({:.3f},{:.3f},{:.3f}) "
-                "targetNodeName={} | sourceTargetBodyDist={:.4f} targetBodyVsRefPosDist={:.4f} targetBodyVsNodeDist={:.4f} | "
-                "gameToHavok={:.8f} havokToGame={:.5f} scaleRevision={} | bhk={:p} hknp={:p} cellFormID={:08X} | playerPos=({:.3f},{:.3f},{:.3f})",
+        if (isPendingForceGrabTarget(targetRef)) {
+            ROCK_LOG_SAMPLE_DEBUG(Hand,
+                g_rockConfig.rockLogSampleMilliseconds,
+                "{} dynamic push skipped: target body {} belongs to an in-flight force-grab transaction",
                 sourceName,
-                sourceBodyId,
-                targetBodyId,
-                sourceIsWeapon ? "yes" : "no",
-                sourceBodyWorld.translate.x, sourceBodyWorld.translate.y, sourceBodyWorld.translate.z,
-                haveSourceBody ? "yes" : "no",
-                sourceVisualPos.x, sourceVisualPos.y, sourceVisualPos.z,
-                sourceVisualKind,
-                haveSourceVisual ? "yes" : "no",
-                sourceBodyVsVisualDist,
-                sourceFrikVisualPos.x, sourceFrikVisualPos.y, sourceFrikVisualPos.z,
-                haveSourceFrikVisual ? "yes" : "no",
-                sourceBodyVsFrikDist,
-                targetBodyWorld.translate.x, targetBodyWorld.translate.y, targetBodyWorld.translate.z,
-                haveTargetBody ? "yes" : "no",
-                targetRefVisualPos.x, targetRefVisualPos.y, targetRefVisualPos.z,
-                targetNodeVisualPos.x, targetNodeVisualPos.y, targetNodeVisualPos.z,
-                targetNode ? targetNode->name.c_str() : "(none)",
-                sourceTargetBodyDist,
-                targetBodyVsRefPosDist,
-                targetBodyVsNodeDist,
-                scaleSnapshot.gameToHavok,
-                scaleSnapshot.havokToGame,
-                scaleSnapshot.revision,
-                static_cast<void*>(bhk),
-                static_cast<void*>(hknp),
-                playerCell ? playerCell->GetFormID() : 0,
-                RE::PlayerCharacter::GetSingleton() ? RE::PlayerCharacter::GetSingleton()->GetPosition().x : 0.0f,
-                RE::PlayerCharacter::GetSingleton() ? RE::PlayerCharacter::GetSingleton()->GetPosition().y : 0.0f,
-                RE::PlayerCharacter::GetSingleton() ? RE::PlayerCharacter::GetSingleton()->GetPosition().z : 0.0f);
-        }
-
-        // EMBED (Jul 18, catch/anti-tunneling): every dynamic body the hand/weapon touches
-        // gets per-body CCD look-ahead ONCE, so an object resting on the open palm cannot
-        // tunnel through the other (thin) hand colliders when it falls off — it was never
-        // grabbed, so the release-path CCD never applied to it. Small ring de-dupes the
-        // native call (hknpWorld::setBodyCollisionLookAheadDistance @0x14153B120; the vec
-        // arg is only read when dist<=0).
-        // EMBED (Jul 20, ordering fix): this block used to run BEFORE the resolveBodyToRef
-        // validity check above, on a targetBodyId published by the physics-step contact
-        // callback and consumed one game frame later - a hand brushing an object deleted
-        // that same frame (grenade detonates, item consumed, cell unload) reaches this with
-        // a freed body slot. Now gated on the same ref-liveness check every other native
-        // body call in this file uses, plus an explicit bodySlotLooksReadable guard (the
-        // one native call in this function that lacked one).
-        if (havok_runtime::bodySlotLooksReadable(hknp, RE::hknpBodyId{ targetBodyId })) {
-            static std::uint32_t s_ccdRing[16] = {};
-            static std::uint32_t s_ccdRingNext = 0;
-            bool seen = false;
-            for (std::uint32_t id : s_ccdRing) {
-                if (id == targetBodyId) { seen = true; break; }
-            }
-            if (!seen) {
-                s_ccdRing[s_ccdRingNext++ & 15u] = targetBodyId;
-                using SetLookAheadFn = void (*)(void*, std::uint32_t, float, const float*);
-                static REL::Relocation<SetLookAheadFn> s_setLookAhead{ REL::Offset(0x153B120) };
-                static const float kZeroVec[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-                s_setLookAhead(hknp, targetBodyId, 0.25f, kZeroVec);
-                ROCK_LOG_SAMPLE_DEBUG(Hand, g_rockConfig.rockLogSampleMilliseconds,
-                    "{} touched body {}: CCD look-ahead enabled (anti-tunneling)", sourceName, targetBodyId);
-            }
+                targetBodyId);
+            return;
         }
 
         object_physics_body_set::BodySetScanOptions scanOptions{};
@@ -317,13 +185,12 @@
         if (!targetRecord) {
             ROCK_LOG_SAMPLE_DEBUG(Hand,
                 g_rockConfig.rockLogSampleMilliseconds,
-                "{} dynamic push skipped: target body {} not found in ref tree formID={:08X} visitedNodes={} collisionObjects={} maxDepth={}",
+                "{} dynamic push skipped: target body {} not found in ref tree formID={:08X} visitedNodes={} collisionObjects={}",
                 sourceName,
                 targetBodyId,
                 targetRef->GetFormID(),
                 bodySet.diagnostics.visitedNodes,
-                bodySet.diagnostics.collisionObjects,
-                scanOptions.maxDepth);
+                bodySet.diagnostics.collisionObjects);
             return;
         }
         if (!targetRecord->accepted) {
@@ -349,6 +216,42 @@
                 targetRecord->motionId,
                 static_cast<int>(targetRecord->motionType));
         }
+        // MELEE HIT PROTECTION (Jul 31). While a melee weapon is drawn, the
+        // weapon hull's push assist must NOT shove hittable targets: the
+        // native VR melee hit test samples its own (smaller) collider against
+        // the target, and our padded hull contacting first was applying
+        // impulses across the target's whole body set (live debug log:
+        // 'Baseball Bat' swings pushing 18-42 bodies on 'Takahashi'/'Percy',
+        // layer 32) — deflecting the limb before the native collider arrived.
+        // Reported as "1 in 5 bat sweeps misses". The game owns actor impact
+        // for melee; our push assist keeps owning props, doors and clutter.
+        //
+        // The target test is BOTH the collision layer AND the resolved form
+        // type: a turret or mounted robot is an actor (kACHR) whose bodies sit
+        // on machine/animstatic layers the biped-layer test never matches, and
+        // it must not be shoved out of a swing any more than a raider.
+        if (sourceIsWeapon &&
+            f4vr::isMeleeWeaponEquipped() &&
+            (collision_layer_policy::isActorOrBipedLayer(targetRecord->collisionLayer) ||
+                targetRef->GetFormType() == RE::ENUM_FORM_ID::kACHR)) {
+            // Cumulative counter embedded in a SAMPLED line: the sampler emits
+            // at most ~1 line per 2s, but because the count is cumulative the
+            // delta between consecutive emitted lines is the exact number of
+            // suppressed pushes in that interval — countable despite sampling.
+            // Info level so melee sessions at the default log level keep it.
+            static std::atomic<std::uint32_t> s_meleePushSkipCount{ 0 };
+            const auto skipCount =
+                s_meleePushSkipCount.fetch_add(1, std::memory_order_relaxed) + 1;
+            ROCK_LOG_SAMPLE_INFO(Hand,
+                g_rockConfig.rockLogSampleMilliseconds,
+                "{} dynamic push skipped: melee weapon drawn — native melee owns actor impact (targetBody={} layer={} formType={} cumulativeCount={})",
+                sourceName,
+                targetBodyId,
+                targetRecord->collisionLayer,
+                static_cast<int>(targetRef->GetFormType()),
+                skipCount);
+            return;
+        }
 
         const auto uniqueMotionRecords = bodySet.uniqueAcceptedMotionRecords();
         if (uniqueMotionRecords.empty()) {
@@ -362,61 +265,23 @@
 
         auto* sourceMotion = havok_runtime::getBodyMotion(hknp, RE::hknpBodyId{ sourceBodyId });
         if (!sourceMotion) {
-            // Previously a SILENT return - the only point in this whole function with
-            // no log at all. Kept (throttled) so a source-side Havok motion lookup
-            // failure never again goes untraced.
-            ROCK_LOG_SAMPLE_DEBUG(Hand,
-                g_rockConfig.rockLogSampleMilliseconds,
-                "{} dynamic push skipped: source body {} has no Havok motion (getBodyMotion failed)",
-                sourceName,
-                sourceBodyId);
             return;
         }
 
-        RE::NiPoint3 sourceVelocityHavok{ sourceMotion->linearVelocity.x, sourceMotion->linearVelocity.y, sourceMotion->linearVelocity.z };
-        // PRECISION FIX (Jul 6): for a HAND collider, use the clean KINEMATIC velocity the drive
-        // sampled from the per-frame target deltas (sampledLinearVelocityHavok) instead of the live
-        // keyframed SOLVER velocity read above. The solver velocity decays to ~0 the instant the hand
-        // is blocked by the object you're pressing on — so a deliberate slow press reads below the
-        // min-speed gate and never pushes (the "hand clips through, only sometimes pushes"). The
-        // soft-contact/provider path already uses this sampled value; the dynamic-push path was the
-        // odd one out. Weapon pushes (sourceHand==null) keep the live velocity (a swing is fast+clean).
-        bool pushUsedSampledVelocity = false;
-        if (sourceHand) {
-            HandColliderBodyMetadata md{};
-            // Jul 19 (workflow-verified): guard like the correct consumer at :811-813 AND make
-            // the substitution max-of-two — the sampled bone-target velocity may only REPLACE
-            // the live solver velocity when it reports MORE motion. An invalid/authority-pinned
-            // sample (rendered hand held at a soft-contact plane reads ~0.01 regardless of
-            // controller speed) can then never MASK real motion; the Jul-6 blocked-solver fix
-            // (solver velocity decays to ~0 when pressing) is preserved by the max.
-            if (sourceHand->tryGetHandColliderMetadata(sourceBodyId, md) &&
-                md.hasSampledLinearVelocityHavok &&
-                havok_runtime::isFinite3(md.sampledLinearVelocityHavok)) {
-                const RE::NiPoint3 sampled{
-                    md.sampledLinearVelocityHavok[0],
-                    md.sampledLinearVelocityHavok[1],
-                    md.sampledLinearVelocityHavok[2] };
-                const float sampledSq = sampled.x * sampled.x + sampled.y * sampled.y + sampled.z * sampled.z;
-                const float solverSq = sourceVelocityHavok.x * sourceVelocityHavok.x +
-                    sourceVelocityHavok.y * sourceVelocityHavok.y +
-                    sourceVelocityHavok.z * sourceVelocityHavok.z;
-                if (sampledSq >= solverSq) {
-                    sourceVelocityHavok = sampled;
-                    pushUsedSampledVelocity = true;
-                }
-            }
-        }
-
-        // The assist is supplemental to Havok's real contact solver. Applying
-        // the hand's raw XYZ velocity after a contact can add an impulse back
-        // INTO a thin finger collider (the fast Subway Token repro logged a
-        // -Z scripted impulse while the token was landing), so the native
-        // solver then needs several frames to depenetrate it. Project the
-        // assist onto the outward source-body -> contacted-body direction.
-        // Tangential friction and all separating/away motion remain native;
-        // the scripted assist can now only separate/push, never deepen overlap.
+        RE::NiPoint3 sourceVelocityHavok{
+            sourceMotion->linearVelocity.x,
+            sourceMotion->linearVelocity.y,
+            sourceMotion->linearVelocity.z,
+        };
         const RE::NiPoint3 rawSourceVelocityHavok = sourceVelocityHavok;
+
+        /*
+         * Push only along the outward hand-to-target direction. If the hand is
+         * no longer approaching while the target is moving away, the contact is
+         * a bounce: bleed the configured fraction of separating radial velocity
+         * so a dropped prop settles into the fingers instead of rebounding into
+         * repeated deep contacts.
+         */
         RE::NiTransform sourceBodyWorld{};
         const bool haveSourceBodyWorld =
             havok_runtime::tryResolveLiveBodyWorldTransform(
@@ -438,8 +303,8 @@
             ROCK_LOG_SAMPLE_DEBUG(
                 Hand,
                 g_rockConfig.rockLogSampleMilliseconds,
-                "{} dynamic push skipped: no trustworthy outward contact "
-                "direction sourceBody={} targetBody={} haveSource={} separation={:.4f}",
+                "{} dynamic push skipped: no trustworthy outward contact direction "
+                "sourceBody={} targetBody={} haveSource={} separation={:.4f}",
                 sourceName,
                 sourceBodyId,
                 targetBodyId,
@@ -447,6 +312,7 @@
                 sourceToTargetLength);
             return;
         }
+
         const float invSeparation = 1.0f / sourceToTargetLength;
         const RE::NiPoint3 outward{
             sourceToTargetGame.x * invSeparation,
@@ -457,42 +323,38 @@
             sourceVelocityHavok.x * outward.x +
             sourceVelocityHavok.y * outward.y +
             sourceVelocityHavok.z * outward.z;
-        if (!std::isfinite(outwardSpeedHavok) || outwardSpeedHavok <= 0.0f) {
-            /*
-             * SOFT-LANDING DAMPER (Jul 27). Reaching here means the hand is NOT driving into the
-             * object — so if the object is moving away from the hand it is BOUNCING off it. That
-             * bounce is what makes a dropped prop hammer the fingers repeatedly, and penetration
-             * depth tracks impact speed (measured: 39.9gu/s -> 1.14gu overlap, 11.6gu/s -> 0.11gu),
-             * so each bounce buys another deep clip. Bleed off the separating radial velocity to
-             * make the hand behave like a soft catch instead of a trampoline.
-             *
-             * Deliberately only on this branch: a hand actively pushing INTO an object takes the
-             * normal push-assist path above and is completely unaffected, so throwing and shoving
-             * keep their current feel. Hands only (a weapon hull should still knock things away).
-             */
+        if (!std::isfinite(outwardSpeedHavok) ||
+            outwardSpeedHavok <= 0.0f) {
             const float restitutionDamping = (std::clamp)(
-                g_rockConfig.rockHandContactRestitutionDamping, 0.0f, 1.0f);
+                g_rockConfig.rockHandContactRestitutionDamping,
+                0.0f,
+                1.0f);
             if (restitutionDamping > 0.0f && !sourceIsWeapon) {
                 if (auto* bounceMotion = havok_runtime::getBodyMotion(
-                        hknp, RE::hknpBodyId{ targetBodyId })) {
+                        hknp,
+                        RE::hknpBodyId{ targetBodyId })) {
                     const float separatingSpeed =
                         bounceMotion->linearVelocity.x * outward.x +
                         bounceMotion->linearVelocity.y * outward.y +
                         bounceMotion->linearVelocity.z * outward.z;
-                    if (std::isfinite(separatingSpeed) && separatingSpeed > 0.0f) {
-                        const float bleed = separatingSpeed * restitutionDamping;
+                    if (std::isfinite(separatingSpeed) &&
+                        separatingSpeed > 0.0f) {
+                        const float bleed =
+                            separatingSpeed * restitutionDamping;
                         const RE::NiPoint3 dampingDelta{
                             -outward.x * bleed,
                             -outward.y * bleed,
                             -outward.z * bleed,
                         };
                         if (push_assist::applyLinearVelocityDeltaDeferred(
-                                hknp, targetBodyId, dampingDelta)) {
+                                hknp,
+                                targetBodyId,
+                                dampingDelta)) {
                             ROCK_LOG_SAMPLE_DEBUG(
                                 Hand,
                                 g_rockConfig.rockLogSampleMilliseconds,
-                                "{} soft-landing damper: bled {:.3f} of {:.3f} separating "
-                                "speed off target {} (damping={:.2f})",
+                                "{} soft-landing damper: bled {:.3f} of {:.3f} "
+                                "separating speed off target {} (damping={:.2f})",
                                 sourceName,
                                 bleed,
                                 separatingSpeed,
@@ -507,16 +369,13 @@
                 g_rockConfig.rockLogSampleMilliseconds,
                 "{} dynamic push skipped: source is not approaching target "
                 "sourceBody={} targetBody={} rawVel=({:.3f},{:.3f},{:.3f}) "
-                "outward=({:.3f},{:.3f},{:.3f}) radialSpeed={:.3f}",
+                "radialSpeed={:.3f}",
                 sourceName,
                 sourceBodyId,
                 targetBodyId,
                 rawSourceVelocityHavok.x,
                 rawSourceVelocityHavok.y,
                 rawSourceVelocityHavok.z,
-                outward.x,
-                outward.y,
-                outward.z,
                 outwardSpeedHavok);
             return;
         }
@@ -544,56 +403,26 @@
         if (!push.apply) {
             ROCK_LOG_SAMPLE_DEBUG(Hand,
                 g_rockConfig.rockLogSampleMilliseconds,
-                "{} dynamic push skipped: reason={} radialSpeed=({:.3f},{:.3f},{:.3f}) "
-                "rawSpeed=({:.3f},{:.3f},{:.3f}) sampled={} targetBody={} "
-                "layer={} acceptedBodies={} separation={:.2f}gu",
+                "{} dynamic push skipped: reason={} speed=({:.3f},{:.3f},{:.3f}) targetBody={} layer={} acceptedBodies={}",
                 sourceName,
                 pushAssistSkipReasonName(push.skipReason),
                 sourceVelocityHavok.x,
                 sourceVelocityHavok.y,
                 sourceVelocityHavok.z,
-                rawSourceVelocityHavok.x,
-                rawSourceVelocityHavok.y,
-                rawSourceVelocityHavok.z,
-                pushUsedSampledVelocity ? "yes" : "no",
                 targetBodyId,
                 targetRecord->collisionLayer,
-                bodySet.acceptedCount(),
-                sourceToTargetLength);
+                bodySet.acceptedCount());
             return;
         }
 
         std::uint32_t appliedCount = 0;
-        RE::NiPoint3 lastAppliedImpulse = push.impulse;
-        bool velocityClampEngaged = false;
         for (const auto* record : uniqueMotionRecords) {
             if (!record) {
                 continue;
             }
             physics_recursive_wrappers::activateBody(hknp, record->bodyId);
-
-            // The impulse above was sized from hand speed alone, with no idea what body it's
-            // about to hit. impulse = mass * deltaV, so the identical impulse that feels right
-            // on a normal-mass prop gives a light one (a coin, a token) a wildly larger velocity
-            // kick. Scale it down per-body so the resulting deltaV never exceeds the configured
-            // ceiling — heavier objects rarely reach it, so their feel is unchanged.
-            RE::NiPoint3 impulseToApply = push.impulse;
-            const float targetMass = readGrabEventBodyMass(hknp, record->bodyId);
-            if (targetMass > 0.0f) {
-                const float velocityDelta = push.impulseMagnitude / targetMass;
-                const float maxVelocityDelta = (std::max)(0.0f, g_rockConfig.rockDynamicPushMaxVelocityDelta);
-                if (maxVelocityDelta > 0.0f && velocityDelta > maxVelocityDelta) {
-                    const float scale = maxVelocityDelta / velocityDelta;
-                    impulseToApply.x *= scale;
-                    impulseToApply.y *= scale;
-                    impulseToApply.z *= scale;
-                    velocityClampEngaged = true;
-                }
-            }
-
-            if (push_assist::applyLinearImpulse(record->collisionObject, impulseToApply)) {
+            if (push_assist::applyLinearImpulse(record->collisionObject, push.impulse)) {
                 ++appliedCount;
-                lastAppliedImpulse = impulseToApply;
             }
         }
 
@@ -603,34 +432,9 @@
             auto* baseObj = targetRef->GetObjectReference();
             auto objName = baseObj ? RE::TESFullName::GetFullName(*baseObj, false) : std::string_view{};
             const std::string nameStr = objName.empty() ? std::string("(unnamed)") : std::string(objName);
-            // Log the impulse ACTUALLY applied (post velocity-delta clamp), plus whether the
-            // clamp engaged — printing the pre-clamp value would send the next log-forensics
-            // session chasing pushes that never landed at that magnitude.
-            const float targetMass = readGrabEventBodyMass(hknp, targetBodyId);
-            auto* targetMotion =
-                havok_runtime::getBodyMotion(hknp, RE::hknpBodyId{ targetBodyId });
-            const RE::NiPoint3 targetVelocity = targetMotion
-                ? RE::NiPoint3{
-                      targetMotion->linearVelocity.x,
-                      targetMotion->linearVelocity.y,
-                      targetMotion->linearVelocity.z }
-                : RE::NiPoint3{};
-            HandColliderBodyMetadata sourceMetadata{};
-            const bool haveSourceMetadata =
-                sourceHand &&
-                sourceHand->tryGetHandColliderMetadata(
-                    sourceBodyId,
-                    sourceMetadata);
             ROCK_LOG_SAMPLE_DEBUG(Hand,
                 g_rockConfig.rockLogSampleMilliseconds,
-                "{} dynamic push applied: '{}' formID={:08X} targetBody={} "
-                "layer={} acceptedBodies={} uniqueMotions={} "
-                "impulse=({:.3f},{:.3f},{:.3f}) velClamped={} "
-                "rawHandVel=({:.3f},{:.3f},{:.3f}) "
-                "radialHandVel=({:.3f},{:.3f},{:.3f}) "
-                "outward=({:.3f},{:.3f},{:.3f}) separation={:.2f}gu "
-                "targetMass={:.4f} targetVel=({:.3f},{:.3f},{:.3f}) "
-                "sourceRole={} sourceFinger={} sourceSegment={}",
+                "{} dynamic push applied: '{}' formID={:08X} targetBody={} layer={} acceptedBodies={} uniqueMotions={} impulse=({:.3f},{:.3f},{:.3f})",
                 sourceName,
                 nameStr,
                 targetRef->GetFormID(),
@@ -638,33 +442,9 @@
                 targetRecord->collisionLayer,
                 bodySet.acceptedCount(),
                 appliedCount,
-                lastAppliedImpulse.x,
-                lastAppliedImpulse.y,
-                lastAppliedImpulse.z,
-                velocityClampEngaged ? "yes" : "no",
-                rawSourceVelocityHavok.x,
-                rawSourceVelocityHavok.y,
-                rawSourceVelocityHavok.z,
-                sourceVelocityHavok.x,
-                sourceVelocityHavok.y,
-                sourceVelocityHavok.z,
-                outward.x,
-                outward.y,
-                outward.z,
-                sourceToTargetLength,
-                targetMass,
-                targetVelocity.x,
-                targetVelocity.y,
-                targetVelocity.z,
-                haveSourceMetadata
-                    ? static_cast<std::uint32_t>(sourceMetadata.role)
-                    : 0xFFFF'FFFFu,
-                haveSourceMetadata
-                    ? static_cast<std::uint32_t>(sourceMetadata.finger)
-                    : 0xFFFF'FFFFu,
-                haveSourceMetadata
-                    ? static_cast<std::uint32_t>(sourceMetadata.segment)
-                    : 0xFFFF'FFFFu);
+                push.impulse.x,
+                push.impulse.y,
+                push.impulse.z);
         }
     }
 
@@ -686,16 +466,7 @@
             auto objName = baseObj ? RE::TESFullName::GetFullName(*baseObj, false) : std::string_view{};
             const std::string nameStr = objName.empty() ? std::string("(unnamed)") : std::string(objName);
 
-            ROCK_LOG_SAMPLE_DEBUG(
-                Hand,
-                g_rockConfig.rockLogSampleMilliseconds,
-                "{} hand touched [{}] '{}' formID={:08X} body={} layer={}",
-                handName,
-                typeName,
-                nameStr,
-                ref->GetFormID(),
-                bodyId.value,
-                layer);
+            ROCK_LOG_DEBUG(Hand, "{} hand touched [{}] '{}' formID={:08X} body={} layer={}", handName, typeName, nameStr, ref->GetFormID(), bodyId.value, layer);
 
             bool isLeft = (std::string_view(handName) == "Left");
             auto& hand = isLeft ? _leftHand : _rightHand;
@@ -720,13 +491,7 @@
                 contactPoint);
             dispatchPhysicsMessage(kPhysMsg_OnTouch, isLeft, ref, ref->GetFormID(), layer);
         } else {
-            ROCK_LOG_SAMPLE_DEBUG(
-                Hand,
-                g_rockConfig.rockLogSampleMilliseconds,
-                "{} hand touched body={} layer={} (unresolved)",
-                handName,
-                bodyId.value,
-                layer);
+            ROCK_LOG_DEBUG(Hand, "{} hand touched body={} layer={} (unresolved)", handName, bodyId.value, layer);
         }
     }
 
@@ -771,10 +536,7 @@
             if (!s_contactEventBridge.rememberRetainedNativeSlot(world, signal, epoch)) {
                 ROCK_LOG_WARN(Init, "Contact event retained-slot table full while reusing bridge slot; future duplicate suppression may be degraded");
             }
-            // This function is polled from the frame loop. Logging the steady
-            // already-subscribed state every frame buried the contact evidence
-            // needed for real collision diagnostics; the actual subscription
-            // and world-transition paths below remain event-logged.
+            ROCK_LOG_DEBUG(Init, "Contact event signal already subscribed for current world; reusing native bridge slot");
             return;
         }
 
@@ -785,16 +547,13 @@
                 static_cast<std::uint32_t>(plan.action));
         }
 
-        // Native FUN_14040ca60 is a 2-arg hkSignal global subscribe: (signal, callback). It stores
-        // `callback` directly in the slot; the dispatcher later calls callback(worldPtr, eventPtr) where
-        // worldPtr is hknpWorld** (proven src/ContactImpulseListener.cpp:439 + ParseEvent:246, which use
-        // this exact function and a 2-arg callback that FIRES in-game). The prior 3-arg call passed
-        // &s_contactEventBridge as `callback` (arg2) — a DATA pointer — so the slot's callback became
-        // static data; when a contact fired, the dispatcher jumped into the logger's s_mutex region and
-        // hit an EXECUTE access violation (crash 2026-07-04 06-41-49). Match the proven ABI exactly.
-        typedef void subscribe_simple_t(void* signal, void* callback);
-        static REL::Relocation<subscribe_simple_t> subscribeSimple{ REL::Offset(offsets::kFunc_SubscribeContactEvent) };
-        subscribeSimple(signal, reinterpret_cast<void*>(&PhysicsInteraction::onContactCallback));
+        ContactEventCallbackInfo cbInfo{};
+        cbInfo.fn = reinterpret_cast<void*>(&PhysicsInteraction::onContactCallback);
+        cbInfo.ctx = 0;
+
+        typedef void subscribe_ext_t(void* signal, void* userData, void* callbackInfo);
+        static REL::Relocation<subscribe_ext_t> subscribeExt{ REL::Offset(offsets::kFunc_SubscribeContactEvent) };
+        subscribeExt(signal, static_cast<void*>(&s_contactEventBridge), &cbInfo);
 
         _contactEventSignal.store(signal, std::memory_order_release);
         _contactEventWorld.store(world, std::memory_order_release);
@@ -858,36 +617,82 @@
             static_cast<const void*>(liveWorld));
     }
 
-    void PhysicsInteraction::onContactCallback(void** worldPtrHolder, void* contactEventData)
+    void PhysicsInteraction::onContactCallback(void* userData, void** worldPtrHolder, void* contactEventData)
     {
         performance_profiler::addEventCount(performance_profiler::Scope::NativeContactCallback);
-        onContactCallbackSeh(worldPtrHolder, contactEventData);
+
+        // Lease the PhysicsInteraction for the duration of this physics-thread callback.
+        // onContactCallbackUnsafe loads bridge->instance and then calls
+        // self->handleContactEvent() on it; destroyPhysicsInteraction() stores
+        // s_hooksEnabled=false and deletes the instance, so without this counter a
+        // callback that already passed the s_hooksEnabled check runs on freed memory.
+        // The counter deliberately lives OUTSIDE onContactCallbackSeh's __try: an RAII
+        // guard inside a __try whose __except can fire would leak the count on unwind.
+        // Mirrors hookedProcessConstraintsCallback (PhysicsHooks.cpp). Incrementing
+        // before the s_hooksEnabled check is safe: a callback that arrives after the
+        // drain completes still returns without dereferencing anything, because
+        // s_hooksEnabled is false and bridge->instance has been cleared.
+        PhysicsInteraction::s_inFlightCallbacks.fetch_add(1, std::memory_order_acq_rel);
+        const bool configRead = g_rockConfig.tryEnterNativeRead();
+        if (configRead) {
+            onContactCallbackSeh(userData, worldPtrHolder, contactEventData);
+            g_rockConfig.leaveNativeRead();
+        }
+        if (PhysicsInteraction::s_inFlightCallbacks.fetch_sub(
+                1,
+                std::memory_order_acq_rel) == 1) {
+            PhysicsInteraction::s_inFlightCallbacks.notify_all();
+        }
     }
 
-    void PhysicsInteraction::onContactCallbackSeh(void** worldPtrHolder, void* contactEventData)
+    namespace contact_exception_detail
     {
-        // Counted OUTSIDE the __try (a destructor-bearing RAII guard inside a __try whose
-        // __except can fire would leak the count on unwind - __except skips destructors).
-        // onContactCallbackUnsafe's own early returns are fine here: they return from that
-        // function back into this one, still before reaching the fetch_sub below.
-        PhysicsInteraction::s_inFlightCallbacks.fetch_add(1, std::memory_order_acq_rel);
+        /*
+         * The old handler used a bare EXCEPTION_EXECUTE_HANDLER and then guessed in the
+         * log ("likely stale world during cell transition") at a cause it had thrown
+         * away the evidence for. The exception record IS the evidence: capture the code
+         * and the faulting instruction address in the FILTER (the only place they still
+         * exist) so the report can name the module that faulted instead of a theory.
+         *
+         * These are file-local; onContactCallbackException is declared in the header and
+         * its signature is not ours to change from this fragment.
+         */
+        inline std::atomic<std::uint32_t> s_lastExceptionCode{ 0 };
+        inline std::atomic<std::uintptr_t> s_lastExceptionAddress{ 0 };
+
+        [[nodiscard]] inline int captureContactException(EXCEPTION_POINTERS* info) noexcept
+        {
+            if (info && info->ExceptionRecord) {
+                s_lastExceptionCode.store(static_cast<std::uint32_t>(info->ExceptionRecord->ExceptionCode), std::memory_order_release);
+                s_lastExceptionAddress.store(reinterpret_cast<std::uintptr_t>(info->ExceptionRecord->ExceptionAddress), std::memory_order_release);
+            } else {
+                s_lastExceptionCode.store(0, std::memory_order_release);
+                s_lastExceptionAddress.store(0, std::memory_order_release);
+            }
+            return EXCEPTION_EXECUTE_HANDLER;
+        }
+    }
+
+    void PhysicsInteraction::onContactCallbackSeh(void* userData, void** worldPtrHolder, void* contactEventData)
+    {
+        // NOTE: no C++ objects with destructors may live in this function (project SEH
+        // rule). The filter is a free noexcept function and the handler body is a single
+        // call, so nothing is constructed here.
         __try {
-            onContactCallbackUnsafe(worldPtrHolder, contactEventData);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            onContactCallbackUnsafe(userData, worldPtrHolder, contactEventData);
+        } __except (contact_exception_detail::captureContactException(GetExceptionInformation())) {
             onContactCallbackException();
         }
-        PhysicsInteraction::s_inFlightCallbacks.fetch_sub(1, std::memory_order_acq_rel);
     }
 
-    void PhysicsInteraction::onContactCallbackUnsafe(void** worldPtrHolder, void* contactEventData)
+    void PhysicsInteraction::onContactCallbackUnsafe(void* userData, void** worldPtrHolder, void* contactEventData)
     {
         if (!s_hooksEnabled.load(std::memory_order_acquire))
             return;
+        if (userData != static_cast<void*>(&s_contactEventBridge)) {
+            return;
+        }
 
-        // Native 2-arg hkSignal ABI: the slot invokes callback(worldPtr, eventPtr) with NO userData
-        // argument (subscribe stores only the raw callback). The subscription bridge is the fixed
-        // process-wide static, so derive it directly rather than expecting it as a (nonexistent) arg.
-        void* userData = static_cast<void*>(&s_contactEventBridge);
         auto* bridge = static_cast<ContactEventSubscriptionBridge*>(userData);
         auto* self = bridge->instance.load(std::memory_order_acquire);
         if (self && self->_initialized.load(std::memory_order_acquire)) {
@@ -915,14 +720,47 @@
 
     void PhysicsInteraction::onContactCallbackException()
     {
-        static int sehLogCounter = 0;
-        if (sehLogCounter++ % 100 == 0) {
+        static std::atomic<int> sehLogCounter{ 0 };
+        const int occurrence = sehLogCounter.fetch_add(1, std::memory_order_acq_rel) + 1;
+
+        /*
+         * This does not "note an exception". It LATCHES s_hooksEnabled off, and
+         * s_hooksEnabled gates the whole native contact path:
+         *   - onContactCallbackUnsafe            (every native hknp contact event)
+         *   - hookedHandleBumpedCharacter        (PhysicsHooks.cpp)
+         *   - hookedProcessConstraintsCallback   (PhysicsHooks.cpp)
+         * The last two are what implement the player character-controller contact
+         * filter, i.e. the large-object block that stops the player walking through
+         * cars. Nothing on the contact path ever sets the flag back to true: the only
+         * writer of `true` is ROCKMain's publishPhysicsInteractionIfReady(), which is
+         * guarded by s_physicsPublished and therefore only runs again after a full
+         * PhysicsInteraction teardown + republish. A save reload or a cell change does
+         * not necessarily do that.
+         *
+         * The old message said none of this. It logged "likely stale world during cell
+         * transition" - a cause nothing here tested - and never mentioned that a feature
+         * had just been switched off, so the log read as a harmless warning about a
+         * transient while the player's collision had silently gone dead.
+         */
+        const bool wasEnabled = s_hooksEnabled.exchange(false, std::memory_order_acq_rel);
+
+        // Log the first occurrence unconditionally (that is the one that disabled the
+        // feature), then rate-limit; this runs on the physics thread.
+        if (wasEnabled || (occurrence % 100) == 1) {
+            const auto exceptionCode = contact_exception_detail::s_lastExceptionCode.load(std::memory_order_acquire);
+            const auto exceptionAddress = contact_exception_detail::s_lastExceptionAddress.load(std::memory_order_acquire);
             logger::error(
-                "[ROCK::Contact] SEH exception caught on physics thread (count={}) — "
-                "likely stale world during cell transition",
-                sehLogCounter);
+                "[ROCK::Contact] FEATURE DISABLED: hardware exception caught inside ROCK's native contact callback on the physics thread "
+                "(occurrence {}, code 0x{:08X}, faulting address 0x{:X} in {}). ROCK's native contact hooks are now latched OFF and are only "
+                "re-armed by a full PhysicsInteraction teardown and republish, not by a cell change or a save reload. "
+                "WHAT STOPS WORKING UNTIL THEN: hand and weapon collision against world objects, held-object impacts, dynamic push assist, and "
+                "the player character-controller contact filter - so large objects such as cars stop blocking the player and become walk-through "
+                "again. Native game physics is unaffected and the original callbacks are still chained.",
+                occurrence,
+                exceptionCode,
+                exceptionAddress,
+                rock::hook_diagnostics::describeAddress(exceptionAddress));
         }
-        s_hooksEnabled.store(false, std::memory_order_release);
     }
 
     void PhysicsInteraction::handleContactEvent(RE::hknpWorld* world, void* contactEventData)
@@ -940,56 +778,8 @@
             return;
         }
 
-        // [CONTACT-DIAG] Registry::tryClassify is a pure atomic-array lookup (see
-        // GeneratedBodyContactRegistry.h) with no Havok dependency, so it is safe to
-        // call ahead of the body-slot readability gate below. Used only to decide
-        // whether this raw event involves a hand or the equipped weapon, so every
-        // stage a hand/weapon+object pair passes through (or is dropped by) can be
-        // traced end to end - e.g. a hand or weapon that clips through a
-        // just-released/thrown object with no push ever applied. Throttled
-        // (SAMPLE_DEBUG) now that the scale-mismatch investigation this was built
-        // for is closed - see PhysicsScale.h.
-        generated_body_contact_registry::Classification diagClassA{};
-        generated_body_contact_registry::Classification diagClassB{};
-        const bool diagBodyAClassified = _generatedBodyContactRegistry.tryClassify(bodyIdA, diagClassA);
-        const bool diagBodyBClassified = _generatedBodyContactRegistry.tryClassify(bodyIdB, diagClassB);
-        const bool diagBodyAIsHand = diagBodyAClassified &&
-            (diagClassA.kind == generated_body_contact_registry::GeneratedBodyKind::RightHand ||
-                diagClassA.kind == generated_body_contact_registry::GeneratedBodyKind::LeftHand);
-        const bool diagBodyBIsHand = diagBodyBClassified &&
-            (diagClassB.kind == generated_body_contact_registry::GeneratedBodyKind::RightHand ||
-                diagClassB.kind == generated_body_contact_registry::GeneratedBodyKind::LeftHand);
-        const bool diagBodyAIsWeapon = diagBodyAClassified && diagClassA.kind == generated_body_contact_registry::GeneratedBodyKind::Weapon;
-        const bool diagBodyBIsWeapon = diagBodyBClassified && diagClassB.kind == generated_body_contact_registry::GeneratedBodyKind::Weapon;
-        const bool diagBodyAIsSource = diagBodyAIsHand || diagBodyAIsWeapon;
-        const bool diagBodyBIsSource = diagBodyBIsHand || diagBodyBIsWeapon;
-        const bool diagInvolvesSource = diagBodyAIsSource || diagBodyBIsSource;
-        const std::uint32_t diagSourceBodyId = diagBodyAIsSource ? bodyIdA : bodyIdB;
-        const std::uint32_t diagOtherBodyId = diagBodyAIsSource ? bodyIdB : bodyIdA;
-        const char* diagSourceKindName = diagBodyAIsSource
-            ? (diagBodyAIsHand ? "Hand" : "Weapon")
-            : (diagBodyBIsHand ? "Hand" : "Weapon");
-        if (diagInvolvesSource) {
-            ROCK_LOG_SAMPLE_DEBUG(Hand,
-                g_rockConfig.rockLogSampleMilliseconds,
-                "[CONTACT-DIAG] native event seen: sourceKind={} sourceBody={} otherBody={}",
-                diagSourceKindName,
-                diagSourceBodyId,
-                diagOtherBodyId);
-        }
-
         if (!havok_runtime::bodySlotLooksReadable(world, RE::hknpBodyId{ bodyIdA }) ||
             !havok_runtime::bodySlotLooksReadable(world, RE::hknpBodyId{ bodyIdB })) {
-            if (diagInvolvesSource) {
-                ROCK_LOG_SAMPLE_DEBUG(Hand,
-                    g_rockConfig.rockLogSampleMilliseconds,
-                    "[CONTACT-DIAG] native event DROPPED (body slot unreadable): sourceKind={} sourceBody={} otherBody={} aReadable={} bReadable={}",
-                    diagSourceKindName,
-                    diagSourceBodyId,
-                    diagOtherBodyId,
-                    havok_runtime::bodySlotLooksReadable(world, RE::hknpBodyId{ bodyIdA }) ? "yes" : "no",
-                    havok_runtime::bodySlotLooksReadable(world, RE::hknpBodyId{ bodyIdB }) ? "yes" : "no");
-            }
             return;
         }
 
@@ -1004,8 +794,8 @@
             return hasRawContactPoint;
         };
 
-        const auto rightId = _rightHand.getCollisionBodyId().value;
-        const auto leftId = _leftHand.getCollisionBodyId().value;
+        const auto rightId = _rightHand.getCollisionBodyIdAtomic().value;
+        const auto leftId = _leftHand.getCollisionBodyIdAtomic().value;
 
         using generated_body_contact_registry::Classification;
         using generated_body_contact_registry::GeneratedBodyKind;
@@ -1120,12 +910,31 @@
         const bool bodyBIsRight = bodyBRight.valid;
         const bool bodyAIsLeft = bodyALeft.valid;
         const bool bodyBIsLeft = bodyBLeft.valid;
-        const bool bodyAIsExternal = ::rock::provider::isExternalBodyId(bodyIdA);
-        const bool bodyBIsExternal = ::rock::provider::isExternalBodyId(bodyIdB);
-        const bool bodyAIsRightHeld = _rightHand.isHeldBodyId(bodyIdA);
-        const bool bodyBIsRightHeld = _rightHand.isHeldBodyId(bodyIdB);
-        const bool bodyAIsLeftHeld = _leftHand.isHeldBodyId(bodyIdA);
-        const bool bodyBIsLeftHeld = _leftHand.isHeldBodyId(bodyIdB);
+        std::uint8_t bodyAHostHeldOwnerMask = 0u;
+        std::uint8_t bodyBHostHeldOwnerMask = 0u;
+        // Only generated-hand contacts need the host registry lookup. This
+        // keeps unrelated world contact traffic allocation-free and prevents a
+        // host-held BIPED_NO_CC body from being routed as a generic actor.
+        if (bodyBIsRight || bodyBIsLeft) {
+            bodyAHostHeldOwnerMask =
+                HostExternalHeldBodyOwnerMask(world, bodyIdA);
+        }
+        if (bodyAIsRight || bodyAIsLeft) {
+            bodyBHostHeldOwnerMask =
+                HostExternalHeldBodyOwnerMask(world, bodyIdB);
+        }
+        const bool bodyAIsRightHeld =
+            _rightHand.isHeldBodyId(bodyIdA) ||
+            (bodyAHostHeldOwnerMask & 1u) != 0u;
+        const bool bodyBIsRightHeld =
+            _rightHand.isHeldBodyId(bodyIdB) ||
+            (bodyBHostHeldOwnerMask & 1u) != 0u;
+        const bool bodyAIsLeftHeld =
+            _leftHand.isHeldBodyId(bodyIdA) ||
+            (bodyAHostHeldOwnerMask & 2u) != 0u;
+        const bool bodyBIsLeftHeld =
+            _leftHand.isHeldBodyId(bodyIdB) ||
+            (bodyBHostHeldOwnerMask & 2u) != 0u;
         const bool bodyAIsWeapon = bodyAWeapon.valid;
         const bool bodyBIsWeapon = bodyBWeapon.valid;
         const bool bodyAIsBody = bodyABodyMetadata.valid;
@@ -1184,29 +993,30 @@
                 .bodyAIsRockSource = bodyAIsRockSource,
                 .bodyBIsRockSource = bodyBIsRockSource,
             })) {
-            if (diagInvolvesSource) {
-                ROCK_LOG_SAMPLE_DEBUG(Hand,
-                    g_rockConfig.rockLogSampleMilliseconds,
-                    "[CONTACT-DIAG] native event DROPPED (prefilter): sourceKind={} sourceBody={} otherBody={} aIsRockSource={} bIsRockSource={}",
-                    diagSourceKindName,
-                    diagSourceBodyId,
-                    diagOtherBodyId,
-                    bodyAIsRockSource ? "yes" : "no",
-                    bodyBIsRockSource ? "yes" : "no");
-            }
             return;
         }
+
+        /*
+         * External-body lookup takes the provider registry mutex. Defer it
+         * until the allocation-free source prefilter proves this contact can
+         * reach a ROCK route; unrelated world contacts then never contend on
+         * the provider mutex.
+         */
+        const bool bodyAIsExternal =
+            ::rock::provider::isExternalBodyId(bodyIdA);
+        const bool bodyBIsExternal =
+            ::rock::provider::isExternalBodyId(bodyIdB);
 
         auto readBodyFilterInfo = [world](std::uint32_t bodyId) {
             std::uint32_t filterInfo = 0;
             if (world && havok_runtime::tryReadFilterInfo(world, RE::hknpBodyId{ bodyId }, filterInfo)) {
                 return filterInfo;
             }
-            return contact_evidence::kUnknownFilterInfo;
+            return contact_pipeline_policy::kUnknownLayer;
         };
 
         auto filterInfoToLayer = [](std::uint32_t filterInfo) {
-            return filterInfo == contact_evidence::kUnknownFilterInfo ? contact_pipeline_policy::kUnknownLayer : (filterInfo & 0x7Fu);
+            return filterInfo == contact_pipeline_policy::kUnknownLayer ? contact_pipeline_policy::kUnknownLayer : (filterInfo & 0x7Fu);
         };
 
         const std::uint32_t bodyAFilterInfo = readBodyFilterInfo(bodyIdA);
@@ -1244,41 +1054,6 @@
         const auto endpointA = makeEndpoint(bodyIdA, bodyALayer, bodyAIsRight, bodyAIsLeft, bodyAIsWeapon, bodyAIsRightHeld, bodyAIsLeftHeld, bodyAIsBody, bodyAIsExternal);
         const auto endpointB = makeEndpoint(bodyIdB, bodyBLayer, bodyBIsRight, bodyBIsLeft, bodyBIsWeapon, bodyBIsRightHeld, bodyBIsLeftHeld, bodyBIsBody, bodyBIsExternal);
         const auto contactRoute = contact_pipeline_policy::classifyContact(endpointA, endpointB);
-
-        if (diagInvolvesSource) {
-            auto diagEndpointKindName = [](contact_pipeline_policy::ContactEndpointKind kind) -> const char* {
-                using Kind = contact_pipeline_policy::ContactEndpointKind;
-                switch (kind) {
-                case Kind::Unknown: return "Unknown";
-                case Kind::RightHand: return "RightHand";
-                case Kind::LeftHand: return "LeftHand";
-                case Kind::Weapon: return "Weapon";
-                case Kind::RightHeldObject: return "RightHeldObject";
-                case Kind::LeftHeldObject: return "LeftHeldObject";
-                case Kind::Body: return "Body";
-                case Kind::External: return "External";
-                case Kind::WorldSurface: return "WorldSurface";
-                case Kind::DynamicProp: return "DynamicProp";
-                case Kind::Actor: return "Actor";
-                case Kind::QueryOnly: return "QueryOnly";
-                default: return "?";
-                }
-            };
-            const auto& diagOtherEndpoint = diagBodyAIsSource ? endpointB : endpointA;
-            ROCK_LOG_SAMPLE_DEBUG(Hand,
-                g_rockConfig.rockLogSampleMilliseconds,
-                "[CONTACT-DIAG] native event ROUTED: sourceKind={} sourceBody={} otherBody={} otherKind={} otherLayer={} route={} driveHandPush={} driveWeaponPush={} recordSemantic={} drivesWeaponSupport={}",
-                diagSourceKindName,
-                diagSourceBodyId,
-                diagOtherBodyId,
-                diagEndpointKindName(diagOtherEndpoint.kind),
-                diagOtherEndpoint.layer == contact_pipeline_policy::kUnknownLayer ? 0xFFFFFFFFu : diagOtherEndpoint.layer,
-                contact_pipeline_policy::routeName(contactRoute.route),
-                contactRoute.driveHandDynamicPush ? "yes" : "no",
-                contactRoute.driveWeaponDynamicPush ? "yes" : "no",
-                contactRoute.recordHandSemanticContact ? "yes" : "no",
-                contactRoute.drivesWeaponSupportContact ? "yes" : "no");
-        }
 
         auto handSourceFor = [&](std::uint32_t bodyId) -> const HandContactSource* {
             if (bodyARight.valid && bodyARight.metadata.bodyId == bodyId) {
@@ -1319,11 +1094,11 @@
         auto fillSourceVelocity = [&](std::uint32_t sourceBodyId,
                                       ::rock::provider::RockProviderExternalSourceKind sourceKind,
                                       const HandColliderBodyMetadata* handMetadata,
-                                      ::rock::provider::RockProviderExternalContactV1& contact) {
+                                      ::rock::provider::RockProviderExternalContactV1& contact) -> bool {
             if (handMetadata && handMetadata->valid && handMetadata->hasSampledLinearVelocityHavok &&
                 havok_runtime::isFinite3(handMetadata->sampledLinearVelocityHavok)) {
                 std::copy_n(handMetadata->sampledLinearVelocityHavok, 4, contact.sourceVelocityHavok);
-                return;
+                return true;
             }
 
             if (sourceKind == ::rock::provider::RockProviderExternalSourceKind::Weapon) {
@@ -1331,22 +1106,23 @@
                 if (weaponSource && weaponSource->valid && weaponSource->hasSampledVelocity &&
                     havok_runtime::isFinite3(weaponSource->sampledVelocityHavok)) {
                     std::copy_n(weaponSource->sampledVelocityHavok, 4, contact.sourceVelocityHavok);
-                    return;
+                    return true;
                 }
             }
 
             if (!world || sourceBodyId == INVALID_CONTACT_BODY_ID) {
-                return;
+                return false;
             }
 
             auto* motion = havok_runtime::getBodyMotion(world, RE::hknpBodyId{ sourceBodyId });
             if (!motion) {
-                return;
+                return false;
             }
 
             contact.sourceVelocityHavok[0] = motion->linearVelocity.x;
             contact.sourceVelocityHavok[1] = motion->linearVelocity.y;
             contact.sourceVelocityHavok[2] = motion->linearVelocity.z;
+            return havok_runtime::isFinite3(contact.sourceVelocityHavok);
         };
 
         auto tryFillAggregateContactPoint = [world](std::uint32_t sourceBodyId,
@@ -1383,10 +1159,17 @@
                 contact.contactNormalHavok[0] = dx * invLen;
                 contact.contactNormalHavok[1] = dy * invLen;
                 contact.contactNormalHavok[2] = dz * invLen;
+                contact.flags |= static_cast<std::uint32_t>(
+                    ::rock::provider::RockProviderExternalContactFlagV1::ContactNormalValid);
             }
 
             contact.contactPointWeightSum = 0.0f;
             contact.quality = ::rock::provider::RockProviderExternalContactQuality::AggregateImpulse;
+            contact.flags |=
+                static_cast<std::uint32_t>(
+                    ::rock::provider::RockProviderExternalContactFlagV1::ContactPointValid) |
+                static_cast<std::uint32_t>(
+                    ::rock::provider::RockProviderExternalContactFlagV1::ContactPointEstimated);
             return true;
         };
 
@@ -1405,13 +1188,27 @@
             contact.sourceKind = sourceKind;
             contact.sourceHand = sourceHand;
             contact.quality = ::rock::provider::RockProviderExternalContactQuality::BodyPairOnly;
-            fillSourceVelocity(sourceBodyId, sourceKind, handMetadata, contact);
+            contact.frameIndex =
+                _palmClockGameFrameIndex.load(std::memory_order_acquire);
+            contact.collisionGeneration =
+                _collisionGenerationAtomic.load(std::memory_order_acquire);
+            if (fillSourceVelocity(sourceBodyId, sourceKind, handMetadata, contact)) {
+                contact.flags |= static_cast<std::uint32_t>(
+                    ::rock::provider::RockProviderExternalContactFlagV1::SourceVelocityValid);
+            }
 
             if (ensureRawContactPoint()) {
                 contact.quality = ::rock::provider::RockProviderExternalContactQuality::RawPoint;
                 contact.contactPointWeightSum = rawContactPoint.contactPointWeightSum;
                 std::copy_n(rawContactPoint.contactPointHavok, 4, contact.contactPointHavok);
                 std::copy_n(rawContactPoint.contactNormalHavok, 4, contact.contactNormalHavok);
+                contact.flags |=
+                    static_cast<std::uint32_t>(
+                        ::rock::provider::RockProviderExternalContactFlagV1::ContactPointValid) |
+                    static_cast<std::uint32_t>(
+                        ::rock::provider::RockProviderExternalContactFlagV1::ContactNormalValid) |
+                    static_cast<std::uint32_t>(
+                        ::rock::provider::RockProviderExternalContactFlagV1::ContactPointMeasured);
             } else {
                 tryFillAggregateContactPoint(sourceBodyId, externalBodyId, contact);
             }
@@ -1428,9 +1225,33 @@
                 }
             }
 
-            ::rock::provider::recordExternalContact(contact);
+            const bool transitionSuppressed =
+                _dynamicHandCollision.isTransitionCollisionSuppressedAtomic();
+            if (transitionSuppressed) {
+                contact.flags |= static_cast<std::uint32_t>(
+                    ::rock::provider::RockProviderExternalContactFlagV1::TransitionSuppressed);
+            } else if ((_lifecycleFlagsAtomic.load(std::memory_order_acquire) &
+                            static_cast<std::uint32_t>(
+                                ::rock::provider::RockProviderLifecycleFlag::PhysicsWriteAllowed)) != 0) {
+                contact.flags |= static_cast<std::uint32_t>(
+                    ::rock::provider::RockProviderExternalContactFlagV1::CollisionAvailable);
+            }
+
+            ::rock::provider::recordExternalContact(
+                contact,
+                _worldGenerationAtomic.load(std::memory_order_acquire),
+                _skeletonGenerationAtomic.load(std::memory_order_acquire),
+                _providerGenerationAtomic.load(std::memory_order_acquire));
         };
 
+        /*
+         * Heisenberg-preserved native contact evidence production (upstream
+         * removed the soft-contact subsystem in 9b7c7ee). This is the only
+         * producer for NativeContactEvidenceCache, which SoftContactRuntime
+         * consumes once per frame. It reuses upstream's own contactRoute /
+         * rawContactPoint / filter-info locals so it stays in lockstep with the
+         * newer routing rather than duplicating it.
+         */
         auto endpointKindForEvidence = [](contact_pipeline_policy::ContactEndpointKind kind) {
             using SourceKind = contact_pipeline_policy::ContactEndpointKind;
             using EvidenceKind = contact_evidence::NativeContactEndpointKind;
@@ -1480,7 +1301,11 @@
 
         auto publishNativeContactEvidence = [&](const HandColliderBodyMetadata* handMetadata = nullptr) {
             if (!contactRoute.recordWorldSurfaceEvidence ||
-                !contact_pipeline_policy::isHand(contactRoute.source.kind) ||
+                (!contact_pipeline_policy::isHand(
+                     contactRoute.source.kind) &&
+                 contactRoute.source.kind !=
+                     contact_pipeline_policy::
+                         ContactEndpointKind::Weapon) ||
                 !contact_evidence::isValidBodyId(contactRoute.sourceBodyId) ||
                 !contact_evidence::isValidBodyId(contactRoute.targetBodyId) ||
                 contactRoute.sourceBodyId == contactRoute.targetBodyId) {
@@ -1597,7 +1422,8 @@
                     .otherIsRightPalmBody = other == rightId,
                     .otherIsLeftPalmBody = other == leftId,
                     .otherIsBodyCollider = otherIsA ? bodyAIsBody : bodyBIsBody,
-                    .otherIsExternalProvider = ::rock::provider::isExternalBodyId(other),
+                    .otherIsExternalProvider =
+                        otherIsA ? bodyAIsExternal : bodyBIsExternal,
                 });
             if (decision.sameHeldObject) {
                 ROCK_LOG_SAMPLE_DEBUG(Hand,
@@ -1650,51 +1476,21 @@
          * generated hand-side effect below it: native evidence, provider
          * contacts, weapon support contact, semantic touch, and dynamic push.
          */
-        // [CONTACT-DIAG] Local, file-scope-only name lookup - HandState's real name
-        // helper (Hand.cpp's handStateName) is anonymous-namespace-private to that
-        // translation unit, so this mirrors it rather than exposing it, purely to
-        // make the unthrottled suppression logs below self-explanatory.
-        auto diagStateName = [](HandState state) -> const char* {
-            switch (state) {
-            case HandState::Idle: return "Idle";
-            case HandState::SelectedClose: return "SelectedClose";
-            case HandState::SelectedFar: return "SelectedFar";
-            case HandState::SelectionLocked: return "SelectionLocked";
-            case HandState::PreGrabItem: return "PreGrabItem";
-            case HandState::PrePullItem: return "PrePullItem";
-            case HandState::HeldInit: return "HeldInit";
-            case HandState::HeldBody: return "HeldBody";
-            case HandState::Pulled: return "Pulled";
-            case HandState::GrabFromOtherHand: return "GrabFromOtherHand";
-            case HandState::GrabExternal: return "GrabExternal";
-            case HandState::LootOtherHand: return "LootOtherHand";
-            case HandState::SelectedTwoHand: return "SelectedTwoHand";
-            case HandState::HeldTwoHanded: return "HeldTwoHanded";
-            case HandState::StashCandidate: return "StashCandidate";
-            case HandState::ConsumeCandidate: return "ConsumeCandidate";
-            default: return "?";
-            }
-        };
-
-        const bool rightDominantWeaponSuppressed = _rightDominantWeaponCollisionSuppressed.load(std::memory_order_acquire);
-        const bool rightHandStateSuppressed = _rightHand.hasContactEvidenceSuppressedAtomic();
-        const bool leftWeaponSupportSuppressed = _leftWeaponSupportCollisionSuppressed.load(std::memory_order_acquire);
-        const bool leftHandStateSuppressed = _leftHand.hasContactEvidenceSuppressedAtomic();
-        const bool rightBodyPairSuppressed = (bodyAIsRight || bodyBIsRight) && (rightDominantWeaponSuppressed || rightHandStateSuppressed);
-        const bool leftBodyPairSuppressed = (bodyAIsLeft || bodyBIsLeft) && (leftWeaponSupportSuppressed || leftHandStateSuppressed);
+        const bool rightBodyPairSuppressed =
+            (bodyAIsRight || bodyBIsRight) &&
+            (_rightDominantWeaponCollisionSuppressed.load(std::memory_order_acquire) ||
+                _rightHand.hasContactEvidenceSuppressedAtomic());
+        const bool leftBodyPairSuppressed =
+            (bodyAIsLeft || bodyBIsLeft) &&
+            (_leftWeaponSupportCollisionSuppressed.load(std::memory_order_acquire) ||
+                _leftHand.hasContactEvidenceSuppressedAtomic());
         if (rightBodyPairSuppressed || leftBodyPairSuppressed) {
             ROCK_LOG_SAMPLE_DEBUG(Hand,
                 g_rockConfig.rockLogSampleMilliseconds,
-                "[CONTACT-DIAG] Suppressed hand body contact skipped: route={} rightSuppressed={} (dominantWeapon={} state={}/{}) leftSuppressed={} (weaponSupport={} state={}/{}) bodyA={} bodyB={}",
+                "Suppressed hand body contact skipped: route={} rightSuppressed={} leftSuppressed={} bodyA={} bodyB={}",
                 contact_pipeline_policy::routeName(contactRoute.route),
                 rightBodyPairSuppressed ? "yes" : "no",
-                rightDominantWeaponSuppressed ? "yes" : "no",
-                rightHandStateSuppressed ? "yes" : "no",
-                diagStateName(_rightHand.getStateAtomic()),
                 leftBodyPairSuppressed ? "yes" : "no",
-                leftWeaponSupportSuppressed ? "yes" : "no",
-                leftHandStateSuppressed ? "yes" : "no",
-                diagStateName(_leftHand.getStateAtomic()),
                 bodyIdA,
                 bodyIdB);
             return;
@@ -1710,19 +1506,12 @@
             return false;
         };
         if (routeSourceHandContactEvidenceSuppressed()) {
-            const bool sourceIsLeft = contact_pipeline_policy::isLeftHand(contactRoute.source.kind);
-            const auto& sourceHandForLog = sourceIsLeft ? _leftHand : _rightHand;
             ROCK_LOG_SAMPLE_DEBUG(Hand,
                 g_rockConfig.rockLogSampleMilliseconds,
-                "[CONTACT-DIAG] Contact evidence skipped for stronger hand owner: route={} sourceBody={} targetBody={} sourceIsLeft={} state={} dominantWeaponSuppressed={} supportSuppressed={} stateSuppressed={}",
+                "Contact evidence skipped for stronger hand owner: route={} sourceBody={} targetBody={}",
                 contact_pipeline_policy::routeName(contactRoute.route),
                 contactRoute.sourceBodyId,
-                contactRoute.targetBodyId,
-                sourceIsLeft ? "yes" : "no",
-                diagStateName(sourceHandForLog.getStateAtomic()),
-                (!sourceIsLeft && rightDominantWeaponSuppressed) ? "yes" : "no",
-                (!sourceIsLeft ? _rightWeaponSupportCollisionSuppressed.load(std::memory_order_acquire) : leftWeaponSupportSuppressed) ? "yes" : "no",
-                sourceHandForLog.hasContactEvidenceSuppressedAtomic() ? "yes" : "no");
+                contactRoute.targetBodyId);
             return;
         }
 
@@ -1734,6 +1523,8 @@
             routeHandMetadata = handSource && handSource->valid ? &handSource->metadata : nullptr;
         }
 
+        // Heisenberg-preserved: feed the soft-contact native evidence cache from
+        // the same routed contact that upstream publishes externally.
         publishNativeContactEvidence(routeHandMetadata);
 
         if (contactRoute.publishExternalContact) {
@@ -1741,19 +1532,8 @@
         }
 
         if (contactRoute.driveWeaponDynamicPush) {
+            // Heisenberg-preserved multi-slot capture (task #204).
             _contactSlotWeapon.record(contactRoute.sourceBodyId, contactRoute.targetBodyId);
-        }
-
-        if (contactRoute.recordWorldSurfaceEvidence) {
-            int logCount = _contactLogCounter.fetch_add(1, std::memory_order_relaxed);
-            if (logCount % 60 == 0) {
-                ROCK_LOG_DEBUG(Hand,
-                    "Surface contact evidence: route={} sourceBody={} targetBody={} targetLayer={}",
-                    contact_pipeline_policy::routeName(contactRoute.route),
-                    contactRoute.sourceBodyId,
-                    contactRoute.targetBodyId,
-                    contactRoute.target.layer == contact_pipeline_policy::kUnknownLayer ? 0xFFFFFFFFu : contactRoute.target.layer);
-            }
         }
 
         auto publishWeaponContactFromPhysics = [&](bool isLeft, const WeaponInteractionContact& weaponContact, std::uint32_t bodyId) {
@@ -1795,103 +1575,6 @@
         const auto* handSource = contactRoute.recordHandSemanticContact ? handSourceFor(contactRoute.sourceBodyId) : nullptr;
         if (!handSource || !handSource->valid) {
             return;
-        }
-
-        /*
-         * A reused hknp contact pair does not always expose a fresh raw
-         * manifold point.  Speed and the main-thread collider/visible-mesh
-         * envelope check do not depend on that point, so always publish the
-         * record and mark the raw fields explicitly.  The previous all-or-
-         * nothing gate is why fast token impacts produced native contact logs
-         * but no [CONTACT-PENETRATION] evidence.
-         */
-        const bool hasRawManifoldPoint = ensureRawContactPoint();
-        const float scale = havokToGameScale();
-        float sourceSpeedGamePerSecond = 0.0f;
-        if (handSource->metadata.hasSampledLinearVelocityHavok) {
-            const auto* velocity =
-                handSource->metadata.sampledLinearVelocityHavok;
-            const float speedSquared =
-                velocity[0] * velocity[0] +
-                velocity[1] * velocity[1] +
-                velocity[2] * velocity[2];
-            if (std::isfinite(speedSquared) &&
-                speedSquared > 0.0f) {
-                sourceSpeedGamePerSecond =
-                    std::sqrt(speedSquared) * scale;
-            }
-        }
-        float targetSpeedGamePerSecond = 0.0f;
-        if (auto* targetMotion = havok_runtime::getBodyMotion(
-                world,
-                RE::hknpBodyId{ contactRoute.targetBodyId })) {
-            const float speedSquared =
-                targetMotion->linearVelocity.x *
-                    targetMotion->linearVelocity.x +
-                targetMotion->linearVelocity.y *
-                    targetMotion->linearVelocity.y +
-                targetMotion->linearVelocity.z *
-                    targetMotion->linearVelocity.z;
-            if (std::isfinite(speedSquared) &&
-                speedSquared > 0.0f) {
-                targetSpeedGamePerSecond =
-                    std::sqrt(speedSquared) * scale;
-            }
-        }
-
-        {
-            std::scoped_lock lock(
-                _contactPenetrationDiagnosticMutex);
-            auto& diagnostic =
-                _contactPenetrationDiagnosticRecords[
-                    _nextContactPenetrationDiagnosticSlot++ %
-                    _contactPenetrationDiagnosticRecords.size()];
-            diagnostic = {};
-            diagnostic.valid = true;
-            diagnostic.isLeft = handSource->isLeft;
-            diagnostic.hasRawManifoldPoint = hasRawManifoldPoint;
-            diagnostic.sequence =
-                ++_contactPenetrationDiagnosticSequence;
-            diagnostic.sourceBodyId =
-                contactRoute.sourceBodyId;
-            diagnostic.targetBodyId =
-                contactRoute.targetBodyId;
-            diagnostic.role = handSource->metadata.role;
-            diagnostic.finger = handSource->metadata.finger;
-            diagnostic.segment = handSource->metadata.segment;
-            // Captured on EVERY record, success or failure: when extraction fails the caller
-            // otherwise sees only `false` and all the manifold fields below stay at their
-            // zero-initialised defaults, which is indistinguishable from "measured zero".
-            diagnostic.rawInlineCount = rawContactPoint.rawInlineCount;
-            diagnostic.extractFailStage =
-                static_cast<std::uint8_t>(rawContactPoint.failStage);
-            diagnostic.rawNormalFinite = rawContactPoint.normalFinite;
-            if (hasRawManifoldPoint) {
-                diagnostic.manifoldContactCount =
-                    rawContactPoint.manifoldContactCount;
-                diagnostic.validContactPointCount =
-                    rawContactPoint.validContactPointCount;
-                diagnostic.contactPointGame = RE::NiPoint3{
-                    rawContactPoint.contactPointHavok[0] * scale,
-                    rawContactPoint.contactPointHavok[1] * scale,
-                    rawContactPoint.contactPointHavok[2] * scale,
-                };
-                diagnostic.contactNormalGame = RE::NiPoint3{
-                    rawContactPoint.contactNormalHavok[0],
-                    rawContactPoint.contactNormalHavok[1],
-                    rawContactPoint.contactNormalHavok[2],
-                };
-                diagnostic.averageSignedSeparationGame =
-                    rawContactPoint.contactPointHavok[3] * scale;
-                diagnostic.minimumSignedSeparationGame =
-                    rawContactPoint.minimumSignedSeparationHavok * scale;
-                diagnostic.maximumSignedSeparationGame =
-                    rawContactPoint.maximumSignedSeparationHavok * scale;
-            }
-            diagnostic.sourceSpeedGamePerSecond =
-                sourceSpeedGamePerSecond;
-            diagnostic.targetSpeedGamePerSecond =
-                targetSpeedGamePerSecond;
         }
 
         const auto contactActivity = _handContactActivity.registerHandContact(handSource->isLeft, handSource->metadata.bodyId, contactRoute.targetBodyId);
@@ -1940,11 +1623,13 @@
         if (handSource->isLeft) {
             _leftHand.recordSemanticContact(handSource->metadata, contactRoute.targetBodyId, semanticContactPoint, semanticContactNormal);
             if (contactRoute.driveHandDynamicPush) {
+                // Heisenberg-preserved multi-slot capture (task #204).
                 _contactSlotLeft.record(handSource->metadata.bodyId, contactRoute.targetBodyId);
             }
         } else {
             _rightHand.recordSemanticContact(handSource->metadata, contactRoute.targetBodyId, semanticContactPoint, semanticContactNormal);
             if (contactRoute.driveHandDynamicPush) {
+                // Heisenberg-preserved multi-slot capture (task #204).
                 _contactSlotRight.record(handSource->metadata.bodyId, contactRoute.targetBodyId);
             }
         }

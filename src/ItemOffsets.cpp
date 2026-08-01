@@ -2,10 +2,12 @@
 #include "ShapeReferences.h"
 #include "EmbeddedOffsets.h"
 #include "F4VROffsets.h"
+#include "SharedUtils.h"  // ContainsCI — mirrored-armour-piece guard in GetArmorDimensionalDonorOffset
 #include "Utils.h"
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
+#include <cctype>
 #include <functional>
 #include <vector>
 #include <nlohmann/json.hpp>
@@ -57,6 +59,83 @@ namespace heisenberg
         std::string result = str;
         std::transform(result.begin(), result.end(), result.begin(), ::tolower);
         return result;
+    }
+
+    static std::string NormalizeFormIdIdentity(std::string formId)
+    {
+        if (formId.starts_with("0x") || formId.starts_with("0X")) {
+            formId.erase(0, 2);
+        }
+        formId.erase(
+            std::remove_if(
+                formId.begin(),
+                formId.end(),
+                [](unsigned char ch) { return std::isspace(ch) != 0; }),
+            formId.end());
+        std::transform(
+            formId.begin(),
+            formId.end(),
+            formId.begin(),
+            [](unsigned char ch) {
+                return static_cast<char>(std::toupper(ch));
+            });
+        if (!formId.empty() && formId.size() < 8) {
+            formId.insert(formId.begin(), 8 - formId.size(), '0');
+        }
+        return formId;
+    }
+
+    static std::string NormalizeEditorIdentity(const std::string& editorId)
+    {
+        return ToLower(editorId);
+    }
+
+    static std::string NormalizeProfileKeyIdentity(
+        std::string_view value)
+    {
+        std::string normalized;
+        normalized.reserve(value.size());
+        for (const unsigned char ch : value) {
+            if (std::isalnum(ch) != 0) {
+                normalized.push_back(
+                    static_cast<char>(std::tolower(ch)));
+            }
+        }
+        return normalized;
+    }
+
+    static void StripTrailingOffsetSuffix(
+        std::string& name,
+        std::string_view suffix)
+    {
+        if (name.size() > suffix.size() &&
+            name.compare(
+                name.size() - suffix.size(),
+                suffix.size(),
+                suffix) == 0) {
+            name.erase(name.size() - suffix.size());
+        }
+    }
+
+    static std::string BaseOffsetLookupName(
+        std::string name,
+        bool isLeftHanded,
+        bool isPowerArmor,
+        bool isThrowable)
+    {
+        // Strip in reverse construction order. This accepts both generated
+        // entries whose name is already suffixed and entries whose variant
+        // metadata is stored separately, without ever producing `_L_L`.
+        if (isThrowable) {
+            StripTrailingOffsetSuffix(name, "_T");
+        }
+        if (isPowerArmor) {
+            StripTrailingOffsetSuffix(name, "_PA");
+        }
+        StripTrailingOffsetSuffix(
+            name,
+            isLeftHanded ? "_L" : "_R");
+        return name;
     }
 
     // Extract category prefix from item name (e.g., "[Drink] Nuka-Cola" -> "Drink")
@@ -329,17 +408,24 @@ namespace heisenberg
             // Format: BaseName[_L][_PA][_T] where:
             //   _L = left-handed, _PA = power armor, _T = throwable
             std::string cleanName = StripCategoryPrefix(std::string(data.name));
-            std::string lookupKey = cleanName;
+            std::string baseName = BaseOffsetLookupName(
+                cleanName,
+                data.isLeftHanded,
+                data.isPowerArmor,
+                data.isThrowable);
+            std::string lookupKey = baseName;
             if (data.isLeftHanded) lookupKey += "_L";
             if (data.isPowerArmor) lookupKey += "_PA";
             if (data.isThrowable) lookupKey += "_T";
             
             _offsets[lookupKey] = offset;
+            IndexNormalizedProfileAlias(baseName);
             
-            // Update form ID index (only for base offsets, not variants)
+            // Update stable identity indexes only for the unsuffixed base
+            // entry. Variants are selected after resolving this base key.
             if (!offset.formId.empty() && offset.formId != "00000000" && 
                 !data.isLeftHanded && !data.isPowerArmor && !data.isThrowable) {
-                _formIdToName[offset.formId] = cleanName;
+                IndexStableIdentity(baseName, offset.formId);
             }
         }
     }
@@ -464,6 +550,10 @@ namespace heisenberg
                 {
                     offset.formId = value["formId"].get<std::string>();
                 }
+                if (value.contains("editorId"))
+                {
+                    offset.editorId = value["editorId"].get<std::string>();
+                }
                 
                 // Load variant flags (if present)
                 if (value.contains("variant"))
@@ -494,23 +584,21 @@ namespace heisenberg
                 // the known suffixes (using the variant flags just loaded above) before
                 // indexing, matching SaveOffset's base-name invariant. Safe no-op for
                 // entries that never had a given suffix (exact-match compare only).
-                std::string formIdIndexName = cleanName;
-                auto stripSuffix = [&](const std::string& suffix) {
-                    if (formIdIndexName.size() > suffix.size() &&
-                        formIdIndexName.compare(formIdIndexName.size() - suffix.size(), suffix.size(), suffix) == 0) {
-                        formIdIndexName.erase(formIdIndexName.size() - suffix.size());
-                    }
-                };
-                if (offset.isThrowable) {
-                    stripSuffix("_T");
-                }
-                if (offset.isPowerArmor) {
-                    stripSuffix("_PA");
-                }
-                stripSuffix(offset.isLeftHanded ? "_L" : "_R");
+                std::string formIdIndexName =
+                    BaseOffsetLookupName(
+                        cleanName,
+                        offset.isLeftHanded,
+                        offset.isPowerArmor,
+                        offset.isThrowable);
+                IndexNormalizedProfileAlias(formIdIndexName);
 
-                if (!offset.formId.empty() && offset.formId != "00000000") {
-                    _formIdToName[offset.formId] = formIdIndexName;
+                if ((!offset.formId.empty() &&
+                     offset.formId != "00000000") ||
+                    !offset.editorId.empty()) {
+                    IndexStableIdentity(
+                        formIdIndexName,
+                        offset.formId,
+                        offset.editorId);
                 }
                 
                 spdlog::debug("[ItemOffsets] Loaded offset for '{}' (from '{}')", cleanName, itemName);
@@ -533,6 +621,9 @@ namespace heisenberg
             // Save item metadata
             j[itemName]["itemType"] = offset.itemType;
             j[itemName]["formId"] = offset.formId;
+            if (!offset.editorId.empty()) {
+                j[itemName]["editorId"] = offset.editorId;
+            }
 
             // Save position
             j[itemName]["position"]["x"] = offset.position.x;
@@ -695,6 +786,141 @@ namespace heisenberg
         return std::string(buf);
     }
 
+    std::string ItemOffsetManager::GetItemEditorId(RE::TESObjectREFR* refr)
+    {
+        if (!refr) {
+            return {};
+        }
+        auto* baseForm = refr->GetObjectReference();
+        if (!baseForm) {
+            return {};
+        }
+        const char* editorId = baseForm->GetFormEditorID();
+        return editorId ? std::string(editorId) : std::string{};
+    }
+
+    void ItemOffsetManager::IndexStableIdentity(
+        const std::string& lookupName,
+        const std::string& formId,
+        const std::string& editorId)
+    {
+        if (lookupName.empty()) {
+            return;
+        }
+        IndexNormalizedProfileAlias(lookupName);
+
+        const std::string normalizedFormId =
+            NormalizeFormIdIdentity(formId);
+        if (!normalizedFormId.empty() &&
+            normalizedFormId != "00000000") {
+            _formIdToName[normalizedFormId] = lookupName;
+        }
+
+        std::string resolvedEditorId = editorId;
+        if (resolvedEditorId.empty() &&
+            !normalizedFormId.empty() &&
+            normalizedFormId != "00000000") {
+            try {
+                const auto numericFormId =
+                    static_cast<RE::TESFormID>(
+                        std::stoul(normalizedFormId, nullptr, 16));
+                if (auto* form = RE::TESForm::GetFormByID(numericFormId)) {
+                    if (const char* runtimeEditorId =
+                            form->GetFormEditorID();
+                        runtimeEditorId && runtimeEditorId[0] != '\0') {
+                        resolvedEditorId = runtimeEditorId;
+                    }
+                }
+            } catch (const std::exception&) {
+                // The FormID index remains useful even when malformed
+                // third-party metadata cannot be resolved to a live form.
+            }
+        }
+
+        if (!resolvedEditorId.empty()) {
+            _editorIdToName[
+                NormalizeEditorIdentity(resolvedEditorId)] =
+                lookupName;
+        }
+    }
+
+    void ItemOffsetManager::IndexNormalizedProfileAlias(
+        const std::string& lookupName)
+    {
+        const std::string normalized =
+            NormalizeProfileKeyIdentity(lookupName);
+        if (normalized.empty() ||
+            _ambiguousNormalizedProfileKeys.contains(normalized)) {
+            return;
+        }
+
+        const auto [it, inserted] =
+            _normalizedProfileKeyToName.emplace(
+                normalized,
+                lookupName);
+        if (!inserted && it->second != lookupName) {
+            spdlog::warn(
+                "[ItemOffsets] Normalized profile identity '{}' is "
+                "ambiguous between '{}' and '{}'; alias disabled",
+                normalized,
+                it->second,
+                lookupName);
+            _normalizedProfileKeyToName.erase(it);
+            _ambiguousNormalizedProfileKeys.insert(normalized);
+        }
+    }
+
+    std::optional<std::string>
+    ItemOffsetManager::FindStableLookupName(
+        RE::TESObjectREFR* refr) const
+    {
+        if (!refr) {
+            return std::nullopt;
+        }
+
+        const std::string formId =
+            NormalizeFormIdIdentity(GetItemFormId(refr));
+        if (!formId.empty() && formId != "00000000") {
+            if (const auto formIt = _formIdToName.find(formId);
+                formIt != _formIdToName.end()) {
+                return formIt->second;
+            }
+        }
+
+        const std::string rawEditorId = GetItemEditorId(refr);
+        const std::string editorId =
+            NormalizeEditorIdentity(rawEditorId);
+        if (!editorId.empty()) {
+            if (const auto editorIt =
+                    _editorIdToName.find(editorId);
+                editorIt != _editorIdToName.end()) {
+                return editorIt->second;
+            }
+
+            const std::string normalizedEditorId =
+                NormalizeProfileKeyIdentity(rawEditorId);
+            if (!normalizedEditorId.empty() &&
+                !_ambiguousNormalizedProfileKeys.contains(
+                    normalizedEditorId)) {
+                if (const auto aliasIt =
+                        _normalizedProfileKeyToName.find(
+                            normalizedEditorId);
+                    aliasIt !=
+                    _normalizedProfileKeyToName.end()) {
+                    return aliasIt->second;
+                }
+            }
+
+            // User-authored databases may use the editor ID itself as their
+            // top-level key. Accept that stable key before a translated FULL
+            // name without requiring a separate alias record.
+            if (_offsets.contains(rawEditorId)) {
+                return rawEditorId;
+            }
+        }
+        return std::nullopt;
+    }
+
     void ItemOffsetManager::GetItemDimensions(RE::TESObjectREFR* refr, float& outLength, float& outWidth, float& outHeight)
     {
         outLength = 0.0f;
@@ -734,22 +960,20 @@ namespace heisenberg
     std::optional<ItemOffset> ItemOffsetManager::GetOffset(RE::TESObjectREFR* refr) const
     {
         if (!refr) return std::nullopt;
-        
-        // Priority 1: Try form ID lookup first (most reliable - handles mods and localizations)
-        std::string formId = GetItemFormId(refr);
-        if (!formId.empty() && formId != "00000000") {
-            auto formIdIt = _formIdToName.find(formId);
-            if (formIdIt != _formIdToName.end()) {
-                auto offsetIt = _offsets.find(formIdIt->second);
-                if (offsetIt != _offsets.end()) {
-                    spdlog::info("[ItemOffsets] Priority 1: FormID match {:08X} -> '{}'", 
-                                 refr->formID, formIdIt->second);
-                    return offsetIt->second;
-                }
+
+        // Stable base FormID/editor ID wins over the localized display name.
+        if (const auto stableName = FindStableLookupName(refr)) {
+            if (const auto offsetIt = _offsets.find(*stableName);
+                offsetIt != _offsets.end()) {
+                spdlog::info(
+                    "[ItemOffsets] Stable identity match {:08X} -> '{}'",
+                    refr->formID,
+                    *stableName);
+                return offsetIt->second;
             }
         }
-        
-        // Priority 2: Try exact name match
+
+        // Localized display name is the compatibility fallback.
         return GetOffset(GetItemName(refr));
     }
     
@@ -770,18 +994,21 @@ namespace heisenberg
     {
         std::string itemName = GetItemName(refr);
         
-        // Create a copy of offset to add form ID if not already set
+        // Create a copy of offset to add stable identities if not already set.
         ItemOffset offsetWithId = offset;
         if (offsetWithId.formId.empty()) {
             offsetWithId.formId = GetItemFormId(refr);
         }
+        if (offsetWithId.editorId.empty()) {
+            offsetWithId.editorId = GetItemEditorId(refr);
+        }
         
         SaveOffset(itemName, offsetWithId);
         
-        // Update form ID index
-        if (!offsetWithId.formId.empty() && offsetWithId.formId != "00000000") {
-            _formIdToName[offsetWithId.formId] = itemName;
-        }
+        IndexStableIdentity(
+            itemName,
+            offsetWithId.formId,
+            offsetWithId.editorId);
     }
 
     void ItemOffsetManager::SaveOffset(const std::string& itemName, const ItemOffset& offset)
@@ -791,10 +1018,7 @@ namespace heisenberg
 
         _offsets[itemName] = offset;
         
-        // Update form ID index
-        if (!offset.formId.empty() && offset.formId != "00000000") {
-            _formIdToName[offset.formId] = itemName;
-        }
+        IndexStableIdentity(itemName, offset.formId, offset.editorId);
         
         SaveOffsetToJsonFile(itemName, offset);
     }
@@ -803,18 +1027,21 @@ namespace heisenberg
     {
         std::string itemName = GetItemName(refr);
         
-        // Create a copy of offset to add form ID if not already set
+        // Create a copy of offset to add stable identities if not already set.
         ItemOffset offsetWithId = offset;
         if (offsetWithId.formId.empty()) {
             offsetWithId.formId = GetItemFormId(refr);
         }
+        if (offsetWithId.editorId.empty()) {
+            offsetWithId.editorId = GetItemEditorId(refr);
+        }
         
         SaveOffset(itemName, offsetWithId, isLeft);
         
-        // Update form ID index (without suffix for lookup)
-        if (!offsetWithId.formId.empty() && offsetWithId.formId != "00000000") {
-            _formIdToName[offsetWithId.formId] = itemName;
-        }
+        IndexStableIdentity(
+            itemName,
+            offsetWithId.formId,
+            offsetWithId.editorId);
     }
     
     void ItemOffsetManager::SaveOffset(const std::string& itemName, const ItemOffset& offset, bool isLeft)
@@ -837,10 +1064,8 @@ namespace heisenberg
         
         _offsets[suffixedName] = offsetWithFlags;
         
-        // Update form ID index (use base name, not suffixed)
-        if (!offset.formId.empty() && offset.formId != "00000000") {
-            _formIdToName[offset.formId] = itemName;
-        }
+        // Stable identity always maps to the unsuffixed base name.
+        IndexStableIdentity(itemName, offset.formId, offset.editorId);
         
         SaveOffsetToJsonFile(suffixedName, offsetWithFlags);
         
@@ -852,60 +1077,68 @@ namespace heisenberg
     
     std::optional<ItemOffset> ItemOffsetManager::GetOffset(RE::TESObjectREFR* refr, bool isLeft) const
     {
-        std::string itemName = GetItemName(refr);
-        return GetOffset(itemName, isLeft);
+        if (!refr) {
+            return std::nullopt;
+        }
+        if (const auto stableName = FindStableLookupName(refr)) {
+            if (auto stableOffset = GetOffset(*stableName, isLeft)) {
+                return stableOffset;
+            }
+        }
+        return GetOffset(GetItemName(refr), isLeft);
     }
     
     std::optional<ItemOffset> ItemOffsetManager::GetExactOffset(RE::TESObjectREFR* refr, bool isLeft) const
     {
         if (!refr) return std::nullopt;
         
-        std::string itemName = GetItemName(refr);
         std::string handSuffix = isLeft ? "_L" : "_R";
-        
-        // Priority 1: FormID lookup (most reliable)
-        std::string formId = GetItemFormId(refr);
-        if (!formId.empty() && formId != "00000000") {
-            auto formIdIt = _formIdToName.find(formId);
-            if (formIdIt != _formIdToName.end()) {
-                std::string baseName = formIdIt->second;
-                
-                // Try hand-specific variant first
-                std::string handName = baseName + handSuffix;
-                auto handIt = _offsets.find(handName);
-                if (handIt != _offsets.end()) {
-                    spdlog::info("[ItemOffsets]  Exact FormID match {} -> '{}' ({} hand)",
-                                formId, handName, isLeft ? "LEFT" : "RIGHT");
-                    ItemOffset result = handIt->second;
-                    result.matchedName = handName;
-                    return result;
-                }
 
-                // Try generic (no hand suffix)
-                auto offsetIt = _offsets.find(baseName);
-                if (offsetIt != _offsets.end()) {
-                    spdlog::info("[ItemOffsets]  Exact FormID match {} -> '{}'", formId, baseName);
-                    ItemOffset result = offsetIt->second;
-                    result.matchedName = baseName;
-                    return result;
-                }
+        // Priority 1: stable base FormID/editor ID. Resolve the unsuffixed
+        // database identity first, then select a hand variant.
+        if (const auto stableName = FindStableLookupName(refr)) {
+            const std::string handName = *stableName + handSuffix;
+            if (const auto handIt = _offsets.find(handName);
+                handIt != _offsets.end()) {
+                spdlog::info(
+                    "[ItemOffsets] Exact stable identity -> '{}' ({} hand)",
+                    handName,
+                    isLeft ? "LEFT" : "RIGHT");
+                ItemOffset result = handIt->second;
+                result.matchedName = handName;
+                return result;
+            }
+
+            if (const auto offsetIt = _offsets.find(*stableName);
+                offsetIt != _offsets.end()) {
+                spdlog::info(
+                    "[ItemOffsets] Exact stable identity -> '{}'",
+                    *stableName);
+                ItemOffset result = offsetIt->second;
+                result.matchedName = *stableName;
+                return result;
             }
         }
 
-        // Priority 2: Exact name match with hand suffix
-        std::string handItemName = itemName + handSuffix;
-        auto handIt = _offsets.find(handItemName);
-        if (handIt != _offsets.end()) {
-            spdlog::info("[ItemOffsets]  Exact name match '{}' ({} hand)", itemName, isLeft ? "LEFT" : "RIGHT");
+        // Compatibility fallback: localized display name.
+        const std::string itemName = GetItemName(refr);
+        const std::string handItemName = itemName + handSuffix;
+        if (const auto handIt = _offsets.find(handItemName);
+            handIt != _offsets.end()) {
+            spdlog::info(
+                "[ItemOffsets] Exact display-name match '{}' ({} hand)",
+                itemName,
+                isLeft ? "LEFT" : "RIGHT");
             ItemOffset result = handIt->second;
             result.matchedName = handItemName;
             return result;
         }
 
-        // Priority 3: Exact name match (generic)
-        auto nameIt = _offsets.find(itemName);
-        if (nameIt != _offsets.end()) {
-            spdlog::info("[ItemOffsets]  Exact name match '{}'", itemName);
+        if (const auto nameIt = _offsets.find(itemName);
+            nameIt != _offsets.end()) {
+            spdlog::info(
+                "[ItemOffsets] Exact display-name match '{}'",
+                itemName);
             ItemOffset result = nameIt->second;
             result.matchedName = itemName;
             return result;
@@ -934,7 +1167,11 @@ namespace heisenberg
         }
 
         // No exact match found - do NOT use dimension-based fallback
-        spdlog::debug("[ItemOffsets] No exact match for '{}' (FormID: {})", itemName, formId);
+        spdlog::debug(
+            "[ItemOffsets] No exact match for '{}' (FormID: {}, EditorID: '{}')",
+            itemName,
+            GetItemFormId(refr),
+            GetItemEditorId(refr));
         return std::nullopt;
     }
     
@@ -1106,26 +1343,30 @@ namespace heisenberg
         spdlog::info("[ItemOffsets] === OFFSET SELECTION for '{}' (FormID: {:08X}, BaseFormID: {}) ===", 
                     itemName, refr->formID, baseFormId);
         
-        // Priority 1: FormId Exact - most reliable (handles mods and localizations)
-        if (!baseFormId.empty() && baseFormId != "00000000") {
-            auto formIdIt = _formIdToName.find(baseFormId);
-            if (formIdIt != _formIdToName.end()) {
-                auto offsetIt = _offsets.find(formIdIt->second);
-                if (offsetIt != _offsets.end()) {
-                    spdlog::info("[ItemOffsets]  Priority 1: FORMID match {} -> '{}'", 
-                                 baseFormId, formIdIt->second);
-                    spdlog::info("[ItemOffsets]   -> pos=({:.2f}, {:.2f}, {:.2f}) fingerDist={:.2f}",
-                                offsetIt->second.position.x, offsetIt->second.position.y, 
-                                offsetIt->second.position.z, offsetIt->second.fingerDistance);
-                    ItemOffset result = offsetIt->second;
-                    result.matchQuality = OffsetMatchQuality::Exact;
-                    result.matchedName = formIdIt->second;  // The name associated with this FormId
-                    return result;
-                }
+        // Priority 1: stable base FormID/editor ID. The editor fallback also
+        // survives plugin load-index changes in user-authored databases.
+        if (const auto stableName = FindStableLookupName(refr)) {
+            if (const auto offsetIt = _offsets.find(*stableName);
+                offsetIt != _offsets.end()) {
+                spdlog::info(
+                    "[ItemOffsets]  Priority 1: stable identity {} / '{}' -> '{}'",
+                    baseFormId,
+                    GetItemEditorId(refr),
+                    *stableName);
+                spdlog::info(
+                    "[ItemOffsets]   -> pos=({:.2f}, {:.2f}, {:.2f}) fingerDist={:.2f}",
+                    offsetIt->second.position.x,
+                    offsetIt->second.position.y,
+                    offsetIt->second.position.z,
+                    offsetIt->second.fingerDistance);
+                ItemOffset result = offsetIt->second;
+                result.matchQuality = OffsetMatchQuality::Exact;
+                result.matchedName = *stableName;
+                return result;
             }
         }
         
-        // Priority 2: Name Exact
+        // Priority 2: localized display-name exact match.
         
         auto exactMatch = GetOffset(itemName);
         if (exactMatch.has_value()) {
@@ -1442,6 +1683,9 @@ namespace heisenberg
         }
         
         std::string itemName = GetItemName(refr);
+        const auto stableName = FindStableLookupName(refr);
+        const std::string& identityName =
+            stableName ? *stableName : itemName;
         bool inPowerArmor = Utils::IsPlayerInPowerArmor();
         
         // =====================================================================
@@ -1484,7 +1728,8 @@ namespace heisenberg
 
         // Priority 1: Power Armor + hand-specific (if in PA)
         if (inPowerArmor) {
-            std::string paHandName = itemName + handSuffix + "_PA";
+            std::string paHandName =
+                identityName + handSuffix + "_PA";
             auto it = _offsets.find(paHandName);
             if (it != _offsets.end()) {
                 spdlog::info("[ItemOffsets]  Found PA+{} hand offset for '{}'", isLeft ? "LEFT" : "RIGHT", itemName);
@@ -1499,7 +1744,7 @@ namespace heisenberg
 
         // Priority 2: Power Armor variant (if in PA)
         if (inPowerArmor) {
-            std::string paName = itemName + "_PA";
+            std::string paName = identityName + "_PA";
             auto it = _offsets.find(paName);
             if (it != _offsets.end()) {
                 spdlog::info("[ItemOffsets]  Found POWER ARMOR offset for '{}'", itemName);
@@ -1514,7 +1759,7 @@ namespace heisenberg
 
         // Priority 3: Hand-specific offset (_L or _R)
         {
-            std::string handName = itemName + handSuffix;
+            std::string handName = identityName + handSuffix;
             auto it = _offsets.find(handName);
             if (it != _offsets.end()) {
                 spdlog::info("[ItemOffsets]  Found {} hand offset for '{}'", isLeft ? "LEFT" : "RIGHT", itemName);
@@ -1741,25 +1986,176 @@ namespace heisenberg
         return std::nullopt;
     }
 
+    std::optional<ItemOffset> ItemOffsetManager::GetArmorDimensionalDonorOffset(
+        RE::TESObjectREFR* refr,
+        bool isLeft) const
+    {
+        if (!refr) {
+            return std::nullopt;
+        }
+
+        // ARMO only. Every other class ties its authored pose to a specific
+        // model's pivot, so borrowing across items would be a guess.
+        if (GetItemType(const_cast<RE::TESObjectREFR*>(refr)) != "ARMO") {
+            return std::nullopt;
+        }
+
+        float L = 0, W = 0, H = 0;
+        GetItemDimensions(const_cast<RE::TESObjectREFR*>(refr), L, W, H);
+        if (L <= 0 || W <= 0) {
+            return std::nullopt;
+        }
+
+        // SLAB GATE — the donor is only sound between GARMENTS.
+        //
+        // Garments are authored around a shared body origin, so their poses
+        // transfer. Chunky pieces (helmets, chest plates, gauntlets, limb
+        // armour) are not, and bounds alone cannot tell them apart from a
+        // folded garment of similar footprint. Leave-one-out over the embedded
+        // ARMO profiles found the damage this does when unguarded: a T-45 Chest
+        // Piece (34x43x34) would take 'Black Vest and Slacks' (34x42x12) at an
+        // XZ distance of 1.00 and land 41.7 units out; 'Cage Armor' would take
+        // 'Super Mutant Heavy Gauntlets' and land 52.1 units and 178 degrees
+        // out. Requiring BOTH sides to be slab-shaped removes that whole class,
+        // and a non-garment simply keeps the generated seat.
+        const auto isSlabShaped = [](float l, float w, float h) {
+            if (!(l > 0.0f) || !(w > 0.0f) || !(h > 0.0f)) {
+                return false;
+            }
+            const float largest = (std::max)(l, (std::max)(w, h));
+            const float smallest = (std::min)(l, (std::min)(w, h));
+            const float middle = l + w + h - largest - smallest;
+            return middle > 0.0f &&
+                   (smallest / middle) <= kArmorDonorMaxThicknessRatio;
+        };
+        if (!isSlabShaped(L, W, H)) {
+            return std::nullopt;
+        }
+
+        const std::string targetName = GetItemName(refr);
+        const bool targetIsLeftPiece = ContainsCI(targetName.c_str(), "left");
+        const bool targetIsRightPiece = ContainsCI(targetName.c_str(), "right");
+
+        const std::string handSuffix = isLeft ? "_L" : "_R";
+        const bool inPowerArmor = Utils::IsPlayerInPowerArmor();
+        const ItemOffset* best = nullptr;
+        std::string bestName;
+        float bestDistance = kArmorDonorMaxXZDistance;
+        int bestRank = -1;
+
+        for (const auto& [candName, candOffset] : _offsets) {
+            if (candOffset.itemType != "ARMO") {
+                continue;
+            }
+            if (candOffset.length <= 0 || candOffset.width <= 0) {
+                continue;
+            }
+            if (!isSlabShaped(candOffset.length, candOffset.width, candOffset.height)) {
+                continue;
+            }
+            // A power-armor pose is authored in a different hand frame, so it
+            // must never reach a normal grab. The reverse is only a preference:
+            // no embedded ARMO profile carries a PA variant, so hard-rejecting
+            // non-PA donors while in power armor would silently disable the
+            // whole feature there. Rank instead (below).
+            if (candOffset.isPowerArmor && !inPowerArmor) {
+                continue;
+            }
+            // Mirrored armour PIECES have identical bounds but opposite poses
+            // ("Metal Left Leg" vs "Metal Right Leg" measured 177 degrees apart
+            // in the embedded data). Bounds alone cannot separate them, so
+            // never let one side donate to the other.
+            const bool candIsLeftPiece = ContainsCI(candName.c_str(), "left");
+            const bool candIsRightPiece = ContainsCI(candName.c_str(), "right");
+            if ((targetIsLeftPiece && candIsRightPiece) ||
+                (targetIsRightPiece && candIsLeftPiece)) {
+                continue;
+            }
+
+            // Footprint (L/W) only, matching how garments actually differ: a
+            // folded garment's HEIGHT is drape, not identity, and that is the
+            // exact reason the strict all-three-axes test missed these items
+            // (BoS Uniform 34x42x10 vs the authored 34x42x12). Measured over
+            // the embedded profiles, an L/W bound leaves fewer catastrophic
+            // (>15u) transfers than folding height into the distance.
+            const float dL = std::abs(candOffset.length - L);
+            const float dW = std::abs(candOffset.width - W);
+            const float xzDistance = std::sqrt(dL * dL + dW * dW);
+            if (!std::isfinite(xzDistance) || xzDistance > bestDistance) {
+                continue;
+            }
+
+            // Prefer this hand's authored variant, then a power-armor variant
+            // when in power armor, when two donors are equally close.
+            int rank = 0;
+            if (candName.size() > handSuffix.size() &&
+                candName.compare(
+                    candName.size() - handSuffix.size(),
+                    handSuffix.size(),
+                    handSuffix) == 0) {
+                rank += 2;
+            }
+            if (inPowerArmor && candOffset.isPowerArmor) {
+                rank += 1;
+            }
+            // _offsets is an unordered_map, so ties must be broken by the data
+            // and not by bucket order — otherwise which garment donates could
+            // change between builds for no visible reason.
+            if (xzDistance < bestDistance ||
+                (xzDistance == bestDistance &&
+                    (rank > bestRank ||
+                        (rank == bestRank && (!best || candName < bestName))))) {
+                bestDistance = xzDistance;
+                bestRank = rank;
+                best = &candOffset;
+                bestName = candName;
+            }
+        }
+
+        if (!best) {
+            return std::nullopt;
+        }
+
+        spdlog::info(
+            "[ItemOffsets] ARMOR donor for '{}' -> '{}' (XZ distance {:.2f}; "
+            "target L={:.1f} W={:.1f} H={:.1f}, donor L={:.1f} W={:.1f} H={:.1f}) "
+            "pos=({:.2f},{:.2f},{:.2f})",
+            GetItemName(refr),
+            bestName,
+            bestDistance,
+            L, W, H,
+            best->length, best->width, best->height,
+            best->position.x, best->position.y, best->position.z);
+
+        ItemOffset result = *best;
+        result.length = L;
+        result.width = W;
+        result.height = H;
+        result.matchQuality = (bestDistance < 0.1f)
+            ? OffsetMatchQuality::Dimensions
+            : OffsetMatchQuality::Fuzzy;
+        result.matchedName = bestName;
+        result.armorDonorXZDistance = bestDistance;
+        return result;
+    }
+
     bool ItemOffsetManager::HasExactMatch(RE::TESObjectREFR* refr) const
     {
         if (!refr) {
             return false;
         }
 
-        // Check for FormID exact match first (most reliable) - Priority 1
-        std::string baseFormId = GetItemFormId(const_cast<RE::TESObjectREFR*>(refr));
-        if (!baseFormId.empty() && baseFormId != "00000000") {
-            auto formIdIt = _formIdToName.find(baseFormId);
-            if (formIdIt != _formIdToName.end()) {
-                auto offsetIt = _offsets.find(formIdIt->second);
-                if (offsetIt != _offsets.end()) {
-                    return true;  // FormID match = exact match
-                }
+        // Stable FormID/editor identity is authoritative and independent of
+        // the language used for the display name.
+        if (const auto stableName = FindStableLookupName(refr)) {
+            if (_offsets.contains(*stableName) ||
+                _offsets.contains(*stableName + "_L") ||
+                _offsets.contains(*stableName + "_R")) {
+                return true;
             }
         }
 
-        // Check for exact name match - Priority 2
+        // Localized display name remains a backwards-compatible fallback.
         std::string itemName = GetItemName(refr);
         auto exactMatch = _offsets.find(itemName);
         if (exactMatch != _offsets.end()) {

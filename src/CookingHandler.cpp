@@ -8,6 +8,8 @@
 #include "f4vr/PlayerNodes.h"
 #include "SharedUtils.h"
 
+#include <limits>
+
 // Activation ViewCasters — these return activation targets (furniture, buttons, cooking stations)
 // Different from the storage ViewCasters in F4VROffsets.h which return pickup/store targets
 using QActivatePickRef_t = RE::ObjectRefHandle*(*)(void* viewCaster, RE::ObjectRefHandle* outHandle);
@@ -303,7 +305,10 @@ namespace heisenberg
                     break;
                 }
             }
-            if (inventoryCount + heldContribution < ing.count) {
+            const auto availableCount =
+                static_cast<std::uint32_t>((std::max)(0, inventoryCount)) +
+                static_cast<std::uint32_t>(heldContribution);
+            if (availableCount < ing.count) {
                 return false;
             }
         }
@@ -336,28 +341,38 @@ namespace heisenberg
 
         std::string lacking;
         for (auto& ing : bestCandidate.ingredients) {
-            if (ing.formID == heldFormID) continue;
-
-            bool found = false;
+            int inventoryCount = 0;
             if (player && player->inventoryList) {
                 for (auto& invItem : player->inventoryList->data) {
                     if (invItem.object && invItem.object->GetFormID() == ing.formID) {
-                        if (invItem.GetCount() >= ing.count) {
-                            found = true;
-                        }
+                        inventoryCount = invItem.GetCount();
                         break;
                     }
                 }
             }
 
-            if (!found) {
+            // Match HasIngredients exactly: the item in the hand contributes one,
+            // but it does not satisfy recipes that require two or more by itself.
+            const int heldContribution = (ing.formID == heldFormID) ? 1 : 0;
+            const auto availableCount =
+                static_cast<std::uint32_t>((std::max)(0, inventoryCount)) +
+                static_cast<std::uint32_t>(heldContribution);
+            const std::uint32_t missingCount =
+                ing.count > availableCount ? ing.count - availableCount : 0;
+            if (missingCount > 0) {
                 if (!lacking.empty()) lacking += ", ";
                 lacking += GetFormDisplayName(ing.formID);
+                if (missingCount > 1) {
+                    lacking += std::format(" x{}", missingCount);
+                }
             }
         }
 
         std::string cookedName = GetFormDisplayName(bestCandidate.cookedFormID);
-        outLackingMsg = std::format("Lacking {} to make {}", lacking, cookedName);
+        outLackingMsg = std::format(
+            "Lacking {} to make {}",
+            lacking.empty() ? "ingredients" : lacking,
+            cookedName);
         return -1;
     }
 
@@ -559,7 +574,7 @@ namespace heisenberg
     void CookingHandler::CookItem(bool isLeft, RE::TESObjectREFR* heldItem, RE::TESFormID heldFormID)
     {
         auto* player = RE::PlayerCharacter::GetSingleton();
-        if (!player) return;
+        if (!player || !heldItem) return;
 
         // Find the best recipe for this ingredient
         std::string lackingMsg;
@@ -594,40 +609,230 @@ namespace heisenberg
 
         spdlog::info("[COOKING] Cooking '{}' -> '{}'", heldName, cookedName);
 
-        // Clear smart grab state (cooking ends the selection cycle)
-        ClearSmartGrab(isLeft);
+        // Every native inventory operation below can return early. Keep the
+        // global HUD setting balanced on all paths (and preserve the user's
+        // original value rather than blindly enabling it).
+        Hooks::SetSuppressHUDMessages(true);
+        struct HUDRestore
+        {
+            ~HUDRestore()
+            {
+                Hooks::SetSuppressHUDMessages(false);
+            }
+        } hudRestore;
 
-        // Step 1: Release the held raw item
+        // Store the raw world reference while the grab still owns a strong
+        // reference. If activation is rejected, leave the item held and do not
+        // consume any ingredients.
+        Hooks::SetInternalActivation(true);
+        const bool rawStored =
+            heldRef->ActivateRef(player, nullptr, 1, false, false, false);
+        Hooks::SetInternalActivation(false);
+        if (!rawStored)
+        {
+            spdlog::error(
+                "[COOKING] Could not store held raw item {:08X}; transaction aborted",
+                heldFormID);
+            return;
+        }
+
+        // Cooking now owns the stored item, so both a normal grab and a smart
+        // grab must end only after activation has succeeded.
+        ClearSmartGrab(isLeft);
         auto& grabMgr = GrabManager::GetSingleton();
         grabMgr.EndGrab(isLeft, nullptr, true);
 
-        // Step 2: Store held item back to inventory via ActivateRef
-        if (heldRef) {
-            Hooks::SetSuppressHUDMessages(true);
-            heldRef->ActivateRef(player, nullptr, 1, false, false, false);
-            Hooks::SetSuppressHUDMessages(false);
+        auto getInventoryCount =
+            [player](RE::TESFormID formID) -> std::int64_t {
+                if (!player->inventoryList)
+                    return 0;
+
+                for (auto& invItem : player->inventoryList->data)
+                {
+                    if (invItem.object &&
+                        invItem.object->GetFormID() == formID)
+                    {
+                        return (std::max)(
+                            std::int64_t{ 0 },
+                            static_cast<std::int64_t>(
+                                invItem.GetCount()));
+                    }
+                }
+                return 0;
+            };
+
+        struct IngredientRemoval
+        {
+            RE::TESFormID formID = 0;
+            RE::TESBoundObject* object = nullptr;
+            std::uint32_t required = 0;
+            std::int64_t before = 0;
+            std::int64_t removed = 0;
+        };
+        std::vector<IngredientRemoval> removals;
+        removals.reserve(recipe.ingredients.size());
+
+        // Aggregate duplicate ingredient rows before validating. Otherwise two
+        // rows could each pass against the same inventory count and overdraw it.
+        for (const auto& ingredient : recipe.ingredients)
+        {
+            if (ingredient.count == 0)
+                continue;
+
+            auto existing = std::find_if(
+                removals.begin(),
+                removals.end(),
+                [&ingredient](const IngredientRemoval& removal) {
+                    return removal.formID == ingredient.formID;
+                });
+            if (existing != removals.end())
+            {
+                const std::uint64_t combined =
+                    static_cast<std::uint64_t>(existing->required) +
+                    ingredient.count;
+                if (combined >
+                    static_cast<std::uint64_t>(
+                        (std::numeric_limits<std::int32_t>::max)()))
+                {
+                    spdlog::error(
+                        "[COOKING] Ingredient count overflow for {:08X}; transaction aborted",
+                        ingredient.formID);
+                    return;
+                }
+                existing->required =
+                    static_cast<std::uint32_t>(combined);
+                continue;
+            }
+
+            auto* ingredientForm =
+                RE::TESForm::GetFormByID(ingredient.formID);
+            auto* ingredientObject = ingredientForm ?
+                ingredientForm->As<RE::TESBoundObject>() : nullptr;
+            if (!ingredientObject)
+            {
+                spdlog::error(
+                    "[COOKING] Invalid ingredient form {:08X}; transaction aborted",
+                    ingredient.formID);
+                return;
+            }
+
+            removals.push_back({
+                ingredient.formID,
+                ingredientObject,
+                ingredient.count,
+                0,
+                0
+            });
         }
 
-        // Step 3: Remove all required ingredients from inventory
-        Hooks::SetSuppressHUDMessages(true);
-        for (auto& ing : recipe.ingredients) {
-            auto* ingForm = RE::TESForm::GetFormByID(ing.formID);
-            if (!ingForm) continue;
-            auto* ingBound = ingForm->As<RE::TESBoundObject>();
-            if (!ingBound) continue;
+        for (auto& removal : removals)
+        {
+            removal.before = getInventoryCount(removal.formID);
+            if (removal.before <
+                static_cast<std::int64_t>(removal.required))
+            {
+                spdlog::error(
+                    "[COOKING] Ingredient {:08X} changed before commit (have {}, need {}); transaction aborted",
+                    removal.formID,
+                    removal.before,
+                    removal.required);
+                return;
+            }
+        }
 
-            RE::TESObjectREFR::RemoveItemData consumeData(ingBound, ing.count);
+        auto rollbackIngredients = [&]() {
+            for (auto& removal : removals)
+            {
+                if (removal.removed <= 0)
+                    continue;
+
+                player->AddObjectToContainer(
+                    removal.object,
+                    {},
+                    static_cast<std::int32_t>(removal.removed),
+                    nullptr,
+                    RE::ITEM_REMOVE_REASON::kNone);
+                const std::int64_t restored =
+                    getInventoryCount(removal.formID);
+                if (restored < removal.before)
+                {
+                    spdlog::critical(
+                        "[COOKING] Rollback incomplete for {:08X}: expected at least {}, found {}",
+                        removal.formID,
+                        removal.before,
+                        restored);
+                }
+                removal.removed = 0;
+            }
+        };
+
+        for (auto& removal : removals)
+        {
+            RE::TESObjectREFR::RemoveItemData consumeData(
+                removal.object,
+                static_cast<std::int32_t>(removal.required));
             consumeData.reason = RE::ITEM_REMOVE_REASON::kNone;
             player->RemoveItem(consumeData);
 
-            spdlog::info("[COOKING] Consumed {}x '{}'", ing.count, GetFormDisplayName(ing.formID));
+            const std::int64_t after =
+                getInventoryCount(removal.formID);
+            removal.removed =
+                (std::max)(std::int64_t{ 0 }, removal.before - after);
+            if (removal.removed !=
+                static_cast<std::int64_t>(removal.required))
+            {
+                spdlog::error(
+                    "[COOKING] Ingredient removal mismatch for {:08X}: requested {}, removed {}; rolling back",
+                    removal.formID,
+                    removal.required,
+                    removal.removed);
+                rollbackIngredients();
+                return;
+            }
+
+            spdlog::info(
+                "[COOKING] Consumed {}x '{}'",
+                removal.required,
+                GetFormDisplayName(removal.formID));
         }
-        // Step 4: Add cooked item to inventory
-        player->AddObjectToContainer(cookedBoundObj, {}, recipe.cookedCount, nullptr, RE::ITEM_REMOVE_REASON::kNone);
-        Hooks::SetSuppressHUDMessages(false);
+
+        // Commit the output only after every ingredient removal was verified.
+        const std::int64_t cookedBefore =
+            getInventoryCount(recipe.cookedFormID);
+        player->AddObjectToContainer(
+            cookedBoundObj,
+            {},
+            recipe.cookedCount,
+            nullptr,
+            RE::ITEM_REMOVE_REASON::kNone);
+        const std::int64_t cookedAfter =
+            getInventoryCount(recipe.cookedFormID);
+        const std::int64_t cookedAdded =
+            (std::max)(std::int64_t{ 0 }, cookedAfter - cookedBefore);
+        if (cookedAdded != recipe.cookedCount)
+        {
+            spdlog::error(
+                "[COOKING] Cooked output add mismatch for {:08X}: requested {}, added {}; rolling back",
+                recipe.cookedFormID,
+                recipe.cookedCount,
+                cookedAdded);
+
+            if (cookedAdded > 0)
+            {
+                RE::TESObjectREFR::RemoveItemData removeOutput(
+                    cookedBoundObj,
+                    static_cast<std::int32_t>(cookedAdded));
+                removeOutput.reason = RE::ITEM_REMOVE_REASON::kNone;
+                player->RemoveItem(removeOutput);
+            }
+            rollbackIngredients();
+            return;
+        }
+
         spdlog::info("[COOKING] Added {}x '{}' to inventory", recipe.cookedCount, cookedName);
 
-        // Step 5: Queue cooked item for drop-to-hand (async, handles 3D loading)
+        // Queue one produced item for drop-to-hand; any additional recipe
+        // output remains in inventory.
         auto& dropToHand = DropToHand::GetSingleton();
         dropToHand.QueueDropToHand(recipe.cookedFormID, isLeft, 1, false, false);
         spdlog::info("[COOKING] Queued cooked item for drop-to-hand");

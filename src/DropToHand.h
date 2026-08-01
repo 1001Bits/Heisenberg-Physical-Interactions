@@ -39,6 +39,10 @@ namespace heisenberg
             _grabsInProgress.clear();
             _recentlyStored.clear();
             _recentlyLootedFrom.clear();
+            _weaponSheatheWait.clear();
+            _lootBurstId = 0;
+            _pipboyDropCapture = false;
+            _pipboyDropRefID = 0;
             spdlog::debug("[DropToHand] Cleared state (save/load cleanup)");
         }
         

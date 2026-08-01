@@ -3,8 +3,10 @@
 #include "ActivatorHandler.h"
 #include "Config.h"
 #include "F4VROffsets.h"
+#include "FingerCurves.h"
 #include "FRIKInterface.h"
 #include "Grab.h"
+#include "GrabPosePolicy.h"
 #include "Heisenberg.h"
 #include "../external/ROCK/src/ROCKMain.h"
 #include "HeisenbergInterface001.h"
@@ -29,6 +31,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
 
 namespace
 {
@@ -103,6 +106,11 @@ namespace heisenberg
         if (IsBlockingMenuOpen()) {
             // Only update tracking (needed for other mods like FRIK)
             UpdateTracking();
+
+            // A blocking menu bypasses UpdateActivatorProximity entirely. Drop
+            // this hand's activator claim now so player collision cannot remain
+            // on layer 15 for the lifetime of the menu.
+            ActivatorHandler::GetSingleton().ClearHandPointingState(_isLeft);
 
             // Clear any selection and transition to idle
             if (_selection.IsValid()) {
@@ -698,8 +706,11 @@ namespace heisenberg
 
     void Hand::UpdateActivatorProximity()
     {
+        auto& activatorHandler = ActivatorHandler::GetSingleton();
+
         // Skip if activators are disabled
         if (!g_config.enableInteractiveActivators) {
+            activatorHandler.ClearHandPointingState(_isLeft);
             _isPointingAtActivator = false;
             _isInActivatorRange = false;
             _nearbyActivatorHandle.reset();
@@ -708,6 +719,7 @@ namespace heisenberg
 
         // Don't check activators while holding or pulling objects
         if (_state == State::Held || _state == State::Pulling) {
+            activatorHandler.ClearHandPointingState(_isLeft);
             _isPointingAtActivator = false;
             _isInActivatorRange = false;
             _nearbyActivatorHandle.reset();
@@ -728,7 +740,6 @@ namespace heisenberg
         // Check proximity to activators
         // Pass hand speed so pointing range can extend for fast-moving hands
         float handSpeed = std::sqrt(_velocity.x * _velocity.x + _velocity.y * _velocity.y + _velocity.z * _velocity.z);
-        auto& activatorHandler = ActivatorHandler::GetSingleton();
         auto result = activatorHandler.CheckProximity(fingerTipPos, _isLeft, handSpeed);
 
         _isPointingAtActivator = result.inPointingRange;
@@ -742,8 +753,11 @@ namespace heisenberg
 
         // Handle activation when finger enters activation range
         if (result.inActivationRange && result.activator) {
-            // Try to activate (will handle cooldowns internally)
-            if (activatorHandler.TryActivate(fingerTipPos, _isLeft)) {
+            // Reuse the result already computed above. Calling CheckProximity
+            // again advanced the per-hand throttle twice on near-contact frames
+            // and made the cell-wide scan run about twice as often exactly when
+            // an activator was nearby.
+            if (activatorHandler.TryActivate(result)) {
                 spdlog::debug("[ACTIVATOR] {} hand activated {:08X}",
                             _isLeft ? "Left" : "Right",
                             result.activator->formID);
@@ -945,11 +959,13 @@ namespace heisenberg
         // contact ONLY when it names the same ref that is still selected. That
         // guarded fallback cannot hijack a different object the player moved to.
         if (heisenberg::IsRockEngineHosted()) {
-            constexpr std::uint32_t kActiveTouchMaxAgeFrames = 4;
+            constexpr std::uint32_t kActiveTouchMaxAgeFrames =
+                grab_pose_policy::kFreshTouchMaxAgeFrames;
             // Roughly two seconds at the headset's usual 90 Hz. This covers a
             // deliberate touch-then-squeeze without allowing the evidence to
             // select anything except the still-current same reference.
-            constexpr std::uint32_t kRecentSameRefMaxAgeFrames = 180;
+            constexpr std::uint32_t kRecentSameRefMaxAgeFrames =
+                grab_pose_policy::kRecentTouchMaxAgeFrames;
 
             RE::TESObjectREFR* selRefr =
                 _selection.IsValid() ? _selection.GetRefr() : nullptr;
@@ -968,6 +984,7 @@ namespace heisenberg
                 &hasContactPoint);
 
             bool recentSameRef = false;
+            float recentCurrentMeshDistance = -1.0f;
             if (!activeTouch && selRefr) {
                 RE::TESObjectREFR* recentTouched = nullptr;
                 if (rock::HostGetHandTouchEvidence(
@@ -979,8 +996,60 @@ namespace heisenberg
                         &contactPointWorld,
                         &hasContactPoint) &&
                     recentTouched == selRefr) {
-                    touched = recentTouched;
-                    recentSameRef = true;
+                    // The long-lived cache proves only that this reference was
+                    // touched recently. Re-check the CURRENT visible mesh
+                    // before promoting it to physical contact; otherwise an
+                    // object selected from across the room inherits a stale
+                    // hit point and bypasses the remote-grab path.
+                    RE::NiPoint3 currentController = _position;
+                    if (auto* playerNodes =
+                            f4cf::f4vr::getPlayerNodes()) {
+                        if (auto* wand =
+                                heisenberg::GetWandNode(
+                                    playerNodes,
+                                    _isLeft)) {
+                            currentController =
+                                wand->world.translate;
+                        }
+                    }
+
+                    RE::NiPoint3 currentMeshPoint{};
+                    std::vector<TriangleData> currentTriangles;
+                    currentTriangles.reserve(512);
+                    if (auto* recentNode =
+                            recentTouched->Get3D()) {
+                        GetTriangles(
+                            recentNode,
+                            currentTriangles,
+                            4096);
+                    }
+                    const bool haveCurrentMesh =
+                        GetClosestMeshPointToPoint(
+                            currentTriangles,
+                            currentController,
+                            currentMeshPoint,
+                            recentCurrentMeshDistance);
+                    if (haveCurrentMesh &&
+                        grab_pose_policy::
+                            ShouldAcceptPhysicalTouchEvidence(
+                                touchAgeFrames,
+                                recentCurrentMeshDistance)) {
+                        touched = recentTouched;
+                        recentSameRef = true;
+                        contactPointWorld = currentMeshPoint;
+                        hasContactPoint = true;
+                    } else {
+                        spdlog::info(
+                            "[GRAB] {} hand: rejected stale same-ref touch "
+                            "{:08X} age={}f currentMeshDist={:.1f} "
+                            "(limit={:.1f}); retaining viewcaster selection",
+                            _isLeft ? "Left" : "Right",
+                            recentTouched->formID,
+                            touchAgeFrames,
+                            recentCurrentMeshDistance,
+                            grab_pose_policy::
+                                kRecentTouchMaxMeshDistance);
+                    }
                 }
             }
 
@@ -992,7 +1061,14 @@ namespace heisenberg
                         const float dx = objPos.x - _position.x;
                         const float dy = objPos.y - _position.y;
                         const float dz = objPos.z - _position.z;
-                        const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+                        const float distance =
+                            recentSameRef &&
+                                    recentCurrentMeshDistance >= 0.0f
+                                ? recentCurrentMeshDistance
+                                : std::sqrt(
+                                      dx * dx +
+                                      dy * dy +
+                                      dz * dz);
                         Selection touchSelection;
                         touchSelection.SetRefr(touched);
                         touchSelection.node.reset(touchedNode);
@@ -1239,24 +1315,148 @@ namespace heisenberg
         // path never offers it and the transfer in GrabManager::StartGrab (which keys on
         // otherState.GetRefr() == selRefr) never fires. Build the selection here from the
         // other hand's held object so that transfer path triggers.
-        if (!_selection.IsValid()) {
+        // A held prop under the empty hand is a stronger co-hold candidate
+        // than an unrelated/broad ViewCaster target. Re-evaluate it even when
+        // ViewCaster currently has a selection; only replace that selection
+        // after current contact or a near visible-mesh point is confirmed.
+        if (!_selection.IsValid() ||
+            g_config.enableTwoHandedGrab) {
             auto& gmXfer = GrabManager::GetSingleton();
             if (gmXfer.IsGrabbing(!_isLeft)) {
                 auto& otherState = gmXfer.GetGrabState(!_isLeft);
                 RE::TESObjectREFR* heldRefr = otherState.GetRefr();
                 RE::NiAVObject* held3D = heldRefr ? heldRefr->Get3D() : nullptr;
                 if (heldRefr && held3D) {
-                    const RE::NiPoint3 objPos = otherState.node
-                        ? otherState.node->world.translate
-                        : RE::NiPoint3{ heldRefr->data.location.x, heldRefr->data.location.y, heldRefr->data.location.z };
-                    const float dist = (objPos - _position).Length();
-                    const float kTransferRange = (std::max)(30.0f, Config::GetSingleton().closeGrabThreshold * 1.5f);
-                    if (dist <= kTransferRange) {
+                    RE::NiPoint3 grabPoint{};
+                    float grabDistance = -1.0f;
+                    bool useHeldObject = false;
+                    bool physicalTouch = false;
+                    bool hasTouchPoint = false;
+                    std::uint32_t touchedBodyId = 0x7FFF'FFFFu;
+                    std::uint32_t touchAgeFrames = 0xFFFF'FFFFu;
+
+                    if (g_config.enableTwoHandedGrab &&
+                        heisenberg::IsRockEngineHosted()) {
+                        RE::TESObjectREFR* touched = nullptr;
+                        RE::NiPoint3 touchPoint{};
+                        constexpr std::uint32_t
+                            kCoHoldTouchMaxAgeFrames = 4;
+                        if (rock::HostGetHandTouchEvidence(
+                                _isLeft,
+                                kCoHoldTouchMaxAgeFrames,
+                                &touched,
+                                &touchedBodyId,
+                                &touchAgeFrames,
+                                &touchPoint,
+                                &hasTouchPoint) &&
+                            touched == heldRefr) {
+                            physicalTouch = true;
+                            useHeldObject = true;
+                            grabPoint =
+                                hasTouchPoint
+                                    ? touchPoint
+                                    : held3D->world.translate;
+                            grabDistance = 0.0f;
+                        }
+                    }
+
+                    if (g_config.enableTwoHandedGrab &&
+                        !useHeldObject) {
+                        // Large props (the shovel is the motivating case)
+                        // can have a pivot far outside either hand. Test the
+                        // visible mesh instead of the object origin so gripping
+                        // a second spot along the shaft reaches StartGrab's
+                        // two-anchor path.
+                        constexpr float kCoHoldMeshDistance = 5.0f;
+                        const float handToBoundCenter =
+                            (held3D->worldBound.center -
+                             _position).Length();
+                        const bool clearlyOutsideHeldMesh =
+                            grab_pose_policy::
+                                CanRejectCoHoldMeshQuery(
+                                    handToBoundCenter,
+                                    held3D->worldBound.fRadius,
+                                    kCoHoldMeshDistance);
+
+                        // worldBound is already a world-space sphere enclosing
+                        // every visible child. If the hand is outside that
+                        // sphere plus the five-unit acceptance distance and
+                        // the policy's five-unit update guard, no triangle can
+                        // qualify. Invalid/degenerate bounds deliberately
+                        // return false and retain the exact compatibility path.
+                        if (!clearlyOutsideHeldMesh) {
+                            std::vector<TriangleData> triangles;
+                            triangles.reserve(512);
+                            GetTriangles(held3D, triangles, 4096);
+                            if (GetClosestMeshPointToPoint(
+                                    triangles,
+                                    _position,
+                                    grabPoint,
+                                    grabDistance) &&
+                                grabDistance <=
+                                    kCoHoldMeshDistance) {
+                                useHeldObject = true;
+                            }
+                        }
+                    }
+
+                    if (!g_config.enableTwoHandedGrab) {
+                        // Preserve the legacy transfer range when co-hold is
+                        // disabled.
+                        const RE::NiPoint3 objPos =
+                            otherState.node
+                                ? otherState.node->world.translate
+                                : RE::NiPoint3{
+                                      heldRefr->data.location.x,
+                                      heldRefr->data.location.y,
+                                      heldRefr->data.location.z};
+                        grabDistance =
+                            (objPos - _position).Length();
+                        const float transferRange =
+                            (std::max)(
+                                30.0f,
+                                Config::GetSingleton().
+                                        closeGrabThreshold *
+                                    1.5f);
+                        if (grabDistance <= transferRange) {
+                            grabPoint = objPos;
+                            useHeldObject = true;
+                        }
+                    }
+
+                    if (useHeldObject) {
                         _selection.SetRefr(heldRefr);
                         _selection.node.reset(held3D);
+                        _selection.hitPoint = grabPoint;
+                        _selection.hitNormal =
+                            RE::NiPoint3(0.0f, 0.0f, 1.0f);
+                        _selection.distance =
+                            (std::max)(0.0f, grabDistance);
                         _selection.isClose = true;
-                        spdlog::info("[GRAB] {} hand: hand-to-hand transfer grab of held {:08X} (dist={:.1f}u)",
-                                     _isLeft ? "Left" : "Right", heldRefr->formID, dist);
+                        _selection.isPhysicalTouch =
+                            physicalTouch;
+                        _selection.physicalTouchBodyId =
+                            touchedBodyId;
+                        _selection.physicalTouchAgeFrames =
+                            touchAgeFrames;
+                        _selection.hasPhysicalTouchPoint =
+                            physicalTouch && hasTouchPoint;
+                        // This selection is tied to the exact same reference
+                        // the other hand owns and was admitted only by a fresh
+                        // ROCK contact or the exact <=5u visible-mesh query
+                        // above. Carry that provenance across StartGrab so it
+                        // cannot be rejected by a second, differently framed
+                        // palm-distance test.
+                        _selection.isHeldObjectTransferContact = true;
+                        spdlog::info(
+                            "[GRAB] {} hand: held-object {} selection "
+                            "{:08X} (mesh/contact dist={:.1f}u)",
+                            _isLeft ? "Left" : "Right",
+                            g_config.enableTwoHandedGrab
+                                ? "co-hold"
+                                : "transfer",
+                            heldRefr->formID,
+                            grabDistance);
                     }
                 }
             }

@@ -2,6 +2,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <optional>
 
 namespace heisenberg
@@ -54,6 +55,7 @@ namespace heisenberg
         // Item metadata
         std::string itemType;  // Form type (e.g., "MISC", "WEAP", "ALCH", etc.)
         std::string formId;    // Form ID as hex string for reference
+        std::string editorId;  // Stable non-localized editor identity, when available
         
         // Coordinate system flag
         // true = offset stored in RIGHT hand space (FRIK weapon offsets)
@@ -75,6 +77,11 @@ namespace heisenberg
         // Matched name - the lookup key that was matched (e.g., "Baton" for partial match)
         // Used to check for left-handed variants after partial name matching
         std::string matchedName;
+
+        // ARMO dimensional donor: sqrt(dL^2 + dW^2) between this item's footprint
+        // and the authored garment whose pose was borrowed. Only meaningful when
+        // the offset came from GetArmorDimensionalDonorOffset. Negative = not a donor.
+        float armorDonorXZDistance = -1.0f;
         
         ItemOffset()
         {
@@ -129,6 +136,9 @@ namespace heisenberg
         // Get the form ID as a hex string
         static std::string GetItemFormId(RE::TESObjectREFR* refr);
 
+        // Get the base form's non-localized editor ID.
+        static std::string GetItemEditorId(RE::TESObjectREFR* refr);
+
         // Get item dimensions from its bounding box
         static void GetItemDimensions(RE::TESObjectREFR* refr, float& outLength, float& outWidth, float& outHeight);
 
@@ -149,6 +159,36 @@ namespace heisenberg
         // Used when player has a grenade equipped and ready to throw
         // Priority: 1. PA+throwable (if in PA), 2. throwable, 3. nullopt
         std::optional<ItemOffset> GetThrowableOffset(const std::string& itemName, bool isLeft = false) const;
+
+        // How far apart two garments' FOOTPRINTS (L/W, game units) may be for
+        // one's authored pose to be borrowed by the other. Live reference: the
+        // three uniforms that placed wrongly had donors at 0.00, 1.41 and 2.00.
+        // Measured over the embedded ARMO profiles, this bound leaves fewer
+        // catastrophic (>15 unit) transfers than folding height into the
+        // distance or scaling the limit with item size.
+        static constexpr float kArmorDonorMaxXZDistance = 6.0f;
+
+        // Both the target and the donor must be slab-shaped (smallest span at
+        // most this fraction of the middle span) — the same rule the broad-palm
+        // seat uses to recognise a flat object. This is what keeps a garment's
+        // pose away from helmets, chest plates and gauntlets, which share
+        // footprints with folded clothing but nothing else.
+        static constexpr float kArmorDonorMaxThicknessRatio = 0.60f;
+
+        // Borrow an authored ARMO pose from the dimensionally nearest garment.
+        //
+        // Garments are the one class where this is sound: they are authored
+        // around the same body origin, so a pose authored for one transfers to
+        // another of the same footprint. Only ARMO donates to ARMO, and only
+        // within kArmorDonorMaxXZDistance of the target's L/W footprint (height
+        // is ignored — a folded garment's thickness varies with its drape).
+        //
+        // Returns nullopt when the item is not ARMO, has no usable dimensions,
+        // or no garment is close enough. The result carries the donor's authored
+        // rotation and finger curls, with the TARGET's dimensions substituted.
+        std::optional<ItemOffset> GetArmorDimensionalDonorOffset(
+            RE::TESObjectREFR* refr,
+            bool isLeft) const;
 
         // Check if an item has an EXACT dimensions match (for armor grab filtering)
         // Returns true only if there's an offset with EXACTLY the same L/W/H dimensions (no tolerance)
@@ -196,12 +236,38 @@ namespace heisenberg
         // Path to offsets folder
         static std::string GetOffsetsPath();
 
+        // Index and resolve non-localized identities before consulting the
+        // translated display name.  `lookupName` is always the unsuffixed
+        // base key; hand/PA variants are selected after this step.
+        void IndexStableIdentity(
+            const std::string& lookupName,
+            const std::string& formId,
+            const std::string& editorId = {});
+        void IndexNormalizedProfileAlias(
+            const std::string& lookupName);
+        std::optional<std::string> FindStableLookupName(
+            RE::TESObjectREFR* refr) const;
+
         // Stored offsets by item name
         std::unordered_map<std::string, ItemOffset> _offsets;
         
         // Secondary index by form ID (hex string like "000211C4")
         // Allows faster lookup when we have the form ID
         std::unordered_map<std::string, std::string> _formIdToName;
+
+        // Secondary index by normalized editor ID.  This survives translated
+        // FULL names and is also useful when a plugin's runtime load index
+        // changes and its full FormID no longer matches a saved file.
+        std::unordered_map<std::string, std::string> _editorIdToName;
+
+        // Ambiguity-safe bridge for older profiles that contain no stable
+        // metadata: "AssaultRifle" can resolve profile key "Assault Rifle".
+        // If two different base keys normalize to the same alphanumeric key,
+        // the alias is removed and permanently fails closed.
+        std::unordered_map<std::string, std::string>
+            _normalizedProfileKeyToName;
+        std::unordered_set<std::string>
+            _ambiguousNormalizedProfileKeys;
 
         // Default offset for items without specific settings
         ItemOffset _defaultOffset;

@@ -3,6 +3,7 @@
 #include "HandAuthority.h"
 #include "Config.h"
 #include "../external/ROCK/src/ROCKMain.h"
+#include "../external/ROCK/src/physics-interaction/visual/FrikCompatibilityPolicy.h"
 
 #include "f4vr/PlayerNodes.h"
 #include "RE/Bethesda/PlayerCharacter.h"
@@ -39,7 +40,7 @@ namespace heisenberg::FrikArmGoalHook
 
         std::uintptr_t s_frikBase = 0;
         std::uintptr_t s_slotAddr = 0;      // absolute address of the pointer slot
-        U1PAFn s_original = nullptr;        // saved original slot value
+        std::atomic<U1PAFn> s_original{ nullptr };  // validated predecessor
         std::atomic<bool> s_active{ false };
         std::atomic<bool> s_disarmed{ false };  // one-shot: SEH fault or failed probe
         std::atomic<bool> s_cleanTruthPublished{ false };
@@ -51,7 +52,6 @@ namespace heisenberg::FrikArmGoalHook
         std::uint32_t s_framesSinceInstall = 0;
         bool s_probePassed = false;
         std::uint32_t s_slotRecheckCountdown = 300;
-        bool s_reinstalledOnce = false;
 
         // ROTATION BASIS CONVERSION (Jul 19): ROCK's authority targets orient the SKINNED
         // hand (the convention the legacy shim consumed), but the goal node we write is the
@@ -86,12 +86,103 @@ namespace heisenberg::FrikArmGoalHook
             }
         }
 
-        bool writeQword(std::uintptr_t addr, std::uint64_t value)
+        bool isWritableQword(const std::uintptr_t addr)
         {
+            if ((addr & (alignof(std::uint64_t) - 1u)) != 0) {
+                return false;
+            }
+
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (::VirtualQuery(
+                    reinterpret_cast<const void*>(addr),
+                    &mbi,
+                    sizeof(mbi)) != sizeof(mbi) ||
+                mbi.State != MEM_COMMIT ||
+                (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+                return false;
+            }
+
+            const auto regionBegin =
+                reinterpret_cast<std::uintptr_t>(mbi.BaseAddress);
+            const auto regionEnd = regionBegin + mbi.RegionSize;
+            if (addr < regionBegin ||
+                addr > regionEnd ||
+                regionEnd - addr < sizeof(std::uint64_t)) {
+                return false;
+            }
+
+            switch (mbi.Protect & 0xFFu) {
+            case PAGE_READWRITE:
+            case PAGE_WRITECOPY:
+            case PAGE_EXECUTE_READWRITE:
+            case PAGE_EXECUTE_WRITECOPY:
+                return true;
+            default:
+                return false;
+            }
+        }
+
+        bool isExecutableAddress(const std::uintptr_t addr)
+        {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!addr ||
+                ::VirtualQuery(
+                    reinterpret_cast<const void*>(addr),
+                    &mbi,
+                    sizeof(mbi)) != sizeof(mbi) ||
+                mbi.State != MEM_COMMIT ||
+                (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+                return false;
+            }
+
+            switch (mbi.Protect & 0xFFu) {
+            case PAGE_EXECUTE:
+            case PAGE_EXECUTE_READ:
+            case PAGE_EXECUTE_READWRITE:
+            case PAGE_EXECUTE_WRITECOPY:
+                return true;
+            default:
+                return false;
+            }
+        }
+
+        bool isValidatedPredecessor(
+            const std::uint64_t candidate,
+            const std::uintptr_t gameBase)
+        {
+            // This seam's ABI is known only for the game-native
+            // Update1StPersonArm entry point. Chaining an arbitrary function
+            // already stored by another mod would call an unverified ABI and
+            // would also steal ownership of that mod's slot.
+            const std::uint64_t expected =
+                static_cast<std::uint64_t>(gameBase) + kU1PAGameOffset;
+            return candidate == expected &&
+                   isExecutableAddress(static_cast<std::uintptr_t>(candidate));
+        }
+
+        // Atomically replace the slot only when it still contains `expected`.
+        // `observed` receives the value that actually owned the slot at the
+        // linearization point; on mismatch this function performs no write.
+        bool compareExchangeQword(
+            const std::uintptr_t addr,
+            const std::uint64_t expected,
+            const std::uint64_t desired,
+            std::uint64_t& observed)
+        {
+            observed = 0;
+            if (!isWritableQword(addr)) {
+                return false;
+            }
+
             __try {
-                *reinterpret_cast<volatile std::uint64_t*>(addr) = value;  // aligned 8-byte store
+                observed = static_cast<std::uint64_t>(
+                    ::InterlockedCompareExchange64(
+                        reinterpret_cast<volatile LONG64*>(addr),
+                        static_cast<LONG64>(desired),
+                        static_cast<LONG64>(expected)));
                 return true;
             } __except (EXCEPTION_EXECUTE_HANDLER) {
+                observed = 0;
                 return false;
             }
         }
@@ -198,8 +289,11 @@ namespace heisenberg::FrikArmGoalHook
 
         void* FrikU1PAShim(RE::PlayerCharacter* pc, RE::NiNode** weapon, RE::NiNode** offset)
         {
-            void* ret = s_original ? s_original(pc, weapon, offset) : nullptr;
-            if (s_disarmed.load(std::memory_order_relaxed)) {
+            const U1PAFn original =
+                s_original.load(std::memory_order_acquire);
+            void* ret = original ? original(pc, weapon, offset) : nullptr;
+            if (!s_active.load(std::memory_order_acquire) ||
+                s_disarmed.load(std::memory_order_relaxed)) {
                 return ret;
             }
 
@@ -263,29 +357,48 @@ namespace heisenberg::FrikArmGoalHook
                 s_cleanTruthSeenMask.store(0, std::memory_order_relaxed);
             }
 
-            // WEAPON-SUBTREE GUARD (Jul 19, forward-runaway fix): the rendered weapon is a
-            // CHILD of the primary hand's fp arm. Input-overriding the PRIMARY pass moves the
-            // weapon itself -> ROCK re-aims from the moved weapon -> next frame's target sits
-            // further forward -> runaway ("gun and hand pulled way to the front"). This is why
-            // FRIK v5's internal re-solve excludes the weapon subtree. Pass-2 is only legal on
-            // the OFFHAND pass (its weapon node is the empty left dummy). Primary-hand
-            // authority falls to the skinned-side solver via ApplyWinners' self-heal.
-            if (!offhandPass) {
+            // WEAPON-SUBTREE GUARD (Jul 19, narrowed Jul 29): the rendered weapon is a
+            // CHILD of the primary hand's fp arm. Input-overriding that pass while a
+            // weapon is drawn moves the weapon itself -> ROCK re-aims from the moved
+            // weapon -> next frame's target runs forward. The old unconditional guard
+            // also rejected an EMPTY primary hand, however, forcing gun-side wall
+            // contact through the late bone-IK fallback while the offhand used FRIK's
+            // coherent arm pass. That asymmetry is the empty gun-hand "chewing gum"
+            // regression. The empty/holstered primary pass has no weapon owner and is
+            // safe; retain the guard only while any native weapon/fist presentation is
+            // actually drawn.
+            const bool playerWeaponDrawn =
+                !pc || pc->GetWeaponMagicDrawn();
+            if (!rock::frik_compatibility_policy::
+                    mayConsumeEmbeddedGoalAuthorityOnPass(
+                        offhandPass,
+                        playerWeaponDrawn)) {
                 return ret;
             }
 
             RE::NiTransform target;
-            bool reachLimitedRigidWeaponTarget = false;
+            bool reachLimitedRigidTarget = false;
+            bool controllerRelativeTarget = false;
             if (!HandAuthority::TryConsumeLatched(
-                    isLeft, target, &reachLimitedRigidWeaponTarget)) {
+                    isLeft,
+                    target,
+                    &reachLimitedRigidTarget,
+                    &controllerRelativeTarget)) {
                 return ret;
             }
 
-            // Rigid weapon targets are an exact hand-to-gun weld. A hand-only projection
-            // here would visibly separate the palm from the rifle; the host's final
-            // support-arm solve applies the bounded visual reach allowance after this pass.
-            // Keep the escape envelope and early projection for free-hand writers only.
-            if (!reachLimitedRigidWeaponTarget) {
+            // Reach-limited rigid targets are exact hand-to-weapon/object welds. A
+            // hand-only projection here would visibly separate the palm from its
+            // held target; the host's final support-arm solve applies the bounded
+            // visual reach allowance after this pass.
+            // Keep the escape envelope and early projection for ordinary free-hand
+            // writers only. Soft contact is already bounded and released against
+            // clean controller truth by SoftContactRuntime. Because this latch is
+            // consumed one frame later on FRIK 0.77.12, applying the generic escape
+            // test to it combines controller motion with the previous correction
+            // and can reject one valid contact frame, producing visible flicker.
+            if (!reachLimitedRigidTarget &&
+                !controllerRelativeTarget) {
                 constexpr float kFreeRadius = 22.0f;   // perp: anchor fully released beyond this
                 constexpr float kAlongEscape = 40.0f;  // along-barrel bailout distance
                 const RE::NiPoint3 truthPos = s_truthHand[hi].translate;
@@ -367,7 +480,7 @@ namespace heisenberg::FrikArmGoalHook
             if (weapon && *weapon) {
                 (*weapon)->IncRefCount();
             }
-            ret = s_original ? s_original(pc, weapon, offset) : ret;
+            ret = original ? original(pc, weapon, offset) : ret;
 
             // Restore the offset node so nothing downstream reads our override as input.
             (void)sehWriteOffsetWorld(off, &savedOffWorld);
@@ -454,16 +567,24 @@ namespace heisenberg::FrikArmGoalHook
             return false;
         }
 
+        const std::uint64_t predecessor = readQword(slot);
+        if (!isValidatedPredecessor(predecessor, gameBase)) {
+            spdlog::warn(
+                "[FRIK-GOAL] refusing U1PA slot predecessor 0x{:X}: expected "
+                "executable game-native Update1StPersonArm 0x{:X}; another "
+                "owner is left untouched",
+                predecessor,
+                static_cast<std::uint64_t>(gameBase) + kU1PAGameOffset);
+            return false;
+        }
+
         s_slotAddr = slot;
-        s_original = reinterpret_cast<U1PAFn>(readQword(slot));
-        if (!s_original) {
-            spdlog::warn("[FRIK-GOAL] slot read failed — degrading");
-            return false;
-        }
-        if (!writeQword(slot, reinterpret_cast<std::uint64_t>(&FrikU1PAShim))) {
-            spdlog::warn("[FRIK-GOAL] slot write failed — degrading");
-            return false;
-        }
+        s_original.store(
+            reinterpret_cast<U1PAFn>(predecessor),
+            std::memory_order_release);
+
+        // Initialize every field the shim can observe before publishing the
+        // shim pointer into FRIK's callable slot.
         s_framesSinceInstall = 0;
         s_probePassed = false;
         s_probePrimarySeen.store(0, std::memory_order_relaxed);
@@ -475,6 +596,42 @@ namespace heisenberg::FrikArmGoalHook
         s_truthReachValid[0] = false;
         s_truthReachValid[1] = false;
         s_slotRecheckCountdown = 300;
+
+        const std::uint64_t shim =
+            reinterpret_cast<std::uint64_t>(&FrikU1PAShim);
+        std::uint64_t observed = 0;
+        if (!compareExchangeQword(
+                slot,
+                predecessor,
+                shim,
+                observed)) {
+            spdlog::warn(
+                "[FRIK-GOAL] atomic U1PA slot install failed — degrading "
+                "without modifying the slot");
+            return false;
+        }
+        if (observed != predecessor) {
+            s_disarmed.store(true, std::memory_order_release);
+            spdlog::warn(
+                "[FRIK-GOAL] U1PA slot ownership changed during install "
+                "(observed 0x{:X}); external owner left untouched and seam "
+                "permanently disarmed",
+                observed);
+            return false;
+        }
+
+        // Detect an owner that raced immediately after our successful CAS. Do
+        // not attempt to take the slot back.
+        const std::uint64_t installedValue = readQword(slot);
+        if (installedValue != shim) {
+            s_disarmed.store(true, std::memory_order_release);
+            spdlog::warn(
+                "[FRIK-GOAL] U1PA slot was externally replaced immediately "
+                "after install (current 0x{:X}); external owner left untouched",
+                installedValue);
+            return false;
+        }
+
         s_active.store(true, std::memory_order_release);
         spdlog::info("[FRIK-GOAL] INSTALLED — FRIK's own arm solver now consumes Heisenberg hand-authority targets (v5-equivalent seam)");
         return true;
@@ -489,10 +646,35 @@ namespace heisenberg::FrikArmGoalHook
         if (!s_active.exchange(false, std::memory_order_acq_rel)) {
             return;
         }
-        if (s_slotAddr && s_original) {
-            writeQword(s_slotAddr, reinterpret_cast<std::uint64_t>(s_original));
+        const U1PAFn original =
+            s_original.load(std::memory_order_acquire);
+        const std::uint64_t shim =
+            reinterpret_cast<std::uint64_t>(&FrikU1PAShim);
+        if (s_slotAddr && original) {
+            std::uint64_t observed = 0;
+            const std::uint64_t restore =
+                reinterpret_cast<std::uint64_t>(original);
+            if (!compareExchangeQword(
+                    s_slotAddr,
+                    shim,
+                    restore,
+                    observed)) {
+                spdlog::warn(
+                    "[FRIK-GOAL] uninstall could not atomically inspect/restore "
+                    "the U1PA slot; no blind write attempted");
+            } else if (observed == shim) {
+                spdlog::info(
+                    "[FRIK-GOAL] uninstalled (owned slot restored to 0x{:X})",
+                    restore);
+            } else {
+                spdlog::warn(
+                    "[FRIK-GOAL] uninstalled after ownership passed to 0x{:X}; "
+                    "external slot owner left untouched",
+                    observed);
+            }
+        } else {
+            spdlog::info("[FRIK-GOAL] uninstalled (no owned slot to restore)");
         }
-        spdlog::info("[FRIK-GOAL] uninstalled (slot restored)");
     }
 
     bool IsActive()
@@ -543,22 +725,19 @@ namespace heisenberg::FrikArmGoalHook
             }
         }
 
-        // Periodic slot self-check: nothing in the known build re-resolves the slot, but a
-        // hostile writer would silently bypass us. Reinstall once; degrade on recurrence.
+        // Periodic ownership check. If another component replaces the slot, it
+        // owns the slot from that point onward. Never take it back and never
+        // restore our predecessor over the new owner.
         if (--s_slotRecheckCountdown == 0) {
             s_slotRecheckCountdown = 300;
             const std::uint64_t cur = readQword(s_slotAddr);
             if (cur != reinterpret_cast<std::uint64_t>(&FrikU1PAShim)) {
-                if (!s_reinstalledOnce) {
-                    s_reinstalledOnce = true;
-                    s_original = reinterpret_cast<U1PAFn>(cur);
-                    writeQword(s_slotAddr, reinterpret_cast<std::uint64_t>(&FrikU1PAShim));
-                    spdlog::warn("[FRIK-GOAL] slot was externally rewritten — re-installed once (new original 0x{:X})", cur);
-                } else {
-                    spdlog::warn("[FRIK-GOAL] slot rewritten AGAIN — permanent degrade to legacy bone IK");
-                    s_disarmed.store(true, std::memory_order_release);
-                    Uninstall();
-                }
+                spdlog::warn(
+                    "[FRIK-GOAL] U1PA slot ownership passed to 0x{:X}; "
+                    "standing down permanently without modifying that owner",
+                    cur);
+                s_disarmed.store(true, std::memory_order_release);
+                Uninstall();
             }
         }
     }

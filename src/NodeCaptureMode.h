@@ -87,8 +87,21 @@ namespace heisenberg
         // Capture result
         CaptureResult _lastResult;
 
+        // When the mode became active, for the inactivity auto-exit below.
+        std::chrono::steady_clock::time_point _modeEnteredTime;
+
         // Constants
         static constexpr float THUMBSTICK_HOLD_TIME_MS = 500.0f;  // Half second hold to enter/capture
+        // While active this mode FORCES a right-hand pointing pose every frame
+        // (thumb/middle/ring/pinky fully curled). Its only exits were a
+        // completed capture or a game load, so a player who armed it by
+        // accident — a 500 ms right-thumbstick hold, which overlaps ordinary
+        // snap-turn input — was left with a curled thumb for the rest of the
+        // session with no indication why. Live evidence: a tester's log shows
+        // "[NodeCaptureMode] Mode entered" with no matching exit for the
+        // remaining ~4 minutes, and reported a constantly bent thumb.
+        // Auto-exit restores the hand if no capture happens.
+        static constexpr float MODE_AUTO_EXIT_MS = 30000.0f;  // 30s without a capture
     };
 
 } // namespace heisenberg

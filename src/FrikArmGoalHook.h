@@ -21,11 +21,12 @@
  * FRIK's own solver then carries the whole arm to our target, natively.
  *
  * Guards: byte-asserted pinned RVAs for the known build, a Tier-1 pattern scan for
- * public-lineage drift, a decisive semantic check (slot value == F4VRbase+0xef6280),
- * a post-install behavioral probe (both offset nodes must be observed within ~300
- * frames or we auto-uninstall), a periodic slot self-check, and SEH passthrough with
- * one-shot disarm. Degrade path is always HandAuthority's legacy post-FRIK bone IK.
- * If the loaded FRIK reports API >= 5, everything stands down (native path exists).
+ * public-lineage drift, a decisive executable-predecessor/ABI check (slot value ==
+ * F4VRbase+0xef6280), compare/exchange slot ownership, a post-install behavioral
+ * probe, a periodic ownership check that stands down without clobbering later
+ * owners, and SEH passthrough with one-shot disarm. Degrade path is always
+ * HandAuthority's legacy post-FRIK bone IK. If the loaded FRIK reports API >= 5,
+ * everything stands down (native path exists).
  */
 
 #include <cstdint>
@@ -35,7 +36,8 @@ namespace heisenberg::FrikArmGoalHook
     // Attempt installation (idempotent). Returns true if the goal-swap seam is live.
     bool Install();
 
-    // Restore the saved slot pointer (safe to call repeatedly).
+    // Restore the saved slot pointer only if the slot is still ours. Safe to call
+    // repeatedly and never overwrites a later owner.
     void Uninstall();
 
     // True while the seam is installed and not disarmed.

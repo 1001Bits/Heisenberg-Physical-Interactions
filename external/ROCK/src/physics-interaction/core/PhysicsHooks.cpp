@@ -1,35 +1,33 @@
 #include "physics-interaction/core/PhysicsHooks.h"
 
+#include "ROCKMain.h"
 #include "physics-interaction/native/HavokOffsets.h"
 #include "physics-interaction/grab/GrabHeldObject.h"
 #include "physics-interaction/input/InputRemapRuntime.h"
 #include "physics-interaction/NativeMeleeSuppressionPolicy.h"
 #include "physics-interaction/collision/CollisionLayerPolicy.h"
 #include "physics-interaction/core/PhysicsInteraction.h"
-#include "physics-interaction/object/ObjectDetection.h"
 #include "physics-interaction/PhysicsLog.h"
 #include "physics-interaction/native/BodyCollisionControl.h"
 #include "physics-interaction/native/CharacterControllerRuntime.h"
 #include "physics-interaction/native/HavokRuntime.h"
 #include "physics-interaction/native/HavokTimingFixPolicy.h"
+#include "physics-interaction/native/HookAddressDiagnostics.h"
 #include "physics-interaction/native/NativeGrabHapticSuppressionPolicy.h"
+#include "physics-interaction/performance/PerformanceProfiler.h"
 
 #include "RockConfig.h"
 
 #include "RE/Bethesda/PlayerCharacter.h"
 #include "RE/Bethesda/InputEvent.h"
 #include "RE/Bethesda/Settings.h"
-#include "RE/Bethesda/TESBoundObjects.h"
 
-#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
-#include <intrin.h>
-#include <mutex>
 #include <string_view>
-#include <unordered_map>
 
 namespace rock
 {
@@ -49,6 +47,17 @@ namespace rock
         static BhkWorldSetDeltaTime_t g_originalBhkWorldSetDeltaTime = nullptr;
         static std::atomic<bool> g_havokTimingFixMissingOriginalLogged{ false };
         static std::atomic<bool> g_havokTimingFixWriteFailureLogged{ false };
+
+        /*
+         * CONFIRMED against Fallout4VR.exe 1.2.72 (Ghidra, image base 0x140000000):
+         *   0x140D84BD0  E8 4B 25 07 01   CALL 0x141DF7120
+         *   ... inside Main::OnIdle_UpdateTimer (entry 0x140D84B40); the next
+         *   instruction is CMP byte ptr [RBX+0x1D0],0x0.
+         *   0x141DF7120 is the entry of bhkWorld::SetDeltaTime (48 89 5C 24 10 57 ...)
+         *   and 0x140D84BD0 is one of its five xrefs.
+         * Both constants are correct. A mismatch at runtime therefore means the CALL
+         * was already redirected, never that the offsets drifted.
+         */
         constexpr std::uintptr_t kFunc_BhkWorldSetDeltaTime = 0x1DF7120;
         constexpr std::uintptr_t kHookSite_BhkWorldSetDeltaTimeMainCall = 0x0D84BD0;
         /*
@@ -146,6 +155,25 @@ namespace rock
 
         bool validateNativeMeleeVtableTarget(std::uintptr_t entryOffset, std::uintptr_t expectedFunctionOffset, const char* label)
         {
+            /*
+             * UNSET-CONSTANT GUARD. A TODO_RE (== 0) offset does not fail loudly on
+             * its own: REL::Offset(0) resolves to the module base, which is readable
+             * PE header, so the checks below read 0x0000000300905A4D out of "MZ\x90..."
+             * and the WARN path returns TRUE. That is how shipped 0.8.4 logged a
+             * phantom "external target 0x300905A4D" for two different slots, and it is
+             * one step away from installNativeMeleeVtableHook writing a hook pointer
+             * into the PE header. Refuse before any of that can happen.
+             */
+            if (entryOffset == 0 || expectedFunctionOffset == 0) {
+                ROCK_LOG_ERROR(Init,
+                    "{} vtable validation failed: offset constant is UNSET (vtableEntry=0x{:X} function=0x{:X}); this is a missing "
+                    "reverse-engineering result in HavokOffsets.h, not a runtime condition",
+                    label,
+                    entryOffset,
+                    expectedFunctionOffset);
+                return false;
+            }
+
             REL::Relocation<std::uintptr_t> entry{ REL::Offset(entryOffset) };
             auto* slot = reinterpret_cast<std::uintptr_t*>(entry.address());
             if (!slot) {
@@ -156,7 +184,10 @@ namespace rock
             const auto current = *slot;
             const auto expected = REL::Offset(expectedFunctionOffset).address();
             if (!current) {
-                ROCK_LOG_ERROR(Init, "{} vtable validation failed: current target is null", label);
+                ROCK_LOG_ERROR(Init, "{} vtable validation failed: slot 0x{:X} in {} holds a null function pointer",
+                    label,
+                    entry.address(),
+                    rock::hook_diagnostics::describeAddress(entry.address()));
                 return false;
             }
 
@@ -165,18 +196,53 @@ namespace rock
             }
 
             if (isAddressInGameText(current)) {
-                ROCK_LOG_ERROR(Init, "{} vtable validation failed: slot 0x{:X} points to game text 0x{:X}, expected 0x{:X}", label, entry.address(), current, expected);
+                ROCK_LOG_ERROR(Init,
+                    "{} vtable validation failed: slot 0x{:X} ({}) holds 0x{:X} ({}), expected 0x{:X} ({}) - both are inside the game image, so the "
+                    "slot constant and the function constant disagree",
+                    label,
+                    entry.address(),
+                    rock::hook_diagnostics::describeAddress(entry.address()),
+                    current,
+                    rock::hook_diagnostics::describeAddress(current),
+                    expected,
+                    rock::hook_diagnostics::describeAddress(expected));
                 return false;
             }
 
-            ROCK_LOG_WARN(Init, "{} vtable slot 0x{:X} is already patched to external target 0x{:X}; ROCK will chain it if hook install proceeds", label, entry.address(), current);
-            return true;
+            /*
+             * Fail open for native melee. Chaining an unverified target would make
+             * suppression depend on a foreign ABI and could strand the player with
+             * only part of the native damage pipeline. Exact vanilla ownership is
+             * required before ROCK writes any of the five hook sites.
+             */
+            ROCK_LOG_ERROR(Init,
+                "{} vtable validation failed: slot 0x{:X} ({}) holds 0x{:X}, expected exact native target 0x{:X}. Found pointer resolves to: {}. "
+                "ROCK will not chain it; native melee suppression stays off.",
+                label,
+                entry.address(),
+                rock::hook_diagnostics::describeAddress(entry.address()),
+                current,
+                expected,
+                rock::hook_diagnostics::describeAddress(current));
+            return false;
         }
 
         bool validateEntryTrampolineTarget(const char* label, std::uintptr_t targetOffset, const std::uint8_t* expectedPrefix, std::size_t stolenBytes)
         {
             if (stolenBytes < 14) {
                 ROCK_LOG_ERROR(Init, "{} entry validation failed: stolen byte count {} cannot hold an absolute jump", label, stolenBytes);
+                return false;
+            }
+
+            // UNSET-CONSTANT GUARD, same reasoning as validateNativeMeleeVtableTarget:
+            // REL::Offset(0) is the module base, whose PE header is readable and never
+            // matches, so a TODO_RE constant reports as "native bytes changed" on every
+            // machine forever. Name the real defect instead of blaming the bytes.
+            if (targetOffset == 0) {
+                ROCK_LOG_ERROR(Init,
+                    "{} entry validation failed: target offset constant is UNSET (0x0). REL::Offset(0) resolves to the module base "
+                    "(PE header), which can never match a function prologue. Fix the constant in HavokOffsets.h.",
+                    label);
                 return false;
             }
 
@@ -188,7 +254,12 @@ namespace rock
             }
 
             if (std::memcmp(targetAddr, expectedPrefix, stolenBytes) != 0) {
-                ROCK_LOG_ERROR(Init, "{} entry validation failed at 0x{:X}; native bytes changed", label, target.address());
+                // Found vs expected, plus the owning module for the target and for any
+                // detour branch now sitting on it. No presumed culprit.
+                ROCK_LOG_ERROR(Init,
+                    "{} entry validation FAILED: {}",
+                    label,
+                    rock::hook_diagnostics::describePrefixMismatch(target.address(), expectedPrefix, stolenBytes));
                 return false;
             }
 
@@ -227,7 +298,98 @@ namespace rock
             return true;
         }
 
-        bool validateBhkWorldSetDeltaTimeMainCallSite()
+        /*
+         * ── WHO OWNS AN ALREADY-PATCHED HOOK SITE ─────────────────────────────────────
+         *
+         * ROCK is compiled INTO the host plugin DLL. So if a patched hook site branches to
+         * an address that the SAME loaded module owns as this very function, the host
+         * plugin put it there. That is a measured fact from GetModuleHandleEx, not the kind
+         * of guess ("another mod likely hooks this") that previously got read back as
+         * evidence and sent two investigations chasing a plugin nobody had installed.
+         *
+         * This distinction is what separates a real failure from a benign duplicate: for
+         * HAVOK_TIMING_FIX and HandleBumpedCharacter the host installs its own hook FIRST
+         * and the feature is fully active — ROCK simply must not patch the site twice.
+         */
+        [[nodiscard]] HMODULE moduleOwning(std::uintptr_t address) noexcept
+        {
+            if (!address) {
+                return nullptr;
+            }
+            HMODULE module = nullptr;
+            if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    reinterpret_cast<LPCSTR>(address),
+                    &module)) {
+                return nullptr;
+            }
+            return module;
+        }
+
+        /// Any object with static storage in this TU; its address is inside this module.
+        const char kHostModuleAnchor = 0;
+
+        /// The module that contains ROCK's own code — i.e. the host plugin DLL.
+        [[nodiscard]] HMODULE hostPluginModule() noexcept
+        {
+            static HMODULE self = moduleOwning(reinterpret_cast<std::uintptr_t>(&kHostModuleAnchor));
+            return self;
+        }
+
+        [[nodiscard]] bool isOwnedByHostPlugin(std::uintptr_t address) noexcept
+        {
+            auto* self = hostPluginModule();
+            return self != nullptr && address != 0 && moduleOwning(address) == self;
+        }
+
+        /*
+         * Numeric twin of hook_diagnostics::describeBranchAtAddress (which returns prose).
+         * Same three detour encodings; returns 0 when the bytes are not a recognised
+         * branch, so a caller can never mistake "not a branch" for a real destination.
+         */
+        [[nodiscard]] std::uintptr_t decodeBranchDestination(std::uintptr_t address) noexcept
+        {
+            if (!rock::hook_diagnostics::isReadable(address, 16)) {
+                return 0;
+            }
+            const auto* bytes = reinterpret_cast<const std::uint8_t*>(address);
+
+            // FF 25 <rel32> : jmp qword ptr [rip + rel32]   (14-byte absolute detour)
+            if (bytes[0] == 0xFF && bytes[1] == 0x25) {
+                const auto rel = *reinterpret_cast<const std::int32_t*>(bytes + 2);
+                const auto slot = address + 6u + static_cast<std::intptr_t>(rel);
+                if (!rock::hook_diagnostics::isReadable(slot, sizeof(std::uintptr_t))) {
+                    return 0;
+                }
+                return *reinterpret_cast<const std::uintptr_t*>(slot);
+            }
+
+            // E9/E8 <rel32> : jmp/call rel32
+            if (bytes[0] == 0xE9 || bytes[0] == 0xE8) {
+                const auto rel = *reinterpret_cast<const std::int32_t*>(bytes + 1);
+                return address + 5u + static_cast<std::intptr_t>(rel);
+            }
+
+            // 48 B8 <imm64> FF E0 : mov rax, imm64 ; jmp rax
+            if (bytes[0] == 0x48 && bytes[1] == 0xB8 && bytes[10] == 0xFF && bytes[11] == 0xE0) {
+                return *reinterpret_cast<const std::uintptr_t*>(bytes + 2);
+            }
+
+            return 0;
+        }
+
+        /*
+         * Outcome of inspecting a hook site that ROCK wants to patch. Three states, because
+         * "not patchable by ROCK" and "broken" are different things and must not share a
+         * log severity.
+         */
+        enum class HookSiteOwnership
+        {
+            VerifiedNative,  ///< Site still holds the expected native bytes — ROCK may patch.
+            HostPluginOwns,  ///< Already redirected into this same plugin DLL — benign, feature active.
+            Unrecognised,    ///< Neither — a genuine validation failure.
+        };
+
+        HookSiteOwnership validateBhkWorldSetDeltaTimeMainCallSite()
         {
             /*
              * Ghidra verified the main update call at 0x140D84BD0 targets
@@ -240,35 +402,72 @@ namespace rock
             auto* callBytes = reinterpret_cast<const std::uint8_t*>(callSiteAddress);
             if (!callBytes) {
                 ROCK_LOG_ERROR(Init, "HAVOK_TIMING_FIX call-site validation failed: call site is null");
-                return false;
+                return HookSiteOwnership::Unrecognised;
             }
 
             if (callBytes[0] != 0xE8) {
                 ROCK_LOG_ERROR(
                     Init,
-                    "HAVOK_TIMING_FIX call-site validation failed at 0x{:X}: expected CALL rel32, found opcode 0x{:02X}",
+                    "HAVOK_TIMING_FIX call-site validation FAILED at 0x{:X} ({}): expected a CALL rel32 (opcode 0xE8), found bytes [{}]",
                     callSiteAddress,
-                    callBytes[0]);
-                return false;
+                    rock::hook_diagnostics::describeAddress(callSiteAddress),
+                    rock::hook_diagnostics::formatBytes(callBytes, 5));
+                return HookSiteOwnership::Unrecognised;
             }
 
             const auto relativeTarget = *reinterpret_cast<const std::int32_t*>(callBytes + 1);
             const auto decodedTarget = callSiteAddress + 5u + relativeTarget;
             const auto expectedTarget = REL::Offset(kFunc_BhkWorldSetDeltaTime).address();
             if (decodedTarget != expectedTarget) {
+                /*
+                 * Resolve BOTH pointers to module+offset. That single fact separates
+                 * the two explanations this line previously could not tell apart:
+                 *   - decoded target inside a loaded DLL  -> that image owns the site,
+                 *   - decoded target owned by NO module   -> the call was redirected to
+                 *     a VirtualAlloc'd detour trampoline (which is what an already-
+                 *     installed hook on this same site looks like).
+                 * Neither conclusion is asserted here; the resolved names are printed
+                 * and the reader draws it from measured data.
+                 */
+                /*
+                 * FOLLOW ONE MORE HOP. CommonLibF4's Trampoline::write_call<5> does NOT
+                 * point the E8 at the hook function: it allocates a 14-byte
+                 * `FF 25 00000000 <addr>` stub inside a VirtualAlloc'd trampoline buffer
+                 * and points the E8 at that stub. The stub belongs to no mapped module, so
+                 * GetModuleHandleEx(FROM_ADDRESS) on the first-level decode always fails
+                 * and the host-ownership branch could never fire - the validator reported
+                 * a working, host-owned, host-installed feature as FAILED/DISABLED.
+                 * decodeBranchDestination already understands the FF 25 shape, so one extra
+                 * hop resolves the stub to the real hook function inside the host module.
+                 */
+                const auto viaTrampoline = decodeBranchDestination(decodedTarget);
+                const auto resolvedTarget = viaTrampoline != 0 ? viaTrampoline : decodedTarget;
+                if (isOwnedByHostPlugin(resolvedTarget)) {
+                    // NOT A FAILURE - see HookSiteOwnership. The host plugin's own
+                    // heisenberg::HavokTimingFix installs a write_call<5> detour at this
+                    // exact site during plugin init. The caller reports it at INFO.
+                    return HookSiteOwnership::HostPluginOwns;
+                }
                 ROCK_LOG_ERROR(
                     Init,
-                    "HAVOK_TIMING_FIX call-site validation failed at 0x{:X}: decoded target 0x{:X}, expected 0x{:X}",
+                    "HAVOK_TIMING_FIX call-site validation FAILED at 0x{:X} ({}): call bytes [{}] decode to 0x{:X} ({}), "
+                    "which resolves through any trampoline stub to 0x{:X} ({}); expected 0x{:X} ({})",
                     callSiteAddress,
+                    rock::hook_diagnostics::describeAddress(callSiteAddress),
+                    rock::hook_diagnostics::formatBytes(callBytes, 5),
                     decodedTarget,
-                    expectedTarget);
-                return false;
+                    rock::hook_diagnostics::describeAddress(decodedTarget),
+                    resolvedTarget,
+                    rock::hook_diagnostics::describeAddress(resolvedTarget),
+                    expectedTarget,
+                    rock::hook_diagnostics::describeAddress(expectedTarget));
+                return HookSiteOwnership::Unrecognised;
             }
 
-            return true;
+            return HookSiteOwnership::VerifiedNative;
         }
 
-        void hookedBhkWorldSetDeltaTime(float rawDeltaSeconds)
+        void hookedBhkWorldSetDeltaTimeWithConfigRead(float rawDeltaSeconds)
         {
             if (!g_originalBhkWorldSetDeltaTime) {
                 if (!g_havokTimingFixMissingOriginalLogged.exchange(true, std::memory_order_acq_rel)) {
@@ -340,28 +539,32 @@ namespace rock
             }
         }
 
-        const RE::Actor* resolveNativePlayerActorGlobal()
+        void hookedBhkWorldSetDeltaTime(float rawDeltaSeconds)
         {
-            // TODO_RE (kData_PlayerActorSingleton == 0): the address formerly stored under this
-            // name (0x5B63B20) was RE-corrected to be the hkMemoryRouter's TLS slot index, not a
-            // PlayerCharacter/Actor singleton pointer slot (see HavokOffsets.h) - dereferencing
-            // it as an `Actor**` returned a small integer reinterpreted as a garbage pointer.
-            // That garbage was only ever pointer-compared below (never dereferenced further), so
-            // it could not crash, but it could also never truthfully match a real actor, making
-            // the "native" cross-check in isPlayerActor() permanently dead weight, plus a
-            // spurious one-time "pointer divergence" warning every session. Fail safe instead:
-            // return null until the real offset is identified. isPlayerActor()'s matchesNative
-            // and divergence-warning checks both short-circuit on a null pointer here, so this
-            // falls through cleanly to the CommonLib PlayerCharacter singleton alone.
-            if (offsets::kData_PlayerActorSingleton == 0) {
-                static std::atomic<bool> loggedUnresolved{ false };
-                if (!loggedUnresolved.exchange(true, std::memory_order_acq_rel)) {
-                    ROCK_LOG_WARN(Combat,
-                        "Native player actor singleton offset unresolved (TODO_RE) - native melee player cross-check disabled, CommonLib PlayerCharacter singleton stays authoritative");
+            if (!g_rockConfig.tryEnterNativeRead()) {
+                /*
+                 * The native timing update is never optional. During the
+                 * very short config mutation window, bypass only ROCK's
+                 * adjustment and preserve Bethesda's original call.
+                 */
+                if (g_originalBhkWorldSetDeltaTime) {
+                    g_originalBhkWorldSetDeltaTime(rawDeltaSeconds);
+                } else if (!g_havokTimingFixMissingOriginalLogged.exchange(
+                               true,
+                               std::memory_order_acq_rel)) {
+                    ROCK_LOG_CRITICAL(
+                        Init,
+                        "HAVOK_TIMING_FIX missing original bhkWorld::SetDeltaTime; timing hook cannot safely continue");
                 }
-                return nullptr;
+                return;
             }
 
+            hookedBhkWorldSetDeltaTimeWithConfigRead(rawDeltaSeconds);
+            g_rockConfig.leaveNativeRead();
+        }
+
+        const RE::Actor* resolveNativePlayerActorGlobal()
+        {
             static REL::Relocation<RE::Actor**> nativePlayerActor{ REL::Offset(offsets::kData_PlayerActorSingleton) };
             return *nativePlayerActor;
         }
@@ -560,12 +763,6 @@ namespace rock
             return true;
         }
 
-        // Restore-side twins of enforceNativeMeleeBinarySetting/enforceNativeMeleeFloatMinimumSetting
-        // above, mirroring restoreNativeGrabHapticBinarySetting/restoreNativeGrabHapticFloatSetting
-        // below - those exist for the haptic suppression path but no equivalent existed for melee,
-        // so disabling melee suppression mid-session (bNativeMeleeSuppression flip / hot reload) left
-        // the velocity-check gate and the 1e9 thresholds applied forever: native melee stayed
-        // completely dead until the game process restarted.
         bool restoreNativeMeleeBinarySetting(NativeBinaryRuntimeSettingState& state, const char* settingName, const char* label)
         {
             if (!state.originalCaptured || !state.applied) {
@@ -587,7 +784,11 @@ namespace rock
 
             if (setting->GetBinary() != state.originalValue) {
                 setting->SetBinary(state.originalValue);
-                ROCK_LOG_INFO(Combat, "Restored FO4VR native VR melee {} setting '{}' to {}", label, settingName, state.originalValue ? "true" : "false");
+                ROCK_LOG_INFO(Combat,
+                    "Restored FO4VR native VR melee {} setting '{}' to {}",
+                    label,
+                    settingName,
+                    state.originalValue ? "true" : "false");
             }
             state.applied = false;
             state.confirmedLogged = false;
@@ -625,7 +826,9 @@ namespace rock
 
         [[nodiscard]] bool nativeMeleeSuppressionApplied()
         {
-            return g_nativeMeleeVelocityCheckState.applied || g_nativeMeleeLinearThresholdState.applied || g_nativeMeleeAngularThresholdState.applied;
+            return g_nativeMeleeVelocityCheckState.applied ||
+                   g_nativeMeleeLinearThresholdState.applied ||
+                   g_nativeMeleeAngularThresholdState.applied;
         }
 
         RE::Setting* resolveNativeGrabHapticRuntimeSetting(RE::Setting*& cachedSetting, const char* settingName, bool& missingLogged)
@@ -907,26 +1110,135 @@ namespace rock
 
         bool hookedWeaponSwingHandler(void* handler, RE::Actor* actor, RE::BSFixedString* side)
         {
+            if (!g_rockConfig.tryEnterNativeRead()) {
+                return g_originalWeaponSwingHandler ?
+                           g_originalWeaponSwingHandler(handler, actor, side) :
+                           false;
+            }
+
             const auto input = makeNativeMeleePolicyInput(native_melee_suppression::NativeMeleeEvent::WeaponSwing, actor, side);
             const auto decision = native_melee_suppression::evaluateNativeMeleeSuppression(native_melee_suppression::NativeMeleeEvent::WeaponSwing, input);
 
             const bool shouldCallNative = decision.action == native_melee_suppression::NativeMeleeSuppressionAction::CallNative;
             const bool decisionResult = applyNativeMeleeDecision(native_melee_suppression::NativeMeleeEvent::WeaponSwing, input, decision);
+            g_rockConfig.leaveNativeRead();
             return shouldCallNative ? (g_originalWeaponSwingHandler ? g_originalWeaponSwingHandler(handler, actor, side) : false) : decisionResult;
         }
 
         bool hookedHitFrameHandler(void* handler, RE::Actor* actor, RE::BSFixedString* side)
         {
+            if (!g_rockConfig.tryEnterNativeRead()) {
+                return g_originalHitFrameHandler ?
+                           g_originalHitFrameHandler(handler, actor, side) :
+                           false;
+            }
+
             const auto input = makeNativeMeleePolicyInput(native_melee_suppression::NativeMeleeEvent::HitFrame, actor, side);
             const auto decision = native_melee_suppression::evaluateNativeMeleeSuppression(native_melee_suppression::NativeMeleeEvent::HitFrame, input);
 
             const bool shouldCallNative = decision.action == native_melee_suppression::NativeMeleeSuppressionAction::CallNative;
             const bool decisionResult = applyNativeMeleeDecision(native_melee_suppression::NativeMeleeEvent::HitFrame, input, decision);
+            g_rockConfig.leaveNativeRead();
             return shouldCallNative ? (g_originalHitFrameHandler ? g_originalHitFrameHandler(handler, actor, side) : false) : decisionResult;
+        }
+
+        /*
+         * MELEE OBSERVATION counters (Jul 31). Written at the top of the two
+         * observation hooks, BEFORE the config read-lock (the lock can be held
+         * by a live INI reload, and this logging must not miss events during
+         * one). Paired semantics: a SWING line with no following IMPACT line
+         * within ~1s is a native miss; SWING->IMPACT is a hit. Counters make
+         * interleaved or dropped lines recoverable. Pointer VALUES only are
+         * ever logged from the impact callback — contactEvent/collisionEvent
+         * have no verified layout (prior hknp manifold offsets in this project
+         * were proven wrong), so they are never dereferenced.
+         */
+        static std::atomic<std::uint32_t> g_playerMeleeSwingCount{ 0 };
+        static std::atomic<std::uint32_t> g_playerMeleeImpactCount{ 0 };
+        static std::atomic<std::uint64_t> g_playerMeleeLastSwingMs{ 0 };
+        static std::atomic<std::uint32_t> g_playerMeleeFilteredCount{ 0 };
+
+        // Read the OTHER contact body's collision filter word from a
+        // VRMeleeImpact (contactEvent, collisionEvent) pair. Offsets are
+        // Ghidra-verified against FUN_140eff000 and
+        // bhkNPCollisionObject::GetCollisionFilterInfo on FO4VR 1.2.72:
+        //   world   = *(uintptr*)contactEvent
+        //   slot    = *(uint*)(contactEvent + 0x20)            (native uses low 32, expects 0/1)
+        //   otherId = *(int*)(collisionEvent + 8 + (1-slot)*4)
+        //   body    = *(uintptr*)(world + 0x20) + otherId*0x90
+        //   filter  = *(uint*)(body + 0x44)
+        // SEH-guarded (pure C, no C++ objects in scope, per the SEH-vs-C++
+        // rule): any fault or implausible value returns false so the caller
+        // forwards the contact to native unchanged (vanilla behaviour).
+        static bool tryReadMeleeContactPartnerFilter(
+            const void* contactEvent,
+            const void* collisionEvent,
+            std::uint32_t& outFilter) noexcept
+        {
+            __try {
+                if (!contactEvent || !collisionEvent) {
+                    return false;
+                }
+                const auto* ce = static_cast<const std::uint8_t*>(contactEvent);
+                const auto* ke = static_cast<const std::uint8_t*>(collisionEvent);
+                const std::uintptr_t world =
+                    *reinterpret_cast<const std::uintptr_t*>(ce);
+                if (world == 0) {
+                    return false;
+                }
+                const std::uint32_t slot =
+                    *reinterpret_cast<const std::uint32_t*>(ce + 0x20);
+                if (slot > 1u) {
+                    return false;  // native assumes the pair selector is 0 or 1
+                }
+                const std::size_t otherOffset =
+                    static_cast<std::size_t>(8u + (1u - slot) * 4u);
+                const std::int32_t otherId =
+                    *reinterpret_cast<const std::int32_t*>(ke + otherOffset);
+                if (otherId < 0 || otherId > 0x000FFFFF) {
+                    return false;  // implausible body index
+                }
+                const std::uintptr_t bodyArray =
+                    *reinterpret_cast<const std::uintptr_t*>(world + 0x20);
+                if (bodyArray == 0) {
+                    return false;
+                }
+                const std::uintptr_t body =
+                    bodyArray + static_cast<std::uintptr_t>(otherId) * 0x90u;
+                outFilter = *reinterpret_cast<const std::uint32_t*>(body + 0x44);
+                return true;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                return false;
+            }
+        }
+
+        // True when a decoded collision filter word belongs to one of our
+        // generated collider families (hand/weapon/body/dynamic-hand-proxy) —
+        // a contact the native melee handler must NOT process, or it arms the
+        // global melee cooldown and eats the real hit. (A body already carrying
+        // the suppression no-collide bit generates no contacts at all, so it
+        // never reaches here as a partner; the layer test is the discriminator.)
+        [[nodiscard]] static bool isRockGeneratedMeleeContact(std::uint32_t filterInfo) noexcept
+        {
+            const std::uint32_t layer = filterInfo & collision_layer_policy::FO4_LAYER_FILTER_MASK;
+            return layer == collision_layer_policy::ROCK_LAYER_HAND ||
+                   layer == collision_layer_policy::ROCK_LAYER_WEAPON ||
+                   layer == collision_layer_policy::ROCK_LAYER_BODY ||
+                   layer == collision_layer_policy::ROCK_LAYER_DYNAMIC_HAND_PROXY;
         }
 
         void hookedPlayerWeaponSwingCallback(RE::Actor* actor, std::uint32_t equipIndex)
         {
+            if (isPlayerActor(actor)) {
+                const auto swingNumber =
+                    g_playerMeleeSwingCount.fetch_add(1, std::memory_order_acq_rel) + 1;
+                g_playerMeleeLastSwingMs.store(GetTickCount64(), std::memory_order_release);
+                ROCK_LOG_INFO(Combat,
+                    "Player melee SWING #{} (equipIndex={})",
+                    swingNumber,
+                    equipIndex);
+            }
+
             /*
              * FO4VR can reach PlayerCharacter::WeaponSwingCallBack separately
              * from the WeaponSwing animation handler vtable. Ghidra verified the
@@ -934,15 +1246,24 @@ namespace rock
              * weapon-swing side effects, so full native suppression must stop it
              * at this player-only boundary without changing NPC swing behavior.
              */
+            if (!g_rockConfig.tryEnterNativeRead()) {
+                if (g_originalPlayerWeaponSwingCallback) {
+                    g_originalPlayerWeaponSwingCallback(actor, equipIndex);
+                }
+                return;
+            }
+
             const auto input = makeNativeMeleePolicyInput(native_melee_suppression::NativeMeleeEvent::WeaponSwing, actor, nullptr);
             const auto decision = native_melee_suppression::evaluateNativeMeleeSuppression(native_melee_suppression::NativeMeleeEvent::WeaponSwing, input);
             const bool shouldCallNative = decision.action == native_melee_suppression::NativeMeleeSuppressionAction::CallNative;
 
             if (!shouldCallNative) {
                 applyNativeMeleeDecision(native_melee_suppression::NativeMeleeEvent::WeaponSwing, input, decision);
+                g_rockConfig.leaveNativeRead();
                 return;
             }
 
+            g_rockConfig.leaveNativeRead();
             if (g_originalPlayerWeaponSwingCallback) {
                 g_originalPlayerWeaponSwingCallback(actor, equipIndex);
             }
@@ -950,6 +1271,81 @@ namespace rock
 
         void hookedVrMeleeImpactCallback(RE::Actor* actor, void* contactEvent, void* collisionEvent)
         {
+            if (isPlayerActor(actor)) {
+                // LIVE-CONFIRMED (Jul 31, 06:59): VRMeleeImpact fires per contact
+                // TICK, not per hit — one swing with the bat left resting in
+                // contact produced 421 callbacks over 4.5s and flooded the log.
+                // Log per-event only the FIRST contact of each swing (that is
+                // the hit/contact confirmation the miss diagnostic needs); the
+                // continuous tail goes through the cumulative-counter sampled
+                // pattern so its exact count stays recoverable from deltas.
+                const auto impactNumber =
+                    g_playerMeleeImpactCount.fetch_add(1, std::memory_order_acq_rel) + 1;
+                const auto swingNumber =
+                    g_playerMeleeSwingCount.load(std::memory_order_acquire);
+                const auto lastSwingMs =
+                    g_playerMeleeLastSwingMs.load(std::memory_order_acquire);
+                const auto nowMs = GetTickCount64();
+                const auto sinceSwingMs =
+                    lastSwingMs != 0 && nowMs >= lastSwingMs
+                        ? static_cast<std::int64_t>(nowMs - lastSwingMs)
+                        : static_cast<std::int64_t>(-1);
+                static std::atomic<std::uint32_t> s_lastImpactLoggedSwing{ 0 };
+                auto expectedSwing = s_lastImpactLoggedSwing.load(std::memory_order_acquire);
+                const bool firstContactOfSwing =
+                    expectedSwing != swingNumber &&
+                    s_lastImpactLoggedSwing.compare_exchange_strong(
+                        expectedSwing, swingNumber, std::memory_order_acq_rel);
+                if (firstContactOfSwing) {
+                    ROCK_LOG_INFO(Combat,
+                        "Native melee CONTACT for swing #{} ({} ms after swing) — the game's melee "
+                        "collider touched something (impact #{} total) actor={:p} contactEvent={:p} collisionEvent={:p}",
+                        swingNumber,
+                        sinceSwingMs,
+                        impactNumber,
+                        static_cast<void*>(actor),
+                        contactEvent,
+                        collisionEvent);
+                } else {
+                    ROCK_LOG_SAMPLE_INFO(Combat,
+                        g_rockConfig.rockLogSampleMilliseconds,
+                        "Native melee contact continuing (swing #{}, cumulativeImpacts={}, {} ms after swing)",
+                        swingNumber,
+                        impactNumber,
+                        sinceSwingMs);
+                }
+            }
+
+            /*
+             * PRECISE FIRST-HIT FIX (Jul 31): drop contacts whose partner is one
+             * of OUR generated colliders BEFORE native sees them. The native
+             * handler arms a global melee cooldown (Actor staminaModifiers,
+             * player+0x908) on every processed contact and early-returns while
+             * it is >0 — so our co-located hull/hand/body bodies were burning
+             * the cooldown at swing onset and the real NPC contact landed no
+             * damage. Not forwarding our-body contacts means native never arms
+             * the cooldown from us; genuine NPC/world contacts (different layers)
+             * pass straight through and the hull stays collidable for world
+             * clank. Runs for the player only; the decode is SEH-guarded and
+             * fails safe to forwarding.
+             */
+            if (isPlayerActor(actor) && g_rockConfig.rockNativeMeleeContactFilterEnabled) {
+                std::uint32_t partnerFilter = 0;
+                if (tryReadMeleeContactPartnerFilter(contactEvent, collisionEvent, partnerFilter) &&
+                    isRockGeneratedMeleeContact(partnerFilter)) {
+                    const auto filtered =
+                        g_playerMeleeFilteredCount.fetch_add(1, std::memory_order_relaxed) + 1;
+                    ROCK_LOG_SAMPLE_INFO(Combat,
+                        g_rockConfig.rockLogSampleMilliseconds,
+                        "Native melee contact DROPPED — partner is a ROCK collider (filter=0x{:08X} layer={}); "
+                        "protected the native melee cooldown (cumulativeDropped={})",
+                        partnerFilter,
+                        partnerFilter & 0x7Fu,
+                        filtered);
+                    return;
+                }
+            }
+
             /*
              * FO4VR registers this callback while attaching native VR melee
              * collision to the first-person weapon nodes. It owns the native
@@ -959,6 +1355,13 @@ namespace rock
              * replacement point-collision damage path without a duplicate native
              * impact firing from the same swing.
              */
+            if (!g_rockConfig.tryEnterNativeRead()) {
+                if (g_originalVrMeleeImpactCallback) {
+                    g_originalVrMeleeImpactCallback(actor, contactEvent, collisionEvent);
+                }
+                return;
+            }
+
             const auto input = makeNativeMeleeImpactPolicyInput(actor);
             const auto decision = native_melee_suppression::evaluateNativeMeleeImpactSuppression(input);
 
@@ -969,9 +1372,11 @@ namespace rock
                     static_cast<void*>(actor),
                     contactEvent,
                     collisionEvent);
+                g_rockConfig.leaveNativeRead();
                 return;
             }
 
+            g_rockConfig.leaveNativeRead();
             if (g_originalVrMeleeImpactCallback) {
                 g_originalVrMeleeImpactCallback(actor, contactEvent, collisionEvent);
             }
@@ -979,10 +1384,17 @@ namespace rock
 
         bool hookedAttackBlockShouldHandleEvent(void* handler, const RE::InputEvent* event)
         {
+            if (!g_rockConfig.tryEnterNativeRead()) {
+                return g_originalAttackBlockShouldHandleEvent ?
+                           g_originalAttackBlockShouldHandleEvent(handler, event) :
+                           false;
+            }
+
             if (input_remap_runtime::shouldSuppressNativeTriggerAction(event)) {
                 ROCK_LOG_SAMPLE_DEBUG(Input,
                     g_rockConfig.rockLogSampleMilliseconds,
                     "Suppressed native WandTrigger AttackBlock gate while ROCK owns holstered or held-weapon trigger input");
+                g_rockConfig.leaveNativeRead();
                 return false;
             }
 
@@ -1012,15 +1424,29 @@ namespace rock
             }
 
             if (decision.action == native_melee_suppression::NativeMeleeInputGateAction::ReturnFalse) {
+                g_rockConfig.leaveNativeRead();
                 return false;
             }
 
+            g_rockConfig.leaveNativeRead();
             return g_originalAttackBlockShouldHandleEvent ? g_originalAttackBlockShouldHandleEvent(handler, event) : false;
         }
 
         template <class HandlerT>
-        bool installNativeMeleeVtableHook(std::uintptr_t entryOffset, HandlerT hook, HandlerT& original, const char* label)
+        bool installNativeMeleeVtableHook(
+            std::uintptr_t entryOffset,
+            std::uintptr_t expectedFunctionOffset,
+            HandlerT hook,
+            HandlerT& original,
+            const char* label)
         {
+            if (entryOffset == 0 || expectedFunctionOffset == 0) {
+                ROCK_LOG_ERROR(Init,
+                    "FAILED to install {} hook: entry or expected native target offset is unset",
+                    label);
+                return false;
+            }
+
             REL::Relocation<std::uintptr_t> entry{ REL::Offset(entryOffset) };
             auto* slot = reinterpret_cast<std::uintptr_t*>(entry.address());
             if (!slot) {
@@ -1030,20 +1456,38 @@ namespace rock
 
             const auto hookAddress = reinterpret_cast<std::uintptr_t>(hook);
             const auto currentTarget = *slot;
+            const auto expectedTarget = REL::Offset(expectedFunctionOffset).address();
             if (currentTarget == hookAddress) {
                 ROCK_LOG_INFO(Init, "{} hook already installed at 0x{:X}", label, entry.address());
                 return original != nullptr;
             }
 
-            original = reinterpret_cast<HandlerT>(currentTarget);
-            if (!original) {
-                ROCK_LOG_ERROR(Init, "FAILED to install {} hook at 0x{:X}: original is null", label, entry.address());
+            if (currentTarget != expectedTarget) {
+                ROCK_LOG_ERROR(Init,
+                    "FAILED to install {} hook at 0x{:X}: target changed after validation (found=0x{:X}, expected exact native=0x{:X}); no write performed",
+                    label,
+                    entry.address(),
+                    currentTarget,
+                    expectedTarget);
                 return false;
             }
+            original = reinterpret_cast<HandlerT>(expectedTarget);
 
             DWORD oldProtect = 0;
             if (!VirtualProtect(slot, sizeof(*slot), kPageExecuteReadWrite, &oldProtect)) {
                 ROCK_LOG_ERROR(Init, "FAILED to install {} hook at 0x{:X}: VirtualProtect failed", label, entry.address());
+                original = nullptr;
+                return false;
+            }
+
+            if (*slot != expectedTarget) {
+                ROCK_LOG_ERROR(Init,
+                    "FAILED to install {} hook at 0x{:X}: target changed while page protection was open (found=0x{:X}, expected exact native=0x{:X}); no write performed",
+                    label,
+                    entry.address(),
+                    *slot,
+                    expectedTarget);
+                VirtualProtect(slot, sizeof(*slot), oldProtect, &oldProtect);
                 original = nullptr;
                 return false;
             }
@@ -1111,7 +1555,22 @@ namespace rock
             "PlayerCharacter::WeaponSwingCallBack");
         const bool vrMeleeImpactValid = validateEntryTrampolineTarget(
             "VRMeleeImpact", offsets::kFunc_VRMeleeImpactCallback, kVrMeleeImpactExpectedPrefix.data(), kVrMeleeImpactExpectedPrefix.size());
-        return swingValid && hitFrameValid && attackBlockValid && playerSwingCallbackValid && vrMeleeImpactValid;
+
+        const bool allValid = swingValid && hitFrameValid && attackBlockValid && playerSwingCallbackValid && vrMeleeImpactValid;
+        if (!allValid) {
+            // Name the failing target(s) explicitly. The old single-line failure said
+            // only "validation failed", so a reader had to guess which of the five it
+            // was - and the per-target lines above scroll far apart in a busy log.
+            ROCK_LOG_ERROR(Init,
+                "Native melee suppression target validation summary: weaponSwing={} hitFrame={} attackBlock={} playerSwingCallback={} vrMeleeImpact={} "
+                "(each failing entry printed its found-vs-expected report above)",
+                swingValid ? "ok" : "FAILED",
+                hitFrameValid ? "ok" : "FAILED",
+                attackBlockValid ? "ok" : "FAILED",
+                playerSwingCallbackValid ? "ok" : "FAILED",
+                vrMeleeImpactValid ? "ok" : "FAILED");
+        }
+        return allValid;
     }
 
     void setNativeMeleePhysicalSwingActive(bool isLeft, bool active)
@@ -1151,9 +1610,6 @@ namespace rock
          */
         const auto currentFrame = g_nativeMeleeFrameClock.load(std::memory_order_acquire);
         const bool shouldSuppress = shouldSuppressNativeVrMeleeVelocity();
-        // Restore is needed exactly when suppression is OFF but a PRIOR call left the
-        // native settings forced (nativeMeleeSuppressionApplied()) - mirrors
-        // enforceNativeGrabHapticRuntimeSuppression's shouldSuppress/shouldRestore split.
         const bool shouldRestore = !shouldSuppress && nativeMeleeSuppressionApplied();
         if (!shouldSuppress && !shouldRestore) {
             return;
@@ -1233,45 +1689,26 @@ namespace rock
 
     using HandleBumpedCharacter_t = void (*)(void*, void*, void*);
     static HandleBumpedCharacter_t g_originalHandleBumped = nullptr;
+    /*
+     * FAIL-SAFE LATCH for the character-bump filter. installBumpHook() sets this;
+     * isNativeCharacterBumpFilterInstalled() is the single truth source for "is
+     * ROCK suppressing player character-controller bumps?". Nothing may infer that
+     * from the config flag alone: rockNativeCharacterControllerObjectContactFilterEnabled
+     * also drives the CC-vs-OBJECT filter, the CHARCONTROLLER layer-matrix rewrite
+     * and the large-blocking-object car fix (#219/#220), so this hook failing must
+     * not switch those off as collateral damage.
+     */
+    static std::atomic<bool> g_nativeCharacterBumpFilterInstalled{ false };
 
-    // installEntryTrampolineHook patches a LIVE function's entry while Havok physics
-    // worker threads can already be executing it (installBumpHook/installRefreshManifoldHook
-    // run from the PhysicsInteraction constructor, which fires at skeleton-ready - well
-    // after Havok worlds and their task threads exist). The full fix (install before any
-    // Havok world exists, or suspend other threads first) is a larger lifecycle change;
-    // this narrows the risk that IS safely fixable here: when the patch site happens to be
-    // 8-byte aligned (common for hot function entries), replace the 6 separate byte writes
-    // for the FF 25 00000000 jump header with ONE aligned interlocked 8-byte store, so a
-    // thread already fetching at this address sees either the fully-old or fully-new header
-    // bytes, never a torn mix. _InterlockedExchange64 on a misaligned address is unsafe, so
-    // the unaligned case falls back to the original sequential writes rather than risk a
-    // guaranteed-fault "fix".
     static void writeAbsoluteJump(std::uint8_t* target, std::uintptr_t destination)
     {
-        // Destination pointer (bytes 6-13) first, while still inert data - nothing decodes
-        // it as an address until the header below makes it live.
-        *reinterpret_cast<std::uintptr_t*>(target + 6) = destination;
-
-        if ((reinterpret_cast<std::uintptr_t>(target) & 0x7u) == 0) {
-            std::int64_t header = 0;
-            std::memcpy(&header, target, 8);  // preserve the just-written low pointer bytes at [6,7]
-            auto* headerBytes = reinterpret_cast<std::uint8_t*>(&header);
-            headerBytes[0] = 0xFF;
-            headerBytes[1] = 0x25;
-            headerBytes[2] = 0x00;
-            headerBytes[3] = 0x00;
-            headerBytes[4] = 0x00;
-            headerBytes[5] = 0x00;
-            _InterlockedExchange64(reinterpret_cast<volatile std::int64_t*>(target), header);
-            return;
-        }
-
         target[0] = 0xFF;
         target[1] = 0x25;
         target[2] = 0x00;
         target[3] = 0x00;
         target[4] = 0x00;
         target[5] = 0x00;
+        *reinterpret_cast<std::uintptr_t*>(target + 6) = destination;
     }
 
     static bool installEntryTrampolineHook(const char* label,
@@ -1294,7 +1731,13 @@ namespace rock
         }
 
         if (std::memcmp(targetAddr, expectedPrefix, stolenBytes) != 0) {
-            ROCK_LOG_ERROR(Init, "{} hook validation failed at 0x{:X}; native bytes changed, hook not installed", label, target.address());
+            // Found vs expected, with module attribution for the target and for any
+            // detour branch now occupying the entry. State findings only - do not
+            // name a suspected owner that has not been resolved.
+            ROCK_LOG_ERROR(Init,
+                "{} hook NOT INSTALLED - entry prefix validation failed: {}",
+                label,
+                rock::hook_diagnostics::describePrefixMismatch(target.address(), expectedPrefix, stolenBytes));
             return false;
         }
 
@@ -1319,6 +1762,16 @@ namespace rock
         DWORD oldProtect = 0;
         if (!VirtualProtect(targetAddr, stolenBytes, kPageExecuteReadWrite, &oldProtect)) {
             ROCK_LOG_ERROR(Init, "{} hook install failed at 0x{:X}: target protection failed", label, target.address());
+            VirtualFree(trampolineMem, 0, kVirtualMemoryRelease);
+            return false;
+        }
+
+        if (std::memcmp(targetAddr, expectedPrefix, stolenBytes) != 0) {
+            ROCK_LOG_ERROR(Init,
+                "{} hook install failed at 0x{:X}: entry changed after exact validation; no ROCK bytes were written",
+                label,
+                target.address());
+            VirtualProtect(targetAddr, stolenBytes, oldProtect, &oldProtect);
             VirtualFree(trampolineMem, 0, kVirtualMemoryRelease);
             return false;
         }
@@ -1400,145 +1853,20 @@ namespace rock
         return cell ? cell->GetbhkWorld() : nullptr;
     }
 
-    bool isMovableStaticPlayerContactTarget(RE::bhkWorld* bhkWorld, RE::hknpWorld* world, RE::hknpBodyId bodyId, std::uint32_t layer)
-    {
-        if (!bhkWorld || !world || !collision_layer_policy::isPlayerCharacterControllerSupportLayer(layer)) {
-            return false;
-        }
-
-        /*
-         * MSTT bodies commonly sit on support layers that the player controller
-         * must preserve for world geometry. For movable statics, form identity is
-         * the safer discriminator than hknp motion flags: those flags can report
-         * static/keyframed while the native controller still generates push
-         * constraints against the movable object.
-         */
-        auto* ref = resolveBodyToRef(bhkWorld, world, bodyId);
-        auto* baseForm = ref ? ref->GetObjectReference() : nullptr;
-        return baseForm && baseForm->Is(RE::ENUM_FORM_ID::kMSTT);
-    }
-
-    /*
-     * ── LARGE BLOCKING OBJECT (car fix, #219/#220) ────────────────────────────
-     *
-     * Restoring the CHARCONTROLLER<->CLUTTER_LARGE matrix column is necessary but
-     * not sufficient: this per-contact policy independently suppresses every
-     * non-support layer, so a car contact would still be dropped before the
-     * native solve. This predicate is the carve-out.
-     *
-     * The discriminator is SIZE, not layer and not mass:
-     *   - Layer alone fails: all 24 vanilla vehicle bodies are on layer 29, but so
-     *     are ~14 man-portable props (metal barrels 1.08m, Tire03Hollow 0.62m,
-     *     TrashCanMetal01 1.02m, BabyCarriage01 1.53m) that must stay grabbable.
-     *   - Mass is unusable: Physics::GetHeldObjectMass returns 0 for static AND
-     *     keyframed bodies, so a parked car reads identical to a wall.
-     * Base-form BOUND_DATA largest axis x ref scale is the measure. Game units:
-     * tyre/cone 43-44, barrel/trash can 71-76, baby carriage 107, motorcycle 199,
-     * sedan 427. Default threshold 150 (usable window 110-195).
-     *
-     * MEMOIZED BY BASE FormID, deliberately not by bodyId: BOUND_DATA is a
-     * property of the base form, body ids churn constantly, and this runs on the
-     * physics thread inside the contact path. For the same reason the resolve is
-     * base-form-only — no Get3D()/worldBound fallback, which would be a per-
-     * INSTANCE value and would poison a per-BASE-form memo.
-     */
-    static std::mutex g_largeBlockingObjectCacheMutex;
-    static std::unordered_map<std::uint32_t, bool> g_largeBlockingObjectCache;
-    static constexpr std::size_t kLargeBlockingObjectCacheCapacity = 4096;
-
-    void clearLargeBlockingObjectCache()
-    {
-        std::lock_guard<std::mutex> lock(g_largeBlockingObjectCacheMutex);
-        g_largeBlockingObjectCache.clear();
-    }
-
-    static bool baseFormExceedsLargeObjectBound(RE::TESBoundObject* baseForm, float refScale, float thresholdGameUnits)
-    {
-        if (!baseForm) {
-            return false;
-        }
-
-        const auto& bounds = baseForm->boundData;
-        const float extentX = static_cast<float>(bounds.boundMax.x - bounds.boundMin.x);
-        const float extentY = static_cast<float>(bounds.boundMax.y - bounds.boundMin.y);
-        const float extentZ = static_cast<float>(bounds.boundMax.z - bounds.boundMin.z);
-        const float maxAxis = (std::max)({ extentX, extentY, extentZ });
-        if (!(std::isfinite)(maxAxis) || maxAxis <= 0.0f) {
-            return false;  // FAIL-OPEN to the pre-fix behaviour
-        }
-
-        const float scale = ((std::isfinite)(refScale) && refScale > 0.0f) ? refScale : 1.0f;
-        return (maxAxis * scale) > thresholdGameUnits;
-    }
-
-    static bool isLargeBlockingPlayerContactTarget(RE::bhkWorld* bhkWorld, RE::hknpWorld* world, RE::hknpBodyId bodyId, std::uint32_t layer)
-    {
-        if (!g_rockConfig.rockLargeObjectPlayerBlockEnabled || !g_rockConfig.rockLargeObjectCharacterControllerBlockEnabled) {
-            return false;
-        }
-        if (!bhkWorld || !world) {
-            return false;
-        }
-        // Cheap early-out BEFORE any ref resolution: with the default restriction on,
-        // only CLUTTER_LARGE(29) can ever be a large blocker, so every other contact
-        // costs one integer compare.
-        if (g_rockConfig.rockLargeObjectBlockRestrictToClutterLargeLayer && layer != collision_layer_policy::FO4_LAYER_CLUTTER_LARGE) {
-            return false;
-        }
-        // Support layers keep their existing handling (world geometry / movable statics).
-        if (collision_layer_policy::isPlayerCharacterControllerSupportLayer(layer)) {
-            return false;
-        }
-
-        auto* ref = resolveBodyToRef(bhkWorld, world, bodyId);
-        auto* baseForm = ref ? ref->GetObjectReference() : nullptr;
-        if (!baseForm) {
-            return false;
-        }
-
-        const std::uint32_t baseFormId = baseForm->formID;
-        {
-            std::lock_guard<std::mutex> lock(g_largeBlockingObjectCacheMutex);
-            const auto it = g_largeBlockingObjectCache.find(baseFormId);
-            if (it != g_largeBlockingObjectCache.end()) {
-                return it->second;
-            }
-        }
-
-        // TESObjectREFR stores scale as refScale (uint16, x100) — there is no GetScale()
-        // in this framework. Same convention as ThrownObjectTracker.cpp:772.
-        const float refScale = ref->refScale > 0 ? (static_cast<float>(ref->refScale) / 100.0f) : 1.0f;
-        const bool isLarge = baseFormExceedsLargeObjectBound(
-            baseForm, refScale, g_rockConfig.rockLargeObjectBoundThresholdGameUnits);
-
-        {
-            std::lock_guard<std::mutex> lock(g_largeBlockingObjectCacheMutex);
-            if (g_largeBlockingObjectCache.size() >= kLargeBlockingObjectCacheCapacity) {
-                // Unbounded growth is the only real risk here; a full drop is cheaper
-                // and simpler than LRU bookkeeping on the physics thread.
-                g_largeBlockingObjectCache.clear();
-            }
-            g_largeBlockingObjectCache[baseFormId] = isLarge;
-        }
-
-        return isLarge;
-    }
-
     collision_layer_policy::PlayerCharacterControllerContactPolicyDecision evaluatePlayerControllerTargetBody(
-        RE::bhkWorld* bhkWorld,
         RE::hknpWorld* world,
         std::uint32_t rawBodyId)
     {
-        // CRASH FIX (Jul 6): an UNREADABLE/transient contact target on the player char-proxy is
-        // the two-handed CTD source. During two-handing the weapon-collision hull + hand colliders
-        // are created/destroyed each frame; a manifold that references a body mid-rebuild (or already
-        // freed) fails tryReadFilterInfo. Previously we PRESERVED it (suppress=false) and passed it
-        // to the native bhkCharProxyController::processConstraints solve, which then dereferenced the
-        // dying body -> AV; the caught SEH can't undo the half-corrupted solver state -> hard crash a
-        // frame later. Readable own-collider layers (43/44/47) are already suppressed as nonSupportLayer.
-        // The only remaining path to the native solve is the unreadable case -> SUPPRESS it. Safe: the
-        // player's real support (static/ground) is readable and preserved, so this only drops contacts
-        // with transient/freed bodies for a frame — no fall-through-floor risk.
+        // CRASH FIX (Jul 6; restored after the attempt-6 port reverted it): an UNREADABLE/transient
+        // contact target on the player char-proxy is the two-handed CTD source. During two-handing the
+        // weapon-collision hull + hand colliders are created/destroyed each frame; a manifold that
+        // references a body mid-rebuild (or already freed) fails tryReadFilterInfo. If we PRESERVE it
+        // (suppress=false) it is passed to the native bhkCharProxyController::processConstraints solve,
+        // which then dereferences the dying body -> AV; the caught SEH can't undo the half-corrupted
+        // solver state -> hard crash a frame later. Readable generated-collider layers
+        // (43/44/47/48) are suppressed explicitly. The only remaining unsafe path to the native solve is the unreadable
+        // case -> SUPPRESS it. Safe: the player's real support (static/ground) is readable and preserved,
+        // so this only drops contacts with transient/freed bodies for a frame - no fall-through-floor risk.
         if (!world || rawBodyId == body_frame::kInvalidBodyId) {
             return collision_layer_policy::PlayerCharacterControllerContactPolicyDecision{ .suppress = true, .reason = "unreadableTargetSuppressed" };
         }
@@ -1556,12 +1884,10 @@ namespace rock
                 .playerController = true,
                 .targetLayerKnown = true,
                 .targetLayer = layer,
-                .targetIsMovableStatic = isMovableStaticPlayerContactTarget(bhkWorld, world, bodyId, layer),
-                .targetIsLargeBlockingObject = isLargeBlockingPlayerContactTarget(bhkWorld, world, bodyId, layer),
             });
     }
 
-    void hookedHandleBumpedCharacter(void* controller, void* bumpedCC, void* contactInfo)
+    void hookedHandleBumpedCharacterWithConfigRead(void* controller, void* bumpedCC, void* contactInfo)
     {
         bool originalAttempted = false;
         if (!PhysicsInteraction::s_hooksEnabled.load(std::memory_order_acquire)) {
@@ -1612,6 +1938,25 @@ namespace rock
         }
     }
 
+    void hookedHandleBumpedCharacter(void* controller, void* bumpedCC, void* contactInfo)
+    {
+        if (!g_rockConfig.tryEnterNativeRead()) {
+            if (g_originalHandleBumped) {
+                __try {
+                    g_originalHandleBumped(controller, bumpedCC, contactInfo);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                }
+            }
+            return;
+        }
+
+        hookedHandleBumpedCharacterWithConfigRead(
+            controller,
+            bumpedCC,
+            contactInfo);
+        g_rockConfig.leaveNativeRead();
+    }
+
     bool installHavokTimingFixHook()
     {
         static bool installed = false;
@@ -1624,8 +1969,67 @@ namespace rock
         }
         installAttempted = true;
 
-        if (!validateBhkWorldSetDeltaTimeMainCallSite()) {
-            ROCK_LOG_ERROR(Init, "HAVOK_TIMING_FIX hook not installed; FO4VR timing call site did not match verified bytes");
+        const auto ownership = validateBhkWorldSetDeltaTimeMainCallSite();
+
+        if (ownership == HookSiteOwnership::HostPluginOwns) {
+            /*
+             * BENIGN DUPLICATE OWNERSHIP — NOT A FAILURE, so this is INFO.
+             *
+             * The Havok timing fix exists twice in this binary: ROCK's copy here and the
+             * host plugin's heisenberg::HavokTimingFix (src/HavokTimingFix.cpp), which
+             * patches the SAME call site and wins the race at plugin init. Only one detour
+             * can live at one call site, so ROCK stands down — the FEATURE IS ACTIVE, just
+             * owned by the host.
+             *
+             * This used to log at ERROR as "validation FAILED", which read as a broken
+             * install of a working feature and was one of the five "failing validators"
+             * that turned out not to be address bugs at all.
+             */
+            g_rockConfig.rockHavokTimingFixEnabled = false;
+            g_originalBhkWorldSetDeltaTime = nullptr;
+            const auto ownedCallSite = REL::Offset(kHookSite_BhkWorldSetDeltaTimeMainCall).address();
+            // Same two-level decode the validator uses: the E8 points at CommonLibF4's
+            // 14-byte VirtualAlloc'd trampoline stub, and only the second hop lands on the
+            // host's hook function. Report both so the line states what was measured
+            // rather than asserting a module the first-level address does not belong to.
+            const auto ownedStub = decodeBranchDestination(ownedCallSite);
+            const auto ownedViaStub = decodeBranchDestination(ownedStub);
+            const auto ownedTarget = ownedViaStub != 0 ? ownedViaStub : ownedStub;
+            ROCK_LOG_INFO(Init,
+                "HAVOK_TIMING_FIX is owned by the HOST PLUGIN and is ACTIVE - the call site at module+0x{:X} (0x{:X}) already calls 0x{:X} ({}), "
+                "which resolves to 0x{:X} ({}), i.e. heisenberg::HavokTimingFix installed its detour first. Only one detour can live at one call "
+                "site, so ROCK does not double-patch it; ROCK's own bHavokTimingFixEnabled is cleared so it stops claiming a detour it does not "
+                "own. Havok substep timing IS being corrected - by the host, under the host's own settings.",
+                kHookSite_BhkWorldSetDeltaTimeMainCall,
+                ownedCallSite,
+                ownedStub,
+                rock::hook_diagnostics::describeAddress(ownedStub),
+                ownedTarget,
+                rock::hook_diagnostics::describeAddress(ownedTarget));
+            return false;
+        }
+
+        if (ownership != HookSiteOwnership::VerifiedNative) {
+            /*
+             * FAIL-SAFE. The call-site detour IS the timing fix: hookedBhkWorldSetDeltaTime
+             * is the only place that reads rockHavokTimingFixEnabled and the only place that
+             * rewrites the substep globals. Leaving the flag set after a failed install left
+             * ROCK's config echo, MCM readback and every "is the timing fix on?" reader
+             * claiming a feature that had nothing behind it.
+             *
+             * Clearing it here is safe and narrow: grep confirms hookedBhkWorldSetDeltaTime
+             * (this file) is the flag's ONLY functional reader; it does not gate the host
+             * plugin's separate heisenberg::HavokTimingFix, which owns its own settings.
+             */
+            const bool wasEnabled = g_rockConfig.rockHavokTimingFixEnabled;
+            g_rockConfig.rockHavokTimingFixEnabled = false;
+            g_originalBhkWorldSetDeltaTime = nullptr;
+            ROCK_LOG_ERROR(Init,
+                "FEATURE DISABLED: ROCK's Havok timing fix (bHavokTimingFixEnabled, was {}) is OFF for this session - its call-site "
+                "detour at module+0x{:X} was not installed because the site did not hold the verified CALL (see the preceding "
+                "found-vs-expected report). Havok substep timing is left exactly as the game/other owners set it.",
+                wasEnabled ? "on" : "off",
+                kHookSite_BhkWorldSetDeltaTimeMainCall);
             return false;
         }
 
@@ -1636,7 +2040,14 @@ namespace rock
         installed = g_originalBhkWorldSetDeltaTime != nullptr;
 
         if (!installed) {
-            ROCK_LOG_CRITICAL(Init, "HAVOK_TIMING_FIX hook install failed at 0x{:X}: original target was null", hookCallSite.address());
+            // FAIL-SAFE, same reasoning as the validation branch above: no detour means
+            // no timing fix, so the flag must not keep claiming otherwise.
+            g_rockConfig.rockHavokTimingFixEnabled = false;
+            ROCK_LOG_CRITICAL(Init,
+                "FEATURE DISABLED: ROCK's Havok timing fix is OFF - write_call<5> at 0x{:X} ({}) returned a null original, so there is "
+                "no callable native bhkWorld::SetDeltaTime to chain to.",
+                hookCallSite.address(),
+                rock::hook_diagnostics::describeAddress(hookCallSite.address()));
             return false;
         }
 
@@ -1660,11 +2071,21 @@ namespace rock
             return;
         installAttempted = true;
 
-        // Ghidra verified HandleBumpedCharacter at 0x141E24980 starts with ordinary
-        // prologue instructions, not an existing branch/call. CommonLib write_branch
-        // cannot derive a callable original from those bytes, so this hook uses an
-        // explicit relocated-entry trampoline and validates the exact whole
-        // instructions before patching.
+        /*
+         * CONFIRMED against Fallout4VR.exe 1.2.72 (Ghidra):
+         *   0x141E24980 is the exact entry of bhkCharacterController::HandleBumpedCharacter
+         *   and its first 15 bytes read
+         *     48 89 5C 24 08   MOV [RSP+08],RBX
+         *     48 89 74 24 18   MOV [RSP+18],RSI
+         *     57               PUSH RDI
+         *     48 83 EC 70      SUB RSP,0x70
+         *   - byte-for-byte the array below, ending on an instruction boundary.
+         * Ordinary prologue instructions, not an existing branch/call: CommonLib
+         * write_branch cannot derive a callable original from those bytes, so this
+         * hook uses an explicit relocated-entry trampoline and validates the exact
+         * whole instructions before patching. Constant and prefix are both correct;
+         * a mismatch means the entry was already patched.
+         */
         constexpr std::array<std::uint8_t, 15> expectedPrefix{
             0x48, 0x89, 0x5C, 0x24, 0x08,
             0x48, 0x89, 0x74, 0x24, 0x18,
@@ -1672,37 +2093,272 @@ namespace rock
             0x48, 0x83, 0xEC, 0x70
         };
 
+        /*
+         * BENIGN DUPLICATE OWNERSHIP CHECK — run BEFORE attempting the patch.
+         *
+         * The host plugin's heisenberg::HandBumpHook (src/HandBumpHook.cpp) hooks this exact
+         * entry, writing an FF 25 absolute jump to its own handler, and it installs first.
+         * ROCK then memcmp'd the prologue the host had already overwritten and reported
+         * "native bytes changed" at ERROR — a working feature that logged like a broken one.
+         *
+         * Ask who owns the branch instead of assuming. A destination inside THIS module can
+         * only be the host plugin; anything else still falls through to the real validator
+         * below and is reported as the failure it is.
+         */
+        const auto bumpEntryAddress = REL::Offset(offsets::kFunc_HandleBumpedCharacter).address();
+        if (const auto existingBranch = decodeBranchDestination(bumpEntryAddress); isOwnedByHostPlugin(existingBranch)) {
+            installed = false;
+            g_originalHandleBumped = nullptr;
+            g_nativeCharacterBumpFilterInstalled.store(false, std::memory_order_release);
+            ROCK_LOG_INFO(Init,
+                "HandleBumpedCharacter is hooked by the HOST PLUGIN and the bump guard is ACTIVE - the entry at module+0x{:X} already branches "
+                "to 0x{:X} ({}), which is this same module, i.e. heisenberg::HandBumpHook installed first. Only one entry detour can exist at "
+                "one address, so ROCK stands down rather than double-patching. ROCK's own character-bump suppression is therefore not installed; "
+                "the host's equivalent guard covers it, and the CC-vs-object contact filter, the CHARCONTROLLER layer matrix and the large-object "
+                "player block are separate mechanisms that remain active.",
+                offsets::kFunc_HandleBumpedCharacter,
+                existingBranch,
+                rock::hook_diagnostics::describeAddress(existingBranch));
+            return;
+        }
+
         void* original = reinterpret_cast<void*>(g_originalHandleBumped);
         installed = installEntryTrampolineHook(
             "HandleBumpedCharacter", offsets::kFunc_HandleBumpedCharacter, expectedPrefix.data(), expectedPrefix.size(), &hookedHandleBumpedCharacter, original);
         g_originalHandleBumped = reinterpret_cast<HandleBumpedCharacter_t>(original);
-    }
 
-    void installNativeGrabHook()
-    {
-        static bool installed = false;
-        if (installed)
-            return;
-        installed = true;
-
-        if (offsets::kFunc_VRGrabInitiate == 0) {
-            ROCK_LOG_WARN(Init, "VR Grab Initiate offset unresolved (TODO_RE) - native grab patch skipped, engine native grab stays active");
+        if (!installed || !g_originalHandleBumped) {
+            /*
+             * FAIL-SAFE: unwind the partial install and latch the feature OFF.
+             *
+             * Dropping the trampoline pointer matters even though the detour never
+             * landed: a non-null g_originalHandleBumped with no detour in front of it
+             * is a callable pointer into a code copy nothing will ever reach through
+             * the intended path, and any future caller of hookedHandleBumpedCharacter
+             * would silently double-run the native bump.
+             *
+             * Deliberately NOT touched: rockNativeCharacterControllerObjectContactFilterEnabled.
+             * That flag is shared with the CC-vs-object filter, the layer-matrix
+             * rewrite and the car-blocking fix; clearing it here would disable three
+             * working features to report one missing hook.
+             */
+            installed = false;
+            g_originalHandleBumped = nullptr;
+            g_nativeCharacterBumpFilterInstalled.store(false, std::memory_order_release);
+            ROCK_LOG_ERROR(Init,
+                "FEATURE DISABLED: ROCK's player character-controller BUMP suppression is OFF for this session - its "
+                "HandleBumpedCharacter entry hook (module+0x{:X}) was not installed (see the preceding found-vs-expected report). "
+                "Character-vs-character bumps keep native behaviour. The CC-vs-object contact filter, the CHARCONTROLLER layer "
+                "matrix and the large-object player block are separate mechanisms and remain active.",
+                offsets::kFunc_HandleBumpedCharacter);
             return;
         }
 
+        g_nativeCharacterBumpFilterInstalled.store(true, std::memory_order_release);
+    }
+
+    bool isNativeCharacterBumpFilterInstalled()
+    {
+        return g_nativeCharacterBumpFilterInstalled.load(std::memory_order_acquire);
+    }
+
+    bool installNativeGrabHook()
+    {
         static REL::Relocation<std::uintptr_t> target{ REL::Offset(offsets::kFunc_VRGrabInitiate) };
         auto* addr = reinterpret_cast<std::uint8_t*>(target.address());
 
-        DWORD oldProtect;
-        if (VirtualProtect(addr, 3, kPageExecuteReadWrite, &oldProtect)) {
-            addr[0] = 0x31;
-            addr[1] = 0xC0;
-            addr[2] = 0xC3;
-            VirtualProtect(addr, 3, oldProtect, &oldProtect);
-            ROCK_LOG_INFO(Init, "Patched VR Grab Initiate at 0x{:X} — native grab DISABLED (xor eax,eax; ret)", target.address());
-        } else {
-            ROCK_LOG_ERROR(Init, "FAILED to patch VR Grab Initiate at 0x{:X} — VirtualProtect failed", target.address());
+        /*
+         * VALIDATE BEFORE PATCHING. This was the only hook in this file that blind-wrote
+         * over bytes it never checked, and in 0.8.4 it never executed at all
+         * (kFunc_VRGrabInitiate was TODO_RE == 0 behind an explicit skip). The constant is
+         * now filled in, so the write is live for the first time - it must fail closed like
+         * every sibling hook rather than silently corrupt whatever is at the address.
+         *
+         * Expected prologue verified against the decrypted Fallout4VR.exe 1.2.72
+         * analysis image (SHA-256
+         * 875A9A3FB50A0C41D8BB20848977106498DF1FFA8B4F7D5FEDA01F6F346C307A):
+         * RVA 0xF19250 maps to .text file offset 0xF18650 and starts with the
+         * exact 16 bytes below.
+         * NOTE ON SCOPE: nulling this function suppresses the native VR hand grab (the
+         * intended effect while ROCK owns grab), but it ALSO nulls
+         * TelekinesisEffect::CreateSpring, which reaches the same MouseSpring helper with
+         * GrabbingType=2. Telekinesis-style spring grabs stop working as a side effect.
+         */
+        static constexpr std::array<std::uint8_t, 16> kVrGrabInitiateExpectedPrefix{
+            0x44, 0x89, 0x4C, 0x24, 0x20,
+            0x89, 0x54, 0x24, 0x10,
+            0x55,
+            0x53,
+            0x56,
+            0x57,
+            0x41, 0x54, 0x41
+        };
+        static constexpr std::array<std::uint8_t, 3> kVrGrabSuppressedPrefix{
+            0x31, 0xC0, 0xC3
+        };
+        // Include the untouched fourth native byte in the atomic exchange.
+        // 0xF19250 is 16-byte aligned, so an interlocked LONG exchange cannot
+        // expose 31 / C0 / C3 as three separate writes to another thread.
+        static_assert((offsets::kFunc_VRGrabInitiate % alignof(LONG)) == 0);
+        constexpr LONG kExpectedEntryWord = static_cast<LONG>(0x244C8944u);
+        constexpr LONG kSuppressedEntryWord = static_cast<LONG>(0x24C3C031u);
+
+        if (!rock::hook_diagnostics::isReadable(
+                target.address(),
+                kVrGrabInitiateExpectedPrefix.size())) {
+            ROCK_LOG_ERROR(Init,
+                "Native VR-grab suppression unresolved: module+0x{:X} (0x{:X}) is not readable for the required "
+                "{}-byte validation. No bytes were written; ROCK cannot claim that native grab is disabled.",
+                offsets::kFunc_VRGrabInitiate,
+                target.address(),
+                kVrGrabInitiateExpectedPrefix.size());
+            return false;
         }
+
+        if (std::memcmp(
+                addr,
+                kVrGrabSuppressedPrefix.data(),
+                kVrGrabSuppressedPrefix.size()) == 0) {
+            ROCK_LOG_INFO(Init,
+                "Native VR-grab suppression already ACTIVE at module+0x{:X} (0x{:X}): compatible "
+                "[31 C0 C3] xor-eax/ret prefix is present. No bytes were written.",
+                offsets::kFunc_VRGrabInitiate,
+                target.address());
+            return true;
+        }
+
+        if (std::memcmp(
+                addr,
+                kVrGrabInitiateExpectedPrefix.data(),
+                kVrGrabInitiateExpectedPrefix.size()) != 0) {
+            ROCK_LOG_ERROR(Init,
+                "Native VR-grab suppression unresolved: module+0x{:X} (0x{:X}) matches neither the verified native "
+                "prologue nor the compatible [31 C0 C3] suppressed state. Expected native [{}], found [{}]. No bytes "
+                "were written; the final behavior of the existing code is UNKNOWN (it must not be reported as active "
+                "or disabled without evidence).",
+                offsets::kFunc_VRGrabInitiate,
+                target.address(),
+                rock::hook_diagnostics::formatBytes(
+                    kVrGrabInitiateExpectedPrefix.data(),
+                    kVrGrabInitiateExpectedPrefix.size()),
+                rock::hook_diagnostics::formatBytes(
+                    addr,
+                    kVrGrabInitiateExpectedPrefix.size()));
+            return false;
+        }
+
+        DWORD oldProtect = 0;
+        constexpr std::size_t kAtomicPatchBytes = sizeof(LONG);
+        if (!VirtualProtect(
+                addr,
+                kAtomicPatchBytes,
+                kPageExecuteReadWrite,
+                &oldProtect)) {
+            ROCK_LOG_ERROR(Init,
+                "Native VR-grab suppression FAILED at module+0x{:X} (0x{:X}): VirtualProtect(RWX) failed "
+                "(GetLastError={}). Verified native bytes remain unchanged.",
+                offsets::kFunc_VRGrabInitiate,
+                target.address(),
+                GetLastError());
+            return false;
+        }
+
+        /*
+         * Revalidate after obtaining write access, then commit the first four
+         * bytes with one compare/exchange. The fourth byte is identical in both
+         * words. A racing patcher therefore yields either the complete native
+         * word or the complete suppressed word, never a half-written function.
+         */
+        LONG observedWord = 0;
+        bool wroteSuppression = false;
+        if (std::memcmp(
+                addr,
+                kVrGrabInitiateExpectedPrefix.data(),
+                kVrGrabInitiateExpectedPrefix.size()) == 0) {
+            observedWord = InterlockedCompareExchange(
+                reinterpret_cast<volatile LONG*>(addr),
+                kSuppressedEntryWord,
+                kExpectedEntryWord);
+            wroteSuppression = observedWord == kExpectedEntryWord;
+        }
+
+        bool instructionCacheFlushed = true;
+        DWORD instructionCacheError = ERROR_SUCCESS;
+        if (wroteSuppression) {
+            instructionCacheFlushed =
+                FlushInstructionCache(
+                    GetCurrentProcess(),
+                    addr,
+                    kAtomicPatchBytes) != FALSE;
+            if (!instructionCacheFlushed) {
+                instructionCacheError = GetLastError();
+            }
+        }
+
+        DWORD ignoredProtect = 0;
+        const bool protectionRestored =
+            VirtualProtect(
+                addr,
+                kAtomicPatchBytes,
+                oldProtect,
+                &ignoredProtect) != FALSE;
+        const DWORD protectionRestoreError =
+            protectionRestored ? ERROR_SUCCESS : GetLastError();
+        if (!protectionRestored) {
+            ROCK_LOG_CRITICAL(Init,
+                "Native VR-grab patch at module+0x{:X} could not restore the original page protection "
+                "(GetLastError={}); final code bytes are verified below, but the page may remain writable.",
+                offsets::kFunc_VRGrabInitiate,
+                protectionRestoreError);
+        }
+
+        const bool finalStateReadable =
+            rock::hook_diagnostics::isReadable(
+                target.address(),
+                kVrGrabSuppressedPrefix.size());
+        const bool finalStateSuppressed =
+            finalStateReadable &&
+            std::memcmp(
+                addr,
+                kVrGrabSuppressedPrefix.data(),
+                kVrGrabSuppressedPrefix.size()) == 0;
+
+        if (!instructionCacheFlushed) {
+            ROCK_LOG_CRITICAL(Init,
+                "Native VR-grab suppression bytes were committed at module+0x{:X}, but FlushInstructionCache failed "
+                "(GetLastError={}). Final byte state is {}; restart is recommended.",
+                offsets::kFunc_VRGrabInitiate,
+                instructionCacheError,
+                finalStateSuppressed ? "the complete [31 C0 C3] patch" : "not the complete patch");
+        }
+
+        if (finalStateSuppressed) {
+            if (wroteSuppression) {
+                ROCK_LOG_INFO(Init,
+                    "Native VR-grab suppression ACTIVE at module+0x{:X} (0x{:X}): atomically installed "
+                    "[31 C0 C3] (xor eax,eax; ret); instruction-cache flush={}, page-protection restore={}.",
+                    offsets::kFunc_VRGrabInitiate,
+                    target.address(),
+                    instructionCacheFlushed ? "ok" : "FAILED",
+                    protectionRestored ? "ok" : "FAILED");
+            } else {
+                ROCK_LOG_INFO(Init,
+                    "Native VR-grab suppression already ACTIVE at module+0x{:X} (0x{:X}): a compatible "
+                    "[31 C0 C3] patch appeared during validation. ROCK wrote no bytes; page-protection restore={}.",
+                    offsets::kFunc_VRGrabInitiate,
+                    target.address(),
+                    protectionRestored ? "ok" : "FAILED");
+            }
+            return true;
+        }
+
+        ROCK_LOG_ERROR(Init,
+            "Native VR-grab suppression FAILED at module+0x{:X} (0x{:X}): atomic compare/exchange observed "
+            "0x{:08X}, and the final entry is not [31 C0 C3]. No partial ROCK patch was written.",
+            offsets::kFunc_VRGrabInitiate,
+            target.address(),
+            static_cast<std::uint32_t>(observedWord));
+        return false;
     }
 
     bool installNativeMeleeSuppressionHooks()
@@ -1763,16 +2419,181 @@ namespace rock
             return true;
         }
 
+        // Observe-only installs (below) legitimately leave exactly the
+        // {vrMeleeImpact, playerWeaponSwingCallback} pair installed. The
+        // partial-set fail-safe must not misread that pair as a stranded
+        // suppression rollback on any future re-entry.
+        static bool observationOnlyInstall = false;
+        if (observationOnlyInstall) {
+            return false;
+        }
+
         const bool anyInstalled = weaponSwingInstalled || hitFrameInstalled || attackBlockInstalled || playerWeaponSwingCallbackInstalled || vrMeleeImpactInstalled;
         if (anyInstalled) {
-            ROCK_LOG_ERROR(Init, "Native melee suppression hook set is partial before install; rolling back before retry");
-            rollbackNativeMeleeSuppressionHooks();
+            /*
+             * Some but not all targets are already hooked on ENTRY to this function. The
+             * only way to get here is a previous rollback that could not un-patch
+             * everything, so treat it as the fail-safe case: unwind again and clear the
+             * flags, exactly as the two failure paths below do. A partial hook set must
+             * never be left live with suppression enabled.
+             */
+            // Snapshot BEFORE rolling back: the rollback helpers clear these by reference,
+            // so reading them afterwards would report "no" for every target and hide which
+            // ones had actually been patched.
+            const char* const swingWas = weaponSwingInstalled ? "yes" : "no";
+            const char* const hitFrameWas = hitFrameInstalled ? "yes" : "no";
+            const char* const attackBlockWas = attackBlockInstalled ? "yes" : "no";
+            const char* const playerSwingWas = playerWeaponSwingCallbackInstalled ? "yes" : "no";
+            const char* const vrImpactWas = vrMeleeImpactInstalled ? "yes" : "no";
+
+            const bool rollbackOk = rollbackNativeMeleeSuppressionHooks();
+            g_rockConfig.rockNativeMeleeSuppressionEnabled = false;
+            g_rockConfig.rockNativeMeleeSuppressWeaponSwing = false;
+            g_rockConfig.rockNativeMeleeSuppressHitFrame = false;
+            g_rockConfig.rockNativeMeleeFullSuppression = false;
+            ROCK_LOG_ERROR(Init,
+                "FEATURE DISABLED: native melee suppression is OFF for this session - the hook set was already partial on entry "
+                "(weaponSwing={} hitFrame={} attackBlock={} playerSwingCallback={} vrMeleeImpact={}) and has been unwound (rollback {}). "
+                "All four suppression flags are cleared, so any hook still in place passes straight through to the native implementation.",
+                swingWas,
+                hitFrameWas,
+                attackBlockWas,
+                playerSwingWas,
+                vrImpactWas,
+                rollbackOk ? "succeeded" : "was INCOMPLETE - see the CRITICAL line above");
+            return false;
+        }
+
+        /*
+         * ── OPT-IN GATE ───────────────────────────────────────────────────────────────
+         *
+         * Checked BEFORE any patching, and deliberately AFTER the partial-rollback block
+         * above so a partially-installed set still gets cleaned up rather than stranded.
+         *
+         * Until now this feature could not install at all: two of its five hook offsets
+         * were TODO_RE == 0, so validation failed on every machine and nothing was ever
+         * patched. Both are now Ghidra-confirmed, which means this code path is about to
+         * execute for the first time in the mod's life. Splicing a 14-byte entry detour
+         * into VRMeleeImpact plus four vtable swaps is not something to switch on silently
+         * in the very change that makes it possible — especially with an open report of
+         * melee not working. So: available, documented, and OFF until asked for.
+         *
+         * Not installing is strictly safer than installing-and-passing-through: the hook
+         * bodies do gate on these same flags at runtime, but declining to patch means the
+         * native code is left completely untouched.
+         */
+        if (!g_rockConfig.rockNativeMeleeSuppressionEnabled) {
+            /*
+             * OBSERVE-ONLY MODE (Jul 31): install just the VRMeleeImpact entry
+             * trampoline and the PlayerCharacter::WeaponSwingCallBack vtable
+             * swap so player swings and native hits are logged with paired
+             * counters. With suppression off, every policy in the hook bodies
+             * returns CallNative ("suppression-disabled"), so both hooks are
+             * pure pass-throughs. g_nativeMeleeSuppressionHooksInstalled stays
+             * FALSE — it gates shouldSuppressNativeVrMeleeVelocity and must
+             * only reflect the full suppression set. The other three hooks
+             * (WeaponSwingHandler / HitFrameHandler animation handlers, the
+             * AttackBlockHandler input gate) observe no hits and stay
+             * uninstalled.
+             */
+            if (g_rockConfig.rockNativeMeleeObservationEnabled) {
+                const bool impactValid = validateEntryTrampolineTarget(
+                    "VRMeleeImpact",
+                    offsets::kFunc_VRMeleeImpactCallback,
+                    kVrMeleeImpactExpectedPrefix.data(),
+                    kVrMeleeImpactExpectedPrefix.size());
+                const bool swingValid = validateNativeMeleeVtableTarget(
+                    offsets::kVtableEntry_PlayerCharacter_WeaponSwingCallBack,
+                    offsets::kFunc_PlayerCharacter_WeaponSwingCallBack,
+                    "PlayerCharacter::WeaponSwingCallBack");
+                if (impactValid && swingValid) {
+                    void* impactOriginal = reinterpret_cast<void*>(g_originalVrMeleeImpactCallback);
+                    vrMeleeImpactInstalled = installEntryTrampolineHook("VRMeleeImpact",
+                        offsets::kFunc_VRMeleeImpactCallback,
+                        kVrMeleeImpactExpectedPrefix.data(),
+                        kVrMeleeImpactExpectedPrefix.size(),
+                        &hookedVrMeleeImpactCallback,
+                        impactOriginal);
+                    g_originalVrMeleeImpactCallback = reinterpret_cast<NativeVrMeleeImpactCallback_t>(impactOriginal);
+                    if (vrMeleeImpactInstalled) {
+                        playerWeaponSwingCallbackInstalled = installNativeMeleeVtableHook(
+                            offsets::kVtableEntry_PlayerCharacter_WeaponSwingCallBack,
+                            offsets::kFunc_PlayerCharacter_WeaponSwingCallBack,
+                            &hookedPlayerWeaponSwingCallback,
+                            g_originalPlayerWeaponSwingCallback,
+                            "PlayerCharacter::WeaponSwingCallBack");
+                    }
+                    if (vrMeleeImpactInstalled && playerWeaponSwingCallbackInstalled) {
+                        observationOnlyInstall = true;
+                        g_nativeMeleeSuppressionHooksInstalled.store(false, std::memory_order_release);
+                        ROCK_LOG_INFO(Init,
+                            "Native melee OBSERVATION hooks installed (observe-only pass-through; suppression remains OFF). "
+                            "Every player melee SWING and every native melee IMPACT (the game's own hit decision) is now logged "
+                            "with paired counters at info level — a SWING with no following IMPACT is a native miss. "
+                            "Disable with [PhysicsInteraction] bNativeMeleeObservationEnabled=0 and RESTART.");
+                        return false;
+                    }
+                    // Partial observation install: unwind whichever half made it.
+                    // The rollback helper restores only hooks whose installed
+                    // flags are set, and the other three are untouched here.
+                    const bool rollbackOk = rollbackNativeMeleeSuppressionHooks();
+                    ROCK_LOG_ERROR(Init,
+                        "Native melee OBSERVATION install was incomplete (vrMeleeImpact={} playerSwingCallback={}) and has been "
+                        "rolled back ({}). Native melee is untouched; swing/hit logging is unavailable this session.",
+                        vrMeleeImpactInstalled ? "yes" : "no",
+                        playerWeaponSwingCallbackInstalled ? "yes" : "no",
+                        rollbackOk ? "cleanly" : "INCOMPLETE - see the CRITICAL line above");
+                } else {
+                    ROCK_LOG_WARN(Init,
+                        "Native melee OBSERVATION targets failed validation (vrMeleeImpact={} playerSwingCallback={}) — nothing was "
+                        "patched; native melee is untouched and swing/hit logging is unavailable this session.",
+                        impactValid ? "ok" : "FAILED",
+                        swingValid ? "ok" : "FAILED");
+                }
+                g_nativeMeleeSuppressionHooksInstalled.store(false, std::memory_order_release);
+                return false;
+            }
+
+            static std::atomic<bool> availabilityLogged{ false };
+            if (!availabilityLogged.exchange(true, std::memory_order_acq_rel)) {
+                ROCK_LOG_INFO(Init,
+                    "Native melee suppression is AVAILABLE but DISABLED BY DEFAULT - no hooks were installed and native melee is fully intact. "
+                    "Its five hook targets are now all Ghidra-confirmed for FO4VR 1.2.72 (the two that were unset are VRMeleeImpact "
+                    "module+0x{:X} and the AttackBlockHandler::ShouldHandleEvent vtable slot module+0x{:X}), so the feature can install for the "
+                    "first time - which is exactly why it is opt-in. To enable it set [PhysicsInteraction] bNativeMeleeSuppressionEnabled=1 in "
+                    "Data\\F4SE\\Plugins\\Heisenberg_F4VR.ini (per-path: bNativeMeleeSuppressWeaponSwing, bNativeMeleeSuppressHitFrame) and "
+                    "RESTART the game; hooks install once at "
+                    "plugin init, so a save reload will not pick it up. Observe-only swing/hit logging "
+                    "(bNativeMeleeObservationEnabled) is also disabled this session.",
+                    offsets::kFunc_VRMeleeImpactCallback,
+                    offsets::kVtableEntry_AttackBlockHandler_ShouldHandleEvent);
+            }
+            g_nativeMeleeSuppressionHooksInstalled.store(false, std::memory_order_release);
             return false;
         }
 
         if (!validateNativeMeleeSuppressionHookTargets()) {
-            ROCK_LOG_ERROR(Init, "Native melee suppression hook validation failed; install deferred");
+            /*
+             * FAIL-SAFE: validation is all-or-nothing and runs BEFORE the first byte is
+             * written, so reaching here means NOTHING has been patched.
+             *
+             * Clear the feature flags here rather than relying on the caller. An equivalent
+             * block exists in PhysicsInteraction::init(), but this safety property must not
+             * depend on a different file continuing to do it: if native melee suppression
+             * cannot install, every reader of these flags must see the feature as OFF or
+             * the config echo will keep advertising suppression that has nothing behind it.
+             */
+            g_rockConfig.rockNativeMeleeSuppressionEnabled = false;
+            g_rockConfig.rockNativeMeleeSuppressWeaponSwing = false;
+            g_rockConfig.rockNativeMeleeSuppressHitFrame = false;
+            g_rockConfig.rockNativeMeleeFullSuppression = false;
             g_nativeMeleeSuppressionHooksInstalled.store(false, std::memory_order_release);
+            ROCK_LOG_ERROR(Init,
+                "FEATURE DISABLED: native melee suppression is OFF for this session - target validation failed, so NOTHING was patched (the "
+                "installer validates all five targets before writing any bytes; see the summary line above for which one and its found-vs-expected "
+                "bytes). bNativeMeleeSuppressionEnabled, bNativeMeleeSuppressWeaponSwing, bNativeMeleeSuppressHitFrame and "
+                "bNativeMeleeFullSuppression are all cleared. CONSEQUENCE: FO4VR's native melee - weapon swing, hit frame, the AttackBlock input "
+                "gate and the VRInput velocity gate - is left completely intact and behaves exactly as vanilla.");
             return false;
         }
 
@@ -1788,20 +2609,32 @@ namespace rock
         }
         if (!weaponSwingInstalled) {
             weaponSwingInstalled = installNativeMeleeVtableHook(
-                offsets::kVtableEntry_WeaponSwingHandler_Handle, &hookedWeaponSwingHandler, g_originalWeaponSwingHandler, "WeaponSwingHandler::Handle");
+                offsets::kVtableEntry_WeaponSwingHandler_Handle,
+                offsets::kFunc_WeaponSwingHandler_Handle,
+                &hookedWeaponSwingHandler,
+                g_originalWeaponSwingHandler,
+                "WeaponSwingHandler::Handle");
         }
         if (!hitFrameInstalled) {
-            hitFrameInstalled =
-                installNativeMeleeVtableHook(offsets::kVtableEntry_HitFrameHandler_Handle, &hookedHitFrameHandler, g_originalHitFrameHandler, "HitFrameHandler::Handle");
+            hitFrameInstalled = installNativeMeleeVtableHook(
+                offsets::kVtableEntry_HitFrameHandler_Handle,
+                offsets::kFunc_HitFrameHandler_Handle,
+                &hookedHitFrameHandler,
+                g_originalHitFrameHandler,
+                "HitFrameHandler::Handle");
         }
         if (!attackBlockInstalled) {
-            attackBlockInstalled = installNativeMeleeVtableHook(offsets::kVtableEntry_AttackBlockHandler_ShouldHandleEvent,
+            attackBlockInstalled = installNativeMeleeVtableHook(
+                offsets::kVtableEntry_AttackBlockHandler_ShouldHandleEvent,
+                offsets::kFunc_AttackBlockHandler_ShouldHandleEvent,
                 &hookedAttackBlockShouldHandleEvent,
                 g_originalAttackBlockShouldHandleEvent,
                 "AttackBlockHandler::ShouldHandleEvent");
         }
         if (!playerWeaponSwingCallbackInstalled) {
-            playerWeaponSwingCallbackInstalled = installNativeMeleeVtableHook(offsets::kVtableEntry_PlayerCharacter_WeaponSwingCallBack,
+            playerWeaponSwingCallbackInstalled = installNativeMeleeVtableHook(
+                offsets::kVtableEntry_PlayerCharacter_WeaponSwingCallBack,
+                offsets::kFunc_PlayerCharacter_WeaponSwingCallBack,
                 &hookedPlayerWeaponSwingCallback,
                 g_originalPlayerWeaponSwingCallback,
                 "PlayerCharacter::WeaponSwingCallBack");
@@ -1815,8 +2648,25 @@ namespace rock
                 attackBlockInstalled ? "yes" : "no",
                 playerWeaponSwingCallbackInstalled ? "yes" : "no",
                 vrMeleeImpactInstalled ? "yes" : "no");
-            rollbackNativeMeleeSuppressionHooks();
+            const bool rollbackOk = rollbackNativeMeleeSuppressionHooks();
             g_nativeMeleeSuppressionHooksInstalled.store(false, std::memory_order_release);
+
+            /*
+             * FAIL-SAFE, same contract as the validation branch: a partial hook set is
+             * never left live. Every target that DID install has just been restored by
+             * rollbackNativeMeleeSuppressionHooks(), so clear the feature flags too - the
+             * hook bodies that survive a failed rollback must then fall through to the
+             * native implementation instead of suppressing anything.
+             */
+            g_rockConfig.rockNativeMeleeSuppressionEnabled = false;
+            g_rockConfig.rockNativeMeleeSuppressWeaponSwing = false;
+            g_rockConfig.rockNativeMeleeSuppressHitFrame = false;
+            g_rockConfig.rockNativeMeleeFullSuppression = false;
+            ROCK_LOG_ERROR(Init,
+                "FEATURE DISABLED: native melee suppression is OFF for this session - installation was incomplete and has been rolled back "
+                "(rollback {}). All four suppression flags are cleared, so any hook that could not be un-patched now passes straight through to "
+                "the native implementation. CONSEQUENCE: FO4VR's native melee behaves as vanilla.",
+                rollbackOk ? "succeeded - no ROCK detours remain" : "was INCOMPLETE - see the CRITICAL line above; some detours may still be in place");
             return false;
         }
 
@@ -1832,14 +2682,222 @@ namespace rock
     using ProcessConstraints_t = void (*)(void*, void*, void*, void*);
     static ProcessConstraints_t g_originalProcessConstraints = nullptr;
 
-    // Renamed from hookedProcessConstraintsCallback: the many early `return`s inside this
-    // function's __try body make an RAII in-flight-callback guard unsafe to place inside
-    // it (a __except unwind skips destructors, and a plain `return` inside a __try
-    // associated with __except does NOT run any code placed after the construct - it
-    // just returns). hookedProcessConstraintsCallback below wraps THIS whole call instead,
-    // so every exit path (early return, normal completion, or SEH fault) is covered by one
-    // unconditional decrement after the call returns.
-    void hookedProcessConstraintsCallbackImpl(void* controller, void* charProxy, void* manifold, void* simplexInput)
+    // Host-held/player separation is an ownership invariant, not a tunable
+    // contact policy. Run this exact world/body filter before taking ROCK's
+    // configuration read lock so a live config reload, dormant ROCK runtime,
+    // or disabled optional object filter cannot let a Heisenberg-held prop
+    // feed displacement into the player's character controller.
+    static void filterExternalHeldPlayerContacts(
+        void* controller,
+        void* manifold,
+        void* simplexInput)
+    {
+        if (!HostHasExternalHeldBodies() ||
+            !isPlayerCharacterController(controller)) {
+            return;
+        }
+
+        performance_profiler::ScopedTimer profilerTimer(
+            performance_profiler::Scope::CharacterControllerContactFilter);
+
+        RE::bhkWorld* const playerBhkWorld =
+            resolvePlayerBhkWorld();
+        RE::hknpWorld* const playerHknpWorld =
+            playerBhkWorld ?
+                havok_runtime::getHknpWorldFromBhk(playerBhkWorld) :
+                nullptr;
+        if (!playerHknpWorld) {
+            return;
+        }
+
+        const auto contactBuffers =
+            held_grab_cc_policy::makeGeneratedContactBufferView(
+                manifold,
+                simplexInput);
+        if (!contactBuffers.valid) {
+            // Constraint-only rows do not expose a target body ID. Never drop
+            // every player constraint as a fallback: that would also remove
+            // floor/wall support. The normal collision-group path remains a
+            // secondary safeguard for this uncommon native layout.
+            return;
+        }
+
+        (void)held_grab_cc_policy::filterGeneratedContactBuffers(
+            contactBuffers,
+            [playerHknpWorld](const std::uint32_t bodyId) {
+                return HostIsExternalHeldBody(
+                    playerHknpWorld,
+                    bodyId);
+            });
+    }
+
+    /*
+     * Keep the timer in this helper rather than the SEH-owning hook below.
+     * MSVC forbids destructor-bearing RAII locals in a function containing
+     * __try, and timing the outer hook would also charge Fallout's original
+     * processConstraints solve to ROCK. This boundary contains only ROCK's
+     * policy checks and manifold compaction.
+     */
+    static void filterRockCharacterControllerContacts(
+        void* controller,
+        void* manifold,
+        void* simplexInput)
+    {
+        performance_profiler::ScopedTimer profilerTimer(
+            performance_profiler::Scope::CharacterControllerContactFilter);
+
+        const bool playerControllerFilterEnabled =
+            g_rockConfig.
+                rockNativeCharacterControllerObjectContactFilterEnabled;
+        const bool playerController =
+            isPlayerCharacterController(controller);
+        RE::bhkWorld* const playerBhkWorld =
+            playerController ? resolvePlayerBhkWorld() : nullptr;
+        RE::hknpWorld* const playerHknpWorld =
+            playerBhkWorld ?
+                havok_runtime::getHknpWorldFromBhk(playerBhkWorld) :
+                nullptr;
+        const bool playerControllerFilterActive =
+            playerControllerFilterEnabled &&
+            playerController &&
+            playerHknpWorld;
+
+        auto* const pi =
+            PhysicsInteraction::s_instance.load(
+                std::memory_order_acquire);
+        const bool piReady = pi && pi->isInitialized();
+        const bool rightHolding =
+            piReady &&
+            pi->getRightHand().isHoldingAtomic();
+        const bool leftHolding =
+            piReady &&
+            pi->getLeftHand().isHoldingAtomic();
+        const bool diagnosticsEnabled =
+            g_rockConfig.rockDebugGrabFrameLogging ||
+            g_rockConfig.rockDebugVerboseLogging;
+        const auto contactPolicy =
+            held_grab_cc_policy::evaluateHeldGrabContactPolicy(
+                held_grab_cc_policy::HeldGrabContactPolicyInput{
+                    .hooksEnabled = piReady,
+                    .holdingHeldObject =
+                        rightHolding || leftHolding,
+                    .diagnosticsEnabled = diagnosticsEnabled,
+                });
+        const bool heldFilterActive =
+            piReady && contactPolicy.mayFilterBeforeOriginal;
+
+        if (!heldFilterActive &&
+            !playerControllerFilterActive) {
+            return;
+        }
+
+        const auto contactBuffers =
+            held_grab_cc_policy::makeGeneratedContactBufferView(
+                manifold,
+                simplexInput);
+        if (!contactBuffers.valid) {
+            /*
+             * Fail open when Havok did not provide the manifold rows that
+             * carry body IDs. Constraint-only rows cannot distinguish a
+             * dying generated collider from a native car or small prop, so
+             * clearing them would silently turn vanilla player collision
+             * off whenever either hand happened to hold an object.
+             */
+            if (g_rockConfig.rockDebugVerboseLogging) {
+                ROCK_LOG_SAMPLE_DEBUG(CC,
+                    g_rockConfig.rockLogSampleMilliseconds,
+                    "Skipped character-controller pre-filter reason={} manifoldCount={} constraintCount={} heldFilter={} playerObjectFilter={}",
+                    contactBuffers.reason,
+                    contactBuffers.manifoldCount,
+                    contactBuffers.constraintCount,
+                    heldFilterActive ? "on" : "off",
+                    playerControllerFilterActive ? "on" : "off");
+            }
+            return;
+        }
+
+        int removedHeldPairs = 0;
+        int removedPlayerObjectPairs = 0;
+        int removedPlayerGeneratedPairs = 0;
+        int removedPlayerTransientPairs = 0;
+        int preservedPlayerSupportPairs = 0;
+        int preservedPlayerNativePairs = 0;
+        const auto filterResult =
+            held_grab_cc_policy::filterGeneratedContactBuffers(
+                contactBuffers,
+                [&](std::uint32_t bodyId) {
+                    if (heldFilterActive) {
+                        bool isHeld = false;
+                        if (rightHolding) {
+                            isHeld =
+                                pi->getRightHand().
+                                    isHeldBodyId(bodyId);
+                        }
+                        if (!isHeld && leftHolding) {
+                            isHeld =
+                                pi->getLeftHand().
+                                    isHeldBodyId(bodyId);
+                        }
+                        if (isHeld) {
+                            ++removedHeldPairs;
+                            return true;
+                        }
+                    }
+
+                    if (playerControllerFilterActive) {
+                        const auto decision =
+                            evaluatePlayerControllerTargetBody(
+                                playerHknpWorld,
+                                bodyId);
+                        if (decision.suppress) {
+                            ++removedPlayerObjectPairs;
+                            if (std::string_view(
+                                    decision.reason) ==
+                                "rockGeneratedBody") {
+                                ++removedPlayerGeneratedPairs;
+                            } else {
+                                ++removedPlayerTransientPairs;
+                            }
+                            return true;
+                        }
+                        if (std::string_view(decision.reason) ==
+                            "supportLayer") {
+                            ++preservedPlayerSupportPairs;
+                        } else {
+                            ++preservedPlayerNativePairs;
+                        }
+                    }
+                    return false;
+                });
+
+        if (diagnosticsEnabled && filterResult.valid) {
+            if (filterResult.removedPairCount > 0) {
+                ROCK_LOG_SAMPLE_DEBUG(CC,
+                    g_rockConfig.rockLogSampleMilliseconds,
+                    "Filtered {} character-controller contacts before original listener kept={} originalPairs={} rockHeldRemoved={} playerObjectRemoved={} playerGeneratedRemoved={} playerTransientRemoved={} playerSupportPreserved={} playerNativePreserved={}",
+                    filterResult.removedPairCount,
+                    filterResult.keptPairCount,
+                    filterResult.originalPairCount,
+                    removedHeldPairs,
+                    removedPlayerObjectPairs,
+                    removedPlayerGeneratedPairs,
+                    removedPlayerTransientPairs,
+                    preservedPlayerSupportPairs,
+                    preservedPlayerNativePairs);
+            } else if (
+                g_rockConfig.rockDebugVerboseLogging) {
+                ROCK_LOG_SAMPLE_DEBUG(CC,
+                    g_rockConfig.rockLogSampleMilliseconds,
+                    "Character-controller pre-filter kept native contacts originalPairs={} reason={} playerSupportPreserved={} playerNativePreserved={}",
+                    filterResult.originalPairCount,
+                    filterResult.reason,
+                    preservedPlayerSupportPairs,
+                    preservedPlayerNativePairs);
+            }
+        }
+    }
+
+    static void hookedProcessConstraintsCallbackImpl(void* controller, void* charProxy, void* manifold, void* simplexInput)
     {
         bool originalAttempted = false;
         if (!PhysicsInteraction::s_hooksEnabled.load(std::memory_order_acquire)) {
@@ -1851,128 +2909,10 @@ namespace rock
         }
 
         __try {
-            const bool playerControllerFilterEnabled = g_rockConfig.rockNativeCharacterControllerObjectContactFilterEnabled;
-            const bool playerController = playerControllerFilterEnabled && isPlayerCharacterController(controller);
-            RE::bhkWorld* playerBhkWorld = playerController ? resolvePlayerBhkWorld() : nullptr;
-            RE::hknpWorld* playerHknpWorld = playerBhkWorld ? havok_runtime::getHknpWorldFromBhk(playerBhkWorld) : nullptr;
-            const bool playerControllerFilterActive = playerController && playerHknpWorld;
-
-            auto* pi = PhysicsInteraction::s_instance.load(std::memory_order_acquire);
-            const bool piReady = pi && pi->isInitialized();
-            const bool rightHolding = piReady && pi->getRightHand().isHoldingAtomic();
-            const bool leftHolding = piReady && pi->getLeftHand().isHoldingAtomic();
-            const bool diagnosticsEnabled = g_rockConfig.rockDebugGrabFrameLogging || g_rockConfig.rockDebugVerboseLogging;
-            const auto contactPolicy = held_grab_cc_policy::evaluateHeldGrabContactPolicy(held_grab_cc_policy::HeldGrabContactPolicyInput{
-                .hooksEnabled = piReady,
-                .holdingHeldObject = rightHolding || leftHolding,
-                .diagnosticsEnabled = diagnosticsEnabled,
-            });
-            const bool heldFilterActive = piReady && contactPolicy.mayFilterBeforeOriginal;
-
-            if (!heldFilterActive && !playerControllerFilterActive) {
-                if (g_originalProcessConstraints) {
-                    originalAttempted = true;
-                    g_originalProcessConstraints(controller, charProxy, manifold, simplexInput);
-                }
-                return;
-            }
-
-            const auto contactBuffers = held_grab_cc_policy::makeGeneratedContactBufferView(manifold, simplexInput);
-            if (!contactBuffers.valid) {
-                if (playerControllerFilterActive && std::string_view(contactBuffers.reason) == "missingManifoldEntries") {
-                    const auto clearResult = held_grab_cc_policy::clearGeneratedConstraintOnlyContacts(contactBuffers);
-                    if (clearResult.valid) {
-                        ROCK_LOG_SAMPLE_DEBUG(CC,
-                            g_rockConfig.rockLogSampleMilliseconds,
-                            "Cleared {} player character-controller constraint-only contacts before original listener reason={} heldFilter={} playerObjectFilter={}",
-                            clearResult.removedPairCount,
-                            clearResult.reason,
-                            heldFilterActive ? "on" : "off",
-                            playerControllerFilterActive ? "on" : "off");
-                    }
-                }
-                if (g_rockConfig.rockDebugVerboseLogging) {
-                    ROCK_LOG_SAMPLE_DEBUG(CC,
-                        g_rockConfig.rockLogSampleMilliseconds,
-                        "Skipped character-controller pre-filter reason={} manifoldCount={} constraintCount={} heldFilter={} playerObjectFilter={}",
-                        contactBuffers.reason,
-                        contactBuffers.manifoldCount,
-                        contactBuffers.constraintCount,
-                        heldFilterActive ? "on" : "off",
-                        playerControllerFilterActive ? "on" : "off");
-                }
-                if (g_originalProcessConstraints) {
-                    originalAttempted = true;
-                    g_originalProcessConstraints(controller, charProxy, manifold, simplexInput);
-                }
-                return;
-            }
-
-            int removedHeldPairs = 0;
-            int removedPlayerObjectPairs = 0;
-            int removedPlayerNonSupportPairs = 0;
-            int removedPlayerMovableStaticPairs = 0;
-            int preservedPlayerSupportPairs = 0;
-            int preservedUnknownTargetPairs = 0;
-            const auto filterResult = held_grab_cc_policy::filterGeneratedContactBuffers(contactBuffers, [&](std::uint32_t bodyId) {
-                if (heldFilterActive) {
-                    bool isHeld = false;
-                    if (rightHolding) {
-                        isHeld = pi->getRightHand().isHeldBodyId(bodyId);
-                    }
-                    if (!isHeld && leftHolding) {
-                        isHeld = pi->getLeftHand().isHeldBodyId(bodyId);
-                    }
-                    if (isHeld) {
-                        ++removedHeldPairs;
-                        return true;
-                    }
-                }
-
-                if (playerControllerFilterActive) {
-                    const auto decision = evaluatePlayerControllerTargetBody(playerBhkWorld, playerHknpWorld, bodyId);
-                    if (decision.suppress) {
-                        ++removedPlayerObjectPairs;
-                        if (std::string_view(decision.reason) == "movableStaticSupportLayer") {
-                            ++removedPlayerMovableStaticPairs;
-                        } else {
-                            ++removedPlayerNonSupportPairs;
-                        }
-                        return true;
-                    }
-                    if (std::string_view(decision.reason) == "supportLayer") {
-                        ++preservedPlayerSupportPairs;
-                    } else if (std::string_view(decision.reason) == "unknownTargetLayer") {
-                        ++preservedUnknownTargetPairs;
-                    }
-                }
-                return false;
-            });
-
-            if (diagnosticsEnabled && filterResult.valid) {
-                if (filterResult.removedPairCount > 0) {
-                    ROCK_LOG_SAMPLE_DEBUG(CC,
-                        g_rockConfig.rockLogSampleMilliseconds,
-                        "Filtered {} character-controller contacts before original listener kept={} originalPairs={} heldRemoved={} playerObjectRemoved={} playerNonSupportRemoved={} playerMovableStaticRemoved={} playerSupportPreserved={} playerUnknownPreserved={}",
-                        filterResult.removedPairCount,
-                        filterResult.keptPairCount,
-                        filterResult.originalPairCount,
-                        removedHeldPairs,
-                        removedPlayerObjectPairs,
-                        removedPlayerNonSupportPairs,
-                        removedPlayerMovableStaticPairs,
-                        preservedPlayerSupportPairs,
-                        preservedUnknownTargetPairs);
-                } else if (g_rockConfig.rockDebugVerboseLogging) {
-                    ROCK_LOG_SAMPLE_DEBUG(CC,
-                        g_rockConfig.rockLogSampleMilliseconds,
-                        "Character-controller pre-filter kept native contacts originalPairs={} reason={} playerSupportPreserved={} playerUnknownPreserved={}",
-                        filterResult.originalPairCount,
-                        filterResult.reason,
-                        preservedPlayerSupportPairs,
-                        preservedUnknownTargetPairs);
-                }
-            }
+            filterRockCharacterControllerContacts(
+                controller,
+                manifold,
+                simplexInput);
 
             if (g_originalProcessConstraints) {
                 originalAttempted = true;
@@ -1995,12 +2935,62 @@ namespace rock
 
     // Counts the call to hookedProcessConstraintsCallbackImpl so destroyPhysicsInteraction
     // can drain in-flight physics-thread callbacks before freeing the PhysicsInteraction
-    // instance this callback dereferences (pi->getRightHand()/getLeftHand() above).
+    // instance this callback dereferences (pi->getRightHand()/getLeftHand() inside). The
+    // counter deliberately lives OUTSIDE the Impl's __try: an RAII guard inside a __try whose
+    // __except can fire would leak the count on unwind. Restored after the attempt-6 port
+    // collapsed the wrapper/Impl split and left ROCKMain's drain loop a permanent no-op.
     void hookedProcessConstraintsCallback(void* controller, void* charProxy, void* manifold, void* simplexInput)
     {
         PhysicsInteraction::s_inFlightCallbacks.fetch_add(1, std::memory_order_acq_rel);
-        hookedProcessConstraintsCallbackImpl(controller, charProxy, manifold, simplexInput);
-        PhysicsInteraction::s_inFlightCallbacks.fetch_sub(1, std::memory_order_acq_rel);
+        __try {
+            filterExternalHeldPlayerContacts(
+                controller,
+                manifold,
+                simplexInput);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            static std::atomic<std::uint32_t>
+                externalHeldFilterFaultCount{ 0 };
+            const auto faultCount =
+                externalHeldFilterFaultCount.fetch_add(
+                    1,
+                    std::memory_order_relaxed) +
+                1;
+            if (faultCount == 1 ||
+                faultCount % 100 == 0) {
+                logger::error(
+                    "[ROCK::CC] external held-body filter fault "
+                    "(count={})",
+                    faultCount);
+            }
+        }
+        const bool configRead = g_rockConfig.tryEnterNativeRead();
+        if (configRead) {
+            hookedProcessConstraintsCallbackImpl(
+                controller,
+                charProxy,
+                manifold,
+                simplexInput);
+            g_rockConfig.leaveNativeRead();
+        } else if (g_originalProcessConstraints) {
+            /*
+             * A config mutation only pauses ROCK's filter. Preserve the
+             * engine callback itself so hot reload cannot drop a native
+             * character-controller solve.
+             */
+            __try {
+                g_originalProcessConstraints(
+                    controller,
+                    charProxy,
+                    manifold,
+                    simplexInput);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+            }
+        }
+        if (PhysicsInteraction::s_inFlightCallbacks.fetch_sub(
+                1,
+                std::memory_order_acq_rel) == 1) {
+            PhysicsInteraction::s_inFlightCallbacks.notify_all();
+        }
     }
 
     void installRefreshManifoldHook()

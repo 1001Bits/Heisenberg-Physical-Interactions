@@ -18,10 +18,14 @@ namespace HeisenbergPluginAPI
         DualWieldStateProvider g_stateProvider = nullptr;
         std::uint32_t g_stateProviderCalls = 0;
         bool g_stateProviderDraining = false;
+        bool g_stateProviderSelfDrain = false;
+        thread_local DualWieldStateProvider g_invokingStateProvider = nullptr;
 
         DualWieldWeaponContactCallback g_contactCallback = nullptr;
         std::uint32_t g_contactCallbackCalls = 0;
         bool g_contactCallbackDraining = false;
+        bool g_contactCallbackSelfDrain = false;
+        thread_local DualWieldWeaponContactCallback g_invokingContactCallback = nullptr;
 
         void FinishStateProviderCall()
         {
@@ -30,6 +34,13 @@ namespace HeisenbergPluginAPI
                 --g_stateProviderCalls;
             }
             if (g_stateProviderCalls == 0) {
+                // A provider is allowed to unregister itself. That call cannot
+                // wait for its own stack frame, so the final in-flight call
+                // completes the deferred drain here.
+                if (g_stateProviderSelfDrain) {
+                    g_stateProviderDraining = false;
+                    g_stateProviderSelfDrain = false;
+                }
                 g_registryCV.notify_all();
             }
         }
@@ -41,6 +52,10 @@ namespace HeisenbergPluginAPI
                 --g_contactCallbackCalls;
             }
             if (g_contactCallbackCalls == 0) {
+                if (g_contactCallbackSelfDrain) {
+                    g_contactCallbackDraining = false;
+                    g_contactCallbackSelfDrain = false;
+                }
                 g_registryCV.notify_all();
             }
         }
@@ -68,6 +83,9 @@ namespace HeisenbergPluginAPI
         std::unique_lock lock(g_registryMutex);
         if (!g_stateProvider) {
             if (g_stateProviderDraining) {
+                if (g_invokingStateProvider == provider) {
+                    return true;
+                }
                 g_registryCV.wait(lock, [] { return g_stateProviderCalls == 0; });
             }
             return true;
@@ -78,6 +96,14 @@ namespace HeisenbergPluginAPI
 
         g_stateProvider = nullptr;
         g_stateProviderDraining = true;
+        if (g_invokingStateProvider == provider) {
+            // Waiting here would deadlock on this very invocation. Keep the
+            // registry closed until FinishStateProviderCall observes the last
+            // in-flight call.
+            g_stateProviderSelfDrain = true;
+            return true;
+        }
+        g_stateProviderSelfDrain = false;
         g_registryCV.wait(lock, [] { return g_stateProviderCalls == 0; });
         g_stateProviderDraining = false;
         return true;
@@ -105,6 +131,9 @@ namespace HeisenbergPluginAPI
         std::unique_lock lock(g_registryMutex);
         if (!g_contactCallback) {
             if (g_contactCallbackDraining) {
+                if (g_invokingContactCallback == callback) {
+                    return true;
+                }
                 g_registryCV.wait(lock, [] { return g_contactCallbackCalls == 0; });
             }
             return true;
@@ -115,6 +144,11 @@ namespace HeisenbergPluginAPI
 
         g_contactCallback = nullptr;
         g_contactCallbackDraining = true;
+        if (g_invokingContactCallback == callback) {
+            g_contactCallbackSelfDrain = true;
+            return true;
+        }
+        g_contactCallbackSelfDrain = false;
         g_registryCV.wait(lock, [] { return g_contactCallbackCalls == 0; });
         g_contactCallbackDraining = false;
         return true;
@@ -149,11 +183,14 @@ namespace HeisenbergPluginAPI
         state.flags = requestFlags;
         state.formID = requestFormID;
         bool succeeded = false;
+        const auto previousProvider = g_invokingStateProvider;
+        g_invokingStateProvider = provider;
         try {
             succeeded = provider(hand, &state);
         } catch (...) {
             succeeded = false;
         }
+        g_invokingStateProvider = previousProvider;
         FinishStateProviderCall();
 
         return succeeded && HasValidHeader(state) && state.physicalHand == hand;
@@ -175,11 +212,14 @@ namespace HeisenbergPluginAPI
             ++g_contactCallbackCalls;
         }
 
+        const auto previousCallback = g_invokingContactCallback;
+        g_invokingContactCallback = callback;
         try {
             callback(&contact);
         } catch (...) {
             // Never unwind a consumer exception through the Havok callback path.
         }
+        g_invokingContactCallback = previousCallback;
         FinishContactCallbackCall();
     }
 

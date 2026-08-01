@@ -49,6 +49,14 @@ namespace heisenberg
         REL::Offset(0x0dac570)
     };
 
+    // TaskQueueInterface::QueueAddRipple(float amount, NiPoint3& position)
+    // VR Offset: 0x0dac660 (Status 2) | ID: 312656
+    using QueueAddRipple_t = void (*)(RE::TaskQueueInterface* taskQueue,
+                                      float amount, RE::NiPoint3& position);
+    inline REL::Relocation<QueueAddRipple_t> TaskQueue_AddRipple{
+        REL::Offset(0x0dac660)
+    };
+
     // =========================================================================
     // TESWaterSystem::AddRipple - DIRECT ripple creation (bypasses task queue)
     // =========================================================================
@@ -85,6 +93,7 @@ namespace heisenberg
     // Cached TESWaterSystem singleton
     static void* g_TESWaterSystem = nullptr;
     static bool  g_TESWaterSystemSearched = false;
+    static std::chrono::steady_clock::time_point g_TESWaterSystemLastSearch{};
 
     // Original engine splash NIF scales (read once, used as base for user scaling)
     static float s_origScaleLarge = -1.0f;
@@ -134,9 +143,17 @@ namespace heisenberg
 
     static void* FindTESWaterSystemSingleton()
     {
-        if (g_TESWaterSystemSearched)
+        if (g_TESWaterSystem)
             return g_TESWaterSystem;
+
+        const auto now = std::chrono::steady_clock::now();
+        if (g_TESWaterSystemSearched &&
+            now - g_TESWaterSystemLastSearch < std::chrono::seconds(1)) {
+            return nullptr;
+        }
+
         g_TESWaterSystemSearched = true;
+        g_TESWaterSystemLastSearch = now;
 
         void* singleton = nullptr;
         uintptr_t ptrAddr = 0, singletonAddr = 0, flagAddr = 0;
@@ -230,6 +247,8 @@ namespace heisenberg
 
     void WaterInteraction::ClearState()
     {
+        RestoreSplashNifScales();
+
         _leftHand.Reset();
         _rightHand.Reset();
         _suspended = false;
@@ -237,6 +256,31 @@ namespace heisenberg
         _playerDepth = 0.0f;
         _playerSpeed = 0.0f;
         _hasPrevPlayerPos = false;
+
+        // The water manager is rebuilt during load/cell transitions. Never
+        // retain a raw engine singleton across that boundary.
+        g_TESWaterSystem = nullptr;
+        g_TESWaterSystemSearched = false;
+        g_TESWaterSystemLastSearch = {};
+    }
+
+    void WaterInteraction::SetEnabled(bool enabled)
+    {
+        if (_config.enabled == enabled)
+            return;
+
+        _config.enabled = enabled;
+        if (!enabled)
+        {
+            RestoreSplashNifScales();
+            _leftHand.Reset();
+            _rightHand.Reset();
+            _suspended = false;
+            _suspendedDueToSneak = false;
+            _playerDepth = 0.0f;
+            _playerSpeed = 0.0f;
+            _hasPrevPlayerPos = false;
+        }
     }
 
     // =========================================================================
@@ -302,7 +346,9 @@ namespace heisenberg
             return;
 
         // Apply NIF scale overrides if config changed (MCM toggle/slider)
-        if (_config.enableSplashNif != _lastNifEnabled || _config.splashNifScale != _lastNifScale)
+        if (!_splashScalesApplied ||
+            _config.enableSplashNif != _lastNifEnabled ||
+            _config.splashNifScale != _lastNifScale)
             ApplySplashNifScales();
 
         // Player depth check
@@ -515,6 +561,7 @@ namespace heisenberg
         }
         else
         {
+            state.waterHeight = -10000.0f;
             state.isSubmerged = false;
             state.depth = 0.0f;
         }
@@ -533,7 +580,11 @@ namespace heisenberg
         float waterHeight = -10000.0f;
         bool hasWater = false;
 
-        if (state.isSubmerged)
+        // UpdateHandWaterState already queried this exact hand position. A
+        // valid height is equally usable for hover math even when the hand is
+        // above the surface; only issue the lowered-z fallback when that first
+        // native query found no water.
+        if (state.waterHeight > -9000.0f)
         {
             waterHeight = state.waterHeight;
             hasWater = true;
@@ -777,6 +828,9 @@ namespace heisenberg
             return -10000.0f;
 
         auto* cell = player->parentCell;
+        if (!cell->HasWater())
+            return -10000.0f;
+
         RE::NiPoint3 checkPos = pos;
         float waterHeight = 0.0f;
 
@@ -803,8 +857,9 @@ namespace heisenberg
     void WaterInteraction::EmitRipple(const RE::NiPoint3& pos, float radius)
     {
         RE::NiPoint3 ripplePos = pos;
+        bool directSucceeded = false;
 
-        if (g_TESWaterSystem)
+        if (FindTESWaterSystemSingleton())
         {
             // Periodically ensure the ripple enable flag stays on
             static int s_flagCheckCounter = 0;
@@ -826,13 +881,30 @@ namespace heisenberg
             __try
             {
                 WaterSystem_AddRipple(g_TESWaterSystem, ripplePos, radius);
+                directSucceeded = true;
             }
             __except (EXCEPTION_EXECUTE_HANDLER)
             {
-                spdlog::error("[Water] Exception in AddRipple - disabling direct path");
+                spdlog::error("[Water] Exception in AddRipple - falling back to queued path");
                 g_TESWaterSystem = nullptr;
-                g_TESWaterSystemSearched = true;
+                g_TESWaterSystemSearched = false;
             }
+        }
+
+        if (directSucceeded)
+            return;
+
+        auto* taskQueue = RE::TaskQueueInterface::GetSingleton();
+        if (!taskQueue)
+            return;
+
+        __try
+        {
+            TaskQueue_AddRipple(taskQueue, radius, ripplePos);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            spdlog::error("[Water] Exception in QueueAddRipple!");
         }
     }
 
@@ -893,12 +965,31 @@ namespace heisenberg
 
         _lastNifEnabled = _config.enableSplashNif;
         _lastNifScale = _config.splashNifScale;
+        _splashScalesApplied = true;
 
         spdlog::info("[Water] Splash NIF: enabled={} scale={:.2f} (L={:.2f} M={:.2f} S={:.2f})",
                      _config.enableSplashNif, _config.splashNifScale,
                      _config.enableSplashNif ? s_origScaleLarge * _config.splashNifScale : 0.0f,
                      _config.enableSplashNif ? s_origScaleMedium * _config.splashNifScale : 0.0f,
-                     _config.enableSplashNif ? s_origScaleSmall * _config.splashNifScale : 0.0f);
+                      _config.enableSplashNif ? s_origScaleSmall * _config.splashNifScale : 0.0f);
+    }
+
+    void WaterInteraction::RestoreSplashNifScales()
+    {
+        if (!_splashScalesApplied || s_origScaleLarge < 0.0f)
+            return;
+
+        __try
+        {
+            *SplashScale_Large.get() = s_origScaleLarge;
+            *SplashScale_Medium.get() = s_origScaleMedium;
+            *SplashScale_Small.get() = s_origScaleSmall;
+            _splashScalesApplied = false;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            spdlog::error("[Water] Exception restoring splash NIF scales!");
+        }
     }
 
 } // namespace heisenberg

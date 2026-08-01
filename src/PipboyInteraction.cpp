@@ -11,6 +11,7 @@
 #include "IntroCeremonyState.h"
 #include "PipboyMeshContactPolicy.h"
 #include "../external/ROCK/src/ROCKMain.h"  // rock::HostIsWeaponSupportGripped — reliable two-handed check (FRIK's own flag gets killed by ROCK's TwoHandedGrip once engaged)
+#include "physics-interaction/performance/PerformanceProfiler.h"
 #include "VRInput.h"
 #include "Utils.h"
 #include "RE/Fallout.h"
@@ -1098,6 +1099,65 @@ namespace heisenberg
                (!rootMustChange || inspection.root != preSwitchRoot);
     }
 
+    // Leave the holo Pip-Boy in exactly the state a trigger close would leave it in.
+    //
+    // FRIK's Pipboy::openClose(false) (verified against FRIK source pipboy/Pipboy.cpp) does
+    // three things: _isOpen = false, setNodeVisibility(ScreenNode,false), and
+    // PipboyRoot_nif_only_node->local.scale = 0. FRIK ALREADY ran all three the instant the
+    // terminal opened ("Close Pipboy due to terminal open..." in FRIK.log, 16ms before our
+    // redirect activates). We then overrode the two scene-graph effects so the terminal could
+    // render on the wrist. So reproducing a trigger close means putting those two back — the
+    // state half is already correct — and FRIK cannot do it for us because openClose() early-
+    // returns on `_isOpen == open`.
+    //
+    // STATE-GATED on FRIK's own isWristPipboyOpen(): if FRIK still considers the Pip-Boy open
+    // (i.e. it kept it open for the terminal rather than closing it), the model is FRIK's to
+    // manage — hiding it here would desync FRIK's state from the visuals, and since openClose()
+    // early-returns on a matching flag the player could be left unable to bring the Pip-Boy
+    // back at all. In that case we do nothing and let FRIK close it now that keep-open is off.
+    // isWristPipboyOpen is the 8th entry of the API struct, inside the v2 ABI prefix that
+    // FRIKInterface::Initialize already requires, so this needs no extra version gate.
+    static bool RestoreFrikHoloHiddenStateAfterTerminal()
+    {
+        if (!f4vr::isPipboyOnWrist()) {
+            return false;  // projected/HMD mode — FRIK never hid anything for us to restore
+        }
+
+        if (FRIKInterface::GetSingleton().IsWristPipboyOpen()) {
+            spdlog::info("[PIPBOY] FRIK still reports its wrist Pip-Boy OPEN — leaving the "
+                         "holo model to FRIK instead of hiding it behind its back");
+            return false;
+        }
+
+        bool restored = false;
+
+        // ScreenNode: prefer the same pointer the per-frame force used (player+0x7B8) so we
+        // cannot restore a different node than the one we modified.
+        RE::NiNode* frikScreen = nullptr;
+        if (auto* player = f4vr::getPlayer()) {
+            const auto screenPtr =
+                *reinterpret_cast<uintptr_t*>(reinterpret_cast<uintptr_t>(player) + 0x07B8);
+            if (screenPtr > 0x10000) {
+                frikScreen = reinterpret_cast<RE::NiNode*>(screenPtr);
+            }
+        }
+        if (frikScreen) {
+            frikScreen->flags.flags |= static_cast<std::uint64_t>(0x1);
+            restored = true;
+        }
+
+        // PipboyRoot: ForceAncestorScales walked the parent chain restoring any zeroed scale,
+        // so zero the root again exactly as FRIK does.
+        if (auto* playerNodes = f4vr::getPlayerNodes()) {
+            if (playerNodes->PipboyRoot_nif_only_node) {
+                playerNodes->PipboyRoot_nif_only_node->local.scale = 0.0f;
+                restored = true;
+            }
+        }
+
+        return restored;
+    }
+
     static void ForceAncestorScales(RE::NiAVObject* node) {
         auto* p = node->parent;
         while (p) {
@@ -1242,7 +1302,13 @@ namespace heisenberg
                 if (blurImod) {
                     stopIMOD(blurImod);
                 }
-                if (blurCount > 0) {
+                // blurCount is the ENGINE's refcount of menus requesting blur.
+                // Zeroing it while a terminal holds a reference means the engine's
+                // matching decrement on close underflows to -1, and a manager that
+                // only stops blurring when the count returns to 0 then never stops.
+                // Clamp in BOTH directions so an already-underflowed count is
+                // repaired rather than driven further negative.
+                if (blurCount != 0) {
                     blurCount = 0;
                 }
                 if (!loggedOnce) {
@@ -1253,6 +1319,51 @@ namespace heisenberg
         }
 
         loggedOnce = true;
+    }
+
+    // Undo everything SuppressTerminalDarkening() and the per-frame terminal
+    // loop force, at redirect teardown.
+    //
+    // The suppression runs EVERY FRAME while a terminal redirect is active and
+    // was never unwound, so anything it forced stayed forced once the loop
+    // stopped: a darkening/blur IMOD the engine restarted on close kept
+    // running, the blur refcount kept whatever value our clamp left, and the
+    // console/terminal-button menus kept the visibility we forced off them.
+    // Symptom: exiting a terminal holotape with grip leaves a black screen
+    // instead of the Pip-Boy inventory.
+    static void RestoreTerminalDarkeningState()
+    {
+        // One last cancel, for an IMOD the engine started as the terminal closed.
+        SuppressTerminalDarkening();
+
+        int blurCountAfter = 0;
+        {
+            static auto uiBlurMgrAddr = REL::Offset(0x5ad5d68).address();
+            auto uiBlurMgr = *reinterpret_cast<uintptr_t*>(uiBlurMgrAddr);
+            if (uiBlurMgr) {
+                auto& blurCount = *reinterpret_cast<int*>(uiBlurMgr + 0x20);
+                // Hand the engine back a clean baseline: no menu is requesting
+                // blur now, and a negative count would never recover on its own.
+                if (blurCount != 0) {
+                    blurCount = 0;
+                }
+                blurCountAfter = blurCount;
+            }
+        }
+
+        // Give the menus we forced invisible their visibility back, so a later
+        // terminal (or the console) is not permanently blank.
+        if (auto* ui = RE::UI::GetSingleton()) {
+            if (auto termBtnMenu = ui->GetMenu(MenuTerminalButtons())) {
+                termBtnMenu->menuCanBeVisible = true;
+            }
+            if (auto consoleMenu = ui->GetMenu(MenuConsole());
+                consoleMenu && consoleMenu->uiMovie) {
+                consoleMenu->uiMovie->SetVisible(true);
+            }
+        }
+
+        spdlog::info("[PIPBOY] Terminal darkening/blur state restored (blurCount={})", blurCountAfter);
     }
 
     // Restore the intro holotape's form type back to kVoice.
@@ -1380,6 +1491,16 @@ namespace heisenberg
 
         if (IsProjectedPipboyNow()) {
             _bootWristOverrideOwned = BeginWristOverrideForHolotape();
+            if (!_bootWristOverrideOwned) {
+                // This is expected when the user's FRIK preference is Holo: the boot
+                // path owns a staged temporary-normal-root transition instead, and the
+                // direct flag override deliberately rejects Holo. Keep it visible at
+                // the release error-only log level so the no-op is never mistaken for
+                // a silently broken projected->wrist transition.
+                spdlog::error(
+                    "[PIPBOY] Boot direct wrist-flag override was not acquired; "
+                    "FRIK Holo/projected mode remains under the staged normal-root transition");
+            }
         }
 
         // Ghidra-verified redesign (Jul 24): do NOT pre-open PipboyMenu here. The real
@@ -1497,6 +1618,19 @@ namespace heisenberg
     // SWF menu closes exposes/activates FRIK's Holo display behind the audio.
     void PipboyInteraction::UpdateIntroHoloOverride()
     {
+        using IntroCloseClock = std::chrono::steady_clock;
+        static IntroCloseClock::time_point s_closeRetryStarted{};
+        static IntroCloseClock::time_point s_nextCloseRetry{};
+        static std::uint32_t s_closeRetryAttempts = 0;
+        static bool s_closeRetryTimeoutLogged = false;
+
+        if (!_introDisplayRestorePending) {
+            s_closeRetryStarted = {};
+            s_nextCloseRetry = {};
+            s_closeRetryAttempts = 0;
+            s_closeRetryTimeoutLogged = false;
+        }
+
         if (_introHoloWaitFrames > 0) {
             if (--_introHoloWaitFrames == 0) {
                 const auto formID = _introHoloWaitFormID;
@@ -1524,16 +1658,46 @@ namespace heisenberg
         // still live: FRIK interprets that mode switch as a fresh open.
         if (_introDisplayRestorePending) {
             if (pipOpen) {
-                DeactivatePipboyScreen();
-                EnableMenuInput(MenuPipboy());
-                EnableMenuInput(MenuHolotape());
-                EnableMenuInput(MenuPipboyHolotape());
-                if (auto* pbm = GetPipboyManagerVR()) {
-                    pbm->ClosedownPipboy();
+                const auto now = IntroCloseClock::now();
+                if (s_closeRetryStarted == IntroCloseClock::time_point{}) {
+                    s_closeRetryStarted = now;
+                    s_nextCloseRetry = now;
+                }
+
+                constexpr auto kRetryInterval =
+                    std::chrono::milliseconds(250);
+                constexpr auto kRetryCeiling =
+                    std::chrono::seconds(5);
+                if (now - s_closeRetryStarted >= kRetryCeiling) {
+                    if (!s_closeRetryTimeoutLogged) {
+                        s_closeRetryTimeoutLogged = true;
+                        spdlog::error(
+                            "[PIPBOY] Intro display still open after {} bounded "
+                            "ClosedownPipboy attempts over 5 s; stopping automatic "
+                            "retries and waiting for a manual close before restoring modes",
+                            s_closeRetryAttempts);
+                    }
+                    return;
+                }
+
+                if (now >= s_nextCloseRetry) {
+                    DeactivatePipboyScreen();
+                    EnableMenuInput(MenuPipboy());
+                    EnableMenuInput(MenuHolotape());
+                    EnableMenuInput(MenuPipboyHolotape());
+                    if (auto* pbm = GetPipboyManagerVR()) {
+                        pbm->ClosedownPipboy();
+                    }
+                    ++s_closeRetryAttempts;
+                    s_nextCloseRetry = now + kRetryInterval;
                 }
                 return;
             }
 
+            s_closeRetryStarted = {};
+            s_nextCloseRetry = {};
+            s_closeRetryAttempts = 0;
+            s_closeRetryTimeoutLogged = false;
             DeactivatePipboyScreen();
             if (_introHoloIniOverrideActive) {
                 EndTemporaryNormalPipboyModel();
@@ -1570,6 +1734,15 @@ namespace heisenberg
 
     void PipboyInteraction::OnFrameUpdate(float deltaTime)
     {
+        rock::performance_profiler::ScopedTimer profilerTimer(
+            rock::performance_profiler::Scope::PipboyFrame);
+
+        // A new main-update phase must never inherit HookEndUpdate's liveness
+        // result. If this function returns before capture (no player/common
+        // root), a later out-of-band accessor will lazily make one fresh
+        // attempt rather than trusting the prior phase.
+        _nodeSnapshotPhaseAttempted = false;
+
         // ROOT-CAUSE FIX for the intro-ceremony "execute at 0x0" CTD: the persistent node caches
         // (_cachedArmNode + the tape-deck sub-nodes) were assumed stable across frames, but the
         // Pip-Boy 3D subtree is torn down and rebuilt on equip / FRIK skeleton reset / cell change —
@@ -1596,6 +1769,45 @@ namespace heisenberg
 
         // Finger POSITION must be refreshed every frame (it's a world-space coordinate, not a pointer).
         _fingerPosCached = false;
+
+        // Bounded watchdog for the grip-exit Pip-Boy lowering (armed in the terminal-redirect
+        // teardown below). ClosedownPipboy is known to sometimes blank the screen yet leave the
+        // menu object alive (see the boot-content path), so re-issue every 250ms until
+        // MenuChecker reports the menu gone; give up after 5s like the intro close retry.
+        if (_terminalClosePipboyPending) {
+            if (!heisenberg::MenuChecker::GetSingleton().IsPipboyOpen()) {
+                _terminalClosePipboyPending = false;
+                // The menu is down; NOW put back the hidden state we overrode for the terminal
+                // render. Ordering matters: doing this while the menu was still up would blank
+                // the display the player is still looking at.
+                bool holoRestored = false;
+                if (_terminalForcedFrikScreenVisible) {
+                    holoRestored = RestoreFrikHoloHiddenStateAfterTerminal();
+                    _terminalForcedFrikScreenVisible = false;
+                }
+                spdlog::info("[PIPBOY] Grip-exit lowering complete — menu closed, "
+                             "FRIK holo model hidden={}", holoRestored);
+            } else {
+                _terminalClosePipboyDeadline  -= deltaTime;
+                _terminalClosePipboyNextRetry -= deltaTime;
+                if (_terminalClosePipboyDeadline <= 0.0f) {
+                    _terminalClosePipboyPending = false;
+                    // Deliberately do NOT restore the hidden state here: the menu is still up,
+                    // so the player is looking at a live Pip-Boy and blanking its model would be
+                    // worse than leaving it. Drop the debt instead and say so.
+                    _terminalForcedFrikScreenVisible = false;
+                    spdlog::error("[PIPBOY] Holo Pip-Boy still open 5s after grip-exit lowering; "
+                                  "stopping bounded ClosedownPipboy retries and leaving the FRIK "
+                                  "holo model visible (menu never closed)");
+                } else if (_terminalClosePipboyNextRetry <= 0.0f) {
+                    _terminalClosePipboyNextRetry = 0.25f;
+                    EnableMenuInput(MenuPipboy());
+                    if (auto* pbm = GetPipboyManagerVR()) {
+                        pbm->ClosedownPipboy();
+                    }
+                }
+            }
+        }
 
         static bool firstCall = true;
         if (firstCall) {
@@ -1635,6 +1847,11 @@ namespace heisenberg
         if (!player || !f4vr::getCommonNode()) {
             return;
         }
+
+        // Capture once for this main-update phase. Every persistent Pip-Boy
+        // pointer used below is checked against this same live-tree snapshot,
+        // replacing several independent recursive scene-graph walks.
+        BeginNodeValidationPhase();
 
         // FRIK refreshes PlayerNodes->ScreenNode->local every frame from the
         // selected Holo offset profile. During the temporary normal handoff that
@@ -2915,7 +3132,22 @@ namespace heisenberg
                     }
                 }
 
-                // Per-frame: force FRIK ScreenNode visible + scaled
+                // Per-frame: force FRIK ScreenNode visible + scaled.
+                //
+                // FRIK hides its holo Pip-Boy the instant a terminal opens — its own log says
+                // "Close Pipboy due to terminal open..." / "Turning Pipboy OFF", measured 16ms
+                // BEFORE our redirect activates. Pipboy::openClose(false) does exactly two things
+                // to the scene graph: setNodeVisibility(ScreenNode,false) and
+                // PipboyRoot_nif_only_node->local.scale = 0. The two lines below undo both, which
+                // is the only reason the terminal is visible on the wrist at all.
+                //
+                // Because we resurrect a model FRIK believes it already closed, FRIK can never
+                // put it back: openClose() early-returns on `_isOpen == open`, and its _isOpen is
+                // already false. So the teardown MUST restore the hidden state itself — see
+                // RestoreFrikHoloHiddenStateAfterTerminal(). Without that the model stays visible
+                // until the player manually opens and closes the Pip-Boy, which is precisely the
+                // reported "grip doesn't close the holo Pip-Boy, I have to use trigger".
+                _terminalForcedFrikScreenVisible = true;
                 {
                     auto* player2 = f4vr::getPlayer();
                     if (player2) {
@@ -3077,6 +3309,11 @@ namespace heisenberg
                     spdlog::info("[PIPBOY] Terminal closed — restored projected Pipboy mode");
                 }
 
+                // 5b. Undo the per-frame darkening/blur/menu suppression. Must
+                // run AFTER the terminal menu has actually closed (above) so a
+                // dim the engine kicked off on close is cancelled too.
+                RestoreTerminalDarkeningState();
+
                 // 6. Reset state
                 _terminalRedirectActive = false;
                 _isWorldTerminalRedirect = false;
@@ -3090,6 +3327,39 @@ namespace heisenberg
 
                 spdlog::info("[PIPBOY] Terminal close complete — checking HUD vtable integrity");
                 heisenberg::Hooks::CheckHUDRolloverVtableIntegrity();
+
+                // Owner directive (Jul 31): grip on a redirected terminal closes EVERYTHING —
+                // the terminal view AND the holo Pip-Boy. This fires only when the TERMINAL
+                // closed while the Pip-Boy was still up (the grip-exit case); if the player
+                // closed the Pip-Boy themselves (pipOpen==false) there is nothing to lower.
+                // Without this, the engine/FRIK tears PipboyMenu down ~35ms later WITHOUT the
+                // native lowering flow, and FRIK's holo model keeps rendering the destroyed
+                // menu's render target — the reported "black screen until a trigger press".
+                // Runs AFTER steps 1-6 + the vtable check on purpose: FRIK's keep-open flag is
+                // already false, the I3D renderer is re-pointed at its original world root, and
+                // the per-frame SRV loop is disarmed, so the close cannot race our writes into a
+                // dying menu (the tape-deck stale-node CTD class). Deliberately NOT calling
+                // DeactivatePipboyScreen() here: in wrist mode ActivatePipboyScreen never ran,
+                // so a blind deactivate would write fallback angles over the player's INI.
+                if (!termMenuOpen && pipOpen) {
+                    EnableMenuInput(MenuPipboy());  // no-op if never disabled
+                    if (auto* pbm = GetPipboyManagerVR()) {
+                        pbm->ClosedownPipboy();
+                    }
+                    _terminalClosePipboyPending   = true;
+                    _terminalClosePipboyDeadline  = 5.0f;
+                    _terminalClosePipboyNextRetry = 0.25f;
+                    spdlog::info("[PIPBOY] Grip-exit on redirected terminal — lowering the holo "
+                                 "Pip-Boy (ClosedownPipboy + bounded watchdog)");
+                } else if (_terminalForcedFrikScreenVisible) {
+                    // The Pip-Boy is already down (the player closed it themselves while the
+                    // terminal was up), so there is no menu to wait on — but we still owe the
+                    // scene graph the hidden state we overrode, and FRIK still will not do it.
+                    const bool holoRestored = RestoreFrikHoloHiddenStateAfterTerminal();
+                    _terminalForcedFrikScreenVisible = false;
+                    spdlog::info("[PIPBOY] Terminal ended with the Pip-Boy already closed — "
+                                 "FRIK holo model hidden={}", holoRestored);
+                }
             }
         }
 
@@ -3453,24 +3723,65 @@ namespace heisenberg
         }
     }
 
-    // Pointer-only liveness check for the persistent eject-button / tape-deck sub-node
-    // caches below: never dereferences target, only walks root's CURRENT children -
-    // safe even if target is a freed/dangling pointer. The OnFrameUpdate generation
-    // check only fires when the 3rd-person SKELETON root pointer changes, but the
-    // engine/FRIK can rebuild the Pip-Boy subtree IN PLACE (post-equip finalize, FRIK
-    // config/holo rebuild) while that root stays the same pointer - this check catches
-    // that case by re-validating against the live arm node every frame instead.
-    static bool NodeStillInSubtree(RE::NiAVObject* root, const RE::NiAVObject* target, int maxDepth = 24)
+    template <std::size_t Capacity>
+    static void CapturePipboySubtree(
+        RE::NiAVObject* object,
+        int parentIndex,
+        int depth,
+        pipboy_node_snapshot::FixedSubtreeMembership<Capacity>& snapshot)
     {
-        if (!root || !target) return false;
-        if (root == target) return true;
-        if (maxDepth <= 0) return false;
-        if (auto* node = root->IsNode()) {
-            for (const auto& child : node->children) {
-                if (child && NodeStillInSubtree(child.get(), target, maxDepth - 1)) return true;
+        if (!object) {
+            return;
+        }
+
+        const int objectIndex =
+            snapshot.Append(object, parentIndex);
+        if (objectIndex < 0) {
+            return;
+        }
+
+        // The former arm-root liveness queries stopped at 24 levels, while a
+        // nested deck/lid query could cover another 24. Capture the combined
+        // envelope once so replacing the nested walks cannot reduce coverage.
+        constexpr int kMaximumCombinedDepth = 48;
+        if (depth >= kMaximumCombinedDepth) {
+            return;
+        }
+
+        if (auto* node = object->IsNode()) {
+            const std::uint32_t childCount =
+                static_cast<std::uint32_t>(node->children.size());
+            for (std::uint32_t i = 0; i < childCount; ++i) {
+                auto* child = node->children[i].get();
+                if (child) {
+                    CapturePipboySubtree(
+                        child,
+                        objectIndex,
+                        depth + 1,
+                        snapshot);
+                }
             }
         }
-        return false;
+    }
+
+    template <std::size_t Capacity>
+    static bool CapturePipboySubtreeSafely(
+        RE::NiAVObject* arm,
+        pipboy_node_snapshot::FixedSubtreeMembership<Capacity>& snapshot)
+    {
+        // No local C++ owner/RAII object lives across this narrow SEH region.
+        // A Pip-Boy subtree can be half-rebuilt even when the overall skeleton
+        // root pointer is unchanged; on a raw child-array fault, discard the
+        // partial snapshot and defer all node work until the next phase.
+        __try {
+            snapshot.Reset();
+            CapturePipboySubtree(arm, -1, 0, snapshot);
+            return true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            snapshot.Reset();
+            snapshot.MarkIncomplete();
+            return false;
+        }
     }
 
     struct SweptMeshContact
@@ -3522,6 +3833,27 @@ namespace heisenberg
         const RE::NiPoint3& b)
     {
         return a.x * b.x + a.y * b.y + a.z * b.z;
+    }
+
+    static RE::NiPoint3 PipboyRotateDirection(
+        const RE::NiMatrix3& rotation,
+        const RE::NiPoint3& localDirection)
+    {
+        RE::NiPoint3 worldDirection(
+            rotation.entry[0][0] * localDirection.x +
+                rotation.entry[1][0] * localDirection.y +
+                rotation.entry[2][0] * localDirection.z,
+            rotation.entry[0][1] * localDirection.x +
+                rotation.entry[1][1] * localDirection.y +
+                rotation.entry[2][1] * localDirection.z,
+            rotation.entry[0][2] * localDirection.x +
+                rotation.entry[1][2] * localDirection.y +
+                rotation.entry[2][2] * localDirection.z);
+        const float length = PointDistance({}, worldDirection);
+        if (!std::isfinite(length) || length <= 1.0e-4f) {
+            return RE::NiPoint3(0.0f, 0.0f, 1.0f);
+        }
+        return worldDirection * (1.0f / length);
     }
 
     // Exact double-sided segment/triangle test. Point sampling alone can step
@@ -3595,10 +3927,57 @@ namespace heisenberg
         const RE::NiPoint3& current,
         const RE::NiPoint3& previous,
         bool previousValid,
-        float contactRadius)
+        float contactRadius,
+        float broadphaseInterestDistance = -1.0f)
     {
         SweptMeshContact result;
         if (!mesh || !IsUsableWorldPoint(current)) return result;
+
+        // Eject-button callers provide the largest distance at which this
+        // query can affect contact, latch, release, or animation. A valid
+        // world bound encloses the visible mesh; expanding it by the
+        // bound-center-to-node-pivot distance encloses the node-point fallback
+        // as well. Reject only when the COMPLETE valid fingertip sweep is
+        // outside that enlarged sphere. A fast crossing therefore still takes
+        // the exact path. Tracking discontinuities and invalid bounds fail open
+        // to extraction below.
+        if (std::isfinite(broadphaseInterestDistance) &&
+            broadphaseInterestDistance >= 0.0f) {
+            bool canUseBroadphase = true;
+            float pathDistanceToBoundCenter =
+                PointDistance(mesh->worldBound.center, current);
+            if (previousValid) {
+                if (!IsUsableWorldPoint(previous)) {
+                    canUseBroadphase = false;
+                } else {
+                    const float travel = PointDistance(previous, current);
+                    // Keep the exact query's tracking-discontinuity behavior:
+                    // it intentionally does not sweep a reacquisition jump.
+                    if (!std::isfinite(travel) || travel > 120.0f) {
+                        canUseBroadphase = false;
+                    } else {
+                        pathDistanceToBoundCenter =
+                            PointToSegmentDistance(
+                                mesh->worldBound.center,
+                                previous,
+                                current);
+                    }
+                }
+            }
+
+            const float meshToPivotDistance =
+                PointDistance(
+                    mesh->worldBound.center,
+                    mesh->world.translate);
+            if (canUseBroadphase &&
+                pipboy_mesh_contact::CanRejectEjectMeshQuery(
+                    pathDistanceToBoundCenter,
+                    mesh->worldBound.fRadius,
+                    meshToPivotDistance,
+                    broadphaseInterestDistance)) {
+                return result;
+            }
+        }
 
         std::vector<TriangleData> triangles;
         triangles.reserve(256);
@@ -3648,35 +4027,152 @@ namespace heisenberg
 
     RE::NiAVObject* PipboyInteraction::GetPipboyArmNode()
     {
-        if (_frameCacheValid && _cachedArmNode) return _cachedArmNode;
+        if (!_nodeSnapshotPhaseAttempted) {
+            BeginNodeValidationPhase();
+        }
+        if (!_nodeSnapshotUsable ||
+            !_frameCacheValid ||
+            !_cachedArmNode ||
+            _cachedArmNode != _nodeSnapshotArm) {
+            return nullptr;
+        }
 
         // CRITICAL: Must use the 3rd-person skeleton (unkF0->rootNode), NOT firstPersonSkeleton.
         // The renderer draws from the 3rd-person tree. Writes to firstPersonSkeleton nodes are invisible.
         // FRIK's Skeleton uses getRootNode() (3rd-person BSFlattenedBoneTree) and searches from getCommonNode() ("COM").
         // VirtualHolsters also uses unkF0->rootNode exclusively.
+        return _nodeSnapshotUsable
+            ? _nodeSnapshotArm
+            : nullptr;
+    }
+
+    void PipboyInteraction::BeginNodeValidationPhase()
+    {
+        _nodeSnapshotPhaseAttempted = true;
+        _nodeSnapshot.Reset();
+        _nodeSnapshotArm = nullptr;
+        _nodeSnapshotUsable = false;
+        _cachedArmNode = nullptr;
+        _frameCacheValid = false;
+
         auto* commonNode = f4vr::getCommonNode();
         if (!commonNode) {
-            return nullptr;
+            ValidatePersistentNodeCaches();
+            return;
         }
 
-        // Pipboy is always on the LEFT wrist (doesn't swap in LH mode)
-        const char* forearmNodeName = "LArm_ForeArm3";
-
-        RE::NiAVObject* node = SafeFindAVObject(commonNode, forearmNodeName);
-
-        static bool loggedOnce = false;
-        if (!loggedOnce) {
-            if (node) {
-                spdlog::debug("[PIPBOY] Found arm node on 3rd-person skeleton: {} addr={}", forearmNodeName, (void*)node);
-            } else {
-                spdlog::warn("[PIPBOY] Arm node {} NOT found on 3rd-person skeleton!", forearmNodeName);
-            }
-            loggedOnce = true;
+        // Resolve from the CURRENT skeleton every phase. In particular,
+        // HookEndUpdate must not reuse the arm pointer captured earlier by
+        // OnFrameUpdate because FRIK can rebuild that subtree between hooks
+        // without changing the top-level common-root address.
+        RE::NiAVObject* arm =
+            SafeFindAVObject(commonNode, "LArm_ForeArm3");
+        if (!arm ||
+            !CapturePipboySubtreeSafely(arm, _nodeSnapshot)) {
+            ValidatePersistentNodeCaches();
+            return;
         }
 
-        _cachedArmNode = node;
+        _nodeSnapshotArm = arm;
+        _nodeSnapshotUsable = true;
+        _cachedArmNode = arm;
         _frameCacheValid = true;
-        return node;
+        ValidatePersistentNodeCaches();
+    }
+
+    bool PipboyInteraction::CachedNodeIsLiveWithin(
+        const RE::NiAVObject* root,
+        const RE::NiAVObject* target) const
+    {
+        return _nodeSnapshotUsable &&
+            root &&
+            target &&
+            _nodeSnapshot.ContainsWithin(root, target);
+    }
+
+    void PipboyInteraction::ValidatePersistentNodeCaches()
+    {
+        RE::NiAVObject* arm =
+            _nodeSnapshotUsable ? _nodeSnapshotArm : nullptr;
+        if (!arm) {
+            _cachedEjectButton = nullptr;
+            _cachedEjectButtonMesh = nullptr;
+            _cachedTapeDeckNode = nullptr;
+            _cachedTapeDeckLid = nullptr;
+            _cachedTapeRef = nullptr;
+            _cachedTapeDeckMesh1 = nullptr;
+            _cachedTapeDeckLidMesh1 = nullptr;
+            _nodesCached = false;
+            return;
+        }
+
+        const bool ejectButtonLive =
+            !_cachedEjectButton ||
+            CachedNodeIsLiveWithin(
+                arm,
+                _cachedEjectButton);
+        const bool ejectMeshLive =
+            !_cachedEjectButtonMesh ||
+            CachedNodeIsLiveWithin(
+                arm,
+                _cachedEjectButtonMesh);
+        if (!ejectButtonLive || !ejectMeshLive) {
+            _cachedEjectButton = nullptr;
+            _cachedEjectButtonMesh = nullptr;
+            _nodesCached = false;
+        }
+
+        if (_cachedTapeDeckNode &&
+            !CachedNodeIsLiveWithin(
+                arm,
+                _cachedTapeDeckNode)) {
+            _cachedTapeDeckNode = nullptr;
+            _cachedTapeDeckMesh1 = nullptr;
+        }
+
+        if (_cachedTapeDeckLid &&
+            !CachedNodeIsLiveWithin(
+                arm,
+                _cachedTapeDeckLid)) {
+            _cachedTapeDeckLid = nullptr;
+            _cachedTapeRef = nullptr;
+            _cachedTapeDeckMesh1 = nullptr;
+            _cachedTapeDeckLidMesh1 = nullptr;
+        }
+
+        if (_cachedTapeRef &&
+            !CachedNodeIsLiveWithin(
+                arm,
+                _cachedTapeRef)) {
+            _cachedTapeRef = nullptr;
+        }
+
+        if (_cachedTapeDeckMesh1 &&
+            (!_cachedTapeDeckNode ||
+             !CachedNodeIsLiveWithin(
+                 _cachedTapeDeckNode,
+                 _cachedTapeDeckMesh1))) {
+            _cachedTapeDeckMesh1 = nullptr;
+        }
+
+        if (_cachedTapeDeckLidMesh1 &&
+            (!_cachedTapeDeckLid ||
+             !CachedNodeIsLiveWithin(
+                 _cachedTapeDeckLid,
+                 _cachedTapeDeckLidMesh1))) {
+            _cachedTapeDeckLidMesh1 = nullptr;
+        }
+
+        static bool s_snapshotCapacityWarningLogged = false;
+        if (!_nodeSnapshot.Complete() &&
+            !s_snapshotCapacityWarningLogged) {
+            s_snapshotCapacityWarningLogged = true;
+            spdlog::warn(
+                "[PIPBOY] Arm subtree exceeded the fixed {}-node "
+                "liveness snapshot; uncaptured caches will be safely "
+                "re-resolved",
+                PIPBOY_NODE_SNAPSHOT_CAPACITY);
+        }
     }
 
     RE::NiPoint3 PipboyInteraction::GetFingerPosition()
@@ -3730,6 +4226,10 @@ namespace heisenberg
         _frameCacheValid = false;
         _cachedArmNode = nullptr;
         _cachedTapeDeckNode = nullptr;
+        _nodeSnapshot.Reset();
+        _nodeSnapshotArm = nullptr;
+        _nodeSnapshotPhaseAttempted = false;
+        _nodeSnapshotUsable = false;
         _fingerPosCached = false;
         _interactionFingerValid = false;
         _previousInteractionFingerValid = false;
@@ -3741,15 +4241,18 @@ namespace heisenberg
         RE::NiAVObject* arm = GetPipboyArmNode();
         if (!arm) return nullptr;
 
-        // Re-validate against the LIVE arm subtree, same as the sibling _cachedTapeDeckLid/
-        // _cachedEjectButton checks (NodeStillInSubtree comment) — this cache was previously
+        // Re-validate against the current phase's LIVE arm snapshot, same as the sibling
+        // _cachedTapeDeckLid/_cachedEjectButton checks — this cache was previously
         // invalidated ONLY by InvalidateFrameCache() on a 3rd-person skeleton ROOT pointer
         // change, but a Pip-Boy pickup can rebuild just the TapeDeck01 sub-node via a partial
         // 3D-equip reload without the overall skeleton root pointer changing, leaving this
         // cache dangling at a freed node. Buffout-confirmed 2026-07-21 (Vault111Cryo):
         // EXECUTE at 0x0 inside findAVObject(tapeDeckNode, "TapeDeck01_mesh:1") called from
         // UpdateTapeDeckAnimation, at Pip-Boy pickup.
-        if (_cachedTapeDeckNode && !NodeStillInSubtree(arm, _cachedTapeDeckNode)) {
+        if (_cachedTapeDeckNode &&
+            !CachedNodeIsLiveWithin(
+                arm,
+                _cachedTapeDeckNode)) {
             _cachedTapeDeckNode = nullptr;
         }
         if (_cachedTapeDeckNode) return _cachedTapeDeckNode;
@@ -3798,10 +4301,13 @@ namespace heisenberg
         RE::NiAVObject* arm = GetPipboyArmNode();
         if (!arm) return;
 
-        // Re-validate against the LIVE arm subtree before trusting the persistent cache -
-        // catches an in-place Pip-Boy rebuild the coarse skeleton-root check in
-        // OnFrameUpdate misses (see NodeStillInSubtree comment).
-        if (_nodesCached && !NodeStillInSubtree(arm, _cachedEjectButton)) {
+        // Re-validate against the phase snapshot before trusting the persistent cache.
+        // This catches an in-place Pip-Boy rebuild the coarse skeleton-root pointer
+        // comparison misses, without recursively walking the same arm again.
+        if (_nodesCached &&
+            !CachedNodeIsLiveWithin(
+                arm,
+                _cachedEjectButton)) {
             _cachedEjectButton     = nullptr;
             _cachedEjectButtonMesh = nullptr;
             _nodesCached           = false;
@@ -3907,7 +4413,8 @@ namespace heisenberg
             fingerPos,
             _previousInteractionFingerPos,
             _previousInteractionFingerValid,
-            contactRadius);
+            contactRadius,
+            releaseRadius);
 
         // Mesh extraction is supported by the vanilla button and remains the active path.
         // Retain a node-point fallback for replacement Pip-Boy NIFs whose geometry buffers
@@ -3961,10 +4468,15 @@ namespace heisenberg
         static int distanceLogCounter = 0;
         if (++distanceLogCounter >= 450) {
             distanceLogCounter = 0;
-            spdlog::debug("[PIPBOY-DIAG] eject mesh={} finger=({:.1f},{:.1f},{:.1f}) currentDist={:.2f} sweptDist={:.2f} enter={:.1f} exit={:.1f} latched={} cooldown={:.2f} state={}",
+            // Print the thresholds the latch ACTUALLY uses (engage/fire/rearm),
+            // not the fallback contact/release radii — the old line printed
+            // enter=2.5/exit=4.5 while the precise mesh path fires at ~0.25,
+            // which misled a log audit into flagging a working latch as broken.
+            spdlog::debug("[PIPBOY-DIAG] eject mesh={} finger=({:.1f},{:.1f},{:.1f}) currentDist={:.2f} sweptDist={:.2f} engage={:.2f} fire={:.2f} rearm={:.2f} latched={} cooldown={:.2f} state={}",
                 contact.meshAvailable,
                 fingerPos.x, fingerPos.y, fingerPos.z,
-                contact.currentDistance, contact.sweptDistance, contactRadius, releaseRadius,
+                contact.currentDistance, contact.sweptDistance,
+                engageDistance, fireDistance, rearmDistance,
                 _ejectContactLatched,
                 _ejectCooldown, static_cast<int>(_tapeDeckState));
         }
@@ -4106,14 +4618,38 @@ namespace heisenberg
         // No tape deck animation in power armor (Pipboy is projected)
         if (Utils::IsPlayerInPowerArmor()) return;
 
+        // The closed, empty deck uses the skeleton's identity/default pose.
+        // Once that pose has been initialized there is nothing to rewrite, so
+        // avoid rebuilding a second full arm-subtree liveness snapshot at the
+        // end of every frame. Any interaction state immediately leaves this
+        // fast path.
+        if (_meshesInitialized &&
+            _tapeDeckState == TapeDeckState::Closed &&
+            !_tapeDeckOpen &&
+            std::fabs(_tapeDeckAnimProgress) < 0.001f &&
+            !_holotapeLoaded &&
+            !_tapREFForceHidden &&
+            !_insertionOpenHandActive)
+        {
+            return;
+        }
+
+        // HookEndUpdate is a distinct liveness phase. FRIK/game animation may
+        // have replaced the arm subtree after OnFrameUpdate, so never reuse the
+        // earlier phase's membership result here.
+        BeginNodeValidationPhase();
+
         RE::NiAVObject* arm = GetPipboyArmNode();
         if (!arm) return;
 
-        // Use cached nodes to avoid per-frame tree searches
+        // Use cached nodes after the phase snapshot has proved their liveness.
         RE::NiAVObject* tapeDeckNode = GetCachedTapeDeckNode();
-        // Re-validate against the LIVE arm subtree - see NodeStillInSubtree comment /
-        // the matching eject-button check in OperateEjectButton.
-        if (_cachedTapeDeckLid && !NodeStillInSubtree(arm, _cachedTapeDeckLid)) {
+        // Keep the local check so this use site retains its validation cadence;
+        // it is now an allocation-free pointer lookup in the phase snapshot.
+        if (_cachedTapeDeckLid &&
+            !CachedNodeIsLiveWithin(
+                arm,
+                _cachedTapeDeckLid)) {
             _cachedTapeDeckLid      = nullptr;
             _cachedTapeRef          = nullptr;
             _cachedTapeDeckMesh1    = nullptr;
@@ -4208,6 +4744,19 @@ namespace heisenberg
         if (std::fabs(_tapeDeckAnimProgress - 1.0f) < 0.001f) {
             if (_tapeDeckState == TapeDeckState::Opening) {
                 _tapeDeckState = TapeDeckState::Open;
+                // Start every newly opened cycle from one coherent mechanical
+                // state. A completed close left _pushProgress at zero and the
+                // prior stroke metadata live; although a later contact normally
+                // recaptured progress, failures before recapture exposed that
+                // stale state in both behavior and diagnostics.
+                _pushProgress = 1.0f;
+                _deckPushStrokeValid = false;
+                _deckPushStrokeUsesWeapon = false;
+                _deckPushStrokeOrigin = {};
+                _deckPushStrokeDirection = {};
+                _deckPushStrokeStartProgress = 1.0f;
+                _deckPushStrokeRequiredTravel = 3.0f;
+                _deckPushStrokeMaxTravel = 0.0f;
                 spdlog::debug("[PIPBOY] Tape deck fully open");
             }
         } else if (std::fabs(_tapeDeckAnimProgress) < 0.001f) {
@@ -4533,7 +5082,10 @@ namespace heisenberg
 
         // Measure against TapREF (the visible holotape), not the rotating tray pivot.
         RE::NiAVObject* tapeRef = _cachedTapeRef;
-        if (!tapeRef || !NodeStillInSubtree(arm, tapeRef)) {
+        if (!tapeRef ||
+            !CachedNodeIsLiveWithin(
+                arm,
+                tapeRef)) {
             tapeRef = SafeFindAVObject(arm, "TapREF");
             _cachedTapeRef = tapeRef;
         }
@@ -4931,6 +5483,9 @@ namespace heisenberg
 
     void PipboyInteraction::CheckHandPush()
     {
+        rock::performance_profiler::ScopedTimer profilerTimer(
+            rock::performance_profiler::Scope::PipboyDeckContactQuery);
+
         // Accept a fast closing swipe near the end of the opening animation, but
         // not on the same frame as the eject-button press. Without this threshold
         // the hand pressing the adjacent button could immediately reverse the tray.
@@ -4949,10 +5504,47 @@ namespace heisenberg
         RE::NiAVObject* tapeDeck = GetCachedTapeDeckNode();
         if (!tapeDeck) return;
 
-        if (!_cachedTapeDeckMesh1 || !NodeStillInSubtree(tapeDeck, _cachedTapeDeckMesh1)) {
+        if (!_cachedTapeDeckMesh1 ||
+            !CachedNodeIsLiveWithin(
+                tapeDeck,
+                _cachedTapeDeckMesh1)) {
             _cachedTapeDeckMesh1 = SafeFindAVObject(tapeDeck, "TapeDeck01_mesh:1");
         }
         RE::NiAVObject* deckMesh = _cachedTapeDeckMesh1;
+
+        // TapeDeckLid_mesh:1 is a separately animated visible half of the open
+        // mechanism. The old contact query only included TapeDeck01_mesh:1, so
+        // pushing the lid was guaranteed to pass through unless the same hand
+        // hull happened to reach the tray too.
+        if (_cachedTapeDeckLid &&
+            !CachedNodeIsLiveWithin(
+                arm,
+                _cachedTapeDeckLid)) {
+            _cachedTapeDeckLid = nullptr;
+            _cachedTapeDeckLidMesh1 = nullptr;
+            // UpdateTapeDeckAnimation normally clears this sibling cache when
+            // it observes the stale lid root. CheckHandPush can now repair the
+            // lid first, which would hide that invalidation from the later
+            // animation pass and leave an old TapREF pointer eligible for a
+            // scale write. Preserve the cache-family invariant here too.
+            _cachedTapeRef = nullptr;
+        }
+        if (!_cachedTapeDeckLid) {
+            _cachedTapeDeckLid =
+                SafeFindAVObject(arm, "TapeDeckLid_mesh");
+        }
+        if (_cachedTapeDeckLid &&
+            (!_cachedTapeDeckLidMesh1 ||
+             !CachedNodeIsLiveWithin(
+                 _cachedTapeDeckLid,
+                 _cachedTapeDeckLidMesh1))) {
+            _cachedTapeDeckLidMesh1 =
+                SafeFindAVObject(
+                    _cachedTapeDeckLid,
+                    "TapeDeckLid_mesh:1");
+        }
+        RE::NiAVObject* deckLidMesh =
+            _cachedTapeDeckLidMesh1;
 
         // The pushing hand is the non-pipboy hand. Pipboy always on left wrist,
         // so push hand is always right.
@@ -4981,29 +5573,29 @@ namespace heisenberg
             RE::NiPoint3 sample{};
             RE::NiPoint3 closest{};
             const char* source = "none";
+            const char* surface = "none";
+            RE::NiPoint3 hinge{};
+            float openAngleRadians =
+                TAPE_DECK_OPEN_ANGLE *
+                3.14159265358979323846f / 180.0f;
             bool swept = false;
         };
 
         /*
-         * TapeDeck01 is an animated visual mesh rather than an independently
+         * The tray and lid are animated visual meshes rather than independently
          * simulated rigid body, so native Havok cannot deliver a body/body
          * contact callback for it. Sample the boundaries of ROCK's exact live
          * generated collision hulls instead. This makes the deck react to the
          * palm/finger boxes and to the equipped weapon collision, rather than
          * to one hidden index-bone point.
          */
-        std::vector<TriangleData> deckTriangles;
-        if (deckMesh) {
-            deckTriangles.reserve(256);
-            GetTriangles(deckMesh, deckTriangles, 2048);
-        }
-        const bool deckMeshAvailable = !deckTriangles.empty();
-        // Generated ROCK samples already carry the real collider radius.  Do not
-        // add the old proximity bubble here: with the deployed settings it expanded
-        // a 0.10-gu fingertip hull to 1.10 gu and closed the tray before visible
-        // contact.  The configured radius remains the compatibility fallback when
-        // generated hand collision is unavailable.
-        constexpr float surfacePadding = 0.0f;
+        // The exported points are vertices/rings from ROCK's continuous convex
+        // hulls, not a watertight triangle representation of those hulls. A
+        // small skin closes the gaps between samples. Keep it well below the old
+        // 1.0-gu bubble (which visibly triggered early); 0.5 gu matches ROCK's
+        // normal world-contact skin and catches the observed 0.59-gu visible
+        // touch with a 0.10-gu convex radius.
+        constexpr float generatedHullContactSkin = 0.5f;
 
         RE::NiPoint3 handFrameDelta{};
         bool handSweepValid = false;
@@ -5020,11 +5612,285 @@ namespace heisenberg
                 handTravel <= 120.0f;
         }
 
+        constexpr std::uint32_t kMaxHandSamples = 384;
+        constexpr std::uint32_t kMaxWeaponSamples = 512;
+        // HostCopy* initializes exactly the returned prefix. Avoid zeroing about
+        // 14 KiB of stack scratch on every open-deck frame before overwriting it.
+        std::array<RE::NiPoint3, kMaxHandSamples> handPoints;
+        std::array<float, kMaxHandSamples> handRadii;
+        std::array<RE::NiPoint3, kMaxWeaponSamples> weaponPoints;
+        std::array<float, kMaxWeaponSamples> weaponRadii;
+        const std::uint32_t handSampleCount = rock::HostCopyHandCollisionSamples(
+            pushHandIsLeft,
+            handPoints.data(),
+            handRadii.data(),
+            kMaxHandSamples);
+        const std::uint32_t weaponSampleCount = rock::HostCopyWeaponCollisionSamples(
+            weaponPoints.data(),
+            weaponRadii.data(),
+            kMaxWeaponSamples);
+
+        const bool globallyBlocked =
+            _slamCooldown > 0.0f || removalIntent || removalTransferInProgress;
+        const bool handContactEligible = !globallyBlocked && !handOccupied;
+        const bool weaponContactEligible = !globallyBlocked;
+
+        /*
+         * PERF BROADPHASE:
+         *
+         * GetTriangles transforms every vertex into world space, then the exact
+         * query can test hundreds of hand/weapon samples against every triangle.
+         * Previously that work ran every open-deck frame even when both hands
+         * were across the room. Cache only the transform-invariant radius
+         * measured by the previous exact query and first ask whether a current
+         * sample (or its validated hand sweep) can reach that surface.
+         *
+         * A new node/scale uses the exact query's maximum possible 48-gu radius
+         * for its first gate, so this optimization cannot reject a contact the
+         * old broadphase would admit. Rotation and translation do not change a
+         * mesh's radius. Pushing is deliberately not special-cased: when no
+         * sample can reach either surface the contacts remain invalid, allowing
+         * the existing release/reopen path below to run on the same frame.
+         */
+        struct DeckSurfaceBroadphaseCache
+        {
+            const RE::NiAVObject* mesh = nullptr;
+            float scale = 1.0f;
+            float radius = 48.0f;
+            bool valid = false;
+        };
+        static std::array<DeckSurfaceBroadphaseCache, 2>
+            surfaceBroadphaseCache{};
+
+        const std::array<RE::NiAVObject*, 2> surfaceMeshes = {
+            deckMesh,
+            deckLidMesh
+        };
+        auto cachedSurfaceRadius =
+            [&](std::size_t surfaceIndex) {
+                const auto* mesh = surfaceMeshes[surfaceIndex];
+                auto& cache = surfaceBroadphaseCache[surfaceIndex];
+                if (!mesh) {
+                    cache = {};
+                    return 0.0f;
+                }
+
+                const float scale = std::fabs(mesh->world.scale);
+                if (!cache.valid ||
+                    cache.mesh != mesh ||
+                    !std::isfinite(scale) ||
+                    std::fabs(cache.scale - scale) > 1.0e-4f) {
+                    // makeSurface clamps its exact broadphase to 48 gu.
+                    return 48.0f;
+                }
+                return cache.radius;
+            };
+
+        auto sampleCloudMayReachSurface =
+            [&](std::size_t surfaceIndex,
+                const RE::NiPoint3* points,
+                const float* radii,
+                std::uint32_t count,
+                float contactSkin,
+                bool includeHandSweep) {
+                const auto* mesh = surfaceMeshes[surfaceIndex];
+                if (!mesh || count == 0) {
+                    return false;
+                }
+
+                const RE::NiPoint3 center = mesh->world.translate;
+                if (!IsUsableWorldPoint(center)) {
+                    // Preserve the old exact-query behavior for malformed
+                    // transforms instead of letting a prefilter decide it.
+                    return true;
+                }
+                const float surfaceRadius =
+                    cachedSurfaceRadius(surfaceIndex);
+                for (std::uint32_t i = 0; i < count; ++i) {
+                    const RE::NiPoint3& sample = points[i];
+                    if (!IsUsableWorldPoint(sample)) {
+                        continue;
+                    }
+                    const float effectiveRadius =
+                        pipboy_mesh_contact::GeneratedDeckContactRadius(
+                            radii[i],
+                            contactSkin);
+                    const float reach =
+                        surfaceRadius + effectiveRadius;
+                    if (PointDistance(sample, center) <= reach) {
+                        return true;
+                    }
+
+                    if (!includeHandSweep || !handSweepValid) {
+                        continue;
+                    }
+                    const RE::NiPoint3 previousSample =
+                        sample - handFrameDelta;
+                    if (IsUsableWorldPoint(previousSample) &&
+                        PointToSegmentDistance(
+                            center,
+                            previousSample,
+                            sample) <= reach) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+        std::array<bool, 2> surfaceQueryNeeded{};
+        for (std::size_t surfaceIndex = 0;
+             surfaceIndex < surfaceMeshes.size();
+             ++surfaceIndex) {
+            if (!surfaceMeshes[surfaceIndex]) {
+                continue;
+            }
+
+            if (handContactEligible) {
+                if (handSampleCount > 0) {
+                    surfaceQueryNeeded[surfaceIndex] =
+                        sampleCloudMayReachSurface(
+                            surfaceIndex,
+                            handPoints.data(),
+                            handRadii.data(),
+                            handSampleCount,
+                            generatedHullContactSkin,
+                            true);
+                } else if (_interactionFingerValid) {
+                    const float fingertipRadius =
+                        (std::clamp)(
+                            g_config.tapeDeckPushCloseRadius,
+                            0.3f,
+                            8.0f);
+                    surfaceQueryNeeded[surfaceIndex] =
+                        sampleCloudMayReachSurface(
+                            surfaceIndex,
+                            &_interactionFingerPos,
+                            &fingertipRadius,
+                            1,
+                            0.0f,
+                            true);
+                }
+            }
+
+            if (!surfaceQueryNeeded[surfaceIndex] &&
+                weaponContactEligible &&
+                weaponSampleCount > 0) {
+                surfaceQueryNeeded[surfaceIndex] =
+                    sampleCloudMayReachSurface(
+                        surfaceIndex,
+                        weaponPoints.data(),
+                        weaponRadii.data(),
+                        weaponSampleCount,
+                        generatedHullContactSkin,
+                        false);
+            }
+        }
+
+        static std::vector<TriangleData> deckTriangles;
+        static std::vector<TriangleData> lidTriangles;
+        deckTriangles.clear();
+        lidTriangles.clear();
+        if (deckMesh && surfaceQueryNeeded[0]) {
+            deckTriangles.reserve(256);
+            GetTriangles(deckMesh, deckTriangles, 2048);
+        }
+        if (deckLidMesh && surfaceQueryNeeded[1]) {
+            lidTriangles.reserve(256);
+            GetTriangles(
+                deckLidMesh,
+                lidTriangles,
+                2048);
+        }
+
+        struct DeckContactSurface
+        {
+            const std::vector<TriangleData>* triangles =
+                nullptr;
+            RE::NiPoint3 center{};
+            RE::NiPoint3 outward{};
+            float broadphaseRadius = 24.0f;
+            float openAngleRadians = 0.0f;
+            const char* name = "none";
+        };
+
+        auto makeSurface = [&](std::size_t surfaceIndex,
+                               RE::NiAVObject* mesh,
+                               const std::vector<TriangleData>& triangles,
+                               float openAngleDegrees,
+                               const char* name) {
+            DeckContactSurface surface;
+            surface.triangles = &triangles;
+            surface.name = name;
+            surface.openAngleRadians =
+                openAngleDegrees *
+                3.14159265358979323846f / 180.0f;
+            if (!mesh) {
+                return surface;
+            }
+
+            surface.center = mesh->world.translate;
+            surface.outward = PipboyRotateDirection(
+                mesh->world.rotate,
+                RE::NiPoint3(0.0f, 0.0f, 1.0f));
+            float meshRadius = 0.0f;
+            for (const auto& triangle : triangles) {
+                meshRadius = (std::max)(
+                    meshRadius,
+                    PointDistance(surface.center, triangle.v0));
+                meshRadius = (std::max)(
+                    meshRadius,
+                    PointDistance(surface.center, triangle.v1));
+                meshRadius = (std::max)(
+                    meshRadius,
+                    PointDistance(surface.center, triangle.v2));
+            }
+            if (std::isfinite(meshRadius) &&
+                meshRadius > 0.0f) {
+                surface.broadphaseRadius =
+                    (std::clamp)(
+                        meshRadius + 8.0f,
+                        12.0f,
+                        48.0f);
+            }
+            if (!triangles.empty()) {
+                auto& cache =
+                    surfaceBroadphaseCache[surfaceIndex];
+                cache.mesh = mesh;
+                cache.scale = std::fabs(mesh->world.scale);
+                cache.radius = surface.broadphaseRadius;
+                cache.valid =
+                    std::isfinite(cache.scale) &&
+                    std::isfinite(cache.radius);
+            }
+            return surface;
+        };
+
+        const std::array<DeckContactSurface, 2>
+            contactSurfaces = {
+                makeSurface(
+                    0,
+                    deckMesh,
+                    deckTriangles,
+                    TAPE_DECK_OPEN_ANGLE,
+                    "tray"),
+                makeSurface(
+                    1,
+                    deckLidMesh,
+                    lidTriangles,
+                    TAPE_LID_OPEN_ANGLE,
+                    "lid")
+            };
+        const bool deckMeshAvailable =
+            !deckTriangles.empty() ||
+            !lidTriangles.empty();
+
         auto evaluateSamples = [&](const RE::NiPoint3* points,
                                    const float* radii,
                                    std::uint32_t count,
                                    const char* source,
-                                   bool sweepWithHand) {
+                                   const char* sweptSource,
+                                   bool sweepWithHand,
+                                   float contactSkin) {
             DeckHullContact best{};
             best.source = source;
             if (!deckMeshAvailable) {
@@ -5037,127 +5903,165 @@ namespace heisenberg
                     continue;
                 }
                 const float effectiveRadius =
-                    (std::max)(0.0f, radii[i]) + surfacePadding;
-
-                // Current-frame overlap remains the normal slow/steady contact path.
-                // Keep the broad phase local to this branch because a fast swept
-                // segment may cross the tray even when both endpoints are farther away.
-                if (PointDistance(sample, tapeDeck->world.translate) <= 24.0f) {
-                    RE::NiPoint3 closest{};
-                    float distance =
-                        (std::numeric_limits<float>::max)();
-                    if (GetClosestMeshPointToPoint(
-                            deckTriangles,
-                            sample,
-                            closest,
-                            distance)) {
-                        const RE::NiPoint3 toCollider =
-                            sample - closest;
-                        const float directionLength =
-                            PointDistance(sample, closest);
-                        // ADMISSION FIX (Jul 25, user: "can't reliably push it closed
-                        // slow"): the slow/steady path demanded near-vertical approach
-                        // (z > 0.45·len) while the fast sweep path only asked 0.15 — but
-                        // the OPEN tray is rotated ~20°, so a natural slow push meets it
-                        // at a shallow angle and was rejected while the identical fast
-                        // motion closed it. Use the same 0.15 dominance both ways; the
-                        // stroke mechanism below already disciplines direction (axial
-                        // travel along the captured closing direction, lateral release).
-                        const bool contactOnTop =
-                            directionLength > 1.0e-3f
-                                ? toCollider.z >
-                                      0.15f * directionLength
-                                : _tapeDeckState ==
-                                      TapeDeckState::Pushing;
-                        const float penetration =
-                            effectiveRadius - distance;
-                        if (contactOnTop &&
-                            (!best.valid ||
-                             penetration > best.penetration)) {
-                            best.valid = true;
-                            best.distance = distance;
-                            best.effectiveRadius =
-                                effectiveRadius;
-                            best.penetration = penetration;
-                            best.sample = sample;
-                            best.closest = closest;
-                            best.swept = false;
-                        }
-                    }
-                }
-
-                if (!sweepWithHand || !handSweepValid) {
-                    continue;
-                }
-
-                // The ROCK sample cloud is regenerated from the same hand hulls
-                // every frame. Translate each current boundary sample back by the
-                // tracked hand motion, then test its whole continuous path. This
-                // prevents a fast hand from appearing on opposite sides of the
-                // thin tray without ever producing a current-frame overlap.
+                    pipboy_mesh_contact::GeneratedDeckContactRadius(
+                        radii[i],
+                        contactSkin);
                 const RE::NiPoint3 previousSample =
                     sample - handFrameDelta;
-                if (!IsUsableWorldPoint(previousSample) ||
-                    PointToSegmentDistance(
-                        tapeDeck->world.translate,
-                        previousSample,
-                        sample) > 24.0f) {
-                    continue;
-                }
 
-                RE::NiPoint3 intersection{};
-                if (!FindFirstSegmentMeshIntersection(
-                        deckTriangles,
-                        previousSample,
-                        sample,
-                        intersection)) {
-                    continue;
-                }
+                for (const auto& surface :
+                     contactSurfaces) {
+                    if (!surface.triangles ||
+                        surface.triangles->empty()) {
+                        continue;
+                    }
 
-                const RE::NiPoint3 approach =
-                    previousSample - intersection;
-                const float approachLength =
-                    PointDistance(previousSample, intersection);
-                const bool sweptFromTop =
-                    approachLength <= 1.0e-3f ||
-                    (approach.z > 0.15f * approachLength &&
-                     sample.z < previousSample.z);
-                if (!sweptFromTop) {
-                    continue;
-                }
+                    // Current-frame overlap remains the normal slow/steady
+                    // contact path. Use each moving surface's own center and
+                    // local +Z face; world-Z admission failed as soon as the
+                    // player rotated their Pip-Boy wrist.
+                    if (PointDistance(
+                            sample,
+                            surface.center) <=
+                        surface.broadphaseRadius +
+                            effectiveRadius) {
+                        RE::NiPoint3 closest{};
+                        float distance =
+                            (std::numeric_limits<float>::max)();
+                        if (GetClosestMeshPointToPoint(
+                                *surface.triangles,
+                                sample,
+                                closest,
+                                distance)) {
+                            const RE::NiPoint3 toCollider =
+                                sample - closest;
+                            const float directionLength =
+                                PointDistance(
+                                    sample,
+                                    closest);
+                            const bool contactOnClosingFace =
+                                directionLength <= 1.0e-3f
+                                    ? _tapeDeckState ==
+                                          TapeDeckState::Pushing
+                                    : PipboyDotProduct(
+                                          toCollider,
+                                          surface.outward) >
+                                          0.15f *
+                                              directionLength;
+                            const float penetration =
+                                effectiveRadius -
+                                distance;
+                            if (contactOnClosingFace &&
+                                (!best.valid ||
+                                 penetration >
+                                     best.penetration)) {
+                                best.valid = true;
+                                best.distance = distance;
+                                best.effectiveRadius =
+                                    effectiveRadius;
+                                best.penetration =
+                                    penetration;
+                                best.sample = sample;
+                                best.closest = closest;
+                                best.source = source;
+                                best.surface =
+                                    surface.name;
+                                best.hinge =
+                                    surface.center;
+                                best.openAngleRadians =
+                                    surface.
+                                        openAngleRadians;
+                                best.swept = false;
+                            }
+                        }
+                    }
 
-                const float sweptPenetration =
-                    (std::max)(effectiveRadius, 0.01f);
-                if (!best.valid ||
-                    sweptPenetration > best.penetration) {
-                    best.valid = true;
-                    best.distance = 0.0f;
-                    best.effectiveRadius = effectiveRadius;
-                    best.penetration = sweptPenetration;
-                    best.sample = intersection;
-                    best.closest = intersection;
-                    best.source = "hand hull sweep";
-                    best.swept = true;
+                    if (!sweepWithHand ||
+                        !handSweepValid ||
+                        !IsUsableWorldPoint(
+                            previousSample) ||
+                        PointToSegmentDistance(
+                            surface.center,
+                            previousSample,
+                            sample) >
+                            surface.broadphaseRadius +
+                                effectiveRadius) {
+                        continue;
+                    }
+
+                    // Translate the live hull boundary sample back by the
+                    // tracked hand motion and test its continuous path against
+                    // both visible mechanism meshes.
+                    RE::NiPoint3 intersection{};
+                    if (!FindFirstSegmentMeshIntersection(
+                            *surface.triangles,
+                            previousSample,
+                            sample,
+                            intersection)) {
+                        continue;
+                    }
+
+                    const RE::NiPoint3 approach =
+                        previousSample - intersection;
+                    const float approachLength =
+                        PointDistance(
+                            previousSample,
+                            intersection);
+                    const float approachFromOutside =
+                        PipboyDotProduct(
+                            approach,
+                            surface.outward);
+                    const float motionTowardSurface =
+                        PipboyDotProduct(
+                            sample - previousSample,
+                            surface.outward);
+                    const bool sweptFromClosingFace =
+                        motionTowardSurface < 0.0f &&
+                        (approachLength <= 1.0e-3f ||
+                         approachFromOutside >
+                             0.15f *
+                                 approachLength);
+                    if (!sweptFromClosingFace) {
+                        continue;
+                    }
+
+                    // Preserve how far the validated sweep ended beyond the
+                    // surface. Treating every crossing as only one 0.10-gu
+                    // convex radius let a fast hand emerge behind the lid
+                    // after advancing it by a tiny fixed step.
+                    const float travelPastSurface =
+                        (std::max)(
+                            0.0f,
+                            -PipboyDotProduct(
+                                sample - intersection,
+                                surface.outward));
+                    const float sweptPenetration =
+                        (std::max)(
+                            effectiveRadius +
+                                travelPastSurface,
+                            0.01f);
+                    if (!best.valid ||
+                        sweptPenetration >
+                            best.penetration) {
+                        best.valid = true;
+                        best.distance = 0.0f;
+                        best.effectiveRadius =
+                            effectiveRadius;
+                        best.penetration =
+                            sweptPenetration;
+                        best.sample = intersection;
+                        best.closest = intersection;
+                        best.source = sweptSource;
+                        best.surface = surface.name;
+                        best.hinge = surface.center;
+                        best.openAngleRadians =
+                            surface.openAngleRadians;
+                        best.swept = true;
+                    }
                 }
             }
             return best;
         };
-
-        constexpr std::uint32_t kMaxHandSamples = 384;
-        constexpr std::uint32_t kMaxWeaponSamples = 512;
-        std::array<RE::NiPoint3, kMaxHandSamples> handPoints{};
-        std::array<float, kMaxHandSamples> handRadii{};
-        std::array<RE::NiPoint3, kMaxWeaponSamples> weaponPoints{};
-        std::array<float, kMaxWeaponSamples> weaponRadii{};
-        const std::uint32_t handSampleCount = rock::HostCopyHandCollisionSamples(
-            pushHandIsLeft,
-            handPoints.data(),
-            handRadii.data(),
-            kMaxHandSamples);
-        const std::uint32_t weaponSampleCount = rock::HostCopyWeaponCollisionSamples(
-            weaponPoints.data(),
-            weaponRadii.data(),
-            kMaxWeaponSamples);
 
         auto sampleCentroid = [](const RE::NiPoint3* points,
                                  std::uint32_t count,
@@ -5191,68 +6095,55 @@ namespace heisenberg
                 weaponSampleCount,
                 weaponHullCentroid);
 
-        DeckHullContact handContact = evaluateSamples(
-            handPoints.data(),
-            handRadii.data(),
-            handSampleCount,
-            "hand hull",
-            true);
-        DeckHullContact weaponContact = evaluateSamples(
-            weaponPoints.data(),
-            weaponRadii.data(),
-            weaponSampleCount,
-            "weapon hull",
-            false);
+        DeckHullContact handContact{};
+        if (handContactEligible) {
+            handContact = evaluateSamples(
+                handPoints.data(),
+                handRadii.data(),
+                handSampleCount,
+                "hand hull",
+                "hand hull sweep",
+                true,
+                generatedHullContactSkin);
+        }
+        DeckHullContact weaponContact{};
+        if (weaponContactEligible) {
+            weaponContact = evaluateSamples(
+                weaponPoints.data(),
+                weaponRadii.data(),
+                weaponSampleCount,
+                "weapon hull",
+                "weapon hull sweep",
+                false,
+                generatedHullContactSkin);
+        }
 
         // Compatibility fallback when generated hand collision is unavailable.
-        // Retain the original swept visible fingertip so old/fallback runtime
-        // configurations can still close the deck and fast hand motion cannot
-        // tunnel through the thin tray mesh.
-        if (handSampleCount == 0 && _interactionFingerValid) {
+        // Retain the swept visible fingertip so old/fallback runtime
+        // configurations can still close either visible mechanism mesh. Its
+        // configured radius is already a complete compatibility envelope, so
+        // do not add the generated-hull sample skin a second time.
+        if (handContactEligible &&
+            handSampleCount == 0 &&
+            _interactionFingerValid) {
             const float fingertipRadius =
                 (std::clamp)(g_config.tapeDeckPushCloseRadius, 0.3f, 8.0f);
-            const SweptMeshContact fallback = QuerySweptMeshContact(
-                deckMesh,
-                _interactionFingerPos,
-                _previousInteractionFingerPos,
-                _previousInteractionFingerValid,
-                fingertipRadius);
-            if (fallback.meshAvailable) {
-                const bool sweptCrossing =
-                    fallback.sweptDistance <= 1.0e-4f &&
-                    _previousInteractionFingerValid;
-                const RE::NiPoint3 contactSidePoint =
-                    sweptCrossing
-                        ? _previousInteractionFingerPos
-                        : _interactionFingerPos;
-                const RE::NiPoint3 toFinger =
-                    contactSidePoint - fallback.closestPoint;
-                const float length =
-                    PointDistance(
-                        contactSidePoint,
-                        fallback.closestPoint);
-                const bool onTop =
-                    length > 1.0e-3f
-                        ? toFinger.z >
-                              (sweptCrossing ? 0.15f : 0.45f) *
-                                  length
-                        : _tapeDeckState ==
-                              TapeDeckState::Pushing;
-                if (onTop) {
-                    handContact.valid = true;
-                    handContact.distance =
-                        (std::min)(fallback.currentDistance, fallback.sweptDistance);
-                    handContact.effectiveRadius = fingertipRadius;
-                    handContact.penetration =
-                        fingertipRadius - handContact.distance;
-                    handContact.sample = _interactionFingerPos;
-                    handContact.closest = fallback.closestPoint;
-                    handContact.source = sweptCrossing
-                        ? "fingertip sweep"
-                        : "fingertip fallback";
-                    handContact.swept = sweptCrossing;
-                }
-            }
+            const std::array<RE::NiPoint3, 1>
+                fallbackPoints = {
+                    _interactionFingerPos
+                };
+            const std::array<float, 1>
+                fallbackRadii = {
+                    fingertipRadius
+                };
+            handContact = evaluateSamples(
+                fallbackPoints.data(),
+                fallbackRadii.data(),
+                1,
+                "fingertip fallback",
+                "fingertip sweep",
+                true,
+                0.0f);
         }
 
         if (_tapeDeckState == TapeDeckState::Pushing && std::isnan(_pushProgress)) {
@@ -5262,19 +6153,26 @@ namespace heisenberg
             _deckPushStrokeMaxTravel = 0.0f;
         }
 
-        const bool globallyBlocked =
-            _slamCooldown > 0.0f || removalIntent || removalTransferInProgress;
+        constexpr float kPushingReleaseHysteresis = 0.3f;
+        const auto contactContinuesPush =
+            [&](const DeckHullContact& contact) {
+                return contact.valid &&
+                    pipboy_mesh_contact::
+                        TapeDeckContactKeepsPushing(
+                            contact.penetration,
+                            contact.swept,
+                            _tapeDeckState ==
+                                TapeDeckState::Pushing,
+                            kPushingReleaseHysteresis);
+            };
         const bool handPushingNow =
             !globallyBlocked && !handOccupied &&
-            handContact.valid &&
-            (handContact.penetration > 0.0f ||
-             handContact.swept);
+            contactContinuesPush(handContact);
         // An equipped weapon is not a GrabManager object. It remains a valid
         // physical pusher even while the right hand is otherwise "occupied".
         const bool weaponPushingNow =
             !globallyBlocked &&
-            weaponContact.valid &&
-            weaponContact.penetration > 0.0f;
+            contactContinuesPush(weaponContact);
         const bool pushingNow = handPushingNow || weaponPushingNow;
         const bool activeUsesWeapon =
             weaponPushingNow &&
@@ -5374,24 +6272,32 @@ namespace heisenberg
             _deckPushStrokeMaxTravel = 0.0f;
 
             const RE::NiPoint3 hinge =
-                deckMesh
-                    ? deckMesh->world.translate
+                IsUsableWorldPoint(
+                    activeContact.hinge)
+                    ? activeContact.hinge
                     : tapeDeck->world.translate;
             const float contactRadiusFromHinge =
                 PointDistance(activeContact.closest, hinge);
-            constexpr float openAngleRadians =
-                TAPE_DECK_OPEN_ANGLE *
-                3.14159265358979323846f / 180.0f;
+            const float openAngleRadians =
+                std::isfinite(
+                    activeContact.openAngleRadians) &&
+                        activeContact.openAngleRadians >
+                            1.0e-4f
+                    ? activeContact.openAngleRadians
+                    : TAPE_DECK_OPEN_ANGLE *
+                          3.14159265358979323846f /
+                          180.0f;
             _deckPushStrokeRequiredTravel =
                 pipboy_mesh_contact::TapeDeckStrokeDistance(
                     contactRadiusFromHinge,
                     _deckPushStrokeStartProgress,
                     openAngleRadians);
             spdlog::debug(
-                "[PIPBOY] Deck proportional push started by {} "
+                "[PIPBOY] Deck proportional push started by {} on {} "
                 "(surfaceDist={:.2f}, hullRadius={:.2f}, "
                 "startProgress={:.2f}, requiredTravel={:.2f})",
                 activeContact.source,
+                activeContact.surface,
                 activeContact.distance,
                 activeContact.effectiveRadius,
                 _deckPushStrokeStartProgress,
@@ -5477,30 +6383,33 @@ namespace heisenberg
                 }
             } else if (activeContact.penetration > 0.0f) {
                 const RE::NiPoint3 hingeNow =
-                    deckMesh
-                        ? deckMesh->world.translate
+                    IsUsableWorldPoint(
+                        activeContact.hinge)
+                        ? activeContact.hinge
                         : tapeDeck->world.translate;
                 const float contactRadius =
                     PointDistance(activeContact.closest, hingeNow);
-                constexpr float openAngleRadiansNow =
-                    TAPE_DECK_OPEN_ANGLE *
-                    3.14159265358979323846f / 180.0f;
-                // Guard a degenerate radius (contact resolved essentially at the hinge): there the
-                // lever arm vanishes and penetration/radius explodes into a full-close snap.
-                if (contactRadius > 1.0f && openAngleRadiansNow > 1.0e-4f) {
-                    const float clearingAngle =
-                        activeContact.penetration / contactRadius;
-                    const float deltaProgress =
-                        clearingAngle / openAngleRadiansNow;
-                    // Cap per-frame motion so one bad depth sample cannot slam the tray shut; at
-                    // 90fps this still allows a full close in ~5 frames of hard pushing.
-                    constexpr float kMaxProgressPerFrame = 0.20f;
-                    _pushProgress = (std::clamp)(
-                        _pushProgress -
-                            (std::min)(deltaProgress, kMaxProgressPerFrame),
-                        0.0f,
-                        1.0f);
-                }
+                const float openAngleRadiansNow =
+                    std::isfinite(
+                        activeContact.openAngleRadians) &&
+                            activeContact.openAngleRadians >
+                                1.0e-4f
+                        ? activeContact.openAngleRadians
+                        : TAPE_DECK_OPEN_ANGLE *
+                              3.14159265358979323846f /
+                              180.0f;
+                // The policy helper owns the degenerate-hinge guard and the
+                // distinction between capped slow overlap and a validated
+                // sweep that must clear its measured crossing this frame.
+                _pushProgress =
+                    pipboy_mesh_contact::
+                        TapeDeckProgressAfterPenetration(
+                            _pushProgress,
+                            activeContact.penetration,
+                            contactRadius,
+                            openAngleRadiansNow,
+                            activeContact.swept,
+                            0.20f);
                 strokeTravelForLog = activeContact.penetration;
             }
 
@@ -5548,14 +6457,17 @@ namespace heisenberg
             if (denseTick || _logCooldown <= 0) {
                 if (_logCooldown <= 0) _logCooldown = 60;
                 spdlog::debug(
-                    "[PIPBOY] Deck collider contact: mesh={} handSamples={} "
-                    "weaponSamples={} nearest={} dist={:.2f} pen={:.2f} "
+                    "[PIPBOY] Deck collider contact: mesh={} tray={} lid={} handSamples={} "
+                    "weaponSamples={} nearest={} surface={} dist={:.2f} pen={:.2f} "
                     "state={} pushProg={:.2f} stroke={} source={} "
                     "travel={:.2f}/{:.2f} lateral={:.2f} blocked={} occupied={}",
                     deckMeshAvailable,
+                    !deckTriangles.empty(),
+                    !lidTriangles.empty(),
                     handSampleCount,
                     weaponSampleCount,
                     nearest ? nearest->source : "none",
+                    nearest ? nearest->surface : "none",
                     nearestDistance,
                     nearest ? nearest->penetration : 0.0f,
                     static_cast<int>(_tapeDeckState),
@@ -5740,6 +6652,10 @@ namespace heisenberg
         _cachedArmNode          = nullptr;
         _nodesCached            = false;
         _frameCacheValid        = false;
+        _nodeSnapshot.Reset();
+        _nodeSnapshotArm        = nullptr;
+        _nodeSnapshotPhaseAttempted = false;
+        _nodeSnapshotUsable     = false;
         _fingerPosCached        = false;
         _interactionFingerPos = {};
         _previousInteractionFingerPos = {};
@@ -5752,6 +6668,8 @@ namespace heisenberg
         _pendingProgramFormID       = 0;
         _pendingProgramWaitFrames   = 0;
         _holotapePauseClearFrames   = 0;
+        _deferredDisableHandle.reset();
+        _deferredDisableFrames      = 0;
         // Restore PipboyMenu input and cursor that may have been disabled during holotape
         EnableMenuInput(MenuPipboy());
         if (auto* ui = RE::UI::GetSingleton()) {
@@ -5780,6 +6698,8 @@ namespace heisenberg
         _terminalRedirectActive     = false;
         _isWorldTerminalRedirect    = false;
         _terminalPatchesSuspended   = false;
+        _terminalClosePipboyPending = false;
+        _terminalForcedFrikScreenVisible = false;
         // Seed the "left the vault" latch: an established character (intro already played) is
         // well past Vault 111, so don't gate their terminal redirect. A fresh playthrough starts
         // false and flips true the moment the player first reaches an exterior cell.

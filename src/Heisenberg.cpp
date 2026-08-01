@@ -1,6 +1,7 @@
 #include "Heisenberg.h"
 #include "HandAuthority.h"
 #include "FrikArmGoalHook.h"
+#include "LegacyFrikFingerPoseAuthority.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -38,6 +39,7 @@
 #include "PlayerCharacterProxyListener.h"
 #include "rock/RockBridge.h"
 #include "../external/ROCK/src/ROCKMain.h"  // rock::HostLoad — embedded-engine host entry (lightweight fwd-decl header only)
+#include "../external/ROCK/src/physics-interaction/native/HavokOffsets.h"
 #include "SmartGrabHandler.h"
 #include "ThrownObjectTracker.h"
 #include "Utils.h"
@@ -56,43 +58,126 @@ namespace heisenberg
     // toggle is off, or forwarding would run ROCK's FRIK/physics init despite the engine being dormant.
     static bool s_rockEngineHosted = false;
 
+    // One post-FRIK tail owns all hosted scene writes. Whole-hand authority
+    // lands first; finger locals then inherit that final wrist/weapon world.
+    static void ApplyRockHostVisualAuthorities()
+    {
+        static bool benchmarkVisualAuthoritiesReset = false;
+        if (rock::HostIsPerformanceBenchmarkBaseline()) {
+            if (!benchmarkVisualAuthoritiesReset) {
+                HandAuthority::Reset();
+                LegacyFrikFingerPoseAuthority::Reset();
+                benchmarkVisualAuthoritiesReset = true;
+            }
+            return;
+        }
+        benchmarkVisualAuthoritiesReset = false;
+        HandAuthority::ApplyWinners();
+        LegacyFrikFingerPoseAuthority::ApplyWinners();
+    }
+
     // Public accessor (audit rank 10): ownership gates elsewhere (e.g. Hooks.cpp
     // UpdateHandCollisionBodies) must treat the EMBEDDED engine like a running ROCK.dll.
     // RockBridge::IsRunning() binds via GetModuleHandleA("ROCK.dll") and is structurally
     // always false in the embed, so gates keyed only on it never yield to the hosted engine.
     bool IsRockEngineHosted() { return s_rockEngineHosted; }
 
-    // ---- Scope-mode exit on support-grip release (Jul 19, user request) ----
+    // ---- Scope-mode exit/re-entry policy for support grips ----
     // Covers BOTH scope systems:
     //  - BetterScopesVR zoom: state tracked from its msg-15 broadcast; exit = msg-16 toggle
     //    (only sent while its own state says zoomed, so it can never toggle zoom ON).
-    //  - Vanilla ScopeMenu: tracked by MenuChecker; exit = UIMessageQueue kHide.
+    //  - Native FO4VR world scope: exit through its verified native state
+    //    transition. The ROCK host hook then consumes repeated inside-cone
+    //    activation until the optic leaves the cone once.
+    //  - Vanilla ScopeMenu: also receives an idempotent UI kHide fallback.
     static bool s_lookingThroughScope = false;
 
-    void SetLookingThroughScope(bool a_looking)
+    static bool HostObservedScopePresentation()
     {
-        if (s_lookingThroughScope != a_looking) {
-            spdlog::debug("[SCOPE] BetterScopesVR looking-through-scope = {}", a_looking);
-        }
-        s_lookingThroughScope = a_looking;
+        return s_lookingThroughScope ||
+               MenuChecker::GetSingleton().IsScopeOpen();
     }
 
-    void ExitScopeModeOnGripRelease()
+    static void ExitScopePresentation(const char* reason)
     {
         if (s_lookingThroughScope) {
             s_lookingThroughScope = false;  // optimistic; its next msg 15 re-syncs
             if (const auto* messaging = F4SE::GetMessagingInterface()) {
                 messaging->Dispatch(16, nullptr, 0, "FO4VRBETTERSCOPES");
-                spdlog::info("[SCOPE] support grip released while zoomed — sent scope-mode exit toggle to BetterScopesVR");
+                spdlog::info(
+                    "[SCOPE] {} while zoomed — sent scope-mode exit "
+                    "toggle to BetterScopesVR",
+                    reason);
             }
         }
-        if (MenuChecker::GetSingleton().IsScopeOpen()) {
-            if (auto* msgQueue = RE::UIMessageQueue::GetSingleton()) {
-                static RE::BSFixedString scopeMenuName("ScopeMenu");
-                msgQueue->AddMessage(scopeMenuName, RE::UI_MESSAGE_TYPE::kHide);
-                spdlog::info("[SCOPE] support grip released while vanilla ScopeMenu open — sent kHide");
-            }
+
+        // Raw-disassembly-verified FO4VR ABI: (PlayerCharacter*, bool).
+        // Calling the false transition is idempotent when no native scope is
+        // active and closes the WSScope presentation even though the game
+        // never reported an exact "ScopeMenu" open event in the failing logs.
+        using NativeScopeStateTransition =
+            void (*)(RE::PlayerCharacter*, bool);
+        static REL::Relocation<NativeScopeStateTransition>
+            nativeScopeStateTransition{
+                REL::Offset(
+                    rock::offsets::
+                        kFunc_NativeScopeStateTransition) };
+        if (auto* player =
+                RE::PlayerCharacter::GetSingleton();
+            player &&
+            nativeScopeStateTransition.address()) {
+            nativeScopeStateTransition(player, false);
+            spdlog::info(
+                "[SCOPE] {} — requested native FO4VR scope state "
+                "exit",
+                reason);
         }
+
+        // Do not gate this on MenuChecker::IsScopeOpen(): Fallout 4 VR can
+        // keep WSScope active without ever publishing an exact ScopeMenu event.
+        // kHide on a closed/unregistered menu is harmless.
+        if (auto* msgQueue = RE::UIMessageQueue::GetSingleton()) {
+            static RE::BSFixedString scopeMenuName("ScopeMenu");
+            msgQueue->AddMessage(
+                scopeMenuName,
+                RE::UI_MESSAGE_TYPE::kHide);
+            spdlog::info(
+                "[SCOPE] {} — sent idempotent vanilla ScopeMenu "
+                "kHide",
+                reason);
+        }
+    }
+
+    void SetLookingThroughScope(bool a_looking)
+    {
+        if (s_lookingThroughScope != a_looking) {
+            spdlog::debug(
+                "[SCOPE] BetterScopesVR looking-through-scope = {}",
+                a_looking);
+        }
+        s_lookingThroughScope = a_looking;
+
+        // BetterScopes can publish a new zoom-on state while Bethesda's
+        // ocular is still inside the activation cone. Keep the presentation
+        // closed for the same leave-then-re-enter episode as native WSScope.
+        if (a_looking &&
+            IsRockEngineHosted() &&
+            rock::HostIsNativeScopeReentryBlocked()) {
+            ExitScopePresentation(
+                "scope re-entry remained blocked");
+        }
+    }
+
+    void ExitScopeModeOnGripRelease()
+    {
+        if (IsRockEngineHosted()) {
+            // Preserve the existing release exit, and give it the same
+            // anti-reopen behavior when release itself occurs while scoped.
+            (void)rock::HostArmNativeScopeReentryBlockIfActive(
+                HostObservedScopePresentation());
+        }
+        ExitScopePresentation(
+            "support grip released");
     }
 
     // Destructor - defined here where Hand is complete
@@ -153,6 +238,19 @@ namespace heisenberg
         }
 
         if (s_rockEngineHosted && a_msg->sender && std::strcmp(a_msg->sender, "F4VRBody") == 0) {
+            using FrikLifecycle =
+                frik::host_api::FRIKApi::LifecycleEvent;
+            const auto lifecycle =
+                static_cast<FrikLifecycle>(a_msg->type);
+            if (lifecycle == FrikLifecycle::kSkeletonReady ||
+                lifecycle == FrikLifecycle::kSkeletonDestroying ||
+                lifecycle == FrikLifecycle::kPowerArmorChanged) {
+                // A rich local pose contains skeleton- and PA-specific authored
+                // translations. Drop host publications at every FRIK lifecycle
+                // boundary so ROCK's active-tag cache must rebuild them.
+                heisenberg::LegacyFrikFingerPoseAuthority::Reset();
+            }
+
             // Host-adapter isolation (integration audit §3.1 / C1): a fault inside the embedded
             // engine must never std::terminate Heisenberg's own message handling.
             try {
@@ -175,10 +273,21 @@ namespace heisenberg
         // Public API: another plugin requests the IHeisenbergInterface001 vtable.
         if (a_msg->type == HeisenbergPluginAPI::HeisenbergMessage::kMessage_GetInterface)
         {
+            constexpr auto kLegacyMessageSize =
+                offsetof(HeisenbergPluginAPI::HeisenbergMessage, structSize);
+            if (!a_msg->data || a_msg->dataLen < kLegacyMessageSize) {
+                spdlog::warn(
+                    "[Heisenberg] Rejected malformed API request from '{}' (data={}, dataLen={})",
+                    a_msg->sender ? a_msg->sender : "?",
+                    a_msg->data != nullptr,
+                    a_msg->dataLen);
+                return;
+            }
             spdlog::info("[Heisenberg] API interface request from '{}'",
                 a_msg->sender ? a_msg->sender : "?");
             HeisenbergPluginAPI::HandleInterfaceRequest(
-                static_cast<HeisenbergPluginAPI::HeisenbergMessage*>(a_msg->data));
+                static_cast<HeisenbergPluginAPI::HeisenbergMessage*>(a_msg->data),
+                a_msg->dataLen);
             return;
         }
 
@@ -285,6 +394,7 @@ namespace heisenberg
             // Destroy hand collision bodies - world/body pointers become invalid on load
             heisenberg::HandCollision::GetSingleton().Shutdown();
             heisenberg::HandAuthority::Reset();
+            heisenberg::LegacyFrikFingerPoseAuthority::Reset();
             // Clear thrown-object tracking - tracked bodies, pending impacts, and the cached
             // hknpWorld pointer all become stale across a load (UAF on first post-load throw).
             heisenberg::ThrownObjectTracker::GetSingleton().Reset();
@@ -327,6 +437,7 @@ namespace heisenberg
             // Destroy hand collision bodies - world/body pointers become invalid on load
             heisenberg::HandCollision::GetSingleton().Shutdown();
             heisenberg::HandAuthority::Reset();
+            heisenberg::LegacyFrikFingerPoseAuthority::Reset();
             // Clear thrown-object tracking - tracked bodies, pending impacts, and the cached
             // hknpWorld pointer all become stale across a load (UAF on first post-load throw).
             heisenberg::ThrownObjectTracker::GetSingleton().Reset();
@@ -400,19 +511,27 @@ namespace heisenberg
         // proper Documents/My Games/Fallout4VR/F4SE/HeisenbergF4VR.log.
         F4SE::Init(a_f4se);
 
-        // RELEASE (v0.8.4): bootstrap at ERROR so nothing chats before Config::Load()
-        // applies the user's iLogLevel. F4SE::Init() has ALREADY emitted the
-        // "{plugin} v{version}" banner above under log::init()'s own level, so the
-        // version stamp still lands in the log; only our own pre-config info lines go
-        // quiet. Errors/criticals from a failed startup still print. Raise to
-        // spdlog::level::info here when you need to see startup before the INI is read.
-        spdlog::set_level(spdlog::level::err);
+        // Release bootstrap is error-only, but users diagnosing launch/config/hook
+        // negotiation need those pre-Config::Load lines. Read the one early escape
+        // hatch directly; Config::Load later applies the steady-state iLogLevel.
+        CSimpleIniA launchIni;
+        launchIni.SetUnicode();
+        launchIni.LoadFile("Data/F4SE/Plugins/Heisenberg_F4VR.ini");
+        const bool verboseLaunch =
+            launchIni.GetBoolValue("Debug", "bVerboseLaunch", false);
+        spdlog::set_level(
+            verboseLaunch ? spdlog::level::debug : spdlog::level::err);
         // PERF (Jul 5): flush per WARN, not per INFO — flushing on every info line is an
         // fflush write syscall per log call on the frame thread (~1000/s under load = real
         // FPS cost). WER minidumps + dmp.py/sym.py cover crash forensics; bump to info/trace
         // temporarily when chasing a CTD whose last line matters.
         spdlog::flush_on(spdlog::level::warn);
 
+        if (verboseLaunch) {
+            spdlog::info(
+                "[Debug] bVerboseLaunch=1 — launch/config/hook diagnostics enabled "
+                "until Config::Load applies iLogLevel");
+        }
         spdlog::info("Heisenberg F4VR loading...");
 
         // Get messaging interface
@@ -457,7 +576,9 @@ namespace heisenberg
         // Register after constructing the singleton so this runs before its
         // own static destructor. Consumers must not assume a cross-DLL atexit
         // order; process-exit cleanup in Controls Config avoids calling back
-        // through this DLL's bridge API.
+        // through this DLL's bridge API. Shutdown's callback drains are bounded
+        // to 500 ms each, so a thread already terminated by ExitProcess cannot
+        // leave Fallout4VR.exe stuck as a zombie.
         static std::once_flag shutdownRegistration;
         std::call_once(shutdownRegistration, [] {
             std::atexit([] {
@@ -483,10 +604,17 @@ namespace heisenberg
                     // Register the plugin-side hand-authority table so ROCK's two-handing / wall-stop
                     // route into our own hand placement when the loaded FRIK lacks the v5 API.
                     rock::HostSetHandAuthority(reinterpret_cast<const rock::HostHandAuthority*>(&heisenberg::HandAuthority::HostTable()));
+                    // Stock FRIK 0.77.12 cannot carry ROCK's independent joints,
+                    // splay, palm motion, or exact mesh-contact locals. Register a
+                    // distinct Heisenberg backend for that payload; native FRIK v5
+                    // remains preferred by the ROCK bridge.
+                    rock::HostSetFingerPoseAuthority(
+                        &heisenberg::LegacyFrikFingerPoseAuthority::HostTable());
                     // Jul 19 (frame-order audit): apply hand authority at the tail of ROCK's
                     // frame — after its weapon write, before the bone-tree flatten — so the
                     // rendered hand tracks the rendered weapon with zero lag.
-                    rock::HostSetPostUpdateCallback(&heisenberg::HandAuthority::ApplyWinners);
+                    rock::HostSetPostUpdateCallback(
+                        &heisenberg::ApplyRockHostVisualAuthorities);
                     // iGrabMode=9 (Full Dynamic): cede grab+selection ownership to the embedded
                     // engine for the whole session (read from the boot ini — g_config loads later).
                     // The seam forces the embed's bGrabEnabled/bSelectionEnabled ON across every
@@ -547,6 +675,7 @@ namespace heisenberg
             if (inputManager->AllocateNewLayer(_inputLayer, "HeisenbergGrab")) {
                 _inputLayerID = _inputLayer->layerID;
                 _inputLayerInitialized = true;
+                RefreshOwnedInputLayer();
                 spdlog::info("Created InputEnableLayer 'HeisenbergGrab' with ID {}", _inputLayerID);
             } else {
                 spdlog::error("Failed to create InputEnableLayer");
@@ -628,419 +757,318 @@ namespace heisenberg
         auto& openvrHook = OpenVRHook::GetSingleton();
         if (openvrHook.IsHooked()) {
             openvrHook.RegisterControllerStateCallback([](bool isLeft, vr::VRControllerState_t* state) -> uint64_t {
-                uint64_t allowMask = 0xFFFFFFFFFFFFFFFF;  // Start with all buttons allowed
+                constexpr std::uint64_t kAllowAll = ~std::uint64_t{0};
+                constexpr std::uint64_t kGripMask = 1ULL << vr::k_EButton_Grip;
+                constexpr std::uint64_t kAcceptMask = 1ULL << vr::k_EButton_A;
+                constexpr double kGrabHoldSeconds = 0.20;
+                constexpr std::uint64_t kTapInjectMilliseconds = 60;
+                constexpr std::uint64_t kPostDropBlockMilliseconds = 500;
 
-                // THREAD SAFETY LOGGING: Track callback entry for deadlock diagnosis
-                // This helps identify if we got stuck inside the callback
-                static std::atomic<int> callbackEntryCount{0};
-                static std::atomic<int> callbackExitCount{0};
-                int entryNum = ++callbackEntryCount;
-
-                // Log every 300th callback to show we're still processing (roughly every 3-5 seconds)
-                if (entryNum % 300 == 0) {
-                    spdlog::debug("[CB HEARTBEAT] OpenVR callback #{} (exits: {}), hand: {}",
-                                 entryNum, callbackExitCount.load(), isLeft ? "L" : "R");
+                if (!state) {
+                    return kAllowAll;
                 }
 
-                // =====================================================================
-                // EARLY NULL CHECKS - Singletons may not be ready during startup/shutdown
-                // =====================================================================
-                auto* heisenbergPtr = &Heisenberg::GetSingleton();
-                if (!heisenbergPtr || !heisenbergPtr->IsInitialized()) {
-                    ++callbackExitCount;
-                    return allowMask;  // Not ready yet
+                auto& modInst = Heisenberg::GetSingleton();
+                const std::uint32_t policy =
+                    modInst._controllerPolicyFlags.load(std::memory_order_acquire);
+                if ((policy & kPolicyInitialized) == 0) {
+                    return kAllowAll;
                 }
-                auto& modInst = *heisenbergPtr;
 
-                // GrabManager singleton - should always be valid if Heisenberg is initialized
-                auto& grabMgr = GrabManager::GetSingleton();
+                // A press/release gesture spans several fields (edge, start
+                // time, long-hold state, deferred synthetic tap, throwable
+                // state). Atomics prevent data races but do not make that
+                // collection one state transition. Serialize each hand's
+                // complete callback so simultaneous OpenVR consumers cannot
+                // observe or publish a half-updated A/X gesture.
+                std::mutex& callbackMutex =
+                    isLeft
+                        ? modInst._controllerCallbackMutexLeft
+                        : modInst._controllerCallbackMutexRight;
+                std::lock_guard callbackStateLock(callbackMutex);
 
-                // =====================================================================
-                // EITHER HAND: Track physical grip state (for main thread finger logic)
-                // =====================================================================
-                // Just set the atomic flag - main thread decides finger animation
-                {
-                    constexpr uint64_t gripMask = 1ULL << vr::k_EButton_Grip;
-                    bool physicalGripPressed = (state->ulButtonPressed & gripMask) != 0;
+                std::uint64_t allowMask = kAllowAll;
+                const std::uint64_t nowMs = GetTickCount64();
+                const double nowSeconds = Utils::GetTime();
+                const std::uint64_t rawPressed = state->ulButtonPressed;
+                const bool physicalGripPressed = (rawPressed & kGripMask) != 0;
+                (isLeft ? modInst._physicalGripPressedLeft
+                        : modInst._physicalGripPressedRight)
+                    .store(physicalGripPressed, std::memory_order_relaxed);
 
-                    if (isLeft) {
-                        modInst._physicalGripPressedLeft.store(physicalGripPressed, std::memory_order_relaxed);
-                    } else {
-                        modInst._physicalGripPressedRight.store(physicalGripPressed, std::memory_order_relaxed);
+                const bool thisHandGrabbing =
+                    (policy & (isLeft ? kPolicyGrabbingLeft
+                                      : kPolicyGrabbingRight)) != 0;
+                const bool leftHanded =
+                    (policy & kPolicyLeftHanded) != 0;
+                const bool isPrimaryHand =
+                    leftHanded ? isLeft : !isLeft;
+                const bool inMenu = (policy & kPolicyMenuOpen) != 0;
+                const bool inGrenadeZone =
+                    isPrimaryHand && (policy & kPolicyChestZone) != 0;
+
+                auto& wasGrabbing =
+                    isLeft ? modInst._cb_wasGrabbingLeft
+                           : modInst._cb_wasGrabbingRight;
+                auto& postDropUntil =
+                    isLeft ? modInst._cb_postDropBlockUntilLeft
+                           : modInst._cb_postDropBlockUntilRight;
+                const bool previouslyGrabbing =
+                    wasGrabbing.exchange(
+                        thisHandGrabbing,
+                        std::memory_order_acq_rel);
+                if (previouslyGrabbing && !thisHandGrabbing) {
+                    postDropUntil.store(
+                        nowMs + kPostDropBlockMilliseconds,
+                        std::memory_order_release);
+                }
+                const bool inPostDropBlock =
+                    nowMs < postDropUntil.load(std::memory_order_acquire);
+
+                if (!inMenu &&
+                    (thisHandGrabbing || inPostDropBlock)) {
+                    allowMask &= ~kAcceptMask;
+                    allowMask &= ~kGripMask;
+                }
+
+                // X/A hold-to-grab must hide a press for its entire grabbed-object
+                // arbitration window. A quick release becomes a real-time synthetic
+                // press long enough for Fallout's poll, independent of how many other
+                // OpenVR consumers queried the same packet.
+                const bool handUsesAccept =
+                    (isLeft && (policy & kPolicyUseXForLeftGrab) != 0) ||
+                    (!isLeft && (policy & kPolicyUseAForRightGrab) != 0);
+                auto& acceptPressTime =
+                    isLeft ? modInst._cb_axGrabPressTimeL
+                           : modInst._cb_axGrabPressTimeR;
+                auto& acceptWasPressed =
+                    isLeft ? modInst._cb_axGrabWasPressedL
+                           : modInst._cb_axGrabWasPressedR;
+                auto& acceptHeldLong =
+                    isLeft ? modInst._cb_axGrabHeldLongL
+                           : modInst._cb_axGrabHeldLongR;
+                auto& acceptIntercepted =
+                    isLeft ? modInst._cb_axGrabInterceptedL
+                           : modInst._cb_axGrabInterceptedR;
+                auto& acceptInjectUntil =
+                    isLeft ? modInst._cb_axGrabInjectUntilL
+                           : modInst._cb_axGrabInjectUntilR;
+
+                if (handUsesAccept && !inMenu) {
+                    const bool physicalAccept =
+                        (rawPressed & kAcceptMask) != 0;
+                    const bool previousAccept =
+                        acceptWasPressed.exchange(
+                            physicalAccept,
+                            std::memory_order_acq_rel);
+                    const bool hasTarget =
+                        (isLeft ? modInst._hasGrabTargetLeft
+                                : modInst._hasGrabTargetRight)
+                            .load(std::memory_order_relaxed);
+
+                    if (physicalAccept && !previousAccept) {
+                        const bool intercept =
+                            hasTarget || thisHandGrabbing || inPostDropBlock;
+                        acceptPressTime.store(
+                            nowSeconds,
+                            std::memory_order_relaxed);
+                        acceptHeldLong.store(
+                            false,
+                            std::memory_order_relaxed);
+                        acceptIntercepted.store(
+                            intercept,
+                            std::memory_order_release);
+                    } else if (physicalAccept && previousAccept) {
+                        if (acceptIntercepted.load(
+                                std::memory_order_acquire) &&
+                            nowSeconds -
+                                    acceptPressTime.load(
+                                        std::memory_order_relaxed) >=
+                                kGrabHoldSeconds) {
+                            acceptHeldLong.store(
+                                true,
+                                std::memory_order_relaxed);
+                        }
+                    } else if (!physicalAccept && previousAccept) {
+                        const bool intercepted =
+                            acceptIntercepted.exchange(
+                                false,
+                                std::memory_order_acq_rel);
+                        const bool wasLong =
+                            acceptHeldLong.exchange(
+                                false,
+                                std::memory_order_acq_rel);
+                        if (intercepted && !wasLong) {
+                            acceptInjectUntil.store(
+                                nowMs + kTapInjectMilliseconds,
+                                std::memory_order_release);
+                        }
                     }
-                }
 
-                // Get state for THIS hand
-                bool thisHandGrabbing = isLeft ? grabMgr.GetGrabState(true).active
-                                               : grabMgr.GetGrabState(false).active;
-
-                // Determine if this is the primary (weapon) hand
-                // Primary = right hand normally, left hand in left-handed mode
-                bool isLeftHandedMode = VRInput::GetSingleton().IsLeftHandedMode();
-                bool isPrimaryHand = (isLeftHandedMode ? isLeft : !isLeft);
-
-                // Check if grenade handling is enabled at all
-                // If enableGrenadeHandling=false: mod doesn't touch grenade input at all (game handles natively)
-                // If enableGrenadeHandling=true: throwable state machine lower in the function decides.
-                // Grenades are handled by the PRIMARY hand (weapon hand)
-                bool inGrenadeZone = isPrimaryHand && modInst.IsInChestPocketZone();
-
-                // =====================================================================
-                // MENU CHECK — don't modify grip/A in menus
-                // =====================================================================
-                bool inMenu = false;
-                auto* ui = RE::UI::GetSingleton();
-                if (ui && ui->menuMode) {
-                    inMenu = true;
+                    if (physicalAccept &&
+                        acceptIntercepted.load(
+                            std::memory_order_acquire)) {
+                        // Keep native activation hidden for a confirmed long hold too.
+                        allowMask &= ~kAcceptMask;
+                    }
+                    if (!physicalAccept &&
+                        nowMs < acceptInjectUntil.load(
+                                    std::memory_order_acquire)) {
+                        state->ulButtonPressed |= kAcceptMask;
+                        state->ulButtonTouched |= kAcceptMask;
+                        allowMask |= kAcceptMask;
+                    }
                 } else {
-                    auto& menuChecker = MenuChecker::GetSingleton();
-                    inMenu = menuChecker.IsPipboyOpen() ||
-                             menuChecker.IsPaused() ||
-                             menuChecker.IsInventoryOpen() ||
-                             menuChecker.IsContainerOpen() ||
-                             menuChecker.IsFavoritesOpen() ||
-                             menuChecker.IsWorkshopOpen() ||
-                             menuChecker.IsGameStopped();
+                    acceptWasPressed.store(false, std::memory_order_relaxed);
+                    acceptHeldLong.store(false, std::memory_order_relaxed);
+                    acceptIntercepted.store(false, std::memory_order_relaxed);
+                    acceptInjectUntil.store(0, std::memory_order_relaxed);
                 }
 
-                // =====================================================================
-                // BLOCK A+GRIP DURING GRAB + POST-DROP COOLDOWN
-                // When this hand is actively grabbing, block A+Grip so the game
-                // doesn't see button presses (important for SteamVR Grip<>A remaps).
-                // After grab ends, continue blocking for 0.5s to prevent the
-                // button release from activating the dropped object.
-                // Skip when a menu is open — grip must pass through to close containers
-                // =====================================================================
-                {
-                    // Per-hand post-drop cooldown (frames remaining)
-                    static int s_postDropCooldownL = 0;
-                    static int s_postDropCooldownR = 0;
-                    static bool s_wasGrabbingL = false;
-                    static bool s_wasGrabbingR = false;
-
-                    bool& wasGrabbing = isLeft ? s_wasGrabbingL : s_wasGrabbingR;
-                    int& postDropCooldown = isLeft ? s_postDropCooldownL : s_postDropCooldownR;
-
-                    // Detect grab-end transition → start cooldown (~0.5s at 90fps)
-                    if (wasGrabbing && !thisHandGrabbing) {
-                        postDropCooldown = 45;  // ~0.5 seconds
-                    }
-                    wasGrabbing = thisHandGrabbing;
-
-                    if (postDropCooldown > 0) {
-                        postDropCooldown--;
-                    }
-
-                    bool shouldBlock = (thisHandGrabbing || postDropCooldown > 0) && !inMenu;
-                    if (shouldBlock) {
-                        constexpr uint64_t aButtonMask = 1ULL << vr::k_EButton_A;
-                        constexpr uint64_t gripMask = 1ULL << vr::k_EButton_Grip;
-                        allowMask &= ~aButtonMask;  // Block A
-                        allowMask &= ~gripMask;     // Block Grip
-                    }
-
-                    // ============================================================
-                    // A/X HOLD-TO-GRAB callback interceptor.
-                    // X on the left controller and A on the right controller share
-                    // bit 7 (vr::k_EButton_A), so the same logic handles both hands.
-                    // When no target: A/X passes through for native game actions
-                    // (activate, loot). When target or grabbing: hold = grab, tap =
-                    // inject native action so the game still sees a quick press.
-                    // ============================================================
-                    bool handUsesAButton = (!isLeft && g_config.useAForRightGrab)
-                                        || (isLeft  && g_config.useXForLeftGrab);
-                    if (handUsesAButton && !inMenu) {
-                        constexpr uint64_t axMask = 1ULL << vr::k_EButton_A;
-                        constexpr float holdThreshold = 0.20f;
-
-                        bool hasTarget = isLeft ? modInst._hasGrabTargetLeft.load(std::memory_order_relaxed)
-                                                : modInst._hasGrabTargetRight.load(std::memory_order_relaxed);
-                        bool shouldIntercept = hasTarget || thisHandGrabbing || postDropCooldown > 0;
-
-                        auto& pressTime = isLeft ? modInst._cb_axGrabPressTimeL  : modInst._cb_axGrabPressTimeR;
-                        auto& wasPressed = isLeft ? modInst._cb_axGrabWasPressedL : modInst._cb_axGrabWasPressedR;
-                        auto& heldLong   = isLeft ? modInst._cb_axGrabHeldLongL   : modInst._cb_axGrabHeldLongR;
-                        auto& injectTap  = isLeft ? modInst._cb_axGrabInjectTapL  : modInst._cb_axGrabInjectTapR;
-
-                        if (shouldIntercept) {
-                            bool axPressed = (state->ulButtonPressed & axMask) != 0;
-                            bool prevPressed = wasPressed.load(std::memory_order_relaxed);
-                            bool prevHeldLong = heldLong.load(std::memory_order_relaxed);
-
-                            if (axPressed && !prevPressed) {
-                                pressTime.store(Utils::GetTime(), std::memory_order_relaxed);
-                                heldLong.store(false, std::memory_order_relaxed);
-                            }
-                            else if (axPressed && prevPressed && !prevHeldLong) {
-                                double held = Utils::GetTime() - pressTime.load(std::memory_order_relaxed);
-                                if (held >= holdThreshold) {
-                                    heldLong.store(true, std::memory_order_relaxed);
-                                }
-                            }
-                            else if (!axPressed && prevPressed) {
-                                // Quick release before threshold = tap; queue 2 frames of injection
-                                if (!prevHeldLong) {
-                                    injectTap.store(2, std::memory_order_relaxed);
-                                }
-                                heldLong.store(false, std::memory_order_relaxed);
-                            }
-                            wasPressed.store(axPressed, std::memory_order_relaxed);
-
-                            // While holding (not yet confirmed-long), block A from
-                            // the game so the native activate doesn't fire during
-                            // the hold-confirmation window.
-                            if (axPressed && !heldLong.load(std::memory_order_relaxed) && hasTarget) {
-                                allowMask &= ~axMask;
-                            }
-                        } else {
-                            // shouldIntercept went false mid-press (selection cleared before
-                            // the 0.20s hold threshold, or between releasing A and the next
-                            // aim) - wasPressed/heldLong/pressTime would otherwise freeze at
-                            // their stale values, since the whole update block above is
-                            // skipped whenever we're not intercepting. A LATER press on a new
-                            // target then reads prevPressed=true/prevHeldLong=stale and
-                            // misclassifies the tap-vs-hold edge (heldLong flips true
-                            // instantly, or a real tap never injects). Reset so a press that
-                            // escapes interception can never leave a stale edge behind.
-                            wasPressed.store(false, std::memory_order_relaxed);
-                            heldLong.store(false, std::memory_order_relaxed);
-                        }
-
-                        // Tap injection: set the A bit for 2 frames after a quick
-                        // release so the game still sees the tap action.
-                        int tapFrames = injectTap.load(std::memory_order_relaxed);
-                        if (tapFrames > 0) {
-                            constexpr uint64_t axMaskInject = 1ULL << vr::k_EButton_A;
-                            state->ulButtonPressed |= axMaskInject;
-                            // Don't strip via allowMask — we want the game to see it.
-                            allowMask |= axMaskInject;
-                            injectTap.store(tapFrames - 1, std::memory_order_relaxed);
-                        }
-                    }
+                const bool stickyCooldown =
+                    (policy & (isLeft ? kPolicyStickyLeft
+                                      : kPolicyStickyRight)) != 0;
+                if (stickyCooldown) {
+                    state->ulButtonPressed &= ~kGripMask;
+                    state->ulButtonTouched &= ~kGripMask;
                 }
 
-                // =====================================================================
-                // BLOCK GRIP DURING STICKY GRAB COOLDOWN (per-hand)
-                // =====================================================================
-                // After releasing a sticky grab (DropToHand item) or storing an item,
-                // there's a 1 second cooldown to prevent accidental re-grab.
-                // Only blocks grip on the specific hand that triggered the cooldown.
-                if (modInst.IsInStickyGrabCooldown(isLeft)) {
-                    constexpr uint64_t gripMask = 1ULL << vr::k_EButton_Grip;
-                    bool gripPressed = (state->ulButtonPressed & gripMask) != 0;
-                    if (gripPressed) {
-                        state->ulButtonPressed &= ~gripMask;  // Strip grip from state
-
-                        // Log periodically
-                        int cooldownBlockCounter = modInst._cb_cooldownBlockCounter.load(std::memory_order_relaxed);
-                        if (++cooldownBlockCounter % 30 == 1) {
-                            spdlog::debug("[COOLDOWN] Blocking grip on {} hand - in cooldown",
-                                         isLeft ? "LEFT" : "RIGHT");
-                        }
-                        modInst._cb_cooldownBlockCounter.store(cooldownBlockCounter, std::memory_order_relaxed);
-                    }
-                }
-
-                // =====================================================================
-                // BLOCK RIGHT CONTROLLER DURING HOLOTAPE GAME PLAYBACK
-                // When a game holotape SWF is active on the Pipboy, block the
-                // Pipboy-operating hand (primary/weapon hand) so its laser pointer
-                // can't click Pipboy tabs behind the game.
-                // =====================================================================
-                if (isPrimaryHand && PipboyInteraction::GetSingleton().IsProgramSWFActive()) {
-                    // Zero all axes (trigger, thumbstick) so nothing registers
+                if (isPrimaryHand &&
+                    (policy & kPolicyProgramSWF) != 0) {
                     for (auto& axis : state->rAxis) {
                         axis.x = 0.0f;
                         axis.y = 0.0f;
                     }
-                    allowMask = 0;  // Block all buttons
-                    ++callbackExitCount;
-                    return allowMask;
+                    return 0;
                 }
 
-                // =====================================================================
-                // THROWABLE ACTIVATION STATE MACHINE (8 cases)
-                // =====================================================================
-                //   alt = bRemapGrenadeButtonToA ("Throwables Alternate Control")
-                //   binding = SteamVR Grip→A binding (detected at runtime — see below)
-                //
-                //   Fire conditions:
-                //     alt=ON  + binding=YES + physical Grip squeeze → fire (case 1)
-                //     alt=ON  + binding=NO  + physical A press      → fire (case 2)
-                //     alt=OFF + binding=NO  + physical Grip squeeze → fire (case 3, native)
-                //     alt=OFF + binding=YES + physical A press      → fire (case 5)
-                //   Block in all other combinations, including "both held simultaneously".
-                //
-                // Input signatures we use to distinguish physical inputs:
-                //   physical Grip, NO binding   →  G=1, a>0.5  (analog grip squeezed,
-                //                                              digital grip bit set)
-                //   physical Grip, WITH binding →  A=1, a>0.5, G=0  (binding routes
-                //                                              digital signal to A)
-                //   physical A press            →  A=1, a≈0,  G=0
-                //
-                // Binding detection: once we observe (A=1, a>0.5, G=0), we know a
-                // Grip→A binding is active. The flag is sticky for the session.
-                //
-                // Fallback: controllers without an analog grip axis (digital-only
-                // grip) skip the analog gate entirely and use the digital A bit.
-                // =====================================================================
-                double aButtonPressTime = modInst._cb_aButtonPressTime.load(std::memory_order_relaxed);
-                bool aButtonHeldLongEnough = modInst._cb_aButtonHeldLongEnough.load(std::memory_order_relaxed);
-                bool aButtonWasPressed = modInst._cb_aButtonWasPressed.load(std::memory_order_relaxed);
-                bool gripABindingDetected = modInst._cb_gripABindingDetected.load(std::memory_order_relaxed);
+                // Throwable classification uses the original physical packet, not
+                // the synthetic tap above. All game/config state was published by
+                // the main thread; this polling path touches no engine singleton.
+                const bool aBit = (rawPressed & kAcceptMask) != 0;
+                const bool gripBit = (rawPressed & kGripMask) != 0;
+                const float analogGrip = state->rAxis[2].x;
+                auto& hasAnalogAtomic =
+                    isLeft ? modInst._cb_hasAnalogGripLeft
+                           : modInst._cb_hasAnalogGripRight;
+                if (analogGrip > 0.1f) {
+                    hasAnalogAtomic.store(
+                        true,
+                        std::memory_order_relaxed);
+                }
+                const bool hasAnalog =
+                    hasAnalogAtomic.load(std::memory_order_relaxed);
+                const bool gripSqueezed =
+                    hasAnalog ? analogGrip > 0.5f : gripBit;
 
-                // Forced arm from a VH unholster (kMessage_ArmThrowable): inject grip
-                // for a few frames so the just-equipped throwable arms instantly,
-                // skipping the hold-to-arm delay.
-                // isPrimaryHand-gated: this callback is invoked once per hand per poll
-                // (both controllers polled every frame), but the throwable-arm feature
-                // this counter serves is primary-hand-only (see isPrimaryHand gating
-                // below). Decrementing on both hands' calls halved ForceArmThrowable()'s
-                // intended ~8-frame window to ~4 (~44ms at 90fps) - if VH's equip plus the
-                // game's grip-event processing took longer than that, the injected grip
-                // never overlapped a frame the game could actually process the ready.
-                if (isPrimaryHand) {
-                    int forceFrames = modInst._cb_forceArmThrowableFrames.load(std::memory_order_relaxed);
-                    if (forceFrames > 0) {
-                        aButtonHeldLongEnough = true;
-                        modInst._cb_forceArmThrowableFrames.store(forceFrames - 1, std::memory_order_relaxed);
-                    }
+                bool bindingDetected =
+                    modInst._cb_gripABindingDetected.load(
+                        std::memory_order_relaxed);
+                if (isPrimaryHand &&
+                    hasAnalog &&
+                    aBit &&
+                    !gripBit &&
+                    gripSqueezed) {
+                    bindingDetected = true;
+                    modInst._cb_gripABindingDetected.store(
+                        true,
+                        std::memory_order_relaxed);
                 }
 
-                const float holdThresholdSeconds = g_config.throwableHoldDuration;
+                const bool physicalGripNative =
+                    isPrimaryHand && gripBit && gripSqueezed;
+                const bool physicalGripRemapped =
+                    isPrimaryHand && aBit && !gripBit && gripSqueezed;
+                const bool physicalAccept =
+                    isPrimaryHand &&
+                    aBit &&
+                    !gripBit &&
+                    (!hasAnalog || analogGrip <= 0.5f);
+                const bool bothBits =
+                    isPrimaryHand && aBit && gripBit;
+                const bool grenadeHandling =
+                    (policy & kPolicyGrenadeHandling) != 0;
+                const bool alternate =
+                    grenadeHandling &&
+                    (policy & kPolicyGrenadeRemapToA) != 0;
 
-                // Snapshot input signals once
-                constexpr uint64_t aButtonMaskTW = 1ULL << vr::k_EButton_A;
-                constexpr uint64_t gripMaskTW   = 1ULL << vr::k_EButton_Grip;
-                bool aBitTW = (state->ulButtonPressed & aButtonMaskTW) != 0;
-                bool gBitTW = (state->ulButtonPressed & gripMaskTW)   != 0;
-                const auto& vri = VRInput::GetSingleton();
-                float analogTW = vri.GetGripValue(isLeft);
-                bool hasAnalogTW = vri.HasAnalogGrip(isLeft);
-                bool gripSqueezed = hasAnalogTW && analogTW > 0.5f;
-
-                // Detect Grip→A binding. Per-frame check; set sticky flag once seen.
-                if (isPrimaryHand && hasAnalogTW && aBitTW && !gBitTW && gripSqueezed) {
-                    if (!gripABindingDetected) {
-                        gripABindingDetected = true;
-                        modInst._cb_gripABindingDetected.store(true, std::memory_order_relaxed);
-                        spdlog::info("[GRENADE] Detected SteamVR Grip→A binding (sticky)");
-                    }
-                }
-
-                // Classify the current physical input on the primary hand
-                bool isGripPhysicalNoBinding   = isPrimaryHand && gBitTW && gripSqueezed;
-                bool isGripPhysicalWithBinding = isPrimaryHand && aBitTW && !gBitTW && gripSqueezed;
-                bool isAPhysical               = isPrimaryHand && aBitTW && !gBitTW
-                                                  && (!hasAnalogTW || analogTW <= 0.5f);
-                bool bothBitsHeld              = isPrimaryHand && aBitTW && gBitTW;
-
-                // Decide if the throwable activator is currently pressed.
-                // The alt toggle is a *functional* "use this button" choice — NOT
-                // a SteamVR-binding proxy (per saved feedback). So:
-                //   altOn  = true  → throwable fires on physical A button press
-                //   altOn  = false → throwable fires on physical Grip squeeze
-                // The Grip→A binding is handled transparently: when active, a
-                // physical grip squeeze produces (A=1, !G, analog>0.5) which is
-                // accepted as a grip squeeze; without the binding it produces
-                // (G=1, analog>0.5). Either signature counts as "physical grip".
-                bool altOn = g_config.remapGrenadeButtonToA && g_config.enableGrenadeHandling;
                 bool activatorPressed = false;
-                if (isPrimaryHand && !bothBitsHeld) {
-                    // alt = "use the *alternate* button compared to your default".
-                    // A SteamVR Grip→A binding inverts what counts as default:
-                    //
-                    //                    | binding active | no binding
-                    //   alt=OFF (default)| A press        | grip squeeze
-                    //   alt=ON  (alt)    | grip squeeze   | A press
-                    //
-                    // With the binding active grip already routes to A, so "stock"
-                    // becomes A press (alt=OFF) and "alternate" becomes literal grip
-                    // squeeze distinguished via the analog axis (alt=ON). Without the
-                    // binding, stock is grip (Bethesda default) and alternate is A.
-                    if (gripABindingDetected) {
-                        activatorPressed = altOn
-                            ? isGripPhysicalWithBinding   // physical grip squeezed (analog>0.5)
-                            : isAPhysical;                // physical A pressed (analog≤0.5)
-                    } else {
-                        activatorPressed = altOn
-                            ? isAPhysical                 // physical A pressed
-                            : isGripPhysicalNoBinding;    // physical grip squeezed
-                    }
+                if (isPrimaryHand && !bothBits) {
+                    activatorPressed = bindingDetected
+                        ? (alternate
+                              ? physicalGripRemapped
+                              : physicalAccept)
+                        : (alternate
+                              ? physicalAccept
+                              : physicalGripNative);
                 }
 
-                // Mod handles the timing+injection in every case EXCEPT
-                // "alt=OFF, no binding" (native game uses fThrowDelay there).
-                bool modHandlesThrowable = isPrimaryHand && g_config.enableGrenadeHandling
-                    && (g_config.throwableActivationZone == 0 || inGrenadeZone)
-                    && (altOn || gripABindingDetected);
+                const bool zoneAllows =
+                    (policy & kPolicyGrenadeZoneDisabled) != 0 ||
+                    inGrenadeZone;
+                const bool modHandlesThrowable =
+                    isPrimaryHand &&
+                    grenadeHandling &&
+                    zoneAllows &&
+                    (alternate || bindingDetected);
+
+                double pressTime =
+                    modInst._cb_aButtonPressTime.load(
+                        std::memory_order_relaxed);
+                bool heldLong =
+                    modInst._cb_aButtonHeldLongEnough.load(
+                        std::memory_order_relaxed);
+                bool wasPressed =
+                    modInst._cb_aButtonWasPressed.load(
+                        std::memory_order_relaxed);
+
+                if (isPrimaryHand &&
+                    nowMs <
+                        modInst._cb_forceArmThrowableUntil.load(
+                            std::memory_order_acquire)) {
+                    heldLong = true;
+                }
 
                 if (modHandlesThrowable && !thisHandGrabbing) {
-                    if (activatorPressed && !aButtonWasPressed) {
-                        aButtonPressTime = Utils::GetTime();
-                        aButtonHeldLongEnough = false;
-                        spdlog::info("[GRENADE] Activator press DOWN (alt={} binding={} A={} G={} analog={:.2f}) — timer started, threshold={:.2f}s",
-                                     altOn, gripABindingDetected, isAPhysical, isGripPhysicalNoBinding || isGripPhysicalWithBinding, analogTW, holdThresholdSeconds);
-                    } else if (activatorPressed && aButtonWasPressed) {
-                        double now = Utils::GetTime();
-                        float heldSeconds = static_cast<float>(now - aButtonPressTime);
-                        if (heldSeconds >= holdThresholdSeconds && !aButtonHeldLongEnough) {
-                            aButtonHeldLongEnough = true;
-                            spdlog::info("[GRENADE] Hold threshold reached ({:.2f}s) — injecting grip on next frame",
-                                         heldSeconds);
+                    if (activatorPressed && !wasPressed) {
+                        pressTime = nowSeconds;
+                        heldLong = false;
+                    } else if (activatorPressed && wasPressed) {
+                        const float threshold =
+                            modInst._controllerThrowableHoldSeconds.load(
+                                std::memory_order_relaxed);
+                        if (nowSeconds - pressTime >= threshold) {
+                            heldLong = true;
                         }
-                    } else if (!activatorPressed && aButtonWasPressed) {
-                        aButtonHeldLongEnough = false;
-                        spdlog::info("[GRENADE] Activator released before threshold");
                     } else if (!activatorPressed) {
-                        aButtonHeldLongEnough = false;
+                        heldLong = false;
                     }
-                    aButtonWasPressed = activatorPressed;
+                    wasPressed = activatorPressed;
                 } else if (isPrimaryHand) {
-                    // Diagnostic: log why we're NOT running the throwable timer.
-                    static double lastSkipLog = 0.0;
-                    double now = Utils::GetTime();
-                    if (now - lastSkipLog > 5.0 && (aBitTW || gBitTW)) {
-                        spdlog::info("[GRENADE] Timer skipped: modHandles={} grabbing={} (zone={} inZone={} altOn={} bindingDet={} enableGren={})",
-                                     modHandlesThrowable, thisHandGrabbing,
-                                     g_config.throwableActivationZone, inGrenadeZone,
-                                     altOn, gripABindingDetected, g_config.enableGrenadeHandling);
-                        lastSkipLog = now;
+                    wasPressed = false;
+                    if (nowMs >=
+                        modInst._cb_forceArmThrowableUntil.load(
+                            std::memory_order_acquire)) {
+                        heldLong = false;
                     }
                 }
 
-                constexpr uint64_t gripMask = 1ULL << vr::k_EButton_Grip;
-
-                // THROWABLE continuous grip-STRIP removed — grenade readying is now controlled at the
-                // GAME level (HookMeleeThrowOnButtonEvent, [ObjectPickup] bUseGrenadeReadyHook), so we
-                // no longer strip grip from the input stream every frame (that broke VirtualHolsters
-                // equip/holster, grip-reload, and mod secondary actions).
-                //
-                // A-LONG-PRESS GRIP INJECT KEPT (remap-to-A): when the grenade button is remapped to A
-                // and the user holds A long enough, synthesize a grip press so the game's throw event
-                // fires (the game hook then lets it through for the remap-to-A path). This fires only on
-                // a deliberate A-long-press, not continuously, so it doesn't disturb VH/reload/secondary.
-                if (modHandlesThrowable && !inMenu && aButtonHeldLongEnough) {
-                    state->ulButtonPressed |= gripMask;
-                    state->ulButtonPressed &= ~aButtonMaskTW;
+                if (modHandlesThrowable && !inMenu && heldLong) {
+                    state->ulButtonPressed |= kGripMask;
+                    state->ulButtonPressed &= ~kAcceptMask;
                 }
 
-                // (Removed redundant "block grip while grabbing": the A+Grip block earlier
-                // already masks grip for the grabbing hand via allowMask when thisHandGrabbing,
-                // so this duplicated it; its grenade-while-grabbing grip re-inject was also
-                // defeated by that same allowMask strip. Grenade-while-grabbing is now the game
-                // hook's concern.)
-
-                // Write back A-button state to atomics (PRIMARY hand only)
                 if (isPrimaryHand) {
-                    modInst._cb_aButtonPressTime.store(aButtonPressTime, std::memory_order_relaxed);
-                    modInst._cb_aButtonHeldLongEnough.store(aButtonHeldLongEnough, std::memory_order_relaxed);
-                    modInst._cb_aButtonWasPressed.store(aButtonWasPressed, std::memory_order_relaxed);
+                    modInst._cb_aButtonPressTime.store(
+                        pressTime,
+                        std::memory_order_relaxed);
+                    modInst._cb_aButtonHeldLongEnough.store(
+                        heldLong,
+                        std::memory_order_relaxed);
+                    modInst._cb_aButtonWasPressed.store(
+                        wasPressed,
+                        std::memory_order_relaxed);
                 }
-
-                // THREAD SAFETY LOGGING: Track callback exit
-                ++callbackExitCount;
-
                 return allowMask;
             });
             spdlog::info("Registered button blocking callback (A→Grip remap in grenade zone)");
@@ -1079,6 +1107,15 @@ namespace heisenberg
             spdlog::warn("Menu checker failed to initialize - using direct UI calls (less safe)");
         }
 
+        // NOTE (Jul 31): a TESHitEvent damage-observer sink was removed here —
+        // RE::TESHitEvent::GetEventSource() resolves via REL::RelocationID
+        // (989868, 1411899), which are the Skyrim-SE / FO4-AE address-library
+        // IDs and have NO Fallout4VR mapping. Calling it at init threw
+        // "Failed to find the id within the address library: 989868" and
+        // aborted the whole plugin at launch. VR-safe hit/damage observation
+        // needs a VR address-library offset for the FO4VR hit-event source (or
+        // a native ProcessHit hook), not this CommonLib helper.
+
         // NOTE: grenade gating is now done entirely by the MeleeThrowHandler hook
         // (Hooks.cpp), which caps the button hold-duration below the throw threshold
         // when readying should be blocked. fThrowDelay:Controls is left at the game
@@ -1087,7 +1124,170 @@ namespace heisenberg
 
         InitHands();
         _initialized = true;
+        PublishControllerPolicy();
         spdlog::info("Heisenberg initialized");
+    }
+
+    void Heisenberg::SetInputSuppression(
+        InputSuppressionReason reason,
+        bool suppressed)
+    {
+        const auto bit = static_cast<std::uint32_t>(reason);
+        const auto before = _inputSuppressionReasons;
+        if (suppressed) {
+            _inputSuppressionReasons |= bit;
+        } else {
+            _inputSuppressionReasons &= ~bit;
+        }
+        if (before != _inputSuppressionReasons) {
+            RefreshOwnedInputLayer();
+        }
+    }
+
+    void Heisenberg::RefreshOwnedInputLayer()
+    {
+        if (!_inputLayerInitialized) {
+            return;
+        }
+        auto* manager = RE::BSInputEnableManager::GetSingleton();
+        if (!manager) {
+            return;
+        }
+
+        using Reason = InputSuppressionReason;
+        const auto has = [this](Reason reason) {
+            return (_inputSuppressionReasons &
+                    static_cast<std::uint32_t>(reason)) != 0;
+        };
+
+        RE::UEFlag disabledUser = static_cast<RE::UEFlag>(0);
+        if (has(Reason::PostGrabFighting) ||
+            has(Reason::HeldObjectFighting)) {
+            disabledUser = disabledUser | RE::UEFlag::kFighting;
+        }
+        if (has(Reason::ItemPositionConfig) ||
+            has(Reason::StorageZoneConfig)) {
+            disabledUser = disabledUser |
+                RE::UEFlag::kMainFour |
+                RE::UEFlag::kVATS |
+                RE::UEFlag::kActivate |
+                RE::UEFlag::kMenu;
+        }
+
+        RE::OEFlag disabledOther = static_cast<RE::OEFlag>(0);
+        if (has(Reason::NativeZKey)) {
+            disabledOther = disabledOther | RE::OEFlag::kZKey;
+        }
+        if (has(Reason::HeldObjectActivation)) {
+            disabledOther = disabledOther | RE::OEFlag::kActivation;
+        }
+        if (has(Reason::ItemPositionConfig) ||
+            has(Reason::StorageZoneConfig)) {
+            disabledOther = disabledOther |
+                RE::OEFlag::kVATS |
+                RE::OEFlag::kActivation |
+                RE::OEFlag::kFavorites;
+        }
+
+        constexpr auto sender = RE::UserEvents::SENDER_ID::kGameplay;
+        // Reset only our named layer, then apply the union of Heisenberg's live
+        // owners. Other mods' layers and the engine force words are untouched.
+        manager->EnableUserEvent(
+            _inputLayerID,
+            RE::UEFlag::kAll,
+            true,
+            sender);
+        manager->EnableOtherEvent(
+            _inputLayerID,
+            RE::OEFlag::kAll,
+            true,
+            sender);
+        if (static_cast<std::uint32_t>(disabledUser) != 0) {
+            manager->EnableUserEvent(
+                _inputLayerID,
+                disabledUser,
+                false,
+                sender);
+        }
+        if (static_cast<std::uint32_t>(disabledOther) != 0) {
+            manager->EnableOtherEvent(
+                _inputLayerID,
+                disabledOther,
+                false,
+                sender);
+        }
+    }
+
+    void Heisenberg::PublishControllerPolicy()
+    {
+        std::uint32_t flags = 0;
+        if (_initialized) {
+            flags |= kPolicyInitialized;
+        }
+        if (VRInput::GetSingleton().IsLeftHandedMode()) {
+            flags |= kPolicyLeftHanded;
+        }
+
+        const auto& menus = MenuChecker::GetSingleton();
+        if (menus.IsPipboyOpen() ||
+            menus.IsPaused() ||
+            menus.IsInventoryOpen() ||
+            menus.IsContainerOpen() ||
+            menus.IsFavoritesOpen() ||
+            menus.IsWorkshopOpen() ||
+            menus.IsGameStopped()) {
+            flags |= kPolicyMenuOpen;
+        }
+        if (_isInChestPocketZone) {
+            flags |= kPolicyChestZone;
+        }
+
+        const auto& grabManager = GrabManager::GetSingleton();
+        if (grabManager.GetGrabState(true).active) {
+            flags |= kPolicyGrabbingLeft;
+        }
+        if (grabManager.GetGrabState(false).active) {
+            flags |= kPolicyGrabbingRight;
+        }
+        if (_leftStickyGrabCooldown > 0.0f) {
+            flags |= kPolicyStickyLeft;
+        }
+        if (_rightStickyGrabCooldown > 0.0f) {
+            flags |= kPolicyStickyRight;
+        }
+        if (PipboyInteraction::GetSingleton().IsProgramSWFActive()) {
+            flags |= kPolicyProgramSWF;
+        }
+        if (g_config.useXForLeftGrab) {
+            flags |= kPolicyUseXForLeftGrab;
+        }
+        if (g_config.useAForRightGrab) {
+            flags |= kPolicyUseAForRightGrab;
+        }
+        if (g_config.enableGrenadeHandling) {
+            flags |= kPolicyGrenadeHandling;
+        }
+        if (g_config.remapGrenadeButtonToA) {
+            flags |= kPolicyGrenadeRemapToA;
+        }
+        if (g_config.throwableActivationZone == 0) {
+            flags |= kPolicyGrenadeZoneDisabled;
+        }
+        _controllerThrowableHoldSeconds.store(
+            g_config.throwableHoldDuration,
+            std::memory_order_relaxed);
+        OpenVRHook::GetSingleton().SetSuppressThumbstickTouch(
+            g_config.suppressThumbstickTouch);
+        _controllerPolicyFlags.store(flags, std::memory_order_release);
+    }
+
+    void Heisenberg::ForceArmThrowable()
+    {
+        // Real-time ownership prevents unrelated OpenVR consumers from consuming
+        // a frame counter before Fallout polls the primary controller.
+        _cb_forceArmThrowableUntil.store(
+            GetTickCount64() + 120,
+            std::memory_order_release);
     }
 
     void Heisenberg::ResetGrenadeZoneState()
@@ -1103,6 +1303,20 @@ namespace heisenberg
         _cb_aButtonPressTime.store(0.0, std::memory_order_relaxed);
         _cb_aButtonHeldLongEnough.store(false, std::memory_order_relaxed);
         _cb_aButtonWasPressed.store(false, std::memory_order_relaxed);
+        _cb_forceArmThrowableUntil.store(0, std::memory_order_relaxed);
+        _cb_axGrabWasPressedL.store(false, std::memory_order_relaxed);
+        _cb_axGrabWasPressedR.store(false, std::memory_order_relaxed);
+        _cb_axGrabHeldLongL.store(false, std::memory_order_relaxed);
+        _cb_axGrabHeldLongR.store(false, std::memory_order_relaxed);
+        _cb_axGrabInterceptedL.store(false, std::memory_order_relaxed);
+        _cb_axGrabInterceptedR.store(false, std::memory_order_relaxed);
+        _cb_axGrabInjectUntilL.store(0, std::memory_order_relaxed);
+        _cb_axGrabInjectUntilR.store(0, std::memory_order_relaxed);
+        _cb_wasGrabbingLeft.store(false, std::memory_order_relaxed);
+        _cb_wasGrabbingRight.store(false, std::memory_order_relaxed);
+        _cb_postDropBlockUntilLeft.store(0, std::memory_order_relaxed);
+        _cb_postDropBlockUntilRight.store(0, std::memory_order_relaxed);
+        PublishControllerPolicy();
     }
 
     void Heisenberg::ProcessPendingWeaponUnequip()
@@ -1272,6 +1486,18 @@ namespace heisenberg
             return;
         }
 
+        const auto frameNow = std::chrono::steady_clock::now();
+        if (_lastFrameTick.time_since_epoch().count() != 0) {
+            _frameDeltaSeconds = std::clamp(
+                std::chrono::duration<float>(
+                    frameNow - _lastFrameTick)
+                    .count(),
+                1.0f / 240.0f,
+                0.10f);
+        }
+        _lastFrameTick = frameNow;
+        const float deltaTime = _frameDeltaSeconds;
+
         // MAIN THREAD HEARTBEAT: Log every ~5 seconds to verify main thread is running.
         // If deadlock occurs, this will stop appearing while OpenVR callback heartbeat continues.
         static int mainThreadHeartbeat = 0;
@@ -1280,6 +1506,28 @@ namespace heisenberg
         if (++mainThreadHeartbeat >= 450) {  // ~5 seconds at 90fps
             mainThreadHeartbeat = 0;
             spdlog::debug("[MAIN THREAD HEARTBEAT] OnInputUpdate running, total frames={}", mainThreadTotalFrames);
+        }
+
+        // STALL WATCHDOG (Jul 31): a 12.4s all-thread log silence was observed
+        // live with no way to tell an external suspension (SteamVR dashboard,
+        // alt-tab, driver) from an in-process hang. Log the wall-clock gap on
+        // the first tick AFTER any >2s main-loop pause, tagged with the menu
+        // state so loading screens (which legitimately gap the main thread for
+        // tens of seconds) stay interpretable rather than alarming.
+        {
+            static ULONGLONG s_lastTickMs = 0;
+            const ULONGLONG nowMs = GetTickCount64();
+            if (s_lastTickMs != 0 && nowMs - s_lastTickMs > 2000) {
+                const auto& menus = MenuChecker::GetSingleton();
+                spdlog::warn(
+                    "[STALL] Main loop did not tick for {} ms (loading={} paused={} gameStopped={}) — "
+                    "external suspension (dashboard/alt-tab) if menus are clear, otherwise investigate",
+                    nowMs - s_lastTickMs,
+                    menus.IsLoading(),
+                    menus.IsPaused(),
+                    menus.IsGameStopped());
+            }
+            s_lastTickMs = nowMs;
         }
 
         // NOTE: kFighting toggle code removed - was causing issues
@@ -1300,11 +1548,30 @@ namespace heisenberg
         // implementation would suppress item names when ShowActivateButton was RET'd.
         Hooks::ApplyHUDRolloverButtonPatches(false);
 
-        // Update sticky grab cooldowns (1 second cooldown after storage/release)
-        // Uses approximate delta time based on 90fps VR headset
-        constexpr float deltaTime = 1.0f / 90.0f;
+        // Update time-based state using measured frame time (clamped above).
         UpdateStickyGrabCooldowns(deltaTime);
         UpdateWeaponUnequipCooldown(deltaTime);
+
+        // Entering or leaving Power Armor REPLACES the skeleton, so a palm frame
+        // measured against the old one describes a hand that no longer exists.
+        // Only kPreLoadGame used to reset it, which left the PA session running
+        // on the pre-PA calibration (live: a 2.97-unit palm/knuckle disagreement
+        // the moment PA was entered). Re-measure across the transition instead.
+        {
+            static bool lastInPowerArmor = false;
+            static bool powerArmorStateKnown = false;
+            const bool inPowerArmor = heisenberg::Utils::IsPlayerInPowerArmor();
+            if (!powerArmorStateKnown) {
+                powerArmorStateKnown = true;
+                lastInPowerArmor = inPowerArmor;
+            } else if (inPowerArmor != lastInPowerArmor) {
+                lastInPowerArmor = inPowerArmor;
+                heisenberg::ResetFingerCalibration();
+                spdlog::info(
+                    "[FINGER-CAL] Power Armor {} — skeleton replaced, re-measuring the palm frame",
+                    inPowerArmor ? "entered" : "exited");
+            }
+        }
 
         // Opportunistic finger calibration — no-op once calibrated. Uses a
         // straightness gate so curled-finger frames abort without committing.
@@ -1356,12 +1623,11 @@ namespace heisenberg
                 // Unarmed fists (drawn + no real weapon) → sheathe to open hand
                 if (weapDrawn && !hasReal && g_config.enableUnarmedAutoUnequip)
                 {
-                    auto* inputMgr = RE::BSInputEnableManager::GetSingleton();
-                    if (inputMgr) {
-                        inputMgr->ForceUserEventEnabled(RE::UEFlag::kFighting, false);
-                        _postGrabFightingSuppressed = true;
-                        spdlog::debug("[INPUT] Suppressed kFighting (unarmed trigger press)");
-                    }
+                    SetInputSuppression(
+                        InputSuppressionReason::PostGrabFighting,
+                        true);
+                    _postGrabFightingSuppressed = true;
+                    spdlog::debug("[INPUT] Suppressed kFighting (unarmed trigger press)");
                     player->DrawWeaponMagicHands(false);
                     spdlog::debug("[INPUT] Trigger: sheathing unarmed fists");
                 }
@@ -1397,6 +1663,12 @@ namespace heisenberg
         UpdateChestPocketZone();
         UpdateStorageZoneConfig();
 
+        // Rollover-hook snapshot + witness drain. UNCONDITIONAL on purpose: it clears the
+        // tracked-activator snapshot when the feature is off (an MCM toggle mid-session must
+        // not leave it latched) and it is the main-thread drain point for the rollover hook's
+        // log witnesses.
+        Hooks::RefreshWandActivatorTargets();
+
         // Update activator handler (checks for cell changes and rescans)
         if (g_config.enableInteractiveActivators) {
             ActivatorHandler::GetSingleton().Update();
@@ -1417,8 +1689,7 @@ namespace heisenberg
         // ==== Pickpocket / Stealing ====
         // Touch NPC while sneaking + grip to steal items
         {
-            constexpr float pickpocketDelta = 1.0f / 90.0f;
-            PickpocketHandler::GetSingleton().Update(pickpocketDelta);
+            PickpocketHandler::GetSingleton().Update(deltaTime);
         }
 
         // ==== Hand Pose Management ====
@@ -1431,9 +1702,8 @@ namespace heisenberg
 
         // ==== Per-frame finger animation update ====
         {
-            constexpr float fingerDeltaTime = 1.0f / 90.0f;
-            _leftFingerAnimator.Update(true, fingerDeltaTime);
-            _rightFingerAnimator.Update(false, fingerDeltaTime);
+            _leftFingerAnimator.Update(true, deltaTime);
+            _rightFingerAnimator.Update(false, deltaTime);
 
             // Failsafe: auto-reset stuck FingerAnimator after 2 seconds if not grabbing
             bool holding = IsHoldingAnything();
@@ -1453,7 +1723,7 @@ namespace heisenberg
 
             if (!holding) {
                 if (_leftFingerAnimator.IsActive()) {
-                    leftStuckTimer += fingerDeltaTime;
+                    leftStuckTimer += deltaTime;
                     if (leftStuckTimer > 2.0f) {
                         spdlog::warn("[FingerAnim] Left hand stuck in state {} for >2s without grab - force resetting",
                                      static_cast<int>(_leftFingerAnimator.GetState()));
@@ -1465,7 +1735,7 @@ namespace heisenberg
                 }
 
                 if (_rightFingerAnimator.IsActive()) {
-                    rightStuckTimer += fingerDeltaTime;
+                    rightStuckTimer += deltaTime;
                     if (rightStuckTimer > 2.0f) {
                         spdlog::warn("[FingerAnim] Right hand stuck in state {} for >2s without grab - force resetting",
                                      static_cast<int>(_rightFingerAnimator.GetState()));
@@ -1491,25 +1761,23 @@ namespace heisenberg
         if (configMode.IsRepositionModeActive())
         {
             constexpr float poseSpeed = 2.0f;  // Full open/close in 0.5 seconds
-            constexpr float poseDeltaTime = 1.0f / 90.0f;
-
             bool leftThumbPressed = g_vrInput.IsPressed(true, VRButton::ThumbstickPress);
             bool rightThumbPressed = g_vrInput.IsPressed(false, VRButton::ThumbstickPress);
 
             if (leftThumbPressed) {
                 // Open hands (towards 1.0)
-                _leftHandPoseValue += poseSpeed * poseDeltaTime;
+                _leftHandPoseValue += poseSpeed * deltaTime;
                 if (_leftHandPoseValue > 1.0f) _leftHandPoseValue = 1.0f;
-                _rightHandPoseValue += poseSpeed * poseDeltaTime;
+                _rightHandPoseValue += poseSpeed * deltaTime;
                 if (_rightHandPoseValue > 1.0f) _rightHandPoseValue = 1.0f;
                 _handPoseOverrideActive = true;
             }
 
             if (rightThumbPressed) {
                 // Close hands (towards 0.0)
-                _leftHandPoseValue -= poseSpeed * poseDeltaTime;
+                _leftHandPoseValue -= poseSpeed * deltaTime;
                 if (_leftHandPoseValue < 0.0f) _leftHandPoseValue = 0.0f;
-                _rightHandPoseValue -= poseSpeed * poseDeltaTime;
+                _rightHandPoseValue -= poseSpeed * deltaTime;
                 if (_rightHandPoseValue < 0.0f) _rightHandPoseValue = 0.0f;
                 _handPoseOverrideActive = true;
             }
@@ -1528,6 +1796,7 @@ namespace heisenberg
                 _rightFingerAnimator.SetCurrentValues(rightJoints);
             }
         }
+        PublishControllerPolicy();
     }
 
     void Heisenberg::OnGrabUpdate()
@@ -1556,7 +1825,7 @@ namespace heisenberg
 
         // Update item position config mode
         auto& itemConfigMode = ItemPositionConfigMode::GetSingleton();
-        constexpr float deltaTime = 1.0f / 90.0f;  // Assume 90fps VR
+        const float deltaTime = _frameDeltaSeconds;
         itemConfigMode.OnFrameUpdate(deltaTime);
 
         // Update drop-to-hand feature (grabs items dropped from inventory)
@@ -1570,6 +1839,7 @@ namespace heisenberg
         // Update Pipboy tape deck interaction (eject button, holotape insertion)
         auto& pipboyInteraction = PipboyInteraction::GetSingleton();
         pipboyInteraction.OnFrameUpdate(deltaTime);
+        PublishControllerPolicy();
 
         // Update water interaction (ripples/splashes when VR hands touch water)
         auto& waterInteraction = WaterInteraction::GetSingleton();
@@ -1672,14 +1942,13 @@ namespace heisenberg
         // === PART 2: Restore kFighting once unarmed is sheathed ===
         // kFighting is suppressed in trigger handler when unarmed is active.
         // Restore it once weapon is no longer drawn (sheathe completed).
-        auto* inputManager = RE::BSInputEnableManager::GetSingleton();
         if (_postGrabFightingSuppressed) {
             bool weapDrawn2 = _cachedWeaponDrawn.load(std::memory_order_relaxed);
             if (!weapDrawn2) {
-                if (inputManager) {
-                    inputManager->ForceUserEventEnabled(RE::UEFlag::kFighting, true);
-                    spdlog::debug("Heisenberg: Restored kFighting (unarmed sheathed)");
-                }
+                SetInputSuppression(
+                    InputSuppressionReason::PostGrabFighting,
+                    false);
+                spdlog::debug("Heisenberg: Restored kFighting (unarmed sheathed)");
                 _postGrabFightingSuppressed = false;
             }
         }
@@ -1689,22 +1958,27 @@ namespace heisenberg
         // holstered. With an object in hand (e.g. a holotape — always held in the right/weapon
         // hand), that trigger unsheathes the weapon THROUGH the held item. The grip path is
         // already blocked (ReadyWeaponHandler hook); the trigger path is only gated by kFighting,
-        // so suppress kFighting for the whole hold. Forced every frame while holding (overrides
-        // any stray re-enable) and self-correcting: once nothing is held we restore it (unless the
+        // so suppress kFighting for the hold — but ONLY while the weapon is holstered. Disabling
+        // fighting controls through the input-enable layer makes the engine force-sheathe a DRAWN
+        // weapon (the DisablePlayerControls path), so engaging this with the weapon out holsters
+        // it ~1s after every grab. The suppression's sole purpose is preventing a draw, which is
+        // moot when the weapon is already drawn. Self-correcting per frame: if the weapon comes
+        // out mid-hold the suppression lifts; once nothing is held we restore it (unless the
         // post-grab unarmed path still owns it, in which case that path restores it).
         {
             auto& grabMgr = heisenberg::GrabManager::GetSingleton();
             const bool holdingObject = grabMgr.IsGrabbing(true) || grabMgr.IsGrabbing(false);
-            if (holdingObject) {
-                if (inputManager) {
-                    inputManager->ForceUserEventEnabled(RE::UEFlag::kFighting, false);
-                }
+            const bool weapDrawnHold = _cachedWeaponDrawn.load(std::memory_order_relaxed);
+            if (holdingObject && !weapDrawnHold) {
+                SetInputSuppression(
+                    InputSuppressionReason::HeldObjectFighting,
+                    true);
                 _holdFightingSuppressed = true;
             } else if (_holdFightingSuppressed) {
-                if (inputManager && !_postGrabFightingSuppressed) {
-                    inputManager->ForceUserEventEnabled(RE::UEFlag::kFighting, true);
-                    spdlog::debug("Heisenberg: Restored kFighting (object released — weapon draw re-enabled)");
-                }
+                SetInputSuppression(
+                    InputSuppressionReason::HeldObjectFighting,
+                    false);
+                spdlog::debug("Heisenberg: Restored kFighting (object released or weapon drawn — draw block lifted)");
                 _holdFightingSuppressed = false;
             }
         }
@@ -1717,9 +1991,10 @@ namespace heisenberg
         // === PART 3: Always suppress Z-key (native spring mode) ===
         // kZKey = Z key grab/spring in flat mode, also mapped to A/X in VR
         // We ALWAYS want this disabled since Heisenberg handles all grabbing
-        // Reuse inputManager from PART 2
-        if (inputManager && !_zKeySuppressed) {
-            inputManager->ForceOtherEventEnabledVR(RE::OEFlag::kZKey, false);
+        if (!_zKeySuppressed) {
+            SetInputSuppression(
+                InputSuppressionReason::NativeZKey,
+                true);
             _zKeySuppressed = true;
             spdlog::debug("Heisenberg: Suppressed native Z-key spring mode");
         }
@@ -1729,17 +2004,17 @@ namespace heisenberg
         bool shouldSuppressActivate = IsHoldingAnything();
 
         if (shouldSuppressActivate && !_inputSuppressed) {
-            if (inputManager) {
-                inputManager->ForceOtherEventEnabledVR(RE::OEFlag::kActivation, false);
-                spdlog::debug("Heisenberg: Suppressing native activation while holding");
-            }
+            SetInputSuppression(
+                InputSuppressionReason::HeldObjectActivation,
+                true);
+            spdlog::debug("Heisenberg: Suppressing native activation while holding");
             _inputSuppressed = true;
         }
         else if (!shouldSuppressActivate && _inputSuppressed) {
-            if (inputManager) {
-                inputManager->ForceOtherEventEnabledVR(RE::OEFlag::kActivation, true);
-                spdlog::debug("Heisenberg: Restoring native activation");
-            }
+            SetInputSuppression(
+                InputSuppressionReason::HeldObjectActivation,
+                false);
+            spdlog::debug("Heisenberg: Restoring native activation");
             _inputSuppressed = false;
         }
     }
@@ -1874,7 +2149,7 @@ namespace heisenberg
 
         // Update cooldown timer
         if (_storageConfigCooldown > 0.0f) {
-            _storageConfigCooldown -= 0.016f;
+            _storageConfigCooldown -= _frameDeltaSeconds;
             if (_storageConfigCooldown < 0.0f) _storageConfigCooldown = 0.0f;
         }
 
@@ -1884,18 +2159,9 @@ namespace heisenberg
             if (player) {
                 f4cf::f4vr::SetActorRestrained(player, !enabled);
             }
-
-            auto* inputManager = RE::BSInputEnableManager::GetSingleton();
-            if (inputManager) {
-                using UEFlag = RE::UserEvents::USER_EVENT_FLAG;
-                // NOTE: kFighting intentionally excluded — always suppressed to prevent unarmed
-                UEFlag flagsToControl = UEFlag::kMainFour | UEFlag::kVATS | UEFlag::kActivate | UEFlag::kMenu;
-                inputManager->ForceUserEventEnabled(flagsToControl, enabled);
-
-                using OEFlag = RE::OtherInputEvents::OTHER_EVENT_FLAG;
-                OEFlag otherFlags = OEFlag::kVATS | OEFlag::kActivation | OEFlag::kFavorites;
-                inputManager->ForceOtherEventEnabledVR(otherFlags, enabled);
-            }
+            Heisenberg::GetSingleton().SetInputSuppression(
+                InputSuppressionReason::StorageZoneConfig,
+                !enabled);
         };
 
         bool aButtonPressed = g_vrInput.IsPressed(false, VRButton::A);  // A button on right controller
@@ -2101,11 +2367,10 @@ namespace heisenberg
         spdlog::debug("[GRAB] Unarmed active at grab start — sheathing fists");
 
         // Suppress kFighting briefly so the game doesn't immediately re-equip fists
-        auto* inputMgr = RE::BSInputEnableManager::GetSingleton();
-        if (inputMgr) {
-            inputMgr->ForceUserEventEnabled(RE::UEFlag::kFighting, false);
-            _postGrabFightingSuppressed = true;
-        }
+        SetInputSuppression(
+            InputSuppressionReason::PostGrabFighting,
+            true);
+        _postGrabFightingSuppressed = true;
     }
 
     // =========================================================================

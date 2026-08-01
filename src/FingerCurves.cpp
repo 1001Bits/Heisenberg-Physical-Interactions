@@ -71,8 +71,9 @@ namespace heisenberg
         { 3.50049f, -0.920029f, 2.56506f },   // Thumb alternate
     };
 
-    // Forward decl — defined further down with the other math helpers.
+    // Forward decls — defined further down with the other math helpers.
     static RE::NiPoint3 TransformPoint(const RE::NiTransform& transform, const RE::NiPoint3& point);
+    static RE::NiPoint3 InverseTransformPoint(const RE::NiTransform& transform, const RE::NiPoint3& point);
 
     // =========================================================================
     // FINGER CALIBRATION
@@ -98,6 +99,59 @@ namespace heisenberg
     // =========================================================================
 
     static bool g_fingerCalibrated[2] = { false, false };  // [0]=right, [1]=left
+    struct FingerCalibrationDiagnostics
+    {
+        std::uint32_t attempts = 0;
+        bool childListLogged = false;
+        bool readinessWarningLogged = false;
+        // Stability witness (below): a candidate frame must be re-measured
+        // unchanged across consecutive idle samples before it is latched.
+        bool hasPendingCandidate = false;
+        std::uint32_t pendingAgreeingSamples = 0;
+        RE::NiPoint3 pendingPalmPos{};
+        RE::NiPoint3 pendingPalmDir{};
+        RE::NiPoint3 pendingPalmarDir{};
+    };
+    static FingerCalibrationDiagnostics
+        g_fingerCalibrationDiagnostics[2];
+
+    // A calibration commit lasts the whole session, so a frame sampled while
+    // the skeleton is still settling after a load poisons every later grab
+    // placement — objects seat against a palm plane that does not exist.
+    // Live evidence (Jul 30): the LEFT hand committed on attempt 1, 14 ms
+    // after a load, a frame whose palmar direction sat 65 deg — and whose
+    // knuckle centroid 5.3 units — away from what the SAME hand measured
+    // after the next load, while the RIGHT hand's two loads agreed to 6 deg.
+    // Everything derived here is hand-LOCAL, so arm motion cannot disturb a
+    // sample; only a changing finger pose can. Requiring the same frame
+    // across ~0.5 s of idle samples therefore rejects the unsettled skeleton
+    // without rejecting a legitimately still hand.
+    // Tolerances are deliberately loose: they only have to separate a
+    // genuinely still hand from an unsettled skeleton, and the observed bad
+    // sample was 65 deg / 5.3 units away — orders of magnitude beyond finger
+    // jitter. Tight tolerances would let normal tremor reset the witness
+    // forever, which would leave placement permanently on the wand fallback.
+    static constexpr std::uint32_t
+        kFingerCalibrationStableSamples = 45;
+    static constexpr std::uint32_t
+        kFingerCalibrationWarmupAttempts = 30;
+    static constexpr float
+        kFingerCalibrationPalmPositionTolerance = 2.0f;
+    static constexpr float
+        kFingerCalibrationDirectionTolerance = 0.94f;  // ~20 degrees
+    // See InvalidateFingerCalibration: a hand whose committed frame keeps
+    // failing live validation is worse than no calibration at all, because
+    // consumers then alternate between two different palm frames per grab.
+    static constexpr std::uint32_t
+        kFingerCalibrationRejectionLimit = 2;
+    static std::uint32_t g_calibrationRejections[2] = { 0, 0 };
+    static bool g_calibrationUntrusted[2] = { false, false };
+    // At the normal idle call cadence this is roughly 1.3 seconds at 90 Hz.
+    // Skeleton/flattened-tree publication commonly needs several transient
+    // frames after load; warn only when it remains unavailable well beyond
+    // that expected readiness window.
+    static constexpr std::uint32_t
+        kFingerCalibrationReadinessAttempts = 120;
 
     // Palm derived from calibrated finger geometry, in hand-local (COM-tree
     // LArm_Hand / RArm_Hand) space. Written once per hand during calibration.
@@ -165,27 +219,11 @@ namespace heisenberg
         return nullptr;
     }
 
-    static inline RE::NiTransform InverseRigidTransform(const RE::NiTransform& t)
-    {
-        RE::NiTransform inv;
-        // Rotation inverse = transpose (assumes orthonormal, which NiNode
-        // world rotations are in practice — uniform scale lives in .scale).
-        for (int r = 0; r < 3; ++r) {
-            for (int c = 0; c < 3; ++c) {
-                inv.rotate.entry[r][c] = t.rotate.entry[c][r];
-            }
-        }
-        inv.scale = t.scale > 0.0001f ? 1.0f / t.scale : 1.0f;
-        // translate = -R^T * t.translate * invScale
-        RE::NiPoint3 nt;
-        nt.x = -(inv.rotate.entry[0][0]*t.translate.x + inv.rotate.entry[0][1]*t.translate.y + inv.rotate.entry[0][2]*t.translate.z);
-        nt.y = -(inv.rotate.entry[1][0]*t.translate.x + inv.rotate.entry[1][1]*t.translate.y + inv.rotate.entry[1][2]*t.translate.z);
-        nt.z = -(inv.rotate.entry[2][0]*t.translate.x + inv.rotate.entry[2][1]*t.translate.y + inv.rotate.entry[2][2]*t.translate.z);
-        inv.translate.x = nt.x * inv.scale;
-        inv.translate.y = nt.y * inv.scale;
-        inv.translate.z = nt.z * inv.scale;
-        return inv;
-    }
+    // (An explicit inverse NiTransform is no longer built here: world->local
+    // now goes through InverseTransformPoint with the node's FORWARD transform,
+    // which is the exact inverse of TransformPoint under the row-vector
+    // convention. Building an inverted transform and then pushing it through a
+    // row-basis point transform was how the two disagreed.)
 
     void CalibrateFingerDataFromSkeleton(RE::NiAVObject* handNode, bool isLeft)
     {
@@ -193,24 +231,50 @@ namespace heisenberg
         InitializeHandFingerDataDefaults();
         int handIdx = isLeft ? 1 : 0;
         if (g_fingerCalibrated[handIdx]) return;
+        // Struck-out hand: stop re-measuring a frame that will only be
+        // rejected again and make placement oscillate (see the rejection
+        // limit above). The last committed per-finger curl vectors are kept.
+        if (g_calibrationUntrusted[handIdx]) return;
+        auto& diagnostics =
+            g_fingerCalibrationDiagnostics[handIdx];
+        const std::uint32_t attempt =
+            ++diagnostics.attempts;
+        const bool sampleTransientDebug =
+            attempt == 1 || (attempt % 60) == 0;
 
-        const RE::NiTransform handInv = InverseRigidTransform(handNode->world);
+        // World -> hand-local uses the hand's FORWARD transform through
+        // InverseTransformPoint. The old code built an inverted NiTransform and
+        // pushed it through the row-basis TransformPoint, which yields
+        // M^T*(w-t) where the convention requires M*(w-t): same length, wrong
+        // direction. That is exactly the "palm anchor ~6 units from the wrist
+        // pointing somewhere different every sample" seen live on Jul 30.
+        const RE::NiTransform& handWorld = handNode->world;
         const char* prefix = isLeft ? "LArm_Finger" : "RArm_Finger";
 
         // One-shot diagnostic: list direct children of the hand node so we
         // can tell whether finger bones are actually in this subtree or if
         // we were handed a non-skinned wrapper node.
-        if (RE::NiNode* handAsNode = handNode->IsNode()) {
-            std::string childNames;
-            for (std::uint32_t i = 0; i < handAsNode->children.size() && i < 32; ++i) {
-                auto& ch = handAsNode->children[i];
-                if (ch) {
-                    childNames += ch->name.c_str();
-                    childNames += ", ";
+        if (!diagnostics.childListLogged) {
+            diagnostics.childListLogged = true;
+            if (spdlog::should_log(spdlog::level::debug)) {
+                if (RE::NiNode* handAsNode = handNode->IsNode()) {
+                    std::string childNames;
+                    for (std::uint32_t i = 0;
+                         i < handAsNode->children.size() && i < 32;
+                         ++i) {
+                        auto& ch = handAsNode->children[i];
+                        if (ch) {
+                            childNames += ch->name.c_str();
+                            childNames += ", ";
+                        }
+                    }
+                    spdlog::debug(
+                        "[FINGER-CAL] {} handNode='{}' direct children: [{}]",
+                        isLeft ? "L" : "R",
+                        handNode->name.c_str(),
+                        childNames);
                 }
             }
-            spdlog::info("[FINGER-CAL] {} handNode='{}' direct children: [{}]",
-                         isLeft ? "L" : "R", handNode->name.c_str(), childNames);
         }
 
         // Stage results locally and commit to g_handFinger* only on full 5/5 success
@@ -240,11 +304,13 @@ namespace heisenberg
                 isLeft,
                 flattenedSnapshot,
                 &flattenedMissingBone);
-        if (!haveFlattenedSnapshot) {
-            spdlog::warn(
-                "[FINGER-CAL] {} root-flattened snapshot unavailable (missing='{}'); using NiAVObject fallback",
+        if (!haveFlattenedSnapshot && sampleTransientDebug) {
+            spdlog::debug(
+                "[FINGER-CAL] {} root-flattened snapshot unavailable "
+                "(missing='{}', attempt={}); using NiAVObject fallback",
                 isLeft ? "LEFT" : "RIGHT",
-                flattenedMissingBone);
+                flattenedMissingBone,
+                attempt);
         }
 
         int foundCount = 0;
@@ -281,19 +347,23 @@ namespace heisenberg
                 }
             }
             if (!haveChain) {
-                spdlog::warn(
-                    "[FINGER-CAL] {} hand: missing bones for finger {} ({}/{}/{})",
-                    isLeft ? "LEFT" : "RIGHT",
-                    fi,
-                    n1,
-                    n2,
-                    n3);
+                if (sampleTransientDebug) {
+                    spdlog::debug(
+                        "[FINGER-CAL] {} hand: missing bones for finger "
+                        "{} ({}/{}/{}) attempt={}",
+                        isLeft ? "LEFT" : "RIGHT",
+                        fi,
+                        n1,
+                        n2,
+                        n3,
+                        attempt);
+                }
                 continue;
             }
 
-            const RE::NiPoint3 p1 = TransformPoint(handInv, p1World);
-            const RE::NiPoint3 p2 = TransformPoint(handInv, p2World);
-            const RE::NiPoint3 p3 = TransformPoint(handInv, p3World);
+            const RE::NiPoint3 p1 = InverseTransformPoint(handWorld, p1World);
+            const RE::NiPoint3 p2 = InverseTransformPoint(handWorld, p2World);
+            const RE::NiPoint3 p3 = InverseTransformPoint(handWorld, p3World);
 
             // zeroAngle = direction of the PROXIMAL segment (p1→p2), not the
             // full knuckle→tip vector. FRIK's idle pose has the medial/distal
@@ -331,8 +401,15 @@ namespace heisenberg
                 // 0.20 floor while relying on TryCalibrateFingerDataIfIdle's
                 // input/grab gates for the first line of defence.
                 if (straightnessDot < 0.20f) {
-                    spdlog::debug("[FINGER-CAL] {} hand: finger {} too curled to calibrate (dot={:.2f}) - skipping this attempt",
-                                 isLeft ? "LEFT" : "RIGHT", fi, straightnessDot);
+                    if (sampleTransientDebug) {
+                        spdlog::debug(
+                            "[FINGER-CAL] {} hand: finger {} too curled "
+                            "to calibrate (dot={:.2f}) - skipping this "
+                            "attempt",
+                            isLeft ? "LEFT" : "RIGHT",
+                            fi,
+                            straightnessDot);
+                    }
                     continue;
                 }
             }
@@ -358,17 +435,107 @@ namespace heisenberg
             stagedNormals[fi] = normal;
             foundCount++;
 
-            spdlog::info("[FINGER-CAL] {} f{}: start=({:.2f},{:.2f},{:.2f}) zero=({:.3f},{:.3f},{:.3f}) normal=({:.3f},{:.3f},{:.3f}) len={:.2f}",
-                         isLeft ? "L" : "R", fi,
-                         p1.x, p1.y, p1.z,
-                         zeroAngle.x, zeroAngle.y, zeroAngle.z,
-                         normal.x, normal.y, normal.z,
-                         fingerLen);
+            if (sampleTransientDebug) {
+                spdlog::debug(
+                    "[FINGER-CAL] {} f{}: start=({:.2f},{:.2f},{:.2f}) "
+                    "zero=({:.3f},{:.3f},{:.3f}) "
+                    "normal=({:.3f},{:.3f},{:.3f}) len={:.2f} attempt={}",
+                    isLeft ? "L" : "R",
+                    fi,
+                    p1.x,
+                    p1.y,
+                    p1.z,
+                    zeroAngle.x,
+                    zeroAngle.y,
+                    zeroAngle.z,
+                    normal.x,
+                    normal.y,
+                    normal.z,
+                    fingerLen,
+                    attempt);
+            }
         }
 
         if (foundCount == 5) {
-            // Commit the staged per-finger results now that all 5 resolved - never a
-            // mixed-frame partial commit (see the staging comment above the loop).
+            // Derive the candidate palm anchor from the STAGED sample before
+            // anything is committed. Average the 5 knuckle positions and
+            // zero-angle directions — centroid of the metacarpals is the
+            // anatomical palm center, and the averaged forward direction is
+            // the palm-forward axis. Both are in the same hand-local frame as
+            // the finger cast data, so placement built from these lands
+            // exactly where the fingers will meet.
+            RE::NiPoint3 palmPos(0, 0, 0);
+            RE::NiPoint3 palmDir(0, 0, 0);
+            for (int i = 0; i < 5; ++i) {
+                palmPos = palmPos + stagedStartPositions[i];
+                palmDir = palmDir + stagedZeroAngleVecs[i];
+            }
+            palmPos = palmPos * 0.2f;
+            palmDir = VectorNormalized(palmDir);
+
+            // Palmar direction: average of cross(fingerNormal, zeroAngle) across
+            // fingers 1..4 (skip thumb — its opposable geometry makes its normal
+            // point off-axis and pollutes the mean). This is the direction each
+            // fingertip moves as the curl angle opens from zero — from the
+            // extended position toward the palm cup. Used to shift the palm
+            // anchor off the knuckle centroid (dorsal side) into the palm.
+            RE::NiPoint3 palmarDir(0, 0, 0);
+            for (int i = 1; i < 5; ++i) {
+                palmarDir = palmarDir + CrossProduct(stagedNormals[i], stagedZeroAngleVecs[i]);
+            }
+            // Orthogonalize against palmDir. The raw sum often has a component
+            // along the finger-forward axis (slight curl/normal asymmetry
+            // across fingers) which would pull the shifted palm anchor toward
+            // the wrist or past the fingertips instead of into the palm cup.
+            const float fwdProj = DotProduct(palmarDir, palmDir);
+            palmarDir = palmarDir - palmDir * fwdProj;
+            palmarDir = VectorNormalized(palmarDir);
+
+            // STABILITY WITNESS — see kFingerCalibrationStableSamples. The
+            // latch is permanent for the session, so require this exact frame
+            // to be re-measured across consecutive idle samples first. A
+            // skeleton still settling after a load moves between samples and
+            // resets the witness; a genuinely still hand does not.
+            const bool matchesPending =
+                diagnostics.hasPendingCandidate &&
+                VectorLength(palmPos - diagnostics.pendingPalmPos) <=
+                    kFingerCalibrationPalmPositionTolerance &&
+                DotProduct(palmDir, diagnostics.pendingPalmDir) >=
+                    kFingerCalibrationDirectionTolerance &&
+                DotProduct(palmarDir, diagnostics.pendingPalmarDir) >=
+                    kFingerCalibrationDirectionTolerance;
+            if (matchesPending) {
+                ++diagnostics.pendingAgreeingSamples;
+            } else {
+                if (diagnostics.hasPendingCandidate && sampleTransientDebug) {
+                    spdlog::debug(
+                        "[FINGER-CAL] {} hand candidate frame moved after {} "
+                        "agreeing sample(s) (attempt={}); restarting the "
+                        "stability witness",
+                        isLeft ? "LEFT" : "RIGHT",
+                        diagnostics.pendingAgreeingSamples,
+                        attempt);
+                }
+                diagnostics.hasPendingCandidate = true;
+                diagnostics.pendingAgreeingSamples = 1;
+            }
+            diagnostics.pendingPalmPos = palmPos;
+            diagnostics.pendingPalmDir = palmDir;
+            diagnostics.pendingPalmarDir = palmarDir;
+
+            if (attempt <= kFingerCalibrationWarmupAttempts ||
+                diagnostics.pendingAgreeingSamples <
+                    kFingerCalibrationStableSamples) {
+                // Keep the previous defaults in place and re-sample next call.
+                // The warm-up covers the case where the unsettled skeleton is
+                // briefly STILL as well as wrong (a load-screen rest pose),
+                // which agreement alone cannot distinguish.
+                return;
+            }
+
+            // Commit the staged per-finger results now that all 5 resolved and
+            // the frame held still - never a mixed-frame partial commit (see
+            // the staging comment above the loop).
             for (int i = 0; i < 5; ++i) {
                 g_handFingerStartPositions[handIdx][i] = stagedStartPositions[i];
                 g_handFingerZeroAngleVecs[handIdx][i] = stagedZeroAngleVecs[i];
@@ -383,52 +550,51 @@ namespace heisenberg
             g_handFingerZeroAngleVecs[handIdx][FINGER_THUMB_ALT] = g_handFingerZeroAngleVecs[handIdx][FINGER_THUMB];
             g_handFingerNormals[handIdx][FINGER_THUMB_ALT] = g_handFingerNormals[handIdx][FINGER_THUMB];
 
-            // Derive palm anchor from calibrated fingers. Average the 5
-            // knuckle positions and zero-angle directions — centroid of the
-            // metacarpals is the anatomical palm center, and the averaged
-            // forward direction is the palm-forward axis. Both are in the
-            // same hand-local frame as the finger cast data, so placement
-            // built from these lands exactly where the fingers will meet.
-            RE::NiPoint3 palmPos(0, 0, 0);
-            RE::NiPoint3 palmDir(0, 0, 0);
-            for (int i = 0; i < 5; ++i) {
-                palmPos = palmPos + g_handFingerStartPositions[handIdx][i];
-                palmDir = palmDir + g_handFingerZeroAngleVecs[handIdx][i];
-            }
-            palmPos = palmPos * 0.2f;
-            palmDir = VectorNormalized(palmDir);
-
-            // Palmar direction: average of cross(fingerNormal, zeroAngle) across
-            // fingers 1..4 (skip thumb — its opposable geometry makes its normal
-            // point off-axis and pollutes the mean). This is the direction each
-            // fingertip moves as the curl angle opens from zero — from the
-            // extended position toward the palm cup. Used to shift the palm
-            // anchor off the knuckle centroid (dorsal side) into the palm.
-            RE::NiPoint3 palmarDir(0, 0, 0);
-            for (int i = 1; i < 5; ++i) {
-                palmarDir = palmarDir + CrossProduct(g_handFingerNormals[handIdx][i], g_handFingerZeroAngleVecs[handIdx][i]);
-            }
-            // Orthogonalize against palmDir. The raw sum often has a component
-            // along the finger-forward axis (slight curl/normal asymmetry
-            // across fingers) which would pull the shifted palm anchor toward
-            // the wrist or past the fingertips instead of into the palm cup.
-            const float fwdProj = DotProduct(palmarDir, palmDir);
-            palmarDir = palmarDir - palmDir * fwdProj;
-            palmarDir = VectorNormalized(palmarDir);
-
             g_calibratedPalmPos[handIdx] = palmPos;
             g_calibratedPalmDir[handIdx] = palmDir;
             g_calibratedPalmarDir[handIdx] = palmarDir;
 
             g_fingerCalibrated[handIdx] = true;
-            spdlog::info("[FINGER-CAL] {} hand calibration complete ({}/5 fingers) palm=({:.2f},{:.2f},{:.2f}) dir=({:.3f},{:.3f},{:.3f}) palmar=({:.3f},{:.3f},{:.3f})",
-                         isLeft ? "LEFT" : "RIGHT", foundCount,
-                         palmPos.x, palmPos.y, palmPos.z,
-                         palmDir.x, palmDir.y, palmDir.z,
-                         palmarDir.x, palmarDir.y, palmarDir.z);
+            spdlog::info(
+                "[FINGER-CAL] {} hand calibration complete ({}/5 fingers, "
+                "attempt={}, stableSamples={}) palm=({:.2f},{:.2f},{:.2f}) "
+                "dir=({:.3f},{:.3f},{:.3f}) "
+                "palmar=({:.3f},{:.3f},{:.3f})",
+                isLeft ? "LEFT" : "RIGHT",
+                foundCount,
+                attempt,
+                diagnostics.pendingAgreeingSamples,
+                palmPos.x,
+                palmPos.y,
+                palmPos.z,
+                palmDir.x,
+                palmDir.y,
+                palmDir.z,
+                palmarDir.x,
+                palmarDir.y,
+                palmarDir.z);
         } else {
-            spdlog::warn("[FINGER-CAL] {} hand: only {}/5 fingers resolved — retaining HIGGS defaults",
-                         isLeft ? "LEFT" : "RIGHT", foundCount);
+            diagnostics.hasPendingCandidate = false;
+            diagnostics.pendingAgreeingSamples = 0;
+            if (attempt >=
+                    kFingerCalibrationReadinessAttempts &&
+                !diagnostics.readinessWarningLogged) {
+                diagnostics.readinessWarningLogged = true;
+                spdlog::warn(
+                    "[FINGER-CAL] {} hand calibration still unavailable "
+                    "after {} idle attempts ({}/5 resolved); retaining "
+                    "HIGGS defaults and continuing background retries",
+                    isLeft ? "LEFT" : "RIGHT",
+                    attempt,
+                    foundCount);
+            } else if (sampleTransientDebug) {
+                spdlog::debug(
+                    "[FINGER-CAL] {} hand transiently resolved {}/5 "
+                    "fingers on attempt {}; retaining HIGGS defaults",
+                    isLeft ? "LEFT" : "RIGHT",
+                    foundCount,
+                    attempt);
+            }
         }
     }
 
@@ -437,12 +603,96 @@ namespace heisenberg
         InitializeHandFingerDataDefaults(true);
         g_fingerCalibrated[0] = false;
         g_fingerCalibrated[1] = false;
+        g_fingerCalibrationDiagnostics[0] = {};
+        g_fingerCalibrationDiagnostics[1] = {};
         g_calibratedPalmPos[0] = RE::NiPoint3();
         g_calibratedPalmPos[1] = RE::NiPoint3();
         g_calibratedPalmDir[0] = RE::NiPoint3();
         g_calibratedPalmDir[1] = RE::NiPoint3();
         g_calibratedPalmarDir[0] = RE::NiPoint3();
         g_calibratedPalmarDir[1] = RE::NiPoint3();
+        // A load/skeleton swap is exactly the event that can make a previously
+        // unreproducible hand reproducible, so give both hands their strikes back.
+        g_calibrationRejections[0] = 0;
+        g_calibrationRejections[1] = 0;
+        g_calibrationUntrusted[0] = false;
+        g_calibrationUntrusted[1] = false;
+    }
+
+    void InvalidateFingerCalibration(bool isLeft)
+    {
+        const int handIdx = isLeft ? 1 : 0;
+        if (!g_fingerCalibrated[handIdx]) {
+            return;
+        }
+        // Strike out a hand whose calibration keeps failing live validation.
+        // Live evidence (Jul 30): the LEFT hand produced a fresh frame nine
+        // times in one session and every one of them disagreed with the live
+        // knuckles by 3-10 units, so grabs alternated between the calibrated
+        // and the wand palm and no two placements matched. One stable frame
+        // beats an accurate one that changes per grab: after this many
+        // rejections the hand stops offering a calibrated palm at all and every
+        // consumer falls back to the configured wand palm for the session.
+        if (++g_calibrationRejections[handIdx] >= kFingerCalibrationRejectionLimit &&
+            !g_calibrationUntrusted[handIdx]) {
+            g_calibrationUntrusted[handIdx] = true;
+            spdlog::warn(
+                "[FINGER-CAL] {} hand calibration rejected {} times — this hand's "
+                "bone frame is not reproducible; using the configured wand palm "
+                "for the rest of the session so placement stays consistent",
+                isLeft ? "LEFT" : "RIGHT",
+                g_calibrationRejections[handIdx]);
+        }
+        // Drop only the palm anchor and the latch. The per-finger g_handFinger*
+        // arrays keep their last sample so the curl solver never falls back to
+        // unrelated HIGGS defaults mid-session; the next idle attempt
+        // re-measures and overwrites them.
+        g_fingerCalibrated[handIdx] = false;
+        g_fingerCalibrationDiagnostics[handIdx].hasPendingCandidate = false;
+        g_fingerCalibrationDiagnostics[handIdx].pendingAgreeingSamples = 0;
+        g_calibratedPalmPos[handIdx] = RE::NiPoint3();
+        g_calibratedPalmDir[handIdx] = RE::NiPoint3();
+        g_calibratedPalmarDir[handIdx] = RE::NiPoint3();
+    }
+
+    bool GetLiveKnuckleCentroidLocal(
+        bool isLeft,
+        RE::NiAVObject* handNode,
+        RE::NiPoint3& outCentroidLocal)
+    {
+        if (!handNode) {
+            return false;
+        }
+        rock::root_flattened_finger_skeleton_runtime::Snapshot snapshot{};
+        if (!rock::root_flattened_finger_skeleton_runtime::
+                resolveLiveFingerSkeletonSnapshot(isLeft, snapshot, nullptr) ||
+            !snapshot.valid) {
+            return false;
+        }
+
+        const RE::NiTransform& handWorld = handNode->world;
+        RE::NiPoint3 sum(0.0f, 0.0f, 0.0f);
+        int count = 0;
+        for (std::size_t fi = 0; fi < 5; ++fi) {
+            const auto& finger = snapshot.fingers[fi];
+            if (!finger.valid) {
+                continue;
+            }
+            const RE::NiPoint3 knuckleLocal =
+                InverseTransformPoint(handWorld, finger.points[0]);
+            if (!std::isfinite(knuckleLocal.x) ||
+                !std::isfinite(knuckleLocal.y) ||
+                !std::isfinite(knuckleLocal.z)) {
+                continue;
+            }
+            sum = sum + knuckleLocal;
+            ++count;
+        }
+        if (count < 5) {
+            return false;
+        }
+        outCentroidLocal = sum * 0.2f;
+        return true;
     }
 
     bool GetCalibratedPalmLocal(bool isLeft, RE::NiPoint3& outPos, RE::NiPoint3& outDir)
@@ -519,17 +769,31 @@ namespace heisenberg
 
     void TriangleData::ApplyTransform(const RE::NiTransform& transform)
     {
-        // Transform each vertex using NiTransform: translate + rotate * point * scale
+        // FO4VR NiTransform is ROW-VECTOR: world = translate + rotate.Transpose() * (local * scale).
+        // This must use the COLUMN basis (entry[0][0], entry[1][0], entry[2][0] ...), matching
+        // rock::grab_mesh::transformPoint (MeshGrab.h, Ghidra-verified against the engine's own
+        // compose path) and every local->world site in Grab.cpp (parent.rotate.Transpose() * local).
+        //
+        // It used to apply the ROW basis, i.e. M*v instead of M^T*v. Because callers convert the
+        // result straight back with worldPointToLocal (the correct inverse, M*(w-t)), the round
+        // trip returned M^2 * v: every extracted mesh came back rotated by the square of its own
+        // node rotation, about its own pivot. Live consequence (Jul 30): the SAME 2868-triangle
+        // uniform measured object-local spans anywhere from (43,38,10) to (37,24,35) depending
+        // only on how it happened to be lying on the floor, so palm seating had no stable geometry
+        // to work from. Meshes on nodes with near-identity rotations were barely affected, which
+        // is why this survived so long.
         auto TransformPointLocal = [&](RE::NiPoint3& p) {
-            RE::NiPoint3 rotated;
-            rotated.x = transform.rotate.entry[0][0] * p.x + transform.rotate.entry[0][1] * p.y + transform.rotate.entry[0][2] * p.z;
-            rotated.y = transform.rotate.entry[1][0] * p.x + transform.rotate.entry[1][1] * p.y + transform.rotate.entry[1][2] * p.z;
-            rotated.z = transform.rotate.entry[2][0] * p.x + transform.rotate.entry[2][1] * p.y + transform.rotate.entry[2][2] * p.z;
-            p.x = rotated.x * transform.scale + transform.translate.x;
-            p.y = rotated.y * transform.scale + transform.translate.y;
-            p.z = rotated.z * transform.scale + transform.translate.z;
+            const float sx = p.x * transform.scale;
+            const float sy = p.y * transform.scale;
+            const float sz = p.z * transform.scale;
+            p.x = transform.rotate.entry[0][0] * sx + transform.rotate.entry[1][0] * sy +
+                  transform.rotate.entry[2][0] * sz + transform.translate.x;
+            p.y = transform.rotate.entry[0][1] * sx + transform.rotate.entry[1][1] * sy +
+                  transform.rotate.entry[2][1] * sz + transform.translate.y;
+            p.z = transform.rotate.entry[0][2] * sx + transform.rotate.entry[1][2] * sy +
+                  transform.rotate.entry[2][2] * sz + transform.translate.z;
         };
-        
+
         TransformPointLocal(v0);
         TransformPointLocal(v1);
         TransformPointLocal(v2);
@@ -539,27 +803,52 @@ namespace heisenberg
     // MATH UTILITIES
     // =========================================================================
 
-    // Transform a point by NiTransform
+    // LOCAL -> WORLD under the FO4VR row-vector convention:
+    //   world = translate + rotate.Transpose() * (local * scale)
+    // (column basis; see the note on TriangleData::ApplyTransform for what the
+    // row basis did to every mesh this file produced).
     static RE::NiPoint3 TransformPoint(const RE::NiTransform& transform, const RE::NiPoint3& point)
     {
-        RE::NiPoint3 rotated;
-        rotated.x = transform.rotate.entry[0][0] * point.x + transform.rotate.entry[0][1] * point.y + transform.rotate.entry[0][2] * point.z;
-        rotated.y = transform.rotate.entry[1][0] * point.x + transform.rotate.entry[1][1] * point.y + transform.rotate.entry[1][2] * point.z;
-        rotated.z = transform.rotate.entry[2][0] * point.x + transform.rotate.entry[2][1] * point.y + transform.rotate.entry[2][2] * point.z;
+        const float sx = point.x * transform.scale;
+        const float sy = point.y * transform.scale;
+        const float sz = point.z * transform.scale;
         return RE::NiPoint3(
-            rotated.x * transform.scale + transform.translate.x,
-            rotated.y * transform.scale + transform.translate.y,
-            rotated.z * transform.scale + transform.translate.z
-        );
+            transform.rotate.entry[0][0] * sx + transform.rotate.entry[1][0] * sy +
+                transform.rotate.entry[2][0] * sz + transform.translate.x,
+            transform.rotate.entry[0][1] * sx + transform.rotate.entry[1][1] * sy +
+                transform.rotate.entry[2][1] * sz + transform.translate.y,
+            transform.rotate.entry[0][2] * sx + transform.rotate.entry[1][2] * sy +
+                transform.rotate.entry[2][2] * sz + transform.translate.z);
     }
 
-    // Transform a vector (direction only, no translate) by NiMatrix3
+    // WORLD -> LOCAL, the exact inverse of TransformPoint. Takes the node's
+    // FORWARD transform (not a pre-inverted one): local = rotate * (world - translate) / scale.
+    static RE::NiPoint3 InverseTransformPoint(const RE::NiTransform& transform, const RE::NiPoint3& point)
+    {
+        const RE::NiPoint3 d = point - transform.translate;
+        const float invScale =
+            (std::isfinite(transform.scale) && std::abs(transform.scale) > 1.0e-4f)
+                ? 1.0f / transform.scale
+                : 1.0f;
+        return RE::NiPoint3(
+            (transform.rotate.entry[0][0] * d.x + transform.rotate.entry[0][1] * d.y +
+                transform.rotate.entry[0][2] * d.z) * invScale,
+            (transform.rotate.entry[1][0] * d.x + transform.rotate.entry[1][1] * d.y +
+                transform.rotate.entry[1][2] * d.z) * invScale,
+            (transform.rotate.entry[2][0] * d.x + transform.rotate.entry[2][1] * d.y +
+                transform.rotate.entry[2][2] * d.z) * invScale);
+    }
+
+    // Rotate a hand-LOCAL direction into world (no translate). Column basis, to
+    // match TransformPoint and the row-vector convention: world = M^T * local.
+    // Every caller here (the finger zero-angle/normal reconstruction) is
+    // local->world.
     static RE::NiPoint3 TransformVector(const RE::NiMatrix3& rotate, const RE::NiPoint3& vec)
     {
         return RE::NiPoint3(
-            rotate.entry[0][0] * vec.x + rotate.entry[0][1] * vec.y + rotate.entry[0][2] * vec.z,
-            rotate.entry[1][0] * vec.x + rotate.entry[1][1] * vec.y + rotate.entry[1][2] * vec.z,
-            rotate.entry[2][0] * vec.x + rotate.entry[2][1] * vec.y + rotate.entry[2][2] * vec.z
+            rotate.entry[0][0] * vec.x + rotate.entry[1][0] * vec.y + rotate.entry[2][0] * vec.z,
+            rotate.entry[0][1] * vec.x + rotate.entry[1][1] * vec.y + rotate.entry[2][1] * vec.z,
+            rotate.entry[0][2] * vec.x + rotate.entry[1][2] * vec.y + rotate.entry[2][2] * vec.z
         );
     }
 
@@ -858,17 +1147,16 @@ namespace heisenberg
         std::uint32_t numTris = *reinterpret_cast<std::uint32_t*>(geomBytes + VR_NUM_TRIANGLES_OFFSET);
         std::uint16_t numVerts = *reinterpret_cast<std::uint16_t*>(geomBytes + VR_NUM_VERTICES_OFFSET);
         
-        // Debug: Also check non-VR offsets and other potential locations to understand the data layout
-        std::uint32_t numTrisNonVR = *reinterpret_cast<std::uint32_t*>(geomBytes + 0x160);
-        std::uint16_t numVertsNonVR = *reinterpret_cast<std::uint16_t*>(geomBytes + 0x164);
-        
-        // Check BSGeometry type byte at 0x198 (VR offset, non-VR would be 0x158)
+        // BSGeometry type byte at the VR offset. (An earlier layout-exploration
+        // dual-read of the non-VR offsets 0x160/0x164 was removed: the layout
+        // is settled on the VR offsets above, and the garbage number the dead
+        // read produced — billions of "tris" — misled a log audit.)
         std::uint8_t geomType = *reinterpret_cast<std::uint8_t*>(geomBytes + 0x198);
-        
+
         if (shouldLog || (numTris == 0 && numVerts > 0)) {
-            spdlog::debug("[FINGER] BSTriShape '{}': VR(0x1A0)={} tris, VR(0x1A4)={} verts | NonVR(0x160)={} tris | type=0x{:02X}",
+            spdlog::debug("[FINGER] BSTriShape '{}': VR(0x1A0)={} tris, VR(0x1A4)={} verts | type=0x{:02X}",
                 geom->name.c_str() ? geom->name.c_str() : "unnamed",
-                numTris, numVerts, numTrisNonVR, geomType);
+                numTris, numVerts, geomType);
         }
         
         if (numTris == 0 || numVerts == 0) {
@@ -1444,9 +1732,11 @@ namespace heisenberg
             return result;
         }
 
-        spdlog::warn("[FINGER] Entry: handNode='{}' objectNode='{}' isLeft={}",
-                    handNode->name.c_str(), objectNode->name.c_str(),
-                    isLeft ? 1 : 0);
+        spdlog::debug(
+            "[FINGER] Entry: handNode='{}' objectNode='{}' isLeft={}",
+            handNode->name.c_str(),
+            objectNode->name.c_str(),
+            isLeft ? 1 : 0);
 
         // Lazily calibrate the finger constants from the FRIK skeleton on
         // first use per hand. VRIK's hardcoded constants don't match FRIK's

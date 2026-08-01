@@ -77,6 +77,11 @@ namespace heisenberg
         // Check if offhand is gripping weapon (two-handed mode)
         bool IsOffHandGrippingWeapon() const;
 
+        // Is FRIK's own wrist/holo Pip-Boy currently open, per FRIK's internal state.
+        // NOT the same as PipboyMenu being open: FRIK closes its holo model when a terminal
+        // opens while the menu stays up, so the two disagree during a terminal redirect.
+        bool IsWristPipboyOpen() const;
+
         // Get FRIK mod version string (e.g. "0.77.1")
         const char* GetModVersion() const;
 

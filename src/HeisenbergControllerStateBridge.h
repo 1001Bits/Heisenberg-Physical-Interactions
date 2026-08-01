@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <type_traits>
 #include <openvr.h>
 
 // Stable C ABI used by input remappers that need to run in Heisenberg's
@@ -109,6 +111,22 @@ namespace heisenberg::controller_bridge
     };
 
     using GetAPI = const API* (__cdecl*)(std::uint32_t requestedAbiVersion);
+
+    static_assert(sizeof(void*) == 8, "F4VR controller bridge requires x64");
+    static_assert(std::is_standard_layout_v<CallbackContext>);
+    static_assert(std::is_trivially_copyable_v<CallbackContext>);
+    static_assert(sizeof(CallbackContext) == 48);
+    static_assert(offsetof(CallbackContext, reserved) == 24);
+    static_assert(offsetof(CallbackContext, heisenbergState) == 32);
+    static_assert(offsetof(CallbackContext, resultFlags) == 40);
+    static_assert(std::is_standard_layout_v<Registration>);
+    static_assert(std::is_trivially_copyable_v<Registration>);
+    static_assert(sizeof(Registration) == 48);
+    static_assert(offsetof(Registration, callback) == 24);
+    static_assert(offsetof(Registration, ownerName) == 40);
+    static_assert(sizeof(BackendStatus) == 16);
+    static_assert(sizeof(API) == 32);
+    static_assert(offsetof(API, registerCallback) == 8);
 }
 
 extern "C"

@@ -8,25 +8,21 @@
 // ---- WeaponSupportAuthorityPolicy.h ----
 
 /*
- * Equipped pistols and long guns use the same two-handed weapon authority:
- * the support controller may steer the weapon, while the captured firing-hand
- * frame remains the immutable root anchor. AttachOnly provider grips remain
- * the explicit glue-only exception. Runtime classification still uses
- * the weapon animation grip keywords because Fallout 4 VR only exposes "gun" at
- * the weapon-type enum level, while actual vanilla and modded pistol records
- * carry `AnimsGripPistol`. Long-gun grip keywords are checked before the
- * sidearm signal so rifle-like weapons keep the solver that owns weapon
- * transform authority. Base WEAP keywords and instance keyword data are read
- * through separate guarded paths: FO4VR can crash inside
- * `BGSKeywordForm::HasKeyword` when a modded `TBO_InstanceData*` lacks the
- * keyword component the engine expects. Name fallback tokens only cover vanilla
- * sidearms whose records do not expose a stronger semantic signal.
+ * Equipped-weapon support authority is selected by distance from the firing
+ * grip. A support grab close to that grip follows the weapon visually without
+ * steering it, leaving one transform owner and allowing the support hand to be
+ * promoted cleanly when it takes the firing grip. A grab farther out retains
+ * full two-handed manipulation authority. Weapon class affects the steering
+ * weight inside the full solver; it must never hard-demote a sidearm and erase
+ * the authority floor. Explicit provider grab modes remain authoritative and
+ * bypass this proximity contract.
  */
 
 #include "physics-interaction/TransformMath.h"
 #include "physics-interaction/weapon/TwoHandedWeaponPolicy.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <string_view>
 
@@ -67,83 +63,70 @@ namespace rock::weapon_support_authority_policy
     }
 
     /*
-     * SIDEARM ESCAPE — restored 2026-07-27 (it had been deleted, leaving this function ignoring
-     * its parameter and returning FullTwoHandedSolver for everything).
-     *
-     * A one-handed gun must NEVER be steered by the off-hand. The solver's angular gain goes as
-     * ~1/leverArm, and a pistol's support cup measures 6-13gu against a long gun's 22gu+, so the
-     * same off-hand motion swings the gun 2-4x harder. Worse, FullTwoHandedSolver also switches on
-     * the firing-wrist drive (see supportGripAppliesPrimaryHandAuthority below), which welds the
-     * rendered firing wrist 1:1 to the weapon's rotation — the user-reported "grip of the weapon
-     * hand gets disturbed". A whole round of tuning (lever-arm gate, authority floor, angular rate
-     * limit, wrist-follow blend) failed to satisfy both ends because aim authority and wrist
-     * rigidity were the SAME scalar.
-     *
-     * Sidearms therefore take VisualOnlySupport: the off-hand is pure visual glue, the weapon and
-     * the firing hand are never touched. The off-hand is then placed ON THE GUN GRIP so it reads as
-     * a proper two-handed pistol hold rather than floating wherever the player happened to touch.
+     * A sidearm remains in the full solver. The Jul-27 contract deliberately
+     * separated aim authority from wrist presentation: short lever arms receive
+     * a non-zero steering floor, the solved rotation is rate-limited, and the
+     * firing-wrist follow is blended independently. Hard-demoting Sidearm here
+     * reintroduces the exact regression that contract fixed: the support hand
+     * can look attached but has no authority over the weapon.
      */
     inline constexpr WeaponSupportAuthorityMode resolveSupportAuthorityMode(
-        WeaponSupportWeaponClass weaponClass)
+        WeaponSupportWeaponClass)
     {
-        return weaponClass == WeaponSupportWeaponClass::Sidearm
-            ? WeaponSupportAuthorityMode::VisualOnlySupport
-            : WeaponSupportAuthorityMode::FullTwoHandedSolver;
+        return WeaponSupportAuthorityMode::FullTwoHandedSolver;
     }
 
     static_assert(
         resolveSupportAuthorityMode(WeaponSupportWeaponClass::Sidearm) ==
-        WeaponSupportAuthorityMode::VisualOnlySupport,
-        "A one-handed gun must never be steered by the off-hand: the off-hand is visual glue only");
+            WeaponSupportAuthorityMode::FullTwoHandedSolver,
+        "A sidearm must retain the configured non-zero support-authority floor");
     static_assert(
         resolveSupportAuthorityMode(WeaponSupportWeaponClass::LongGun) ==
-        WeaponSupportAuthorityMode::FullTwoHandedSolver,
+            WeaponSupportAuthorityMode::FullTwoHandedSolver,
         "Long guns keep the rigid two-handed solver");
 
-    inline constexpr bool supportGripOwnsWeaponTransform(WeaponSupportAuthorityMode mode)
+    /*
+     * Class policy and proximity policy compose without letting the near-grip
+     * rule erase a sidearm's steering floor. A pistol support hold is naturally
+     * adjacent to the firing grip, so applying the long-gun handoff radius to a
+     * sidearm would hard-demote virtually every valid pistol cup to visual-only.
+     * Explicit provider AttachOnly/FullTwoHandAuthority modes bypass this local
+     * combination before reaching this helper.
+     */
+    inline constexpr WeaponSupportAuthorityMode combineSupportAuthorityModes(
+        WeaponSupportAuthorityMode classMode,
+        WeaponSupportAuthorityMode proximityMode,
+        WeaponSupportWeaponClass weaponClass =
+            WeaponSupportWeaponClass::Unknown)
     {
-        return mode == WeaponSupportAuthorityMode::FullTwoHandedSolver;
-    }
-
-    inline constexpr bool supportGripAppliesPrimaryHandAuthority(WeaponSupportAuthorityMode mode)
-    {
-        return mode == WeaponSupportAuthorityMode::FullTwoHandedSolver;
-    }
-
-    inline constexpr bool supportGripAppliesSupportHandAuthority(WeaponSupportAuthorityMode)
-    {
-        return true;
-    }
-
-    template <class Transform>
-    inline Transform buildVisualOnlySupportHandWorld(const Transform& weaponWorld, const Transform& supportHandWeaponLocal)
-    {
-        return transform_math::composeTransforms(weaponWorld, supportHandWeaponLocal);
-    }
-
-    inline char lowerAscii(char value)
-    {
-        return value >= 'A' && value <= 'Z' ? static_cast<char>(value - 'A' + 'a') : value;
-    }
-
-    inline std::string_view trimAscii(std::string_view value)
-    {
-        while (!value.empty() && (value.front() == ' ' || value.front() == '\t' || value.front() == '\r' || value.front() == '\n')) {
-            value.remove_prefix(1);
+        if (weaponClass == WeaponSupportWeaponClass::Sidearm &&
+            classMode == WeaponSupportAuthorityMode::FullTwoHandedSolver) {
+            return WeaponSupportAuthorityMode::FullTwoHandedSolver;
         }
-        while (!value.empty() && (value.back() == ' ' || value.back() == '\t' || value.back() == '\r' || value.back() == '\n')) {
-            value.remove_suffix(1);
-        }
-        return value;
+        return (classMode == WeaponSupportAuthorityMode::VisualOnlySupport ||
+                   proximityMode == WeaponSupportAuthorityMode::VisualOnlySupport) ?
+                   WeaponSupportAuthorityMode::VisualOnlySupport :
+                   WeaponSupportAuthorityMode::FullTwoHandedSolver;
     }
 
-    inline bool containsIgnoreCase(std::string_view haystack, std::string_view needle)
+    static_assert(
+        combineSupportAuthorityModes(
+            WeaponSupportAuthorityMode::FullTwoHandedSolver,
+            WeaponSupportAuthorityMode::VisualOnlySupport,
+            WeaponSupportWeaponClass::Sidearm) ==
+            WeaponSupportAuthorityMode::FullTwoHandedSolver,
+        "Near-grip proximity must not hard-demote a sidearm support hold");
+
+    inline constexpr char lowerAscii(char value)
     {
-        needle = trimAscii(needle);
-        if (needle.empty() || needle.size() > haystack.size()) {
+        return (value >= 'A' && value <= 'Z') ? static_cast<char>(value - 'A' + 'a') : value;
+    }
+
+    inline constexpr bool containsIgnoreCase(std::string_view haystack, std::string_view needle)
+    {
+        if (needle.empty() || haystack.size() < needle.size()) {
             return false;
         }
-
         for (std::size_t start = 0; start + needle.size() <= haystack.size(); ++start) {
             bool matched = true;
             for (std::size_t index = 0; index < needle.size(); ++index) {
@@ -211,6 +194,79 @@ namespace rock::weapon_support_authority_policy
 
         return WeaponSupportWeaponClass::Unknown;
     }
+
+    /*
+     * The proximity contract applies uniformly to equipped weapons. Provider-
+     * mandated grab modes are exempt: AttachOnly must never be upgraded and
+     * FullTwoHandAuthority must never be downgraded by local proximity.
+     * The decision is made once at grip capture; changing modes requires
+     * releasing and re-grabbing.
+     */
+    inline constexpr bool canApplyFiringGripProximityAuthority(
+        bool providerGrabModeOverride)
+    {
+        return !providerGrabModeOverride;
+    }
+
+    inline constexpr WeaponSupportAuthorityMode resolveFiringGripProximityAuthorityMode(
+        float supportPalmToFiringGripDistance,
+        float visualOnlyRadius)
+    {
+        return supportPalmToFiringGripDistance <= visualOnlyRadius ?
+                   WeaponSupportAuthorityMode::VisualOnlySupport :
+                   WeaponSupportAuthorityMode::FullTwoHandedSolver;
+    }
+
+    inline constexpr bool supportGripOwnsWeaponTransform(WeaponSupportAuthorityMode mode)
+    {
+        return mode == WeaponSupportAuthorityMode::FullTwoHandedSolver;
+    }
+
+    static_assert(
+        two_handed_weapon_policy::usesRigidSupportGripHandAuthority(
+            true,
+            supportGripOwnsWeaponTransform(
+                resolveSupportAuthorityMode(
+                    WeaponSupportWeaponClass::Sidearm)),
+            false),
+        "A full-solver sidearm must publish a rigid support-hand target");
+    static_assert(
+        two_handed_weapon_policy::usesRigidSupportGripHandAuthority(
+            true,
+            supportGripOwnsWeaponTransform(
+                resolveSupportAuthorityMode(
+                    WeaponSupportWeaponClass::LongGun)),
+            false),
+        "A full-solver long gun must publish a rigid support-hand target");
+
+    inline constexpr bool supportGripAppliesPrimaryHandAuthority(WeaponSupportAuthorityMode mode)
+    {
+        return mode == WeaponSupportAuthorityMode::FullTwoHandedSolver;
+    }
+
+    inline constexpr bool supportGripAppliesSupportHandAuthority(WeaponSupportAuthorityMode)
+    {
+        return true;
+    }
+
+    inline constexpr bool canPromoteSupportGripToFiringGrip(
+        WeaponSupportAuthorityMode mode,
+        bool authoredSupportGrip)
+    {
+        // A non-touch authored seat may be used for presentation under the
+        // visual-only pistol/near-grip contract, but it must never turn that
+        // acquisition into weapon authority. A true-touch dynamic visual grip
+        // retains the established explicit handoff path.
+        return mode != WeaponSupportAuthorityMode::VisualOnlySupport ||
+               !authoredSupportGrip;
+    }
+
+    template <class Transform>
+    inline Transform buildVisualOnlySupportHandWorld(const Transform& weaponWorld, const Transform& supportHandWeaponLocal)
+    {
+        return transform_math::composeTransforms(weaponWorld, supportHandWeaponLocal);
+    }
+
 }
 
 // ---- WeaponSupportGripPolicy.h ----
@@ -238,6 +294,8 @@ namespace rock::weapon_support_grip_policy
         case WeaponPartKind::Handguard:
             return WeaponGripPoseId::HandguardClamp;
         case WeaponPartKind::Barrel:
+        case WeaponPartKind::MuzzleDevice:
+        case WeaponPartKind::Bipod:
             return WeaponGripPoseId::BarrelWrap;
         case WeaponPartKind::Magazine:
         case WeaponPartKind::Magwell:
@@ -255,11 +313,16 @@ namespace rock::weapon_support_grip_policy
         case WeaponPartKind::Lever:
         case WeaponPartKind::Sight:
         case WeaponPartKind::Accessory:
+        case WeaponPartKind::LaserSight:
+        case WeaponPartKind::Flashlight:
+        case WeaponPartKind::LaserFlashlightCombo:
+        case WeaponPartKind::Scope:
             return WeaponGripPoseId::ReceiverSupport;
         case WeaponPartKind::Shell:
         case WeaponPartKind::Round:
         case WeaponPartKind::CosmeticAmmo:
         case WeaponPartKind::Other:
+        case WeaponPartKind::Count:
         default:
             return WeaponGripPoseId::BarrelWrap;
         }
@@ -276,75 +339,33 @@ namespace rock::weapon_support_grip_policy
     }
 }
 
-// ---- WeaponSupportThumbPosePolicy.h ----
-
-/*
- * Two-handed equipped-weapon support grip uses ROCK's mesh probe to decide
- * whether the thumb should follow the alternate thumb path. FRIK's existing
- * scalar pose API can bend the thumb, but it cannot switch the local rotation
- * basis by itself. Keep the publication decision isolated here so the runtime
- * only sends local thumb transforms when the mesh solve selected that alternate
- * path and the provider can actually accept those transforms.
- */
-
-namespace rock::weapon_support_thumb_pose_policy
-{
-    [[nodiscard]] constexpr bool shouldPublishAlternateThumbLocalOverride(
-        const bool solvedFingerPose,
-        const bool usedAlternateThumbCurve,
-        const bool hasLocalTransformApi)
-    {
-        return solvedFingerPose && usedAlternateThumbCurve && hasLocalTransformApi;
-    }
-
-    template <class Vector>
-    [[nodiscard]] constexpr Vector predictThumbNodeWorldForGripFrame(
-        const Vector& liveThumbNodeWorld,
-        const Vector& currentSupportGripPivotWorld,
-        const Vector& targetGripPointWorld)
-    {
-        const Vector supportHandOffset{
-            targetGripPointWorld.x - currentSupportGripPivotWorld.x,
-            targetGripPointWorld.y - currentSupportGripPivotWorld.y,
-            targetGripPointWorld.z - currentSupportGripPivotWorld.z,
-        };
-        return Vector{
-            liveThumbNodeWorld.x + supportHandOffset.x,
-            liveThumbNodeWorld.y + supportHandOffset.y,
-            liveThumbNodeWorld.z + supportHandOffset.z,
-        };
-    }
-
-    template <class Vector>
-    [[nodiscard]] constexpr Vector vectorToGripFromPredictedThumbNode(
-        const Vector& liveThumbNodeWorld,
-        const Vector& currentSupportGripPivotWorld,
-        const Vector& targetGripPointWorld)
-    {
-        const Vector predictedNodeWorld =
-            predictThumbNodeWorldForGripFrame(liveThumbNodeWorld, currentSupportGripPivotWorld, targetGripPointWorld);
-        return Vector{
-            targetGripPointWorld.x - predictedNodeWorld.x,
-            targetGripPointWorld.y - predictedNodeWorld.y,
-            targetGripPointWorld.z - predictedNodeWorld.z,
-        };
-    }
-}
-
 // ---- EquippedWeaponManualOwnershipPolicy.h ----
 
 namespace rock::equipped_weapon_manual_ownership_policy
 {
+    inline constexpr std::uint8_t kPrimaryReleaseConfirmFrames = 2;
+
+    struct GripReleaseDebounceState
+    {
+        std::uint8_t consecutiveOpenFrames{ 0 };
+    };
+
+    struct GripReleaseDebounceDecision
+    {
+        bool retained{ false };
+        bool releaseConfirmed{ false };
+    };
+
     struct RuntimeState
     {
         bool active{ false };
-        std::uint64_t weaponGenerationKey{ 0 };
+        std::uint64_t ownershipKey{ 0 };
     };
 
     struct Input
     {
         bool weaponEquipped{ false };
-        std::uint64_t weaponGenerationKey{ 0 };
+        std::uint64_t ownershipKey{ 0 };
         bool startRequested{ false };
         bool primaryGripRetained{ false };
         bool supportGripRetained{ false };
@@ -362,21 +383,60 @@ namespace rock::equipped_weapon_manual_ownership_policy
     {
         bool pending{ false };
         bool gripHeld{ false };
-        bool configEnabled{ true };
+        bool ownershipModeEnabled{ true };
         bool primaryPoseBlockerAvailable{ true };
+        // Heisenberg-preserved: a VirtualHolsters holster zone owns the grip
+        // button, so a pending primary-only start must not survive into it.
         bool virtualHolstersOwnsInput{ false };
     };
 
+    struct FiringGripModeAvailability
+    {
+        bool primaryDetachEnabled{ false };
+        bool ambidextrousHandoffAvailable{ false };
+    };
+
+    struct HeldWeaponEquipOwnershipInput
+    {
+        FiringGripModeAvailability modes{};
+        bool handIsLeft{ false };
+        bool gripHeld{ false };
+    };
+
+    [[nodiscard]] inline constexpr bool firingGripOwnershipEnabled(const FiringGripModeAvailability& modes) noexcept
+    {
+        return modes.primaryDetachEnabled || modes.ambidextrousHandoffAvailable;
+    }
+
+    [[nodiscard]] inline constexpr bool shouldStartHeldWeaponEquipOwnership(const HeldWeaponEquipOwnershipInput& input) noexcept
+    {
+        return input.gripHeld &&
+               (input.modes.primaryDetachEnabled ||
+                   (input.handIsLeft && input.modes.ambidextrousHandoffAvailable));
+    }
+
+    [[nodiscard]] inline constexpr bool canSettleEquipInGripZone(bool gripZoneEquipEnabled) noexcept
+    {
+        return gripZoneEquipEnabled;
+    }
+
+    [[nodiscard]] inline constexpr bool shouldRetainPrimaryOnlyOwnership(
+        bool primaryDetachEnabled,
+        bool primaryGripHeld) noexcept
+    {
+        return !primaryDetachEnabled || primaryGripHeld;
+    }
+
     [[nodiscard]] inline constexpr bool featureAvailable(
-        bool configEnabled,
+        bool ownershipModeEnabled,
         bool primaryPoseBlockerAvailable,
         bool weaponNodeAvailable,
-        std::uint64_t weaponGenerationKey) noexcept
+        std::uint64_t equippedWeaponOwnershipKey) noexcept
     {
-        return configEnabled &&
+        return ownershipModeEnabled &&
                primaryPoseBlockerAvailable &&
                weaponNodeAvailable &&
-               weaponGenerationKey != 0;
+               equippedWeaponOwnershipKey != 0;
     }
 
     [[nodiscard]] inline constexpr bool shouldKeepPendingPrimaryOnlyStart(const PendingPrimaryOnlyStartInput& input) noexcept
@@ -384,29 +444,84 @@ namespace rock::equipped_weapon_manual_ownership_policy
         // Keep trigger-equip's already-held grip alive across equipped weapon node/collision generation latency.
         return input.pending &&
                input.gripHeld &&
-               input.configEnabled &&
+               input.ownershipModeEnabled &&
                input.primaryPoseBlockerAvailable &&
                !input.virtualHolstersOwnsInput;
+    }
+
+    [[nodiscard]] inline constexpr bool canPreserveManualOwnership(
+        std::uint64_t activeEquippedOwnershipKey,
+        std::uint64_t currentEquippedOwnershipKey,
+        std::uint64_t currentCollisionGenerationKey,
+        bool collisionGenerationRequired = true) noexcept
+    {
+        return activeEquippedOwnershipKey != 0 &&
+               activeEquippedOwnershipKey == currentEquippedOwnershipKey &&
+               (!collisionGenerationRequired || currentCollisionGenerationKey != 0);
+    }
+
+    /*
+     * A firing-grip release that confirms while the support grab is only a
+     * few frames old is part of the SAME physical gesture (reach-over
+     * takeover) or a grab-synchronized grip flicker - never an independent,
+     * deliberate release. Acting on it immediately let a fresh offhand grab
+     * steal the firing role one frame after capture (left-firing round-4
+     * break, 2026-07-12). The window must exceed the release-confirm
+     * debounce so the earliest confirm reachable after a grab is always
+     * deferred; ~5 frames (about 110ms at 45Hz) also outlasts short grip
+     * click flickers while staying imperceptible for deliberate takeovers.
+     */
+    inline constexpr std::uint32_t kFreshSupportGripPrimaryReleaseDeferFrames = 5;
+    static_assert(kFreshSupportGripPrimaryReleaseDeferFrames > kPrimaryReleaseConfirmFrames,
+        "defer window must outlast the release-confirm debounce or a grab-synchronized release acts on its first confirmable frame");
+
+    [[nodiscard]] inline constexpr bool shouldDeferPrimaryReleaseActionForFreshSupportGrip(std::uint32_t supportGripAgeFrames) noexcept
+    {
+        return supportGripAgeFrames <= kFreshSupportGripPrimaryReleaseDeferFrames;
+    }
+
+    [[nodiscard]] inline constexpr GripReleaseDebounceDecision debouncePrimaryGripRelease(
+        GripReleaseDebounceState& state,
+        bool physicallyHeld,
+        std::uint8_t confirmFrames = kPrimaryReleaseConfirmFrames) noexcept
+    {
+        if (physicallyHeld) {
+            state = {};
+            return GripReleaseDebounceDecision{ .retained = true };
+        }
+
+        if (confirmFrames == 0) {
+            state = {};
+            return GripReleaseDebounceDecision{ .releaseConfirmed = true };
+        }
+
+        if (state.consecutiveOpenFrames < confirmFrames) {
+            ++state.consecutiveOpenFrames;
+        }
+        return GripReleaseDebounceDecision{
+            .retained = state.consecutiveOpenFrames < confirmFrames,
+            .releaseConfirmed = state.consecutiveOpenFrames == confirmFrames,
+        };
     }
 
     inline constexpr Decision update(RuntimeState& state, const Input& input) noexcept
     {
         Decision decision{};
 
-        if (!input.weaponEquipped || input.weaponGenerationKey == 0) {
+        if (!input.weaponEquipped || input.ownershipKey == 0) {
             decision.cleared = state.active;
             state = {};
             return decision;
         }
 
-        if (state.active && state.weaponGenerationKey != input.weaponGenerationKey) {
+        if (state.active && state.ownershipKey != input.ownershipKey) {
             decision.cleared = true;
             state = {};
         }
 
         if (!state.active && input.startRequested) {
             state.active = true;
-            state.weaponGenerationKey = input.weaponGenerationKey;
+            state.ownershipKey = input.ownershipKey;
             decision.started = true;
         }
 
@@ -441,6 +556,13 @@ namespace rock::weapon_two_handed_grip_math
         DropEquippedWeapon = 2,
     };
 
+    struct SupportReleaseOwnershipInput
+    {
+        bool firingGripOwnershipEnabled{ false };
+        bool primaryDetachEnabled{ false };
+        bool primaryGripHeld{ false };
+    };
+
     /*
      * Equipped weapon two-hand support has two independent ownership rules:
      * the support hand must be attached to the mesh point it actually touched,
@@ -458,6 +580,34 @@ namespace rock::weapon_two_handed_grip_math
         return result;
     }
 
+    /*
+     * Finger solving keeps the live skeleton in its current authoritative hand
+     * frame and moves the contacted mesh by the inverse of the pending hand-seat
+     * translation. This is rigidly equivalent to moving the hand onto the
+     * weapon, but it lets the regular frozen-target solver, pad probes, and
+     * object-local surface capture all observe one coherent final relation.
+     */
+    template <class Transform, class Vector>
+    inline Transform virtualizeMeshForTranslatedHandSeat(
+        const Transform& meshWorldTransform,
+        const Vector& currentGripPivotWorld,
+        const Vector& targetGripPointWorld)
+    {
+        Transform result = meshWorldTransform;
+        const Vector handSeatCorrection = weaponSolverSub(targetGripPointWorld, currentGripPivotWorld);
+        result.translate = weaponSolverSub(result.translate, handSeatCorrection);
+        return result;
+    }
+
+    template <class Vector>
+    inline Vector virtualizeGripPointForTranslatedHandSeat(
+        const Vector& currentGripPivotWorld,
+        const Vector& targetGripPointWorld)
+    {
+        const Vector handSeatCorrection = weaponSolverSub(targetGripPointWorld, currentGripPivotWorld);
+        return weaponSolverSub(targetGripPointWorld, handSeatCorrection);
+    }
+
     inline bool canStartSupportGrip(bool touchingSupportPart, bool gripPressed, bool supportHandHoldingObject)
     {
         return touchingSupportPart && gripPressed && !supportHandHoldingObject;
@@ -468,22 +618,33 @@ namespace rock::weapon_two_handed_grip_math
         return gripPressed && !supportHandHoldingObject;
     }
 
-    inline constexpr SupportReleaseManualAction resolveSupportReleaseManualAction(bool primaryDetachEnabled, bool primaryGripHeld)
+    inline constexpr SupportReleaseManualAction resolveSupportReleaseManualAction(const SupportReleaseOwnershipInput& input)
     {
-        if (!primaryDetachEnabled) {
+        if (!input.firingGripOwnershipEnabled) {
             return SupportReleaseManualAction::EndSupportOnly;
         }
 
-        return primaryGripHeld ? SupportReleaseManualAction::KeepPrimaryOwnership : SupportReleaseManualAction::DropEquippedWeapon;
-    }
-
-    inline bool canProcessNormalGrabInput(bool isLeft, bool equippedWeaponSupportGripActive, bool rightHandWeaponEquipped, bool primaryHandDetached)
-    {
-        if (isLeft) {
-            return !equippedWeaponSupportGripActive;
+        if (input.primaryGripHeld || !input.primaryDetachEnabled) {
+            return SupportReleaseManualAction::KeepPrimaryOwnership;
         }
 
-        return !rightHandWeaponEquipped || primaryHandDetached;
+        return SupportReleaseManualAction::DropEquippedWeapon;
+    }
+
+    /*
+     * Normal (world) grab gating per hand ROLE, not per physical hand. The
+     * firing hand is blocked while an equipped weapon exists unless it is
+     * detached and free in part-carry; the support hand is blocked only while
+     * its own weapon part grip is active. Roles follow the runtime firing
+     * hand (TwoHandedGrip::isFiringHandLeft()).
+     */
+    inline bool canProcessNormalGrabInput(bool handIsFiringHand, bool weaponEquipped, bool handPartGripActive, bool handDetachedFree)
+    {
+        if (!handIsFiringHand) {
+            return !handPartGripActive;
+        }
+
+        return !weaponEquipped || handDetachedFree;
     }
 
     struct FiringGripReattachInput
@@ -562,11 +723,10 @@ namespace rock
         float minimumSeparation{ 0.001f };
         float supportNormalTwistFactor{ 0.0f };
         bool useSupportNormalTwist{ false };
-        // Jul 25 (pistol grip fix B): when set, roll about the aim axis is referenced
-        // to the LIVE FIRING controller's palm normal (captured weapon-local vs live
-        // world target), pivoted at the PRIMARY grip point — both grip points lie on
-        // the twist axis, so the firing weld is exactly preserved while the firing
-        // hand owns roll. Takes precedence over the support-normal twist.
+        // When active, roll about the aim axis follows the live firing
+        // controller and pivots at the primary grip. This takes precedence over
+        // support-normal twist so the firing hand, not the support palm, owns
+        // weapon roll.
         Vector primaryRollLocal{};
         Vector primaryRollTargetWorld{};
         float primaryRollTwistFactor{ 1.0f };
@@ -581,8 +741,6 @@ namespace rock
         bool solved{ false };
         float primaryError{ 0.0f };
         float supportError{ 0.0f };
-        // Signed roll twist actually applied about the aim axis this solve (0 when the
-        // twist was skipped as degenerate). Diagnostic only.
         float appliedTwistRadians{ 0.0f };
     };
 
@@ -788,17 +946,11 @@ namespace rock
         return weaponSolverAdd(primaryTargetWorld, weaponSolverScale(direction, lockedGripDistance));
     }
 
-    // FIX C (power-armor jitter insurance, secondary): a raw single-frame discontinuity
-    // in the tracked support direction -- from a hand-tracking glitch, a generation-key
-    // rebuild, or a Fix-B-class bone-lookup mismatch -- otherwise latches straight into
-    // the aim target and shows up as unattenuated weapon-aim wobble. This wraps
-    // makeLockedSupportGripTarget with a small per-frame exponential low-pass filter on
-    // the tracked direction so a single bad sample is spread over a few frames instead of
-    // applied immediately, dt-scaled so it does not depend on frame rate. The default time
-    // constant settles roughly 2-4 frames' worth of a step at typical VR frame rates
-    // without perceptibly lagging intentional fast aim motion. smoothedDirectionWorld and
-    // hasSmoothedDirection are caller-owned persistent per-hand state (reset at grip
-    // start/end so a new hold never blends against a stale direction).
+    /*
+     * Low-pass the support direction without changing the locked grip
+     * separation. The state is owned by a single grip episode and reset at
+     * acquisition/release, so a new hold can never inherit stale aim.
+     */
     template <class Vector>
     inline Vector makeSmoothedLockedSupportGripTarget(
         const Vector& primaryTargetWorld,
@@ -828,8 +980,6 @@ namespace rock
         const Vector rawDirection = weaponSolverNormalize(targetAxis);
         Vector direction = rawDirection;
         if (hasSmoothedDirection && smoothingTimeConstantSeconds > 0.0f && dt > 0.0f) {
-            // Exponential low-pass: alpha -> 1 as dt grows relative to the time constant,
-            // so a hitch/stall does not freeze the filter open indefinitely.
             const float alpha = 1.0f - std::exp(-dt / smoothingTimeConstantSeconds);
             const Vector blended = weaponSolverAdd(
                 weaponSolverScale(smoothedDirectionWorld, 1.0f - alpha),
@@ -842,7 +992,6 @@ namespace rock
 
         smoothedDirectionWorld = direction;
         hasSmoothedDirection = true;
-
         return weaponSolverAdd(primaryTargetWorld, weaponSolverScale(direction, lockedGripDistance));
     }
 
@@ -875,38 +1024,38 @@ namespace rock
         result.primaryError = weaponSolverLength(weaponSolverSub(primaryWorld, input.primaryTargetWorld));
         result.supportError = weaponSolverLength(weaponSolverSub(supportWorld, input.supportTargetWorld));
 
-        // Jul 25 (pistol grip fix B): the twist's roll reference. Legacy path: support
-        // palm normal at the configured (partial) factor, pivoted at the SUPPORT point.
-        // Primary-roll path: the LIVE FIRING controller's palm normal at its own factor,
-        // pivoted at the PRIMARY grip point — the firing hand owns roll, so the gun can
-        // no longer roll out of the captured firing grip; both grip points lie on the
-        // twist axis so both welds are preserved exactly. Degenerate projections (palm
-        // normal near-parallel to the aim axis, i.e. near-vertical aim) skip the twist —
-        // the incremental rotation seed then simply carries last frame's roll.
-        const bool primaryRollActive = input.usePrimaryRollTwist && input.primaryRollTwistFactor > 0.0f;
-        if (primaryRollActive || (input.useSupportNormalTwist && input.supportNormalTwistFactor > 0.0f)) {
+        const bool primaryRollActive =
+            input.usePrimaryRollTwist && input.primaryRollTwistFactor > 0.0f;
+        if (primaryRollActive ||
+            (input.useSupportNormalTwist && input.supportNormalTwistFactor > 0.0f)) {
             const Vector twistAxis = weaponSolverNormalize(weaponSolverSub(input.supportTargetWorld, input.primaryTargetWorld));
             const Vector currentNormalWorld = transform_math::localVectorToWorld(
                 result.weaponWorldTransform,
                 primaryRollActive ? input.primaryRollLocal : input.supportNormalLocal);
-            const Vector desiredNormalWorld = primaryRollActive ? input.primaryRollTargetWorld : input.supportNormalTargetWorld;
-            const float twistFactor = primaryRollActive ? input.primaryRollTwistFactor : input.supportNormalTwistFactor;
+            const Vector desiredNormalWorld =
+                primaryRollActive ? input.primaryRollTargetWorld : input.supportNormalTargetWorld;
+            const float twistFactor =
+                primaryRollActive ? input.primaryRollTwistFactor : input.supportNormalTwistFactor;
             const Vector currentProjected = weaponSolverNormalize(weaponSolverProjectOntoPlane(currentNormalWorld, twistAxis));
             const Vector desiredProjected = weaponSolverNormalize(weaponSolverProjectOntoPlane(desiredNormalWorld, twistAxis));
 
             if (weaponSolverLength(currentProjected) > input.minimumSeparation && weaponSolverLength(desiredProjected) > input.minimumSeparation) {
                 const float dotValue = (std::max)(-1.0f, (std::min)(1.0f, weaponSolverDot(currentProjected, desiredProjected)));
                 const Vector crossValue = weaponSolverCross(currentProjected, desiredProjected);
-                const float signedAngle = std::atan2(weaponSolverDot(twistAxis, crossValue), dotValue) * twistFactor;
+                const float signedAngle =
+                    std::atan2(weaponSolverDot(twistAxis, crossValue), dotValue) * twistFactor;
                 result.appliedTwistRadians = signedAngle;
                 const auto twistRotation = weaponSolverAxisAngleStored<decltype(input.weaponWorldTransform.rotate), Vector>(twistAxis, signedAngle);
                 result.rotationDelta =
                     weaponSolverApplyWorldRotationToStoredBasis<decltype(input.weaponWorldTransform.rotate), Vector>(twistRotation, result.rotationDelta);
 
-                const Vector twistPivot = primaryRollActive ? input.primaryTargetWorld : input.supportTargetWorld;
-                const Vector pivotToWeapon = weaponSolverSub(result.weaponWorldTransform.translate, twistPivot);
+                const Vector twistPivot =
+                    primaryRollActive ? input.primaryTargetWorld : input.supportTargetWorld;
+                const Vector pivotToWeapon =
+                    weaponSolverSub(result.weaponWorldTransform.translate, twistPivot);
                 const Vector rotatedPivotToWeapon = weaponSolverApplyStoredWorldRotationToVector<decltype(input.weaponWorldTransform.rotate), Vector>(twistRotation, pivotToWeapon);
-                result.weaponWorldTransform.translate = weaponSolverAdd(twistPivot, rotatedPivotToWeapon);
+                result.weaponWorldTransform.translate =
+                    weaponSolverAdd(twistPivot, rotatedPivotToWeapon);
                 result.weaponWorldTransform.rotate =
                     weaponSolverApplyWorldRotationToStoredBasis<decltype(input.weaponWorldTransform.rotate), Vector>(twistRotation, result.weaponWorldTransform.rotate);
 

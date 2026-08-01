@@ -242,6 +242,29 @@ namespace heisenberg
     bool GetCalibratedPalmLocal(bool isLeft, RE::NiPoint3& outPos, RE::NiPoint3& outDir);
 
     /**
+     * Drop a committed palm calibration so the idle sampler re-measures it.
+     * Used when a consumer detects that the cached frame no longer describes
+     * the live hand (see GetLiveKnuckleCentroidLocal). The per-finger curl
+     * vectors are deliberately retained until the re-measure succeeds.
+     */
+    void InvalidateFingerCalibration(bool isLeft);
+
+    /**
+     * Live centroid of the 5 finger knuckles in hand-local space, sampled
+     * from the current skeleton rather than the calibration cache.
+     *
+     * The knuckle (metacarpal-phalangeal) joint origins do not move when the
+     * fingers curl, so this is a pose-independent witness of where the palm
+     * actually is — the one quantity that can prove a cached calibration was
+     * taken against a different (unsettled) skeleton state. Returns false if
+     * the live finger snapshot is unavailable or incomplete.
+     */
+    bool GetLiveKnuckleCentroidLocal(
+        bool isLeft,
+        RE::NiAVObject* handNode,
+        RE::NiPoint3& outCentroidLocal);
+
+    /**
      * Fetch the hand-local palmar direction (knuckle centroid → palm cup)
      * established at calibration. Used to shift the palm anchor off the
      * dorsal (back of hand) knuckle centroid into the palm cup so grabbed

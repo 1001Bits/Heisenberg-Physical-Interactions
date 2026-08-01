@@ -4,7 +4,9 @@
 #include "physics-interaction/hand/HandSkeleton.h"
 #include "physics-interaction/native/GeneratedKeyframedBodyDrive.h"
 #include "physics-interaction/hand/HandColliderTypes.h"
+#include "physics-interaction/hand/DynamicHandTwinTargets.h"
 #include "physics-interaction/native/HavokPhysicsTiming.h"
+#include "physics-interaction/native/PhysicsCallbackQuiescenceGate.h"
 
 #include "RE/Havok/hknpShape.h"
 #include "RE/Havok/hknpWorld.h"
@@ -14,7 +16,6 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
-#include <vector>
 
 namespace rock
 {
@@ -31,22 +32,19 @@ namespace rock
         float sampledLinearVelocityHavok[4]{};
     };
 
-    struct HandColliderFrameSnapshot
-    {
-        bool valid = false;
-        hand_collider_semantics::HandColliderRole role =
-            hand_collider_semantics::HandColliderRole::PalmAnchor;
-        RE::NiTransform transform{};
-        float lengthGameUnits = 0.0f;
-        float radiusGameUnits = 0.0f;
-        float convexRadiusGameUnits = 0.0f;
-    };
-
     class HandBoneColliderSet
     {
     public:
         HandBoneColliderSet();
 
+        void setPhysicsCallbackGate(PhysicsCallbackQuiescenceGate* gate) { _physicsCallbackGate = gate; }
+
+        // authorityTranslationOffsetGame: Heisenberg-preserved grab-locomotion
+        // authority lead (upstream removed the subsystem in 6452acd). The bone
+        // lookup reads the LIVE skeleton, which does not carry the bridge lead
+        // that PhysicsInteractionFrame.inl already added to rawHandWorld, so the
+        // same offset has to be re-applied to every captured bone frame or the
+        // colliders trail the grab hand while the player is moving.
         bool create(
             RE::hknpWorld* world,
             void* bhkWorld,
@@ -56,23 +54,13 @@ namespace rock
             const RE::NiPoint3& authorityTranslationOffsetGame = RE::NiPoint3{});
         void destroy(void* bhkWorld, BethesdaPhysicsBody& palmAnchorBody);
         void reset();
-        // suppressionActive: true while ANY Hand collision-suppression lease (grab hold,
-        // host-external, held-loose-weapon) references these colliders' bodyIds. Mirrors
-        // the existing palmAnchorBody.isConstrained() rebuild-deferral: an internal rebuild
-        // (drive failure, source/tuning change) destroys all 16 bodies and creates
-        // replacements with FRESH bodyIds and the plain unsuppressed filter, and nothing
-        // re-arms the caller's suppression leases for the new ids afterward - without this,
-        // a mid-hold rebuild (skeleton refresh, power-armor enter/exit, tuning INI reload)
-        // silently un-suppresses the hand colliders while the caller still believes
-        // collision is off, producing contact-force jitter on the held object.
         void update(
             RE::hknpWorld* world,
             bool isLeft,
             const RE::NiTransform& rollAuthorityWorld,
             BethesdaPhysicsBody& palmAnchorBody,
             float deltaTime,
-            const RE::NiPoint3& authorityTranslationOffsetGame = RE::NiPoint3{},
-            bool suppressionActive = false);
+            const RE::NiPoint3& authorityTranslationOffsetGame = RE::NiPoint3{});
         void flushPendingPhysicsDrive(RE::hknpWorld* world, const havok_physics_timing::PhysicsTimingSample& timing, BethesdaPhysicsBody& palmAnchorBody);
 
         bool hasBodies() const { return _created; }
@@ -81,18 +69,38 @@ namespace rock
         bool isColliderBodyIdAtomic(std::uint32_t bodyId) const;
         bool tryGetBodyMetadataAtomic(std::uint32_t bodyId, HandColliderBodyMetadata& outMetadata) const;
         bool tryGetBodyRoleAtomic(std::uint32_t bodyId, hand_collider_semantics::HandColliderRole& outRole) const;
-        bool tryGetCollisionFrame(
-            std::uint32_t bodyId,
-            HandColliderFrameSnapshot& outFrame) const;
         bool tryGetPalmAnchorTarget(RE::NiTransform& outTarget) const;
+        /*
+         * EMBEDDED-HOST SEAM: hull sample points (world) + convex radii for the
+         * host's own contact reasoning. Uses the collision frames cached by the
+         * last update(), so it is safe to call from the host frame thread.
+         */
         std::uint32_t copyCollisionSamples(
             RE::NiPoint3* outWorldPoints,
             float* outRadiiGame,
             std::uint32_t maxSamples) const;
 
+        /*
+         * Stage A dynamic-twin publication (main thread only): the exact palm
+         * anchor and fingertip role frames this set drives its keyframed bodies
+         * with, refreshed every update. buildDynamicTwinShape builds the same
+         * hull the keyframed twin uses for those dimensions.
+         */
+        const dynamic_hand_twin::TwinTargets& dynamicTwinTargets() const { return _dynamicTwinTargets; }
+        RE::hknpShape* buildDynamicTwinShape(const dynamic_hand_twin::TwinSlotFrame& slotFrame, bool isPalm) const;
+
     private:
         static constexpr std::size_t MAX_SEGMENT_BODIES = hand_collider_semantics::kHandSegmentColliderBodyCountPerHand;
         static constexpr std::uint32_t kInvalidPublicationIndex = 0xFFFF'FFFFu;
+
+        struct RoleFrameResult
+        {
+            bool valid = false;
+            RE::NiTransform transform{};
+            float length = 1.0f;
+            float radius = 0.5f;
+            float convexRadius = 0.1f;
+        };
 
         struct BodyInstance
         {
@@ -102,10 +110,8 @@ namespace rock
             bool ownsShapeRef = false;
             GeneratedKeyframedBodyDriveState driveState{};
             std::uint32_t publicationIndex = kInvalidPublicationIndex;
-            RE::NiTransform collisionFrameTransform{};
-            float collisionFrameLength = 1.0f;
-            float collisionFrameRadius = 0.5f;
-            float collisionFrameConvexRadius = 0.1f;
+            // Host-seam cache: last frame this body was driven from.
+            RoleFrameResult collisionFrame{};
             bool collisionFrameValid = false;
         };
 
@@ -122,26 +128,17 @@ namespace rock
             bool hasForearm3 = false;
         };
 
-        struct RoleFrameResult
-        {
-            bool valid = false;
-            RE::NiTransform transform{};
-            float length = 1.0f;
-            float radius = 0.5f;
-            float convexRadius = 0.1f;
-        };
-
         bool captureBoneLookup(
             bool isLeft,
             const RE::NiTransform& rollAuthorityWorld,
-            const RE::NiPoint3& authorityTranslationOffsetGame,
-            BoneFrameLookup& outLookup);
+            BoneFrameLookup& outLookup,
+            const RE::NiPoint3& authorityTranslationOffsetGame = RE::NiPoint3{});
         void applyAuthorityTranslationOffset(BoneFrameLookup& lookup, const RE::NiPoint3& authorityTranslationOffsetGame) const;
         bool makeRoleFrame(const BoneFrameLookup& lookup, bool isLeft, hand_collider_semantics::HandColliderRole role, RoleFrameResult& outFrame) const;
+        RE::hknpShape* buildShapeForRole(const RoleFrameResult& frame, hand_collider_semantics::HandColliderRole role) const;
         std::vector<RE::NiPoint3> makeLocalCollisionPointsForRole(
             const RoleFrameResult& frame,
             hand_collider_semantics::HandColliderRole role) const;
-        RE::hknpShape* buildShapeForRole(const RoleFrameResult& frame, hand_collider_semantics::HandColliderRole role) const;
         bool createBodyForRole(RE::hknpWorld* world, void* bhkWorld, bool isLeft, hand_collider_semantics::HandColliderRole role, const RoleFrameResult& frame, BodyInstance& instance);
         void queueBodyTarget(BethesdaPhysicsBody& body, const RE::NiTransform& target, float sourceDeltaSeconds, GeneratedKeyframedBodyDriveState& driveState, std::uint32_t publicationIndex);
         void handleGeneratedBodyDriveResult(const GeneratedKeyframedBodyDriveResult& result, const char* ownerName, std::uint32_t bodyIndex);
@@ -150,14 +147,16 @@ namespace rock
         void publishSampledVelocityAtomic(std::uint32_t publicationIndex, const GeneratedKeyframedBodyDriveQueueResult& queueResult);
         void clearAtomicBodyIds();
 
-        DirectSkeletonBoneReader _reader;
         std::array<BodyInstance, MAX_SEGMENT_BODIES> _bodies{};
+        RoleFrameResult _palmAnchorCollisionFrame{};
         RE::hknpWorld* _cachedWorld = nullptr;
         void* _cachedBhkWorld = nullptr;
         GeneratedKeyframedBodyDriveState _palmAnchorDriveState{};
         RE::NiTransform _latestPalmAnchorTarget{};
         bool _hasLatestPalmAnchorTarget = false;
-        RoleFrameResult _palmAnchorCollisionFrame{};
+        dynamic_hand_twin::TwinTargets _dynamicTwinTargets{};
+        dynamic_hand_twin::TwinTargets _canonicalDynamicTwinDimensions{};
+        PhysicsCallbackQuiescenceGate* _physicsCallbackGate = nullptr;
         const void* _cachedSkeleton = nullptr;
         const void* _cachedBoneTree = nullptr;
         bool _cachedPowerArmor = false;
@@ -170,6 +169,7 @@ namespace rock
         std::atomic<std::uint32_t> _driveFailureCount{ 0 };
         std::uint32_t _palmAnchorPublicationIndex = kInvalidPublicationIndex;
         bool _created = false;
+        std::uint64_t _dynamicTwinGeometryGeneration = 0;
         int _updateLogCounter = 0;
 
         std::array<std::atomic<std::uint32_t>, hand_collider_semantics::kHandColliderBodyCountPerHand> _bodyIdsAtomic{};

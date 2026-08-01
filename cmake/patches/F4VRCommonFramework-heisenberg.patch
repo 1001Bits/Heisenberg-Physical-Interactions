@@ -1,0 +1,39 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 7deb4ea..d4ed1be 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-cmake_minimum_required(VERSION 4.2)
++cmake_minimum_required(VERSION 4.0)
+ 
+ 
+ # >>> Project
+diff --git a/src/f4vr/F4VRUtils.cpp b/src/f4vr/F4VRUtils.cpp
+index d7a3c20..3c6bdeb 100644
+--- a/src/f4vr/F4VRUtils.cpp
++++ b/src/f4vr/F4VRUtils.cpp
+@@ -123,19 +123,13 @@ namespace f4cf::f4vr
+         return IsSneaking(getPlayer());
+     }
+ 
+-    // Thanks Shizof and SmoothMovementVR for below code
++    // Use Fallout's native authoritative PowerArmor::ActorInPowerArmor result.
++    // The reverse-engineered biped slot walk reports false in live VR for
++    // some valid power-armor states and poisons skeleton/profile caches.
+     bool isInPowerArmor()
+     {
+-        const auto biped = getPlayer()->biped.get();
+-        if (!biped) {
+-            return false;
+-        }
+-        const auto* equippedForm = biped->object[0x03].parent.object;
+-        if (!equippedForm || equippedForm->formType != RE::ENUM_FORM_ID::kARMO) {
+-            return false;
+-        }
+-        const auto* armor = static_cast<const RE::TESObjectARMO*>(equippedForm);
+-        return hasKeyword(armor, KEYWORD_POWER_ARMOR) || hasKeyword(armor, KEYWORD_POWER_ARMOR_FRAME);
++        const auto player = getPlayer();
++        return player && PowerArmor_ActorInPowerArmor(player);
+     }
+ 
+     /**

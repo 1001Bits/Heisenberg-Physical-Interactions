@@ -67,7 +67,10 @@ namespace heisenberg
         // Resolve a Havok body ID to a reference for immediate use.
         RE::TESObjectREFR* GetRefrFromBodyId(void* bhkWorld, std::uint32_t bodyId);
 
-        // Check if an object can be grabbed
+        // Check whether an object is a physics-interactable grab candidate. This
+        // intentionally does not apply the oversized-object ceiling: proximity
+        // contact, push and haptics consume the same predicate. The final,
+        // centralized grab commit in GrabManager::StartGrab applies that ceiling.
         bool IsGrabbable(RE::TESObjectREFR* refr);
 
         /**
@@ -282,7 +285,8 @@ namespace heisenberg
 
         /**
          * Enable or disable player collision with world objects.
-         * Used to let hands reach through player hitbox to touch activators.
+         * Legacy low-level recovery API. Activator reach must not disable the
+         * player's global collision body; prefer pair-specific collision filters.
          * @param enabled True to enable normal collision, false to disable
          * @return True if successful
          */

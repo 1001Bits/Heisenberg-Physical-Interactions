@@ -215,6 +215,7 @@ namespace heisenberg
         void Initialize();
         void Update(float deltaTime);
         void ClearState();
+        void SetEnabled(bool enabled);
 
         // Public accessors for other systems
         bool IsLeftHandInWater() const { return _leftHand.isSubmerged; }
@@ -271,8 +272,10 @@ namespace heisenberg
 
         // Splash NIF scale override
         void ApplySplashNifScales();
+        void RestoreSplashNifScales();
         bool _lastNifEnabled = true;
         float _lastNifScale = 1.0f;
+        bool _splashScalesApplied = false;
 
         // Splash amount computation
         float ComputeEntrySplashAmount(float downSpeed) const;

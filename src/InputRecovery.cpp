@@ -13,9 +13,9 @@
 /*
  * POST-LOAD INPUT RECOVERY (Jul 26).
  *
- * Symptom being chased: loading a save that was CREATED IN A VANILLA (mod-free) setup leaves the
- * player unable to move or jump, while looking/turning, menus, and VR tracking all still work. A
- * save created at the same spot in a modded new game loads fine. Movement+jump dead with looking
+ * Symptom being chased: adding/updating Heisenberg on an existing save (including a save that
+ * already serialized a prior Heisenberg/menu input state) can leave the player unable to move or
+ * jump, while looking/turning, menus, and VR tracking still work. Movement+jump dead with looking
  * alive is the signature of the engine's player-control gating (USER_EVENT_FLAG kMovement /
  * kJumping), NOT of a dead controller axis and NOT of FRIK's thumbstick deadzone trick (a deadzone
  * cannot disable a jump BUTTON).
@@ -39,10 +39,10 @@
  *      events instead" comments), so the typed reads below are corroborated by, not trusted over,
  *      the raw words. The layer debug names should name the culprit outright.
  *
- *   2. HEAL. Re-assert un-restrained + force-enable the movement family at each checkpoint, so a
- *      stale lock cannot outlive the load. Gated by bPostLoadInputRecovery; skipped whenever a
- *      menu that legitimately owns the controls is open, so a real cutscene/terminal/dialogue lock
- *      is never stomped.
+ *   2. HEAL. Release only positively identified input layers whose owning menu is no longer open,
+ *      then perform the legacy one-shot post-load actor-unrestrain used for old saves. We never
+ *      write BSInputEnableManager's process-global force-enable words: those have no ownership
+ *      model, survive after this watchdog disarms, and can override another mod or menu.
  *
  * SEH rule for this file: every raw/engine read happens inside a wrapper function whose __try
  * frame constructs no C++ objects (MSVC C2712). Formatting and logging happen after the guarded
@@ -60,6 +60,7 @@ namespace heisenberg::InputRecovery
         constexpr std::size_t kOffCachedOther = 0x11C;
         constexpr std::size_t kOffForceUser = 0x120;
         constexpr std::size_t kOffForceOther = 0x124;
+        constexpr std::uint32_t kMovementJumpMask = (1u << 0) | (1u << 10);
 
         // The user-event bits a stale control-disable layer strips. Measured from the failing
         // save: a leftover 'PauseMenu Input Layer' carried 0xFFFFFEBA, i.e. Movement, Activate,
@@ -87,6 +88,9 @@ namespace heisenberg::InputRecovery
 
         std::atomic<std::uint64_t> s_loadCompleteTick{ 0 };
         std::atomic<std::uint32_t> s_nextCheckpoint{ kCheckpointCount };
+        // Retain the old-save movement recovery, but make it a one-shot instead of repeatedly
+        // clearing actor restraint for the full 30-second watchdog window.
+        std::atomic<bool> s_postLoadUnrestrainPending{ false };
 
         struct Snapshot
         {
@@ -283,6 +287,13 @@ namespace heisenberg::InputRecovery
 
     void LogInputEnableState(const char* tag)
     {
+        // Layer-name copies, flag descriptions, and the raw manager dump are
+        // forensic diagnostics. Avoid all of that work in normal release
+        // logging; targeted recovery below still runs at every checkpoint.
+        if (!spdlog::should_log(spdlog::level::debug)) {
+            return;
+        }
+
         auto* mgr = RE::BSInputEnableManager::GetSingleton();
         if (!mgr) {
             spdlog::warn("[INPUT-DIAG] {}: BSInputEnableManager singleton is null", tag);
@@ -295,7 +306,7 @@ namespace heisenberg::InputRecovery
             return;
         }
 
-        spdlog::info(
+        spdlog::debug(
             "[INPUT-DIAG] {}: cachedUser=0x{:08X} ({}) cachedOther=0x{:08X} "
             "forceUser=0x{:08X} ({}) forceOther=0x{:08X} layers={} names={} inSaveLoad={}",
             tag,
@@ -311,7 +322,7 @@ namespace heisenberg::InputRecovery
 
         const std::uint32_t layerCap = snap.layerCount < kMaxLayers ? snap.layerCount : kMaxLayers;
         for (std::uint32_t i = 0; i < layerCap; ++i) {
-            spdlog::info(
+            spdlog::debug(
                 "[INPUT-DIAG] {}:   layer[{}] '{}' user=0x{:08X} ({}) other=0x{:08X}",
                 tag,
                 i,
@@ -329,13 +340,14 @@ namespace heisenberg::InputRecovery
             std::snprintf(chunk, sizeof(chunk), "%03zX=%08X ", kDumpBase + i * 4, snap.words[i]);
             raw += chunk;
         }
-        spdlog::info("[INPUT-DIAG] {}:   raw {}", tag, raw);
+        spdlog::debug("[INPUT-DIAG] {}:   raw {}", tag, raw);
     }
 
     void OnLoadComplete()
     {
         s_loadCompleteTick.store(GetTickCount64(), std::memory_order_release);
         s_nextCheckpoint.store(0, std::memory_order_release);
+        s_postLoadUnrestrainPending.store(true, std::memory_order_release);
         spdlog::info("[INPUT-DIAG] post-load input watchdog armed ({} checkpoints)", kCheckpointCount);
     }
 
@@ -362,16 +374,23 @@ namespace heisenberg::InputRecovery
             return;
         }
         if (BlockingMenuOpen()) {
-            spdlog::info("[INPUT-DIAG] {}: heal skipped - a control-owning menu is open", tag);
+            spdlog::debug("[INPUT-DIAG] {}: heal skipped - a control-owning menu is open", tag);
             return;
         }
 
-        // Re-assert both mechanisms that can strand movement across a load. Both are idempotent
-        // no-ops when the player is already free, and the NEXT checkpoint's dump shows whether the
-        // write actually moved the engine's state - which is the point of doing it more than once.
-        if (auto* player = RE::PlayerCharacter::GetSingleton()) {
-            f4cf::f4vr::SetActorRestrained(player, false);
+        // Preserve the old-save movement repair, but perform it once at the first checkpoint at
+        // which no legitimate control-owning menu is open. Repeating this for 30 seconds could
+        // continually defeat a scripted restraint that begins after load.
+        bool unrestrained = false;
+        if (s_postLoadUnrestrainPending.load(std::memory_order_acquire)) {
+            if (auto* player = RE::PlayerCharacter::GetSingleton()) {
+                f4cf::f4vr::SetActorRestrained(player, false);
+                s_postLoadUnrestrainPending.store(false, std::memory_order_release);
+                unrestrained = true;
+            }
         }
+
+        int releasedLayers = 0;
         if (auto* mgr = RE::BSInputEnableManager::GetSingleton()) {
             // PRIMARY REPAIR: release input-enable layers that a menu stranded in the savegame.
             //
@@ -385,21 +404,28 @@ namespace heisenberg::InputRecovery
             //
             // Restoring the layer to fully-permissive is precisely what closing the menu would
             // have done. Only layers whose owning menu is provably NOT open are touched.
-            ReleaseStrandedMenuLayers(mgr, tag);
+            releasedLayers = ReleaseStrandedMenuLayers(mgr, tag);
 
-            // MASK IS DELIBERATELY MINIMAL — kMovement|kJumping and nothing else.
-            //
-            // In VR the user-event and other-event flag spaces ALIAS each other inside the single
-            // forceEnableInputUserEventsFlags word: ForceOtherEventEnabledVR
-            // (BSInputEnableManager.h:152-160) casts an OEFlag straight into it. So
-            // UEFlag::kSneaking(0x80) IS OEFlag::kZKey, kLooking(0x02) IS kActivation, and
-            // kPOVSwitch(0x20) IS kFavorites — all three of which Heisenberg deliberately CLEARS
-            // elsewhere (Heisenberg.cpp:1718 kZKey, :1729 kActivation). A wide "re-enable
-            // everything" mask therefore silently re-arms input Heisenberg is intentionally
-            // suppressing. Only the two bits matching the reported symptom (cannot move, cannot
-            // jump, CAN turn) are asserted here; kMovement aliases the harmless kJournalTabs.
-            mgr->ForceUserEventEnabled(UEFlag::kMovement | UEFlag::kJumping, true);
+            Snapshot after{};
+            if (CaptureGuarded(mgr, after) &&
+                (after.cachedUser & kMovementJumpMask) != kMovementJumpMask) {
+                // Unknown/script-owned layers are diagnostic only. Guessing at their ownership
+                // is more dangerous than leaving a real quest/cutscene lock intact.
+                spdlog::warn(
+                    "[INPUT-DIAG] {}: movement remains gated after targeted recovery "
+                    "(cachedUser=0x{:08X}, missing=0x{:08X}); no global override applied",
+                    tag,
+                    after.cachedUser,
+                    kMovementJumpMask & ~after.cachedUser);
+            }
         }
-        spdlog::info("[INPUT-DIAG] {}: heal applied (unrestrain + force-enable movement family)", tag);
+        if (unrestrained || releasedLayers > 0) {
+            spdlog::info(
+                "[INPUT-DIAG] {}: targeted recovery applied (actorUnrestrained={}, "
+                "strandedLayersReleased={}, globalForceOverride=no)",
+                tag,
+                unrestrained ? "yes" : "no",
+                releasedLayers);
+        }
     }
 }

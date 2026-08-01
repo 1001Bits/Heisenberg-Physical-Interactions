@@ -5,6 +5,8 @@
 #include "../external/ROCK/src/physics-interaction/grab/TouchGrabBridge.h"
 #include "../external/ROCK/src/physics-interaction/native/HavokRuntime.h"
 #include "../external/ROCK/src/physics-interaction/TransformMath.h"
+#include "../external/ROCK/src/physics-interaction/weapon/LooseWeaponGripZone.h"
+#include "../external/ROCK/src/physics-interaction/weapon/NativeScopeReentryPolicy.h"
 #include "DropToHand.h"
 #include "DualWieldAPI.h"
 #include "F4VROffsets.h"
@@ -12,6 +14,7 @@
 #include "FRIKInterface.h"
 #include "GrabConstraint.h"
 #include "GrabPosePolicy.h"
+#include "HeldCollisionBodySetPolicy.h"
 #include "HandCollision.h"
 #include "Hand.h"
 #include "Heisenberg.h"
@@ -32,6 +35,7 @@
 #include "f4vr/PlayerNodes.h"
 #include "f4vr/F4VRUtils.h"
 #include "RE/Bethesda/UI.h"
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -39,6 +43,13 @@
 #include <limits>
 #include <memory>
 #include <sstream>
+
+namespace
+{
+    constexpr const char* OBJECT_COHOLD_HAND_TAG =
+        "Heisenberg_ObjectCoHold";
+    constexpr int OBJECT_COHOLD_HAND_PRIORITY = 95;
+}
 
 // =====================================================================
 // bhkNPCollisionProxyObject - Proxy collision object structure
@@ -187,6 +198,44 @@ namespace heisenberg
     static RE::bhkNPCollisionObject*
     TryResolveNpcCollisionObjectFromRaw(
         RE::NiCollisionObject* rawCollision);
+
+    static constexpr std::size_t kMaxCollisionWrappers = 64;
+    struct CollisionWrapperSet
+    {
+        std::array<
+            RE::bhkNPCollisionObject*,
+            kMaxCollisionWrappers>
+            wrappers{};
+        std::array<bool, kMaxCollisionWrappers> visible{};
+        std::uint32_t count = 0;
+        std::uint32_t totalWrapperCount = 0;
+        bool overflowed = false;
+
+        [[nodiscard]] bool Contains(
+            const RE::bhkNPCollisionObject* collision) const
+        {
+            for (std::uint32_t i = 0; i < count; ++i) {
+                if (wrappers[i] == collision) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        [[nodiscard]] bool IsVisible(
+            const RE::bhkNPCollisionObject* collision) const
+        {
+            for (std::uint32_t i = 0; i < count; ++i) {
+                if (wrappers[i] == collision) {
+                    return visible[i];
+                }
+            }
+            return false;
+        }
+    };
+
+    static CollisionWrapperSet CollectCollisionWrappers(
+        RE::NiAVObject* referenceRoot);
 }
 
 namespace
@@ -211,6 +260,12 @@ namespace
 
     bool ApplyRuntimeFingerCurls(const heisenberg::GrabState& state, bool isLeft)
     {
+        if (state.rockRichFingerPosePublished) {
+            // The ROCK_Grab registry winner is persistent and is re-applied
+            // after FRIK each frame. Re-sending the lossy curl-only API here
+            // would erase splay and local surface corrections on 0.77.12.
+            return true;
+        }
         if (!state.hasRuntimeFingerCurls) {
             return false;
         }
@@ -385,9 +440,16 @@ namespace
             }
         }
 
+        // CALIBRATED local -> world uses the row-vector convention:
+        //   world = rotate.Transpose() * (local * scale) + translate.
+        // The calibration that produced palmLocal/dirLocal now measures in the
+        // true hand-local basis (FingerCurves InverseTransformPoint), so this
+        // side must transpose. Previously BOTH sides used the row basis and
+        // round-tripped, which hid the error until a re-measure at a different
+        // wrist orientation returned a different "hand-local" palm.
         const auto& xform = skinned->world;
-        outPos = xform.rotate * (palmLocal * xform.scale) + xform.translate;
-        outDir = heisenberg::VectorNormalized(xform.rotate * dirLocal);
+        outPos = xform.rotate.Transpose() * (palmLocal * xform.scale) + xform.translate;
+        outDir = heisenberg::VectorNormalized(xform.rotate.Transpose() * dirLocal);
         return true;
     }
 
@@ -421,7 +483,12 @@ namespace
             heisenberg::g_config.palmVectorZ);
         if (isLeft) palmVectorLocal.x *= -1.0f;
 
-        return heisenberg::VectorNormalized(handNode->world.rotate * palmVectorLocal);
+        // Row-vector convention: local -> world is rotate.Transpose() * local.
+        // Using `rotate * local` here does NOT describe a fixed hand-local
+        // direction — it is off by R^2, so it swung with the wrist and no INI
+        // value could have made it stable (which is why the config palm never
+        // felt tunable). See the note in GetCalibratedPalmWorld.
+        return heisenberg::VectorNormalized(handNode->world.rotate.Transpose() * palmVectorLocal);
     }
 
     // HIGGS-style palm position. See GetPalmDirection for the frame rationale:
@@ -445,8 +512,793 @@ namespace
             heisenberg::g_config.palmPositionZ);
         if (isLeft) palmPosLocal.x *= -1.0f;
 
+        // Row-vector local -> world (see GetPalmDirection).
         const auto& xform = handNode->world;
-        return xform.rotate * (palmPosLocal * xform.scale) + xform.translate;
+        return xform.rotate.Transpose() * (palmPosLocal * xform.scale) + xform.translate;
+    }
+
+    // Palm input for any solver that also publishes rendered-hand authority.
+    // HostGetPreAuthorityHandWorld is captured after FRIK but before authority
+    // writers, so it cannot contain this solver's previous output.  If that
+    // same-frame seam or finger calibration is unavailable, deliberately use
+    // the controller/wand frame rather than reading the skinned hand.
+    bool GetCleanTrackedPalmPosition(
+        RE::NiAVObject* wandNode,
+        bool isLeft,
+        RE::NiPoint3& outPos)
+    {
+        RE::NiPoint3 palmLocal{};
+        RE::NiPoint3 directionLocal{};
+        RE::NiTransform cleanHandWorld{};
+        if (rock::HostGetPreAuthorityHandWorld(
+                isLeft,
+                cleanHandWorld) &&
+            heisenberg::GetCalibratedPalmLocal(
+                isLeft,
+                palmLocal,
+                directionLocal)) {
+            const float depth =
+                heisenberg::g_config.palmDepthOffset;
+            if (depth != 0.0f) {
+                RE::NiPoint3 palmarLocal{};
+                if (heisenberg::GetCalibratedPalmarLocal(
+                        isLeft,
+                        palmarLocal)) {
+                    palmLocal =
+                        palmLocal + palmarLocal * depth;
+                }
+            }
+
+            // Calibrated local -> world: transpose (see GetCalibratedPalmWorld).
+            outPos =
+                cleanHandWorld.rotate.Transpose() *
+                    (palmLocal * cleanHandWorld.scale) +
+                cleanHandWorld.translate;
+            if (std::isfinite(outPos.x) &&
+                std::isfinite(outPos.y) &&
+                std::isfinite(outPos.z)) {
+                return true;
+            }
+        }
+
+        if (!wandNode) {
+            return false;
+        }
+
+        RE::NiPoint3 wandPalmLocal(
+            heisenberg::g_config.palmPositionX,
+            heisenberg::g_config.palmPositionY,
+            heisenberg::g_config.palmPositionZ);
+        if (isLeft) {
+            wandPalmLocal.x *= -1.0f;
+        }
+        const auto& wandWorld = wandNode->world;
+        outPos =
+            wandWorld.rotate *
+                (wandPalmLocal * wandWorld.scale) +
+            wandWorld.translate;
+        return std::isfinite(outPos.x) &&
+               std::isfinite(outPos.y) &&
+               std::isfinite(outPos.z);
+    }
+
+    // The knuckle centroid does not move when the fingers curl, so a cached
+    // calibration whose anchor no longer matches a LIVE knuckle sample was
+    // taken against a different skeleton state and describes a palm that does
+    // not exist. Measured Jul 30: a LEFT calibration committed 14 ms after a
+    // load sat 5.3 units (and 65 degrees) away from what the same hand
+    // measured after the next load, which laid grabbed armor flat against a
+    // plane nowhere near the hand. This check works at grab time, when the
+    // hand is gripping and the idle-only re-calibration cannot run.
+    inline constexpr float kCalibratedPalmLiveDriftLimit = 2.5f;
+
+    bool CalibratedPalmFrameMatchesLiveHand(
+        bool isLeft,
+        RE::NiAVObject* skinnedHand,
+        const RE::NiPoint3& calibratedPalmLocal)
+    {
+        RE::NiPoint3 liveKnuckleCentroidLocal{};
+        if (!heisenberg::GetLiveKnuckleCentroidLocal(
+                isLeft,
+                skinnedHand,
+                liveKnuckleCentroidLocal)) {
+            // No live witness this frame — keep the cached frame rather than
+            // discarding a good calibration over a transient snapshot miss.
+            return true;
+        }
+
+        const float drift =
+            heisenberg::Utils::VectorLength(
+                liveKnuckleCentroidLocal - calibratedPalmLocal);
+        if (!std::isfinite(drift) ||
+            drift <= kCalibratedPalmLiveDriftLimit) {
+            return true;
+        }
+
+        spdlog::warn(
+            "[FINGER-CAL] {} hand palm anchor disagrees with the live "
+            "knuckles by {:.2f} units (cached=({:.2f},{:.2f},{:.2f}) "
+            "live=({:.2f},{:.2f},{:.2f})) — dropping the stale calibration "
+            "and seating from the configured wand palm",
+            isLeft ? "LEFT" : "RIGHT",
+            drift,
+            calibratedPalmLocal.x,
+            calibratedPalmLocal.y,
+            calibratedPalmLocal.z,
+            liveKnuckleCentroidLocal.x,
+            liveKnuckleCentroidLocal.y,
+            liveKnuckleCentroidLocal.z);
+        heisenberg::InvalidateFingerCalibration(isLeft);
+        return false;
+    }
+
+    bool GetPalmSurfaceSeatFrame(
+        RE::NiAVObject* wandNode,
+        bool isLeft,
+        RE::NiTransform& outParentWorld,
+        RE::NiPoint3& outPalmWorld,
+        RE::NiPoint3& outPalmarWorld,
+        bool& outUsesSkinnedHand)
+    {
+        outUsesSkinnedHand = false;
+
+        RE::NiPoint3 palmLocal{};
+        RE::NiPoint3 fingerForwardLocal{};
+        RE::NiPoint3 palmarLocal{};
+        if (RE::NiNode* skinned = GetSkinnedHandNode(isLeft);
+            skinned &&
+            heisenberg::GetCalibratedPalmLocal(
+                isLeft,
+                palmLocal,
+                fingerForwardLocal) &&
+            heisenberg::GetCalibratedPalmarLocal(
+                isLeft,
+                palmarLocal) &&
+            CalibratedPalmFrameMatchesLiveHand(isLeft, skinned, palmLocal)) {
+            const float depth =
+                heisenberg::g_config.palmDepthOffset;
+            palmLocal += palmarLocal * depth;
+            outParentWorld = skinned->world;
+            // Calibrated local -> world: transpose (see GetCalibratedPalmWorld).
+            outPalmWorld =
+                outParentWorld.rotate.Transpose() *
+                    (palmLocal * outParentWorld.scale) +
+                outParentWorld.translate;
+            outPalmarWorld =
+                heisenberg::VectorNormalized(
+                    outParentWorld.rotate.Transpose() * palmarLocal);
+            outUsesSkinnedHand = true;
+        } else if (wandNode) {
+            // The wand fallback uses the SAME row-vector convention. Its
+            // "local" is the INI constants palmPosition*/palmVector*, and it is
+            // tempting to argue those were eyeball-tuned against the old
+            // untransposed form and should be left alone. That argument does not
+            // survive the algebra: `rotate * p_const` is not a fixed wand-local
+            // point at all — matching a fixed point would require p_const to be
+            // R^2-corrected, i.e. to change with the wrist. So the configured
+            // palm was never a stable offset that tuning could pin down; with
+            // the defaults (0, 6.0, -2.4), |p| = 6.46, it wandered by up to ~13
+            // units with wrist pose. This branch is the one MOST grabs take
+            // (13 of 18 unauthored seats in the Jul 30 log), so leaving it
+            // inverted would have left the dominant path broken.
+            outParentWorld = wandNode->world;
+            palmLocal = RE::NiPoint3(
+                heisenberg::g_config.palmPositionX,
+                heisenberg::g_config.palmPositionY,
+                heisenberg::g_config.palmPositionZ);
+            palmarLocal = RE::NiPoint3(
+                heisenberg::g_config.palmVectorX,
+                heisenberg::g_config.palmVectorY,
+                heisenberg::g_config.palmVectorZ);
+            if (isLeft) {
+                palmLocal.x *= -1.0f;
+                palmarLocal.x *= -1.0f;
+            }
+            outPalmWorld =
+                outParentWorld.rotate.Transpose() *
+                    (palmLocal * outParentWorld.scale) +
+                outParentWorld.translate;
+            outPalmarWorld =
+                heisenberg::VectorNormalized(
+                    outParentWorld.rotate.Transpose() * palmarLocal);
+        } else {
+            return false;
+        }
+
+        return std::isfinite(outPalmWorld.x) &&
+               std::isfinite(outPalmWorld.y) &&
+               std::isfinite(outPalmWorld.z) &&
+               std::isfinite(outPalmarWorld.x) &&
+               std::isfinite(outPalmarWorld.y) &&
+               std::isfinite(outPalmarWorld.z) &&
+               heisenberg::Utils::VectorLength(outPalmarWorld) > 0.5f;
+    }
+
+    void StoreRuntimeWorldPlacement(
+        heisenberg::GrabState& state,
+        const RE::NiTransform& parentWorld,
+        const RE::NiPoint3& desiredPivotWorld,
+        const RE::NiMatrix3& desiredRotationWorld,
+        bool usesSkinnedHand)
+    {
+        const RE::NiPoint3 localPosition =
+            parentWorld.rotate *
+            (desiredPivotWorld - parentWorld.translate);
+        const RE::NiMatrix3 localRotation =
+            desiredRotationWorld *
+            parentWorld.rotate.Transpose();
+
+        state.itemOffset.position = localPosition;
+        state.itemOffset.rotation = localRotation;
+        state.grabOffsetLocal = localPosition;
+        state.hasItemOffset = false;
+        state.isFRIKOffset = false;
+        state.SetRuntimeHandPlacement(
+            localPosition,
+            localRotation,
+            usesSkinnedHand);
+    }
+
+    // Replacement for the geometry-blind palm-snap constant.
+    //
+    // The old formula was pos = (0, 1 + longestAuthoredDim * 0.5, 3) in WAND
+    // space. It pushed the object's PIVOT half its longest authored dimension
+    // in front of the wand, assumed the pivot sits at the object's centre, and
+    // knew nothing about where the palm actually is. Every assumption fails on
+    // real meshes: Maxson's Battlecoat came to rest with its visible geometry
+    // 14 units from the palm, floating with nothing touching the hand.
+    //
+    // This seats from the object's live world bound instead. The bound centre
+    // supplies the pivot->centre correction the constant could not make, and
+    // the palm frame supplies the real palm position and normal. The result is
+    // returned in WAND-local space because that is the frame this offset is
+    // applied in. Callers with mesh triangles available should prefer the
+    // broad/mesh palm seat, which is exact; this is the no-triangle path.
+    bool TryCalculateBoundPalmSnapLocal(
+        heisenberg::GrabState& state,
+        RE::NiAVObject* wandNode,
+        bool isLeft,
+        const RE::NiTransform& objectWorld,
+        float itemLength,
+        float itemWidth,
+        float itemHeight,
+        RE::NiPoint3& outWandLocalPosition)
+    {
+        if (!wandNode) {
+            return false;
+        }
+
+        RE::NiTransform parentWorld{};
+        RE::NiPoint3 palmWorld{};
+        RE::NiPoint3 palmarWorld{};
+        bool usesSkinnedHand = false;
+        if (!GetPalmSurfaceSeatFrame(
+                wandNode,
+                isLeft,
+                parentWorld,
+                palmWorld,
+                palmarWorld,
+                usesSkinnedHand)) {
+            return false;
+        }
+
+        // Thinnest authored dimension is the side an object most plausibly
+        // presents once it comes to rest in the palm. Erring toward the palm
+        // is deliberate: slight overlap reads as "held", a gap reads as
+        // "floating" — the defect this replaces.
+        float halfThickness = 0.0f;
+        {
+            float smallest = 0.0f;
+            bool haveSmallest = false;
+            for (const float dimension : { itemLength, itemWidth, itemHeight }) {
+                if (std::isfinite(dimension) &&
+                    dimension > 0.1f &&
+                    (!haveSmallest || dimension < smallest)) {
+                    smallest = dimension;
+                    haveSmallest = true;
+                }
+            }
+            if (haveSmallest) {
+                halfThickness = smallest * 0.5f;
+            }
+        }
+
+        const RE::NiPoint3 targetCentreWorld =
+            palmWorld +
+            palmarWorld *
+                (heisenberg::grab_pose_policy::kPalmSurfaceSkin +
+                 halfThickness);
+
+        // Without a usable bound the pivot has to stand in for the centre —
+        // the one assumption of the old constant that cannot be avoided here.
+        RE::NiPoint3 desiredPivotWorld = targetCentreWorld;
+        if (state.node) {
+            const float boundRadius = state.node->worldBound.fRadius;
+            const RE::NiPoint3 boundCentre = state.node->worldBound.center;
+            if (std::isfinite(boundRadius) &&
+                boundRadius > 0.01f &&
+                boundRadius < 10000.0f &&
+                std::isfinite(boundCentre.x) &&
+                std::isfinite(boundCentre.y) &&
+                std::isfinite(boundCentre.z)) {
+                desiredPivotWorld =
+                    objectWorld.translate +
+                    (targetCentreWorld - boundCentre);
+            }
+        }
+
+        // The palm frame may be the skinned hand, but this offset is consumed
+        // in wand space, so express the result there in every case.
+        (void)parentWorld;
+        (void)usesSkinnedHand;
+        outWandLocalPosition =
+            wandNode->world.rotate *
+            (desiredPivotWorld - wandNode->world.translate);
+        return std::isfinite(outWandLocalPosition.x) &&
+               std::isfinite(outWandLocalPosition.y) &&
+               std::isfinite(outWandLocalPosition.z);
+    }
+
+    bool TryCalculateCanonicalLooseWeaponPlacement(
+        heisenberg::GrabState& state,
+        RE::NiAVObject* wandNode,
+        bool isLeft,
+        RE::TESObjectREFR* weaponRef,
+        const char*& outReason)
+    {
+        outReason = "canonicalHoldUnavailable";
+        if (!state.node || !wandNode || !weaponRef) {
+            outReason = "missingPlacementInput";
+            return false;
+        }
+
+        RE::NiTransform canonicalHandWorld{};
+        RE::NiTransform handWeaponLocal{};
+        if (!rock::loose_weapon_grip_zone::
+                tryResolveLooseWeaponFiringHandHold(
+                    isLeft,
+                    weaponRef,
+                    canonicalHandWorld,
+                    handWeaponLocal,
+                    &outReason)) {
+            return false;
+        }
+
+        // The ROCK resolver returns the authored firing hand in WEAPON-root
+        // space. Invert that relation to obtain the deterministic loose weapon
+        // root world transform, then express it in the exact rendered-hand
+        // frame Heisenberg will use for the held-object drive.
+        const RE::NiTransform desiredWeaponWorld =
+            rock::transform_math::composeTransforms(
+                canonicalHandWorld,
+                rock::transform_math::invertTransform(
+                    handWeaponLocal));
+
+        RE::NiTransform placementParent = wandNode->world;
+        bool usesSkinnedHand = false;
+        if (RE::NiNode* renderedHand =
+                GetSkinnedHandNode(isLeft)) {
+            placementParent = renderedHand->world;
+            usesSkinnedHand = true;
+        }
+
+        StoreRuntimeWorldPlacement(
+            state,
+            placementParent,
+            desiredWeaponWorld.translate,
+            desiredWeaponWorld.rotate,
+            usesSkinnedHand);
+        state.usedSnapMode = true;
+        return true;
+    }
+
+    bool TryCalculateKickballPalmPlacement(
+        heisenberg::GrabState& state,
+        RE::NiAVObject* wandNode,
+        bool isLeft,
+        const RE::NiTransform& objectWorld)
+    {
+        if (!state.node || !wandNode) {
+            return false;
+        }
+
+        RE::NiTransform parentWorld{};
+        RE::NiPoint3 palmWorld{};
+        RE::NiPoint3 palmarWorld{};
+        bool usesSkinnedHand = false;
+        if (!GetPalmSurfaceSeatFrame(
+                wandNode,
+                isLeft,
+                parentWorld,
+                palmWorld,
+                palmarWorld,
+                usesSkinnedHand)) {
+            return false;
+        }
+
+        float radius = state.node->worldBound.fRadius;
+        const RE::NiPoint3 boundCenter =
+            state.node->worldBound.center;
+        if (!std::isfinite(radius) ||
+            radius < 1.0f ||
+            radius > 1000.0f ||
+            !std::isfinite(boundCenter.x) ||
+            !std::isfinite(boundCenter.y) ||
+            !std::isfinite(boundCenter.z)) {
+            spdlog::warn(
+                "[GRAB-ROCK-POSE] Kickball bound is invalid "
+                "(radius={:.2f}); refusing an arbitrary one-unit seat",
+                radius);
+            return false;
+        }
+        const float centerDistance =
+            heisenberg::grab_pose_policy::
+                SpherePalmCenterDistance(radius);
+        const RE::NiPoint3 targetCenter =
+            palmWorld + palmarWorld * centerDistance;
+        // Compensate NIFs whose pivot is not at their bound centre. Moving the
+        // pivot by this delta seats the actual sphere surface, not an arbitrary
+        // origin, at ROCK's 0.5-unit palm skin.
+        const RE::NiPoint3 desiredPivot =
+            objectWorld.translate +
+            (targetCenter - boundCenter);
+        if (!std::isfinite(desiredPivot.x) ||
+            !std::isfinite(desiredPivot.y) ||
+            !std::isfinite(desiredPivot.z)) {
+            return false;
+        }
+        StoreRuntimeWorldPlacement(
+            state,
+            parentWorld,
+            desiredPivot,
+            objectWorld.rotate,
+            usesSkinnedHand);
+        state.usedSnapMode = true;
+        return true;
+    }
+
+    bool TryCalculateSelectedSurfacePalmPlacement(
+        heisenberg::GrabState& state,
+        RE::NiAVObject* wandNode,
+        bool isLeft,
+        const RE::NiTransform& objectWorld)
+    {
+        if (!state.node || !wandNode) {
+            return false;
+        }
+
+        RE::NiTransform parentWorld{};
+        RE::NiPoint3 palmWorld{};
+        RE::NiPoint3 palmarWorld{};
+        bool usesSkinnedHand = false;
+        if (!GetPalmSurfaceSeatFrame(
+                wandNode,
+                isLeft,
+                parentWorld,
+                palmWorld,
+                palmarWorld,
+                usesSkinnedHand)) {
+            return false;
+        }
+
+        std::vector<heisenberg::TriangleData> triangles;
+        triangles.reserve(512);
+        heisenberg::GetTriangles(
+            state.node.get(),
+            triangles,
+            4096);
+        RE::NiPoint3 currentSurfaceWorld{};
+        float selectedPointMeshDistance = -1.0f;
+        if (!heisenberg::GetClosestMeshPointToPoint(
+                triangles,
+                palmWorld,
+                currentSurfaceWorld,
+                selectedPointMeshDistance) ||
+            !std::isfinite(selectedPointMeshDistance) ||
+            selectedPointMeshDistance > 5.0f) {
+            return false;
+        }
+
+        const RE::NiPoint3 targetSurfaceWorld =
+            palmWorld +
+            palmarWorld *
+                heisenberg::grab_pose_policy::kPalmSurfaceSkin;
+        const RE::NiPoint3 desiredPivot =
+            objectWorld.translate +
+            (targetSurfaceWorld - currentSurfaceWorld);
+        StoreRuntimeWorldPlacement(
+            state,
+            parentWorld,
+            desiredPivot,
+            objectWorld.rotate,
+            usesSkinnedHand);
+        state.usedSnapMode = true;
+        return true;
+    }
+
+    RE::NiMatrix3 MakeVectorAlignmentRotation(
+        const RE::NiPoint3& fromVector,
+        const RE::NiPoint3& toVector);
+
+    bool TryCalculateBroadObjectPalmPlacement(
+        heisenberg::GrabState& state,
+        RE::NiAVObject* wandNode,
+        bool isLeft,
+        const RE::NiTransform& objectWorld,
+        bool isHolotape,
+        bool hasAuthoredPlacement,
+        bool directTouchPlacement,
+        bool replacingGeometryBlindSeat)
+    {
+        if (!state.node || !wandNode ||
+            !std::isfinite(objectWorld.scale) ||
+            std::abs(objectWorld.scale) < 1.0e-4f) {
+            return false;
+        }
+
+        RE::NiTransform parentWorld{};
+        RE::NiPoint3 palmWorld{};
+        RE::NiPoint3 palmarWorld{};
+        bool usesSkinnedHand = false;
+        if (!GetPalmSurfaceSeatFrame(
+                wandNode,
+                isLeft,
+                parentWorld,
+                palmWorld,
+                palmarWorld,
+                usesSkinnedHand)) {
+            return false;
+        }
+
+        std::vector<heisenberg::TriangleData> triangles;
+        triangles.reserve(512);
+        heisenberg::GetTriangles(
+            state.node.get(),
+            triangles,
+            4096);
+        if (triangles.empty()) {
+            return false;
+        }
+
+        const float infinity =
+            (std::numeric_limits<float>::infinity)();
+        RE::NiPoint3 localMin{ infinity, infinity, infinity };
+        RE::NiPoint3 localMax{ -infinity, -infinity, -infinity };
+        std::size_t finiteVertexCount = 0;
+        const auto includeVertex =
+            [&](const RE::NiPoint3& worldVertex) {
+                if (!std::isfinite(worldVertex.x) ||
+                    !std::isfinite(worldVertex.y) ||
+                    !std::isfinite(worldVertex.z)) {
+                    return;
+                }
+                const RE::NiPoint3 localVertex =
+                    rock::transform_math::worldPointToLocal(
+                        objectWorld,
+                        worldVertex);
+                if (!std::isfinite(localVertex.x) ||
+                    !std::isfinite(localVertex.y) ||
+                    !std::isfinite(localVertex.z)) {
+                    return;
+                }
+                localMin.x = (std::min)(localMin.x, localVertex.x);
+                localMin.y = (std::min)(localMin.y, localVertex.y);
+                localMin.z = (std::min)(localMin.z, localVertex.z);
+                localMax.x = (std::max)(localMax.x, localVertex.x);
+                localMax.y = (std::max)(localMax.y, localVertex.y);
+                localMax.z = (std::max)(localMax.z, localVertex.z);
+                ++finiteVertexCount;
+            };
+        for (const auto& triangle : triangles) {
+            includeVertex(triangle.v0);
+            includeVertex(triangle.v1);
+            includeVertex(triangle.v2);
+        }
+        if (finiteVertexCount < 3) {
+            return false;
+        }
+
+        const float worldScale = std::abs(objectWorld.scale);
+        const RE::NiPoint3 localSpans{
+            localMax.x - localMin.x,
+            localMax.y - localMin.y,
+            localMax.z - localMin.z,
+        };
+        const RE::NiPoint3 actualSpans{
+            localSpans.x * worldScale,
+            localSpans.y * worldScale,
+            localSpans.z * worldScale,
+        };
+        const bool broadPalmSeat =
+            heisenberg::grab_pose_policy::
+                ShouldApplyBroadPalmSeat(
+                    isHolotape,
+                    hasAuthoredPlacement,
+                    directTouchPlacement,
+                    actualSpans.x,
+                    actualSpans.y,
+                    actualSpans.z);
+        const bool meshSeatFallback =
+            !broadPalmSeat &&
+            heisenberg::grab_pose_policy::
+                ShouldApplyMeshPalmSeatFallback(
+                    isHolotape,
+                    hasAuthoredPlacement,
+                    directTouchPlacement,
+                    replacingGeometryBlindSeat,
+                    actualSpans.x,
+                    actualSpans.y,
+                    actualSpans.z);
+        if (!broadPalmSeat && !meshSeatFallback) {
+            // Log the reject with its measured spans. A silent false here sent
+            // Maxson's Battlecoat to the geometry-blind constant formula and
+            // left it floating 14 units off the palm with no trace in the log.
+            spdlog::info(
+                "[GRAB-BROAD-PALM] '{}' not seated: spans=({:.2f},{:.2f},{:.2f}) "
+                "triangles={} holotape={} authored={} directTouch={} "
+                "snapConstantSeat={} — placement left to the caller",
+                state.node->name.c_str(),
+                actualSpans.x,
+                actualSpans.y,
+                actualSpans.z,
+                triangles.size(),
+                isHolotape,
+                hasAuthoredPlacement,
+                directTouchPlacement,
+                replacingGeometryBlindSeat);
+            return false;
+        }
+
+        // Center the complete visible object across the palm. First rotate its
+        // thinnest object-local axis onto the palm normal so a slab cannot
+        // remain edge-on, then put its broad rear face exactly one skin-width
+        // in front of the palm. Unlike first-contact attachment, no individual
+        // fingertip can become the object's pivot.
+        const RE::NiPoint3 localGeometryCenter{
+            (localMin.x + localMax.x) * 0.5f,
+            (localMin.y + localMax.y) * 0.5f,
+            (localMin.z + localMax.z) * 0.5f,
+        };
+
+        int thinAxisIndex = 0;
+        RE::NiPoint3 thinAxisLocal{ 1.0f, 0.0f, 0.0f };
+        float thinSpan = actualSpans.x;
+        if (actualSpans.y < thinSpan) {
+            thinAxisIndex = 1;
+            thinAxisLocal = RE::NiPoint3{ 0.0f, 1.0f, 0.0f };
+            thinSpan = actualSpans.y;
+        }
+        if (actualSpans.z < thinSpan) {
+            thinAxisIndex = 2;
+            thinAxisLocal = RE::NiPoint3{ 0.0f, 0.0f, 1.0f };
+            thinSpan = actualSpans.z;
+        }
+
+        RE::NiPoint3 currentThinAxisWorld =
+            heisenberg::VectorNormalized(
+                rock::transform_math::localVectorToWorld(
+                    objectWorld,
+                    thinAxisLocal));
+        float thinAxisPalmDot =
+            heisenberg::DotProduct(
+                currentThinAxisWorld,
+                palmarWorld);
+        if (thinAxisPalmDot < 0.0f) {
+            thinAxisLocal = thinAxisLocal * -1.0f;
+            currentThinAxisWorld =
+                currentThinAxisWorld * -1.0f;
+            thinAxisPalmDot = -thinAxisPalmDot;
+        }
+        if (broadPalmSeat &&
+            heisenberg::Utils::VectorLength(
+                currentThinAxisWorld) < 0.5f) {
+            return false;
+        }
+
+        // The broad seat turns the mesh's thin axis onto the palm normal so a
+        // slab cannot stay edge-on. The fallback seat has no broad face to
+        // present, so it keeps the object's own orientation and only moves it.
+        RE::NiMatrix3 desiredRotationWorld = objectWorld.rotate;
+        if (broadPalmSeat) {
+            const RE::NiMatrix3 broadFaceAlignment =
+                MakeVectorAlignmentRotation(
+                    currentThinAxisWorld,
+                    palmarWorld);
+            desiredRotationWorld =
+                objectWorld.rotate *
+                broadFaceAlignment.Transpose();
+        }
+        RE::NiTransform desiredObjectWorld = objectWorld;
+        desiredObjectWorld.rotate = desiredRotationWorld;
+        desiredObjectWorld.translate =
+            RE::NiPoint3{ 0.0f, 0.0f, 0.0f };
+
+        // How deep the mesh reaches toward the palm once rotated, measured
+        // from its own centre. For the broad seat this is exactly -thinSpan/2;
+        // deriving it from the corners instead keeps the fallback (arbitrary
+        // orientation) correct with the same line of code, so the SURFACE —
+        // never the pivot — is what lands one skin-width off the palm.
+        float rearPlaneProjection = 0.0f;
+        bool haveRearPlane = false;
+        for (int corner = 0; corner < 8; ++corner) {
+            const RE::NiPoint3 cornerLocal{
+                (corner & 1) ? localMax.x : localMin.x,
+                (corner & 2) ? localMax.y : localMin.y,
+                (corner & 4) ? localMax.z : localMin.z,
+            };
+            const RE::NiPoint3 cornerOffsetWorld =
+                rock::transform_math::localVectorToWorld(
+                    desiredObjectWorld,
+                    cornerLocal - localGeometryCenter);
+            const float projection =
+                heisenberg::DotProduct(cornerOffsetWorld, palmarWorld);
+            if (!std::isfinite(projection)) {
+                continue;
+            }
+            if (!haveRearPlane || projection < rearPlaneProjection) {
+                rearPlaneProjection = projection;
+                haveRearPlane = true;
+            }
+        }
+        if (!haveRearPlane) {
+            return false;
+        }
+
+        const RE::NiPoint3 targetGeometryCenter =
+            palmWorld +
+            palmarWorld *
+                (heisenberg::grab_pose_policy::kPalmSurfaceSkin -
+                 rearPlaneProjection);
+        const RE::NiPoint3 rotatedCenterOffset =
+            rock::transform_math::localVectorToWorld(
+                desiredObjectWorld,
+                localGeometryCenter);
+        const RE::NiPoint3 desiredPivot =
+            targetGeometryCenter - rotatedCenterOffset;
+        if (!std::isfinite(desiredPivot.x) ||
+            !std::isfinite(desiredPivot.y) ||
+            !std::isfinite(desiredPivot.z)) {
+            return false;
+        }
+
+        StoreRuntimeWorldPlacement(
+            state,
+            parentWorld,
+            desiredPivot,
+            desiredRotationWorld,
+            usesSkinnedHand);
+        state.usedSnapMode = true;
+        state.itemOffset.hasFingerCurls = false;
+        state.itemOffset.hasJointCurls = false;
+        state.ClearRuntimeFingerCurls();
+
+        spdlog::info(
+            "[GRAB-BROAD-PALM] '{}' seat={} spans=({:.2f},{:.2f},{:.2f}) "
+            "triangles={} thinAxis={} thinSpan={:.2f} "
+            "alignmentDot={:.3f} rearPlane={:.2f} skin={:.2f} "
+            "centerLocal=({:.2f},{:.2f},{:.2f}) "
+            "placementLocal=({:.2f},{:.2f},{:.2f}) frame={} "
+            "source={} — centered on palm, not first-contact finger",
+            state.node->name.c_str(),
+            broadPalmSeat ? "broad-face" : "mesh-fallback",
+            actualSpans.x,
+            actualSpans.y,
+            actualSpans.z,
+            triangles.size(),
+            thinAxisIndex,
+            thinSpan,
+            thinAxisPalmDot,
+            rearPlaneProjection,
+            heisenberg::grab_pose_policy::kPalmSurfaceSkin,
+            localGeometryCenter.x,
+            localGeometryCenter.y,
+            localGeometryCenter.z,
+            state.runtimeHandPlacementPosition.x,
+            state.runtimeHandPlacementPosition.y,
+            state.runtimeHandPlacementPosition.z,
+            usesSkinnedHand ? "skinned" : "wand",
+            directTouchPlacement ? "direct-touch" : "unauthored-snap");
+        return true;
     }
 
     RE::NiMatrix3 MakeIdentityMatrix()
@@ -794,6 +1646,21 @@ namespace
         }
 
         std::array<float, 15> jointCurls{};
+        if (rock::touch_grab_bridge::
+                SolveAndPublishTouchGrabFingerPose(
+                    state.node.get(),
+                    handNode->world,
+                    isLeft,
+                    palmPos,
+                    palmPos,
+                    0.0f,
+                    true,
+                    &jointCurls)) {
+            state.SetRuntimeJointCurls(jointCurls);
+            state.rockRichFingerPosePublished = true;
+            return true;
+        }
+        state.rockRichFingerPosePublished = false;
         if (!rock::touch_grab_bridge::SolveTouchGrabFingerPose(
                 state.node.get(),
                 handNode->world,
@@ -1334,6 +2201,69 @@ namespace
         void* hknpWorld,
         std::uint32_t bodyId);
 
+    static void ClearCapturedHeldBodyFrames(
+        heisenberg::GrabState& state)
+    {
+        state.capturedHeldBodies = {};
+        state.capturedHeldBodyCount = 0;
+        state.capturedHeldBodySetValid = false;
+        state.capturedHeldBodiesWorld = nullptr;
+        state.instantPreTeleportBodyCaptureAttempted = false;
+        state.capturedHeldBodiesExcludeAlternateWrappers = false;
+        state.capturedHeldBodiesIncludeAlternateWrappers = false;
+    }
+
+    static RE::bhkWorld* ResolveMatchingHeldBhkWorld(
+        const heisenberg::GrabState& state)
+    {
+        if (!state.collisionObject) {
+            return nullptr;
+        }
+        void* liveHknpWorld = AccessWorld(state.collisionObject);
+        if (!liveHknpWorld) {
+            return nullptr;
+        }
+
+        const auto matches = [liveHknpWorld](RE::bhkWorld* candidate) {
+            return candidate &&
+                   heisenberg::Physics::GetHknpWorldFromBhk(candidate) ==
+                       liveHknpWorld;
+        };
+        if (matches(state.lastSyncedBhkWorld)) {
+            return state.lastSyncedBhkWorld;
+        }
+        if (auto* player = RE::PlayerCharacter::GetSingleton()) {
+            if (auto* cell = player->GetParentCell()) {
+                if (auto* playerWorld = cell->GetbhkWorld();
+                    matches(playerWorld)) {
+                    return playerWorld;
+                }
+            }
+        }
+        if (auto* refr = state.GetRefr()) {
+            if (auto* referenceWorld = GetBhkWorldFromRefr(refr);
+                matches(referenceWorld)) {
+                return referenceWorld;
+            }
+        }
+        return matches(state.savedState.savedBhkWorld)
+            ? state.savedState.savedBhkWorld
+            : nullptr;
+    }
+
+    static bool LockedWorldMatchesHeldCollision(
+        const heisenberg::GrabState& state,
+        RE::bhkWorld* bhkWorld,
+        RE::hknpWorld* expectedHknpWorld)
+    {
+        return state.collisionObject &&
+               bhkWorld &&
+               expectedHknpWorld &&
+               heisenberg::Physics::GetHknpWorldFromBhk(bhkWorld) ==
+                   expectedHknpWorld &&
+               AccessWorld(state.collisionObject) == expectedHknpWorld;
+    }
+
     static bool CapturedHeldBodyStillOwned(
         const heisenberg::GrabState& state,
         RE::hknpWorld* world,
@@ -1341,6 +2271,7 @@ namespace
     {
         if (!state.collisionObject ||
             !world ||
+            state.capturedHeldBodiesWorld != world ||
             !captured.ownerCollisionObject ||
             !captured.ownerNode) {
             return false;
@@ -1356,6 +2287,17 @@ namespace
             captured.ownerCollisionObject) {
             return false;
         }
+        if (rock::havok_runtime::getOwnerNodeFromCollisionObject(
+                captured.ownerCollisionObject) !=
+            captured.ownerNode.get()) {
+            return false;
+        }
+        if (body->motionIndex != captured.motionId ||
+            !rock::havok_runtime::getMotion(
+                world,
+                captured.motionId)) {
+            return false;
+        }
         for (auto* current = captured.ownerNode.get();
              current;
              current = current->parent) {
@@ -1364,6 +2306,35 @@ namespace
             }
         }
         return false;
+    }
+
+    static bool CapturedHeldBodySetStillOwned(
+        const heisenberg::GrabState& state)
+    {
+        if (!state.collisionObject ||
+            !state.capturedHeldBodySetValid ||
+            state.capturedHeldBodyCount == 0) {
+            return false;
+        }
+        auto* world = static_cast<RE::hknpWorld*>(
+            AccessWorld(state.collisionObject));
+        if (!world ||
+            state.capturedHeldBodiesWorld != world) {
+            return false;
+        }
+        for (std::uint32_t i = 0;
+             i < state.capturedHeldBodyCount;
+             ++i) {
+            const auto& captured = state.capturedHeldBodies[i];
+            if (!captured.valid ||
+                !CapturedHeldBodyStillOwned(
+                    state,
+                    world,
+                    captured)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     // Build a descendant's transform from the scene graph's authored local
@@ -1418,30 +2389,34 @@ namespace
                std::isfinite(outRootLocal.scale);
     }
 
-    static bool UsesSelectedCollisionWrapperMotionScope(
+    // Recursive subtree motion is safe only when a complete body-frame set was
+    // captured. Any rigid-object capture failure stays on the selected wrapper
+    // for setup, lag recovery, and release so uncaptured bodies are never left
+    // KEYFRAMED or restored through a mismatched scope.
+    static bool RequiresSelectedCollisionWrapperMotionScope(
         const heisenberg::GrabState& state)
     {
         const auto* refr = state.GetRefr();
         return refr &&
                refr->GetFormType() != RE::ENUM_FORM_ID::kACHR &&
                state.collisionObject &&
-               state.capturedHeldBodyCount == 0 &&
-               state.isProxyCollision;
+               !state.capturedHeldBodySetValid;
     }
 
-    // Capture every body in the selected wrapper's shared physics system whose
-    // owner belongs to this reference subtree. Mutually exclusive mesh variants
-    // still share the same reference root; leaving a hidden alternate dynamic
-    // lets it overwrite that root after the visible body was keyframed. We keep
-    // the selected visible wrapper as placement authority, but drive all shared
-    // bodies through authored root->owner frames so they cannot split.
+    // Capture the union of every collision wrapper's physics system under this
+    // reference root, including hidden variants on independent systems. A
+    // multipart weapon can expose several simultaneously rendered wrappers,
+    // while an ammo variant can keep alternate bodies hidden. Body identity is
+    // unique for filter/cache ownership; motion identity is unique for
+    // transform/velocity writes.
+    //
+    // Capture is transactional. Any unreadable wrapper/system/body clears the
+    // complete set, forcing the selected-wrapper-only motion fallback. A
+    // partial set must never be paired with recursive subtree keyframing.
     // Ragdoll/actor proxies remain outside this rigid clutter path.
     static bool CaptureHeldCollisionBodyFrames(heisenberg::GrabState& state)
     {
-        state.capturedHeldBodies = {};
-        state.capturedHeldBodyCount = 0;
-        state.capturedHeldBodiesExcludeAlternateWrappers = false;
-        state.capturedHeldBodiesIncludeAlternateWrappers = false;
+        ClearCapturedHeldBodyFrames(state);
         if (!state.collisionObject || !state.node) {
             return false;
         }
@@ -1455,21 +2430,72 @@ namespace
 
         auto* world = static_cast<RE::hknpWorld*>(
             AccessWorld(state.collisionObject));
-        if (!world) {
+        auto* bhkWorld =
+            ResolveMatchingHeldBhkWorld(state);
+        if (!LockedWorldMatchesHeldCollision(
+                state,
+                bhkWorld,
+                world)) {
             return false;
+        }
+        heisenberg::Physics::WorldReadLock readLock(bhkWorld);
+        if (!readLock.IsLocked() ||
+            !LockedWorldMatchesHeldCollision(
+                state,
+                bhkWorld,
+                world)) {
+            return false;
+        }
+
+        const auto collisionWrappers =
+            heisenberg::CollectCollisionWrappers(
+                state.node.get());
+        if (collisionWrappers.overflowed) {
+            spdlog::warn(
+                "[GRAB-MULTIBODY] Collision-wrapper capture skipped for "
+                "{:08X}: wrapperOccurrences={} unique=>{} cap={}",
+                state.GetRefr() ? state.GetRefr()->formID : 0,
+                collisionWrappers.totalWrapperCount,
+                collisionWrappers.count,
+                heisenberg::kMaxCollisionWrappers);
+            return false;
+        }
+
+        // Physical-touch acquisition can legitimately nominate a wrapper that
+        // the geometry visibility walk did not classify. Scan it as placement
+        // authority without falsely labelling it as rendered.
+        std::array<
+            RE::bhkNPCollisionObject*,
+            heisenberg::kMaxCollisionWrappers + 1>
+            scanWrappers{};
+        std::uint32_t scanWrapperCount = 0;
+        for (std::uint32_t i = 0;
+             i < collisionWrappers.count;
+             ++i) {
+            scanWrappers[scanWrapperCount++] =
+                collisionWrappers.wrappers[i];
+        }
+        if (!collisionWrappers.Contains(state.collisionObject)) {
+            scanWrappers[scanWrapperCount++] =
+                state.collisionObject;
         }
 
         struct CaptureContext
         {
             heisenberg::GrabState* state = nullptr;
             RE::hknpWorld* world = nullptr;
+            const heisenberg::CollisionWrapperSet*
+                collisionWrappers = nullptr;
             RE::NiTransform rootInverse{};
             std::uint32_t eligibleBodyCount = 0;
-            std::uint32_t alternateWrapperBodyCount = 0;
+            std::uint32_t visibleWrapperBodyCount = 0;
+            std::uint32_t hiddenWrapperBodyCount = 0;
+            std::uint32_t duplicateBodySkips = 0;
             bool eligibleCaptureFailed = false;
         } context{
             &state,
             world,
+            &collisionWrappers,
             rock::transform_math::invertTransform(state.node->world),
         };
 
@@ -1479,22 +2505,38 @@ namespace
                 return false;
             }
             auto& state = *context->state;
+
+            // Several visible wrappers can point at one shared physics system.
+            // Keep exactly one record for each world-local body ID.
+            for (std::uint32_t i = 0;
+                 i < state.capturedHeldBodyCount;
+                 ++i) {
+                if (state.capturedHeldBodies[i].bodyId == bodyId) {
+                    ++context->duplicateBodySkips;
+                    return true;
+                }
+            }
+
             auto* body = rock::havok_runtime::getBody(
                 context->world,
                 RE::hknpBodyId{ bodyId });
-            if (!body) {
+            if (!body ||
+                !rock::havok_runtime::getMotion(
+                    context->world,
+                    body->motionIndex)) {
                 context->eligibleCaptureFailed = true;
                 return false;
             }
 
             auto* ownerCollision =
                 rock::havok_runtime::getCollisionObjectFromBody(body);
+            if (!ownerCollision) {
+                context->eligibleCaptureFailed = true;
+                return false;
+            }
             auto* resolvedOwnerCollision =
                 heisenberg::TryResolveNpcCollisionObjectFromRaw(
                     ownerCollision);
-            if (resolvedOwnerCollision != state.collisionObject) {
-                ++context->alternateWrapperBodyCount;
-            }
 
             ++context->eligibleBodyCount;
             if (state.capturedHeldBodyCount >=
@@ -1546,11 +2588,17 @@ namespace
             captured.originalFilterInfo = filterInfo;
             captured.ownerCollisionObject = ownerCollision;
             captured.ownerNode.reset(ownerNode);
-            // PHANTOM-BODY FIX (Jul 25): remember whether this body belongs to the
-            // wrapper that won grab acquisition (the VISIBLE mesh variant). Bodies of
-            // alternate/hidden wrappers get dragged along invisibly and must not be
-            // allowed to knock over world objects — see ApplyCapturedHeldBodyFilters.
-            captured.isActiveWrapper = (resolvedOwnerCollision == state.collisionObject);
+            captured.isActiveWrapper =
+                resolvedOwnerCollision == state.collisionObject;
+            captured.isVisibleWrapper =
+                context->collisionWrappers &&
+                context->collisionWrappers->IsVisible(
+                    resolvedOwnerCollision);
+            if (captured.isVisibleWrapper) {
+                ++context->visibleWrapperBodyCount;
+            } else {
+                ++context->hiddenWrapperBodyCount;
+            }
             const RE::NiTransform runtimeOwnerRootLocal =
                 rock::transform_math::composeTransforms(
                     context->rootInverse,
@@ -1594,15 +2642,78 @@ namespace
             return true;
         };
 
-        constexpr int kMaxPhysicsSystemBodiesToInspect = 64;
-        const auto scan =
-            rock::havok_runtime::forEachPhysicsSystemBodyIdDetailed(
-                static_cast<RE::NiCollisionObject*>(state.collisionObject),
-                world,
-                kMaxPhysicsSystemBodiesToInspect,
-                visitor,
-                &context);
-        if (!scan.enumerated() ||
+        constexpr std::uint32_t kMaxPhysicsSystemBodiesToInspect = 64;
+        std::array<
+            const void*,
+            heisenberg::kMaxCollisionWrappers + 1>
+            scannedSystems{};
+        std::uint32_t uniqueSystemCount = 0;
+        std::uint32_t duplicateSystemSkips = 0;
+        std::uint32_t totalSystemBodySlots = 0;
+        std::uint32_t totalVisitedBodies = 0;
+        std::uint32_t totalInvalidBodySkips = 0;
+        std::uint32_t failedScanStatus =
+            (std::numeric_limits<std::uint32_t>::max)();
+        bool systemScanFailed = scanWrapperCount == 0;
+
+        for (std::uint32_t wrapperIndex = 0;
+             wrapperIndex < scanWrapperCount &&
+             !systemScanFailed;
+             ++wrapperIndex) {
+            auto* wrapper = scanWrappers[wrapperIndex];
+            auto* system = wrapper
+                ? wrapper->spSystem.get()
+                : nullptr;
+            if (!wrapper || !system) {
+                systemScanFailed = true;
+                continue;
+            }
+
+            bool alreadyScanned = false;
+            for (std::uint32_t i = 0;
+                 i < uniqueSystemCount;
+                 ++i) {
+                if (scannedSystems[i] == system) {
+                    alreadyScanned = true;
+                    break;
+                }
+            }
+            if (alreadyScanned) {
+                ++duplicateSystemSkips;
+                continue;
+            }
+            scannedSystems[uniqueSystemCount++] = system;
+
+            const auto scan =
+                rock::havok_runtime::
+                    forEachPhysicsSystemBodyIdDetailed(
+                        static_cast<RE::NiCollisionObject*>(
+                            wrapper),
+                        world,
+                        kMaxPhysicsSystemBodiesToInspect,
+                        visitor,
+                        &context);
+            if (scan.bodyCount > 0) {
+                totalSystemBodySlots +=
+                    static_cast<std::uint32_t>(
+                        scan.bodyCount);
+            }
+            totalVisitedBodies += scan.visitedBodies;
+            totalInvalidBodySkips +=
+                scan.skippedInvalidBodies;
+            if (!scan.enumerated() ||
+                scan.bodyCount >
+                    static_cast<std::int32_t>(
+                        kMaxPhysicsSystemBodiesToInspect) ||
+                scan.skippedInvalidBodies > 0) {
+                failedScanStatus =
+                    static_cast<std::uint32_t>(
+                        scan.status);
+                systemScanFailed = true;
+            }
+        }
+
+        if (systemScanFailed ||
             context.eligibleCaptureFailed ||
             context.eligibleBodyCount >
                 heisenberg::GrabState::kMaxCapturedHeldBodies ||
@@ -1610,46 +2721,100 @@ namespace
                 context.eligibleBodyCount ||
             state.capturedHeldBodyCount == 0) {
             spdlog::warn(
-                "[GRAB-MULTIBODY] Active-wrapper capture skipped: status={} "
-                "systemBodies={} eligible={} captured={} alternates={} cap={}",
-                static_cast<std::uint32_t>(scan.status),
-                scan.bodyCount,
+                "[GRAB-MULTIBODY] All-visible capture skipped: status={} "
+                "wrappers={}/{} systems={} sharedSystemSkips={} "
+                "systemBodies={} visited={} invalidIds={} eligible={} "
+                "captured={} duplicateBodies={} visibleBodies={} "
+                "hiddenBodies={} cap={}",
+                failedScanStatus,
+                collisionWrappers.count,
+                collisionWrappers.totalWrapperCount,
+                uniqueSystemCount,
+                duplicateSystemSkips,
+                totalSystemBodySlots,
+                totalVisitedBodies,
+                totalInvalidBodySkips,
                 context.eligibleBodyCount,
                 state.capturedHeldBodyCount,
-                context.alternateWrapperBodyCount,
+                context.duplicateBodySkips,
+                context.visibleWrapperBodyCount,
+                context.hiddenWrapperBodyCount,
                 heisenberg::GrabState::kMaxCapturedHeldBodies);
-            state.capturedHeldBodies = {};
-            state.capturedHeldBodyCount = 0;
-            state.capturedHeldBodiesExcludeAlternateWrappers = false;
-            state.capturedHeldBodiesIncludeAlternateWrappers = false;
+            ClearCapturedHeldBodyFrames(state);
             return false;
         }
 
+        // setBodyTransformDeferred/setBodyVelocityDeferred both address a body
+        // but mutate its motion. The pure policy chooses one placement
+        // authority per shared motion and rejects duplicate body identity.
+        std::array<
+            heisenberg::held_collision_body_set_policy::BodyCandidate,
+            heisenberg::GrabState::kMaxCapturedHeldBodies>
+            motionCandidates{};
+        for (std::uint32_t i = 0;
+             i < state.capturedHeldBodyCount;
+             ++i) {
+            const auto& captured =
+                state.capturedHeldBodies[i];
+            motionCandidates[i] = {
+                captured.bodyId,
+                captured.motionId,
+                captured.isActiveWrapper,
+                captured.isVisibleWrapper,
+            };
+        }
+        const auto motionSelection =
+            heisenberg::held_collision_body_set_policy::
+                SelectMotionRepresentatives(
+                    motionCandidates,
+                    state.capturedHeldBodyCount);
+        if (!motionSelection.valid) {
+            ClearCapturedHeldBodyFrames(state);
+            return false;
+        }
+        for (std::uint32_t i = 0;
+             i < state.capturedHeldBodyCount;
+             ++i) {
+            state.capturedHeldBodies[i]
+                .isMotionRepresentative =
+                motionSelection.representatives[i];
+        }
+        const auto uniqueMotionCount =
+            motionSelection.uniqueMotionCount;
+
+        state.capturedHeldBodiesWorld = world;
+        state.capturedHeldBodySetValid = true;
         state.capturedHeldBodiesExcludeAlternateWrappers = false;
         state.capturedHeldBodiesIncludeAlternateWrappers =
-            context.alternateWrapperBodyCount > 0;
-        if (state.capturedHeldBodyCount > 0) {
-            state.heldOriginalFilterInfo =
-                state.capturedHeldBodies[0].originalFilterInfo;
-            state.heldHadSuppressionBitOriginally =
-                (state.heldOriginalFilterInfo & 0x000B0000u) ==
-                0x000B0000u;
-        }
+            context.hiddenWrapperBodyCount > 0;
+        // Each captured body owns its byte-exact originalFilterInfo. Do not seed
+        // the single-body fallback from capturedHeldBodies[0]: enumeration order
+        // is not the selected/primary wrapper and those scalar fields are never
+        // consumed while a valid captured set exists.
         spdlog::info(
-            "[GRAB-MULTIBODY] Captured {} shared-reference body frame(s) "
-            "for {:08X} root='{}' (systemBodies={} alternateWrappers={})",
-            state.capturedHeldBodyCount,
+            "[GRAB-MULTIBODY] Captured all-visible set for {:08X} "
+            "root='{}': wrappers={}/{} systems={} bodies={} motions={} "
+            "visibleBodies={} hiddenBodies={} duplicateBodies={} "
+            "sharedSystemSkips={}",
             state.GetRefr() ? state.GetRefr()->formID : 0,
             state.node->name.c_str(),
-            scan.bodyCount,
-            context.alternateWrapperBodyCount);
+            collisionWrappers.count,
+            collisionWrappers.totalWrapperCount,
+            uniqueSystemCount,
+            state.capturedHeldBodyCount,
+            uniqueMotionCount,
+            context.visibleWrapperBodyCount,
+            context.hiddenWrapperBodyCount,
+            context.duplicateBodySkips,
+            duplicateSystemSkips);
         for (std::uint32_t i = 0;
              i < state.capturedHeldBodyCount;
              ++i) {
             const auto& body = state.capturedHeldBodies[i];
             spdlog::info(
                 "[GRAB-MULTIBODY] body[{}]={} motion={} filter=0x{:08X} "
-                "owner='{}' ownerRootLocal=({:.2f},{:.2f},{:.2f}) "
+                "owner='{}' selected={} visible={} motionRep={} "
+                "ownerRootLocal=({:.2f},{:.2f},{:.2f}) "
                 "bodyOwnerLocal=({:.2f},{:.2f},{:.2f})",
                 i,
                 body.bodyId,
@@ -1658,6 +2823,9 @@ namespace
                 body.ownerNode
                     ? body.ownerNode->name.c_str()
                     : "NULL",
+                body.isActiveWrapper,
+                body.isVisibleWrapper,
+                body.isMotionRepresentative,
                 body.ownerRootLocal.translate.x,
                 body.ownerRootLocal.translate.y,
                 body.ownerRootLocal.translate.z,
@@ -1668,20 +2836,52 @@ namespace
         return state.capturedHeldBodyCount > 0;
     }
 
-    static bool ApplyCapturedHeldBodyFilters(heisenberg::GrabState& state)
+    static void QueueDeferredFilterRestore(
+        void* world,
+        std::uint32_t bodyId,
+        std::uint32_t filter,
+        int frames);
+
+    static bool ApplyCapturedHeldBodyFilters(
+        heisenberg::GrabState& state,
+        RE::bhkWorld* bhkWorld,
+        bool keepRenderedWrappersCollidable)
     {
+        const bool firstHeldFilterApply =
+            !state.heldPlayerFilterApplied;
         if (!state.collisionObject ||
+            !state.capturedHeldBodySetValid ||
+            !bhkWorld ||
             state.capturedHeldBodyCount == 0) {
             return false;
         }
         auto* world = static_cast<RE::hknpWorld*>(
             AccessWorld(state.collisionObject));
-        if (!world) {
+        if (!LockedWorldMatchesHeldCollision(
+                state,
+                bhkWorld,
+                world)) {
+            return false;
+        }
+        heisenberg::Physics::WorldWriteLock lock(bhkWorld);
+        if (!lock.IsLocked() ||
+            !LockedWorldMatchesHeldCollision(
+                state,
+                bhkWorld,
+                world)) {
             return false;
         }
 
-        constexpr std::uint32_t kHandGroupBits = 0x000Bu << 16;
-        bool applied = false;
+        std::array<
+            std::uint32_t,
+            heisenberg::GrabState::kMaxCapturedHeldBodies>
+            currentFilters{};
+        std::array<
+            std::uint32_t,
+            heisenberg::GrabState::kMaxCapturedHeldBodies>
+            desiredFilters{};
+
+        // Validate and read the complete set before the first mutation.
         for (std::uint32_t i = 0;
              i < state.capturedHeldBodyCount;
              ++i) {
@@ -1691,14 +2891,13 @@ namespace
                     state,
                     world,
                     captured)) {
-                continue;
+                return false;
             }
-            std::uint32_t current = 0;
             if (!heisenberg::Physics::TryReadBodyFilterInfo(
                     world,
                     captured.bodyId,
-                    current)) {
-                continue;
+                    currentFilters[i])) {
+                return false;
             }
             // PHANTOM-BODY FIX (Jul 25, user-reported knockover): bodies of alternate/
             // hidden wrappers (the invisible second Havok body of dual-body NIFs like
@@ -1707,44 +2906,137 @@ namespace
             // objects over invisibly. Park them on the non-collidable layer (15, the
             // same constant the held-object non-collidable path uses) for the capture
             // lifetime; the raw filter write preserves group/system bits, dodging the
-            // known SetLayerLocked preset-clobber bug. The VISIBLE wrapper's body keeps
-            // the intended bHeldObjectCollidable behavior. Restore is byte-exact from
-            // originalFilterInfo on release.
-            constexpr std::uint32_t kNonCollidableLayer = 15u;
-            const std::uint32_t desired = captured.isActiveWrapper
-                ? (current | kHandGroupBits)
-                : ((current & ~0x7Fu) | kNonCollidableLayer | kHandGroupBits);
-            if (desired != current &&
+            // known SetLayerLocked preset-clobber bug. Every rendered wrapper
+            // keeps the intended bHeldObjectCollidable behavior; acquisition
+            // authority remains collidable defensively even if the visibility
+            // walk did not classify it. Restore is byte-exact from
+            // originalFilterInfo on release. When the entire held object is
+            // configured non-collidable, every captured body uses the same raw
+            // layer-only rewrite so mixed native filters are still preserved.
+            const bool renderedCollisionAuthority =
+                keepRenderedWrappersCollidable &&
+                heisenberg::held_collision_body_set_policy::
+                    ShouldKeepNativeCollision(
+                        captured.isActiveWrapper,
+                        captured.isVisibleWrapper);
+            desiredFilters[i] =
+                heisenberg::held_collision_body_set_policy::
+                    HeldBodyFilter(
+                        currentFilters[i],
+                        renderedCollisionAuthority);
+        }
+
+        // Commit transactionally. If one native write fails, restore every
+        // earlier body to the exact filter observed at function entry.
+        for (std::uint32_t i = 0;
+             i < state.capturedHeldBodyCount;
+             ++i) {
+            if (desiredFilters[i] != currentFilters[i] &&
                 !heisenberg::Physics::TryWriteBodyFilterInfo(
                     world,
-                    captured.bodyId,
-                    desired)) {
-                continue;
+                    state.capturedHeldBodies[i].bodyId,
+                    desiredFilters[i])) {
+                for (std::uint32_t rollback = 0;
+                     rollback < i;
+                     ++rollback) {
+                    if (desiredFilters[rollback] !=
+                        currentFilters[rollback]) {
+                        const auto rollbackBodyId =
+                            state.capturedHeldBodies[rollback]
+                                .bodyId;
+                        if (!heisenberg::Physics::
+                                TryWriteBodyFilterInfo(
+                                    world,
+                                    rollbackBodyId,
+                                    currentFilters[rollback])) {
+                            QueueDeferredFilterRestore(
+                                world,
+                                rollbackBodyId,
+                                currentFilters[rollback],
+                                1);
+                            spdlog::warn(
+                                "[GRAB-MULTIBODY] Deferred failed "
+                                "transaction rollback for body {} -> "
+                                "0x{:08X}",
+                                rollbackBodyId,
+                                currentFilters[rollback]);
+                        }
+                    }
+                }
+                return false;
             }
+        }
+
+        for (std::uint32_t i = 0;
+             i < state.capturedHeldBodyCount;
+             ++i) {
+            auto& captured = state.capturedHeldBodies[i];
             // filterChanged must reflect the FULL divergence from the original filter
             // (the old hand-bits-only test under-reported once the layer changes too),
             // so RestoreCapturedHeldBodyFilters knows a byte-exact restore is needed.
-            captured.filterChanged = (desired != captured.originalFilterInfo);
-            if (desired != current && !captured.isActiveWrapper) {
-                // Layer transition on a live body: rebuild its pair caches so existing
-                // contact pairs drop immediately (standing rule: every raw Havok filter
-                // write needs a pair-cache rebuild).
+            captured.filterChanged =
+                desiredFilters[i] != captured.originalFilterInfo;
+            if ((desiredFilters[i] & 0x7Fu) !=
+                (currentFilters[i] & 0x7Fu)) {
+                // A real layer transition must invalidate all cached pair
+                // verdicts immediately.
                 RebuildBodyCollisionCachesNative(world, captured.bodyId);
             }
-            applied = true;
         }
-        return applied;
+        if (firstHeldFilterApply) {
+            std::uint32_t noCharacterControllerBodies = 0;
+            std::uint32_t hiddenNonCollidableBodies = 0;
+            for (std::uint32_t i = 0;
+                 i < state.capturedHeldBodyCount;
+                 ++i) {
+                const auto layer =
+                    desiredFilters[i] &
+                    heisenberg::held_collision_body_set_policy::
+                        kCollisionLayerMask;
+                noCharacterControllerBodies +=
+                    layer ==
+                    heisenberg::held_collision_body_set_policy::
+                        kHeldNoCharacterControllerLayer;
+                hiddenNonCollidableBodies +=
+                    layer ==
+                    heisenberg::held_collision_body_set_policy::
+                        kNonCollidableLayer;
+            }
+            spdlog::info(
+                "[GRAB-FILTER] Leased held body set world={:p} "
+                "bodies={} BIPED_NO_CC={} NONCOLLIDABLE={} "
+                "(CHARCONTROLLER<->BIPED_NO_CC matrix pair disabled)",
+                static_cast<void*>(world),
+                state.capturedHeldBodyCount,
+                noCharacterControllerBodies,
+                hiddenNonCollidableBodies);
+        }
+        return true;
     }
 
-    static bool RestoreCapturedHeldBodyFilters(heisenberg::GrabState& state)
+    static bool RestoreCapturedHeldBodyFilters(
+        heisenberg::GrabState& state,
+        RE::bhkWorld* bhkWorld)
     {
         if (!state.collisionObject ||
+            !bhkWorld ||
             state.capturedHeldBodyCount == 0) {
             return false;
         }
         auto* world = static_cast<RE::hknpWorld*>(
             AccessWorld(state.collisionObject));
-        if (!world) {
+        if (!LockedWorldMatchesHeldCollision(
+                state,
+                bhkWorld,
+                world)) {
+            return false;
+        }
+        heisenberg::Physics::WorldWriteLock lock(bhkWorld);
+        if (!lock.IsLocked() ||
+            !LockedWorldMatchesHeldCollision(
+                state,
+                bhkWorld,
+                world)) {
             return false;
         }
         bool restoredAny = false;
@@ -1765,6 +3057,7 @@ namespace
                     captured.bodyId,
                     captured.originalFilterInfo)) {
                 restoredAny = true;
+                captured.filterChanged = false;
                 // Phantom bodies spent the hold on the non-collidable layer; without a
                 // pair-cache rebuild the stale "no collide" verdicts would outlive the
                 // restore and the body would stay intangible after release.
@@ -1775,6 +3068,22 @@ namespace
                     captured.bodyId,
                     captured.originalFilterInfo,
                     captured.originalFilterInfo & 0x7Fu);
+            } else {
+                // Do not discard the byte-exact restore ledger on a transient
+                // native write failure. The deferred queue retries after the
+                // current physics step, when release/world bookkeeping has
+                // settled, and owns this entry from here.
+                QueueDeferredFilterRestore(
+                    world,
+                    captured.bodyId,
+                    captured.originalFilterInfo,
+                    1);
+                captured.filterChanged = false;
+                spdlog::warn(
+                    "[GRAB-MULTIBODY] Deferred failed filter restore for "
+                    "body {} -> 0x{:08X}",
+                    captured.bodyId,
+                    captured.originalFilterInfo);
             }
         }
         return restoredAny;
@@ -1787,16 +3096,27 @@ namespace
     {
         if (!state.collisionObject ||
             !bhkWorld ||
+            !state.capturedHeldBodySetValid ||
             state.capturedHeldBodyCount == 0) {
             return false;
         }
         auto* world = static_cast<RE::hknpWorld*>(
             AccessWorld(state.collisionObject));
-        if (!world) {
+        if (!LockedWorldMatchesHeldCollision(
+                state,
+                bhkWorld,
+                world)) {
             return false;
         }
 
         heisenberg::Physics::WorldWriteLock lock(bhkWorld);
+        if (!lock.IsLocked() ||
+            !LockedWorldMatchesHeldCollision(
+                state,
+                bhkWorld,
+                world)) {
+            return false;
+        }
 
         // Multipart clutter is one rigid visual object.  Validate the entire
         // captured set before writing any body so a wrapper disappearing or
@@ -1814,10 +3134,14 @@ namespace
             }
         }
 
+        std::uint32_t writtenMotionCount = 0;
         for (std::uint32_t i = 0;
              i < state.capturedHeldBodyCount;
              ++i) {
             const auto& captured = state.capturedHeldBodies[i];
+            if (!captured.isMotionRepresentative) {
+                continue;
+            }
             const RE::NiTransform desiredOwnerWorld =
                 rock::transform_math::composeTransforms(
                     rootWorld,
@@ -1826,13 +3150,16 @@ namespace
                 rock::transform_math::composeTransforms(
                     desiredOwnerWorld,
                     captured.bodyOwnerLocal);
-            rock::havok_runtime::setBodyTransformDeferred(
-                world,
-                captured.bodyId,
-                desiredBodyWorld,
-                1);
+            if (!rock::havok_runtime::setBodyTransformDeferred(
+                    world,
+                    captured.bodyId,
+                    desiredBodyWorld,
+                    1)) {
+                return false;
+            }
+            ++writtenMotionCount;
         }
-        return true;
+        return writtenMotionCount > 0;
     }
 
     // Alternate collision variants can enter acquisition with the reference
@@ -1921,19 +3248,30 @@ namespace
     {
         if (!state.collisionObject ||
             !bhkWorld ||
+            !state.capturedHeldBodySetValid ||
             state.capturedHeldBodyCount == 0) {
             return false;
         }
         auto* world = static_cast<RE::hknpWorld*>(
             AccessWorld(state.collisionObject));
-        if (!world) {
+        if (!LockedWorldMatchesHeldCollision(
+                state,
+                bhkWorld,
+                world)) {
             return false;
         }
         heisenberg::Physics::WorldWriteLock lock(bhkWorld);
+        if (!lock.IsLocked() ||
+            !LockedWorldMatchesHeldCollision(
+                state,
+                bhkWorld,
+                world)) {
+            return false;
+        }
 
-        // Release velocity must also be all-or-nothing.  Giving only one body
-        // in a multipart NIF a velocity immediately splits its collision frame
-        // from the rendered root on the next simulation step.
+        // Release velocity must also be all-or-nothing by captured set, but a
+        // shared motion receives exactly one native write. Writing every body
+        // in that group would repeatedly overwrite the same hknp motion.
         for (std::uint32_t i = 0;
              i < state.capturedHeldBodyCount;
              ++i) {
@@ -1947,30 +3285,50 @@ namespace
             }
         }
 
+        std::uint32_t writtenMotionCount = 0;
         for (std::uint32_t i = 0;
              i < state.capturedHeldBodyCount;
              ++i) {
             const auto& captured = state.capturedHeldBodies[i];
-            rock::havok_runtime::setBodyVelocityDeferred(
-                world,
-                captured.bodyId,
-                linear,
-                angular);
+            if (!captured.isMotionRepresentative) {
+                continue;
+            }
+            if (!rock::havok_runtime::setBodyVelocityDeferred(
+                    world,
+                    captured.bodyId,
+                    linear,
+                    angular)) {
+                return false;
+            }
+            ++writtenMotionCount;
         }
-        return true;
+        return writtenMotionCount > 0;
     }
 
     static void RebuildCapturedHeldBodyCollisionCaches(
         heisenberg::GrabState& state,
+        RE::bhkWorld* bhkWorld,
         float lookAheadHavok)
     {
         if (!state.collisionObject ||
+            !bhkWorld ||
             state.capturedHeldBodyCount == 0) {
             return;
         }
         auto* world = static_cast<RE::hknpWorld*>(
             AccessWorld(state.collisionObject));
-        if (!world) {
+        if (!LockedWorldMatchesHeldCollision(
+                state,
+                bhkWorld,
+                world)) {
+            return;
+        }
+        heisenberg::Physics::WorldWriteLock lock(bhkWorld);
+        if (!lock.IsLocked() ||
+            !LockedWorldMatchesHeldCollision(
+                state,
+                bhkWorld,
+                world)) {
             return;
         }
         for (std::uint32_t i = 0;
@@ -1994,32 +3352,216 @@ namespace
         }
     }
 
-    // Suppress collision between the held (collidable, keyframed) object and the player by
-    // OR'ing ROCK's "hand group" bits (0x000B << 16 = 0x000B0000) into the held object's
-    // collisionFilterInfo. The engine's pair filter recognises the 0x000B group as "hand-
-    // group body" and rejects pairs against player-attached bodies (proxy, biped, weapons,
-    // FRIK avatar etc.) at broadphase. Same mechanism HandCollision uses for hand bodies.
-    //
-    // Crucially: the object's LAYER (low 7 bits) is preserved — so it still collides with
-    // world clutter / walls / tables normally and can still be grabbed by the other hand
-    // (selection rays look at the layer, not the group bits).
-    //
-    // Replaces the previous DisableCollisionBetween approach which was SEH-faulting every
-    // single attempt on keyframed bodies (the engine's per-pair filter doesn't accept those
-    // body ids cleanly while they're in keyframed state).
-    static bool TryDisablePlayerHeldObjectCollision(heisenberg::GrabState& state)
+    static void ClearExternalHeldBodiesForPlayerSuppression(
+        heisenberg::GrabState& state,
+        const bool isLeft)
     {
-        if (state.capturedHeldBodyCount > 0) {
-            return ApplyCapturedHeldBodyFilters(state);
+        // GrabState moves between hand slots during an atomic two-hand
+        // promotion, so clear the slot recorded by the state rather than
+        // assuming that its current array slot still owns the publication.
+        // Once cleared, repeated failed refreshes remain no-ops.
+        if (state.externalHeldBodiesPublished) {
+            rock::HostClearExternalHeldBodies(
+                state.externalHeldBodiesPublishedForLeft);
         }
-        const bool firstApply = !state.heldPlayerFilterApplied;
+        state.externalHeldBodiesPublished = false;
+        state.externalHeldBodiesPublishedForLeft = isLeft;
+    }
+
+    // Publish exact host-owned body identities before KEYFRAMED authority is
+    // enabled. The character-controller hook matches both hknpWorld and body
+    // ID, so an authored native collision group can never be mistaken for a
+    // held object. This publication is independent of the optional filter-word
+    // rewrite below: even if that native write fails, the exact solver filter
+    // still prevents the held body from displacing the player.
+    static bool PublishExternalHeldBodiesForPlayerSuppression(
+        heisenberg::GrabState& state,
+        const bool isLeft)
+    {
+        const auto failWithoutReplacing = []() {
+            /*
+             * Publication is a replace-on-success transaction. A transient
+             * validation/read failure must not erase the last complete exact
+             * snapshot: during a handover that old hand slot still protects
+             * the same keyframed body. Proven invalidation sites (world
+             * rollover, body-sync failure, release/abort) clear explicitly.
+             */
+            return false;
+        };
+
+        if (!state.collisionObject ||
+            !state.collisionObject->spSystem) {
+            return failWithoutReplacing();
+        }
+
+        auto* const liveWorld =
+            static_cast<RE::hknpWorld*>(
+                AccessWorld(state.collisionObject));
+        if (!liveWorld) {
+            return failWithoutReplacing();
+        }
+
+        std::array<
+            std::uint32_t,
+            heisenberg::GrabState::kMaxCapturedHeldBodies>
+            bodyIds{};
+        std::uint32_t bodyCount = 0;
+
+        if (state.capturedHeldBodySetValid &&
+            state.capturedHeldBodyCount > 0) {
+            if (state.capturedHeldBodiesWorld != liveWorld ||
+                !CapturedHeldBodySetStillOwned(state)) {
+                return failWithoutReplacing();
+            }
+            for (std::uint32_t i = 0;
+                 i < state.capturedHeldBodyCount;
+                 ++i) {
+                const auto& captured =
+                    state.capturedHeldBodies[i];
+                if (!captured.valid ||
+                    captured.bodyId == 0x7FFFFFFFu ||
+                    captured.bodyId == 0xFFFFFFFFu) {
+                    return failWithoutReplacing();
+                }
+                bodyIds[bodyCount++] = captured.bodyId;
+            }
+        } else {
+            std::uint32_t selectedBodyId = 0x7FFFFFFFu;
+            heisenberg::ConstraintFunctions::
+                BhkPhysicsSystemGetBodyId(
+                    state.collisionObject->spSystem.get(),
+                    &selectedBodyId,
+                    state.collisionObject->systemBodyIdx);
+            if (selectedBodyId == 0x7FFFFFFFu ||
+                selectedBodyId == 0xFFFFFFFFu) {
+                return failWithoutReplacing();
+            }
+            bodyIds[bodyCount++] = selectedBodyId;
+        }
+
+        if (bodyCount == 0) {
+            return failWithoutReplacing();
+        }
+
+        const bool firstPublication =
+            !state.externalHeldBodiesPublished;
+        const bool publicationChangedHand =
+            state.externalHeldBodiesPublished &&
+            state.externalHeldBodiesPublishedForLeft != isLeft;
+        const bool clearPreviousHandAfterPublish =
+            state.externalHeldBodiesPublished &&
+            state.externalHeldBodiesPublishedForLeft != isLeft;
+        const bool previousPublishedForLeft =
+            state.externalHeldBodiesPublishedForLeft;
+
+        // HostPublish swaps a complete double-buffered snapshot. During a
+        // handover, publish the destination first and only then clear the old
+        // source slot so the still-keyframed body is never unprotected between
+        // the two operations.
+        rock::HostPublishExternalHeldBodies(
+            isLeft,
+            liveWorld,
+            bodyIds.data(),
+            bodyCount);
+        if (clearPreviousHandAfterPublish) {
+            rock::HostClearExternalHeldBodies(
+                previousPublishedForLeft);
+        }
+        state.externalHeldBodiesPublished = true;
+        state.externalHeldBodiesPublishedForLeft = isLeft;
+        if (firstPublication || publicationChangedHand) {
+            spdlog::info(
+                "[GRAB-FILTER] Published exact held-body registry "
+                "world={:p} hand={} bodies={} firstBody={}",
+                static_cast<void*>(liveWorld),
+                isLeft ? "left" : "right",
+                bodyCount,
+                bodyIds[0]);
+        }
+        return true;
+    }
+
+    // Move only the exact held body to the BIPED_NO_CC layer while it is
+    // keyframed. Fallout's vendored Havok wrapper documents this as the
+    // grabbed-object path that avoids character-controller bumping. Bits 7-31
+    // remain byte-identical and the complete original filter is restored on
+    // release.
+    static bool TryDisablePlayerHeldObjectCollision(
+        heisenberg::GrabState& state,
+        RE::bhkWorld* bhkWorld)
+    {
+        if (!bhkWorld) {
+            return false;
+        }
+        if (state.capturedHeldBodyCount > 0 &&
+            state.capturedHeldBodySetValid) {
+            auto* liveWorld = state.collisionObject
+                ? static_cast<RE::hknpWorld*>(AccessWorld(state.collisionObject))
+                : nullptr;
+            if (liveWorld &&
+                state.capturedHeldBodiesWorld == liveWorld &&
+                CapturedHeldBodySetStillOwned(state)) {
+                if (ApplyCapturedHeldBodyFilters(
+                        state,
+                        bhkWorld,
+                        true)) {
+                    return true;
+                }
+
+                // Filter writes can fail transiently while every captured body
+                // frame is still valid. Keep the transform/release authority:
+                // discarding it here would make release restore only one body
+                // even though setup recursively keyframed the whole subtree.
+                spdlog::warn(
+                    "[GRAB-MULTIBODY] Held-filter apply failed for an "
+                    "otherwise valid {}-body set; retaining motion/release "
+                    "authority for retry",
+                    state.capturedHeldBodyCount);
+                return false;
+            }
+
+            // Keep the per-body original filters as a release ledger even when
+            // transform authority becomes unusable. Restore everything still
+            // owned/readable now, then let the selected-body scalar path carry
+            // collision suppression for the remainder of the hold.
+            (void)RestoreCapturedHeldBodyFilters(
+                state,
+                bhkWorld);
+            state.capturedHeldBodySetValid = false;
+            spdlog::warn(
+                "[GRAB-MULTIBODY] Retaining unusable captured set as a "
+                "filter-restore ledger before "
+                "held-filter apply (capturedWorld={:p} liveWorld={:p} bodies={}); "
+                "falling back to selected body",
+                state.capturedHeldBodiesWorld,
+                static_cast<void*>(liveWorld),
+                state.capturedHeldBodyCount);
+        }
+        const bool firstApply = !state.heldScalarFilterApplied;
         if (!state.collisionObject || !state.collisionObject->spSystem) {
             if (firstApply) spdlog::warn("[GRAB-FILTER] skip: collObj/spSystem null");
             return false;
         }
-        void* hknpWorld = AccessWorld(state.collisionObject);
-        if (!hknpWorld) {
+        auto* hknpWorld = static_cast<RE::hknpWorld*>(
+            AccessWorld(state.collisionObject));
+        if (!LockedWorldMatchesHeldCollision(
+                state,
+                bhkWorld,
+                hknpWorld)) {
             if (firstApply) spdlog::warn("[GRAB-FILTER] skip: AccessWorld null");
+            return false;
+        }
+        heisenberg::Physics::WorldWriteLock lock(bhkWorld);
+        if (!lock.IsLocked() ||
+            !LockedWorldMatchesHeldCollision(
+                state,
+                bhkWorld,
+                hknpWorld)) {
+            if (firstApply) {
+                spdlog::warn(
+                    "[GRAB-FILTER] skip: held world changed or write "
+                    "lock failed");
+            }
             return false;
         }
         std::uint32_t objBodyId = 0x7FFFFFFF;
@@ -2030,8 +3572,6 @@ namespace
             return false;
         }
 
-        // Direct 0x000B group-bit OR (proven to work; see
-        // feedback_rock_hand_layer_for_no_player_push.md).
         std::uint32_t cur = 0;
         if (!heisenberg::Physics::TryReadBodyFilterInfo(hknpWorld, objBodyId, cur)) {
             if (firstApply) spdlog::warn("[GRAB-FILTER] skip: TryReadBodyFilterInfo failed for body 0x{:08X}", objBodyId);
@@ -2039,44 +3579,43 @@ namespace
         }
         if (firstApply) {
             state.heldOriginalFilterInfo = cur;
-            state.heldHadSuppressionBitOriginally = (cur & 0x000B0000u) == 0x000B0000u;
         }
-        // ROCK-style "held object that pushes world but not the player" filter:
-        //   KEEP the body's NATIVE layer and OR in only the 0x000B group bits — the
-        //   engine's pair filter rejects player-attached pairs by GROUP, not layer.
-        // FAITHFULNESS FIX (2026-07-05 audit rank 6): this used to also swap the layer to
-        // ROCK's hand layer 43, contradicting the documented working approach (see the
-        // "REVERTED 2026-05-29" comment at the call site) and diverging from standalone
-        // ROCK, which never re-layers held objects. Layer 43's matrix row excludes layer 43
-        // itself, PROJECTILE/SPELL and ITEMPICK/LOS — so the free hand's colliders,
-        // bullets, and activation picks all passed through anything you held. Native
-        // CharController-object contact suppression (already active in the embed) is what
-        // actually prevents player-push, making the layer swap redundant AND harmful.
-        // Write directly into the hknp body's filter info. We deliberately do NOT call
-        // bhkUtilFunctions_SetLayerLocked here — that helper rewrites the filter from
-        // layer-presets and clobbers group/system bits, poisoning the saved "original"
-        // filter and breaking thrown-object damage on release.
-        constexpr std::uint32_t kHandGroupBits = 0x000Bu << 16;
-        const std::uint32_t merged = cur | kHandGroupBits;
-        if (merged == cur) {
-            if (firstApply) spdlog::info("[GRAB-FILTER] body 0x{:08X} already has 0x000B group bits (filter=0x{:08X})", objBodyId, cur);
+        const std::uint32_t heldFilter =
+            heisenberg::held_collision_body_set_policy::
+                HeldBodyFilter(cur, true);
+        if (heldFilter == cur) {
+            state.heldScalarFilterApplied = true;
+            if (firstApply) {
+                spdlog::info(
+                    "[GRAB-FILTER] body 0x{:08X} already uses "
+                    "BIPED_NO_CC (filter=0x{:08X})",
+                    objBodyId,
+                    cur);
+            }
             return true;
         }
-        if (!heisenberg::Physics::TryWriteBodyFilterInfo(hknpWorld, objBodyId, merged)) {
+        if (!heisenberg::Physics::TryWriteBodyFilterInfo(
+                hknpWorld,
+                objBodyId,
+                heldFilter)) {
             if (firstApply) spdlog::warn("[GRAB-FILTER] skip: TryWriteBodyFilterInfo failed for body 0x{:08X}", objBodyId);
             return false;
         }
+        RebuildBodyCollisionCachesNative(hknpWorld, objBodyId);
+        state.heldScalarFilterApplied = true;
         if (firstApply) {
-            spdlog::info("[GRAB-FILTER] body 0x{:08X} filter 0x{:08X} -> 0x{:08X} (native layer kept + 0x000B group bits)",
-                         objBodyId, cur, merged);
+            spdlog::info(
+                "[GRAB-FILTER] body 0x{:08X} filter 0x{:08X} -> "
+                "0x{:08X} (temporary BIPED_NO_CC layer)",
+                objBodyId,
+                cur,
+                heldFilter);
         }
         return true;
     }
 
-    // Clear ROCK's hand-group bits from the held object's collisionFilterInfo on release,
-    // unless they were already set before we grabbed (in which case leave them — the body
-    // is intentionally part of the hand group). Restores the body to its pre-grab collision
-    // behavior so the thrown/dropped object hits NPCs + the player normally afterward.
+    // Restore the exact pre-grab filter so released/thrown bodies regain their
+    // authored layer and continue to hit actors and world objects normally.
     // Jul 18 v3: engine primitive that destroys+rebuilds a body's collision caches so stale
     // pair verdicts die immediately. hknpWorld::rebuildBodyCollisionCaches(hknpBodyId), PDB
     // VA 0x14153C5A0 (F4VR 1.2.72). SEH rule: Relocation lives outside any __try.
@@ -2087,77 +3626,169 @@ namespace
         s_fn(hknpWorld, bodyId);
     }
 
-    // [REL-DIAG v2] tiny deferred filter-restore queue for the pair-cache poke. Entries are
-    // written back N post-physics frames after release so the engine sees two distinct filter
-    // transitions (bit14 on -> steps -> off) and rebuilds the stale hand<->object pair.
+    // Deferred byte-exact restore queue. A multipart object can expose up to
+    // 64 bodies per hand, so reserve both hands' worst case; dropping a failed
+    // restore would strand a temporary hold filter in the world.
     struct DeferredFilterRestore
     {
         void* world = nullptr;
         std::uint32_t bodyId = 0x7FFFFFFF;
         std::uint32_t filter = 0;
         int framesLeft = 0;
+        int attemptsLeft = 0;
     };
-    static DeferredFilterRestore g_deferredFilterRestores[8];
+    static DeferredFilterRestore g_deferredFilterRestores[128];
+    static std::atomic<bool> g_hasDeferredFilterRestores{ false };
 
     static void QueueDeferredFilterRestore(void* world, std::uint32_t bodyId, std::uint32_t filter, int frames)
     {
+        if (!world ||
+            bodyId == 0x7FFFFFFFu ||
+            bodyId == 0xFFFFFFFFu) {
+            return;
+        }
         for (auto& e : g_deferredFilterRestores) {
-            if (e.framesLeft <= 0) {
-                e = { world, bodyId, filter, frames };
+            if (e.framesLeft > 0 &&
+                e.world == world &&
+                e.bodyId == bodyId) {
+                e.filter = filter;
+                e.framesLeft = (std::max)(frames, 1);
+                e.attemptsLeft = 8;
+                g_hasDeferredFilterRestores.store(
+                    true,
+                    std::memory_order_release);
                 return;
             }
         }
-        // queue full: restore immediately rather than dropping the write
-        heisenberg::Physics::TryWriteBodyFilterInfo(world, bodyId, filter);
+        for (auto& e : g_deferredFilterRestores) {
+            if (e.framesLeft <= 0) {
+                e = {
+                    world,
+                    bodyId,
+                    filter,
+                    (std::max)(frames, 1),
+                    8
+                };
+                g_hasDeferredFilterRestores.store(
+                    true,
+                    std::memory_order_release);
+                return;
+            }
+        }
+        // Queue exhaustion should be impossible for two 64-body holds. Still
+        // make one immediate recovery attempt and report a failure loudly.
+        if (!heisenberg::Physics::TryWriteBodyFilterInfo(
+                world,
+                bodyId,
+                filter)) {
+            spdlog::error(
+                "[GRAB-FILTER] Deferred restore queue full and immediate "
+                "restore failed for body 0x{:08X}",
+                bodyId);
+        }
     }
 
     void TickDeferredFilterRestores(void* liveHknpWorld)
     {
+        bool anyPending = false;
         for (auto& e : g_deferredFilterRestores) {
             if (e.framesLeft <= 0) continue;
-            // REGRESSION FIX (Jul 18): do NOT drop on world-pointer mismatch — EndGrab captures
-            // the world via AccessWorld() while this tick reads bhk+0x60; both can name the SAME
-            // world through different accessors. Dropping left bit14 set forever -> the released
-            // object collided with NOTHING and fell through the floor. Always complete the
-            // restore against the world captured at queue time (write is SEH-guarded).
+            // Do not drop on world-pointer mismatch: the queue owns the exact
+            // hknpWorld captured with the body ID, and body IDs are meaningful
+            // only in that namespace.
             (void)liveHknpWorld;
             if (--e.framesLeft == 0) {
-                heisenberg::Physics::TryWriteBodyFilterInfo(e.world, e.bodyId, e.filter);
-                spdlog::debug("[REL-DIAG] deferred filter restore body=0x{:08X} -> 0x{:08X}", e.bodyId, e.filter);
+                if (heisenberg::Physics::TryWriteBodyFilterInfo(
+                        e.world,
+                        e.bodyId,
+                        e.filter)) {
+                    RebuildBodyCollisionCachesNative(
+                        e.world,
+                        e.bodyId);
+                    spdlog::debug(
+                        "[REL-DIAG] deferred filter restore body=0x{:08X} "
+                        "-> 0x{:08X}",
+                        e.bodyId,
+                        e.filter);
+                    e = {};
+                } else if (--e.attemptsLeft > 0) {
+                    e.framesLeft = 1;
+                    anyPending = true;
+                } else {
+                    spdlog::error(
+                        "[GRAB-FILTER] Exhausted deferred filter restore "
+                        "retries for body 0x{:08X}",
+                        e.bodyId);
+                    e = {};
+                }
+            } else {
+                anyPending = true;
             }
         }
+        g_hasDeferredFilterRestores.store(
+            anyPending,
+            std::memory_order_release);
     }
 
-    static void TryRestoreHeldObjectCollision(heisenberg::GrabState& state)
+    static void TryRestoreHeldObjectCollision(
+        heisenberg::GrabState& state,
+        RE::bhkWorld* bhkWorld)
     {
-        if (!state.heldPlayerFilterApplied) return;
+        if (!state.heldPlayerFilterApplied || !bhkWorld) return;
         if (state.capturedHeldBodyCount > 0) {
-            (void)RestoreCapturedHeldBodyFilters(state);
+            (void)RestoreCapturedHeldBodyFilters(
+                state,
+                bhkWorld);
+        }
+        if (!state.heldScalarFilterApplied) return;
+        if (!state.collisionObject || !state.collisionObject->spSystem) return;
+        auto* hknpWorld = static_cast<RE::hknpWorld*>(
+            AccessWorld(state.collisionObject));
+        if (!LockedWorldMatchesHeldCollision(
+                state,
+                bhkWorld,
+                hknpWorld)) {
             return;
         }
-        if (!state.collisionObject || !state.collisionObject->spSystem) return;
-        void* hknpWorld = AccessWorld(state.collisionObject);
-        if (!hknpWorld) return;
+        heisenberg::Physics::WorldWriteLock lock(bhkWorld);
+        if (!lock.IsLocked() ||
+            !LockedWorldMatchesHeldCollision(
+                state,
+                bhkWorld,
+                hknpWorld)) {
+            return;
+        }
         std::uint32_t objBodyId = 0x7FFFFFFF;
         heisenberg::ConstraintFunctions::BhkPhysicsSystemGetBodyId(
             state.collisionObject->spSystem.get(), &objBodyId, state.collisionObject->systemBodyIdx);
         if (objBodyId == 0x7FFFFFFF) return;
 
-        // Clear the 0x000B hand-group bits we OR'd in during disable.
-        // Since we no longer call SetLayerLocked on grab, the body's layer/system are
-        // untouched and only the group bits diverge. heldOriginalFilterInfo holds the
-        // exact pre-grab filter (captured before we OR'd anything), so we can either
-        // write it back directly or strip just the 0x000B bits. Writing the original
-        // back is the cleanest revert.
-        if (state.heldHadSuppressionBitOriginally) return;  // already-suppressed bodies — leave alone
         std::uint32_t cur = 0;
         if (!heisenberg::Physics::TryReadBodyFilterInfo(hknpWorld, objBodyId, cur)) return;
         const std::uint32_t restored = state.heldOriginalFilterInfo;
         if (restored != cur) {
-            heisenberg::Physics::TryWriteBodyFilterInfo(hknpWorld, objBodyId, restored);
-            spdlog::info("[GRAB-KEYFRAMED] Held object 0x{:08X} filter restored 0x{:08X} -> 0x{:08X} (layer={})",
-                         objBodyId, cur, restored, restored & 0x7Fu);
+            if (heisenberg::Physics::TryWriteBodyFilterInfo(
+                    hknpWorld,
+                    objBodyId,
+                    restored)) {
+                RebuildBodyCollisionCachesNative(
+                    hknpWorld,
+                    objBodyId);
+                spdlog::info("[GRAB-KEYFRAMED] Held object 0x{:08X} filter restored 0x{:08X} -> 0x{:08X} (layer={})",
+                             objBodyId, cur, restored, restored & 0x7Fu);
+            } else {
+                QueueDeferredFilterRestore(
+                    hknpWorld,
+                    objBodyId,
+                    restored,
+                    1);
+                spdlog::warn(
+                    "[GRAB-KEYFRAMED] Deferred failed scalar filter "
+                    "restore for body 0x{:08X}",
+                    objBodyId);
+            }
         }
+        state.heldScalarFilterApplied = false;
     }
 
     // FAITHFULNESS FIX (2026-07-05 audit rank 7): capture the held object's REAL pre-grab
@@ -2843,10 +4474,24 @@ namespace
     // Add grabbed item to player inventory and delete the world reference
     // Uses ActivateRef like HIGGS Skyrim - this is safer than PickUpObject
     // showHudMessage: If false, don't show "X was stored" message (for quickloot items that already showed a message)
-    bool StoreGrabbedItem(RE::TESObjectREFR* refr, bool showHudMessage = true)
+    bool StoreGrabbedItem(
+        RE::TESObjectREFR* refr,
+        bool showHudMessage = true,
+        RE::TESForm** outStoredBaseForm = nullptr)
     {
         if (!refr)
             return false;
+
+        // ActivateRef may synchronously remove the world reference. Keep the
+        // object alive for the duration of this function, and capture every
+        // value needed after activation before calling into the engine.
+        RE::NiPointer<RE::TESObjectREFR> refrHolder(refr);
+        refr = refrHolder.get();
+        const RE::TESFormID storedRefID = refr->GetFormID();
+        RE::TESForm* baseForm = refr->GetObjectReference();
+        if (outStoredBaseForm) {
+            *outStoredBaseForm = baseForm;
+        }
         
         auto* player = RE::PlayerCharacter::GetSingleton();
         if (!player)
@@ -2857,7 +4502,6 @@ namespace
         // to GetDisplayFullName() (e.g. "Desk Fan [Steel, Screw]" instead of "Desk Fan")
         std::string itemName;
         if (showHudMessage) {
-            auto* baseForm = refr->GetObjectReference();
             if (baseForm) {
                 auto fullName = RE::TESFullName::GetFullName(*baseForm, false);
                 if (!fullName.empty())
@@ -2900,7 +4544,6 @@ namespace
         // PipboyInteraction when inserted into the tape deck.
         // Mark this item as recently stored so loot-to-hand doesn't re-grab it
         // ActivateRef fires TESContainerChangedEvent which loot-to-hand would intercept
-        auto* baseForm = refr->GetObjectReference();
         if (baseForm) {
             heisenberg::DropToHand::GetSingleton().MarkAsRecentlyStored(baseForm->formID);
         }
@@ -2920,7 +4563,7 @@ namespace
             SafeDisableRef(refr);
             result = true;
             spdlog::info("[STORE] {} {:08X} stored via AddObjectToContainer (no read/playback)",
-                         storeFormType == RE::ENUM_FORM_ID::kBOOK ? "Book/magazine" : "Holotape", refr->formID);
+                         storeFormType == RE::ENUM_FORM_ID::kBOOK ? "Book/magazine" : "Holotape", storedRefID);
         } else {
             // Use ActivateRef like HIGGS Skyrim does
             // Parameters: actionRef (player), objectToGet (nullptr), count,
@@ -2937,7 +4580,7 @@ namespace
         // Instead, queue our custom message for display after deferred unsuppress.
 
         if (result) {
-            spdlog::info("[STORE] Stored item {:08X} '{}' x{} to inventory via ActivateRef", refr->formID, itemName, extraCount);
+            spdlog::info("[STORE] Stored item {:08X} '{}' x{} to inventory", storedRefID, itemName, extraCount);
 
             // Build HUD message and queue it for deferred display
             if (showHudMessage && heisenberg::g_config.showStorageMessages) {
@@ -2954,7 +4597,7 @@ namespace
                 heisenberg::Hooks::ScheduleDeferredHUDUnsuppress(15);
             }
         } else {
-            spdlog::warn("[STORE] ActivateRef failed for {:08X} '{}'", refr->formID, itemName);
+            spdlog::warn("[STORE] ActivateRef failed for {:08X} '{}'", storedRefID, itemName);
             heisenberg::Hooks::ScheduleDeferredHUDUnsuppress(15);
         }
 
@@ -3290,11 +4933,122 @@ namespace
         return ArmorZoneType::None;
     }
     
-    // Check if a held weapon is close to the weapon hand's fingertip for equipping
-    // When holding a weapon in one hand, bringing it near the opposite (weapon) hand's fingertip
-    // will trigger equipping. This allows natural "handing off" the weapon to your weapon hand.
-    // Returns true if weapon should be equipped
-    bool CheckWeaponEquipByFingertip(const RE::NiPoint3& heldWeaponPos, float handSpeed, bool holdingInLeftHand)
+    // Weapon-equip contact rule (Jul 30, user): a weapon held in the OFF hand
+    // equips when its collision actually TOUCHES the weapon hand's collision —
+    // not when their origins come within some radius of each other. The old
+    // 15-unit fingertip proximity test fired across a visible gap (and fired
+    // instantly on a Pip-Boy drop, where the item materialises next to the
+    // weapon hand), so contact is both the stricter and the more intuitive rule.
+    //
+    // "Touching" is evaluated against the SAME generated hand hull Havok
+    // collides with, via HostCopyHandCollisionSamples — the boundary spheres of
+    // the weapon hand's colliders — measured against the held weapon's visible
+    // mesh. A small skin absorbs the gap between the render mesh and the hull.
+    constexpr std::uint32_t kWeaponEquipHandSampleLimit = 384;
+    constexpr float kWeaponEquipContactSkin = 1.0f;
+    constexpr std::uint32_t kWeaponEquipTouchEvidenceMaxAgeFrames = 4;
+
+    // Minimum separation between the weapon hand's generated collision hull and
+    // the held weapon's visible mesh, in game units. Negative means the hull is
+    // inside the mesh. Returns false when the measurement cannot be made at all
+    // (no hull published yet, or no triangles) — callers must NOT treat that as
+    // a touch.
+    bool TryMeasureWeaponHandHullSeparation(
+        heisenberg::GrabState& state,
+        bool weaponHandIsLeft,
+        float& outSeparation)
+    {
+        if (!state.node) {
+            return false;
+        }
+
+        static std::array<RE::NiPoint3, kWeaponEquipHandSampleLimit> handPoints;
+        static std::array<float, kWeaponEquipHandSampleLimit> handRadii;
+        const std::uint32_t handSampleCount =
+            rock::HostCopyHandCollisionSamples(
+                weaponHandIsLeft,
+                handPoints.data(),
+                handRadii.data(),
+                kWeaponEquipHandSampleLimit);
+        if (handSampleCount == 0) {
+            return false;
+        }
+
+        // Broadphase: the hull is a hand, the mesh can be a rifle. Reject on the
+        // world bound before transforming thousands of vertices every frame.
+        const float boundRadius = state.node->worldBound.fRadius;
+        const RE::NiPoint3 boundCentre = state.node->worldBound.center;
+        const bool boundUsable =
+            std::isfinite(boundRadius) &&
+            boundRadius > 0.0f &&
+            boundRadius < 10000.0f &&
+            std::isfinite(boundCentre.x) &&
+            std::isfinite(boundCentre.y) &&
+            std::isfinite(boundCentre.z);
+        if (boundUsable) {
+            bool anySampleInRange = false;
+            for (std::uint32_t i = 0; i < handSampleCount; ++i) {
+                const float reach =
+                    boundRadius + handRadii[i] + kWeaponEquipContactSkin;
+                if (heisenberg::Utils::VectorLength(handPoints[i] - boundCentre) <= reach) {
+                    anySampleInRange = true;
+                    break;
+                }
+            }
+            if (!anySampleInRange) {
+                outSeparation = (std::numeric_limits<float>::max)();
+                return true;
+            }
+        }
+
+        std::vector<heisenberg::TriangleData> triangles;
+        triangles.reserve(1024);
+        heisenberg::GetTriangles(state.node.get(), triangles, 4096);
+        if (triangles.empty()) {
+            return false;
+        }
+
+        float best = (std::numeric_limits<float>::max)();
+        for (std::uint32_t i = 0; i < handSampleCount; ++i) {
+            const RE::NiPoint3& sample = handPoints[i];
+            if (!std::isfinite(sample.x) ||
+                !std::isfinite(sample.y) ||
+                !std::isfinite(sample.z)) {
+                continue;
+            }
+            RE::NiPoint3 closest{};
+            float distance = -1.0f;
+            if (!heisenberg::GetClosestMeshPointToPoint(
+                    triangles,
+                    sample,
+                    closest,
+                    distance) ||
+                !std::isfinite(distance)) {
+                continue;
+            }
+            const float radius =
+                (std::isfinite(handRadii[i]) && handRadii[i] > 0.0f) ? handRadii[i] : 0.0f;
+            const float separation = distance - radius;
+            if (separation < best) {
+                best = separation;
+            }
+        }
+        if (best == (std::numeric_limits<float>::max)()) {
+            return false;
+        }
+        outSeparation = best;
+        return true;
+    }
+
+    // Decide whether a weapon held in the OFF hand should be equipped, using the
+    // contact rule described above: the weapon's collision must be TOUCHING the
+    // weapon hand's collision. outMeasuredSeparation receives the measured hull
+    // separation in game units when one was computed (stays at max otherwise).
+    bool CheckWeaponEquipByHandContact(
+        heisenberg::GrabState& state,
+        float handSpeed,
+        bool holdingInLeftHand,
+        float* outMeasuredSeparation = nullptr)
     {
         // Check if weapon equip is disabled
         if (heisenberg::g_config.weaponEquipMode == 0)
@@ -3315,9 +5069,9 @@ namespace
         // "drop on weapon hand" equip. This function only runs while grabbing a weapon, so
         // the log isn't spammy during normal play.
         const float speedMax = heisenberg::g_config.armorEquipVelocityThreshold;
-        constexpr float weaponEquipRadius = 15.0f;  // 15cm
-        bool fingertipOk = false;
-        float dist = -1.0f;
+        float separation = (std::numeric_limits<float>::max)();
+        bool measured = false;
+        bool havokContact = false;
         bool result = false;
         const char* reason = "";
 
@@ -3328,30 +5082,58 @@ namespace
         } else if (handSpeed >= speedMax) {
             reason = "BLOCKED: hand moving too fast";
         } else {
-            auto& frik = heisenberg::FRIKInterface::GetSingleton();
-            RE::NiPoint3 weaponHandFingertip;
-            if (frik.IsAvailable() && frik.GetIndexFingerTipPosition(weaponHandIsLeft, weaponHandFingertip)) {
-                fingertipOk = true;
-            } else {
-                auto* playerNodes = f4cf::f4vr::getPlayerNodes();
-                RE::NiAVObject* wandNode = playerNodes ? heisenberg::GetWandNode(playerNodes, weaponHandIsLeft) : nullptr;
-                if (wandNode) { weaponHandFingertip = wandNode->world.translate; fingertipOk = true; }
+            // 1) Havok's own contact evidence for the weapon hand, when the
+            //    engine already reports it touching this exact reference.
+            if (auto* heldRef = state.GetRefr()) {
+                RE::TESObjectREFR* touchedRef = nullptr;
+                std::uint32_t touchedBodyId = 0;
+                std::uint32_t touchedAgeFrames = 0;
+                RE::NiPoint3 touchedPoint{};
+                bool hasTouchedPoint = false;
+                if (rock::HostGetHandTouchEvidence(
+                        weaponHandIsLeft,
+                        kWeaponEquipTouchEvidenceMaxAgeFrames,
+                        &touchedRef,
+                        &touchedBodyId,
+                        &touchedAgeFrames,
+                        &touchedPoint,
+                        &hasTouchedPoint) &&
+                    touchedRef == heldRef) {
+                    havokContact = true;
+                }
             }
-            if (!fingertipOk) {
-                reason = "BLOCKED: no FRIK fingertip and no wand node for weapon hand";
+
+            // 2) Exact hull-vs-mesh separation. This is the primary test: a held
+            //    body is keyframed onto a temporary layer while held, so Havok
+            //    contact events for it cannot be relied on as the only signal.
+            measured = TryMeasureWeaponHandHullSeparation(
+                state,
+                weaponHandIsLeft,
+                separation);
+            if (outMeasuredSeparation && measured) {
+                *outMeasuredSeparation = separation;
+            }
+
+            if (havokContact) {
+                result = true;
+                reason = "DETECTED (havok contact) — will equip on release";
+            } else if (!measured) {
+                reason = "BLOCKED: no hand collision hull or mesh to measure";
+            } else if (separation <= kWeaponEquipContactSkin) {
+                result = true;
+                reason = "DETECTED (hull touch) — will equip on release";
             } else {
-                dist = (heldWeaponPos - weaponHandFingertip).Length();
-                if (dist < weaponEquipRadius) { result = true; reason = "DETECTED — will equip on release"; }
-                else { reason = "too far from weapon-hand fingertip"; }
+                reason = "not touching the weapon hand's collision";
             }
         }
 
         static int weqLogCtr = 0;
         if (result || ++weqLogCtr >= 30) {
             weqLogCtr = 0;
-            spdlog::info("[WEAP-EQUIP] grabHand={} usingOffHand={} speed={:.2f}(max{:.2f}) fingertipOK={} dist={:.1f}cm(need<{:.0f}) => {}",
+            spdlog::info("[WEAP-EQUIP] grabHand={} usingOffHand={} speed={:.2f}(max{:.2f}) havokContact={} measured={} separation={:.2f}gu(need<={:.2f}) => {}",
                          holdingInLeftHand ? "LEFT" : "RIGHT", !holdingInPrimaryHand, handSpeed, speedMax,
-                         fingertipOk, dist, weaponEquipRadius, reason);
+                         havokContact, measured,
+                         measured ? separation : -1.0f, kWeaponEquipContactSkin, reason);
         }
         return result;
     }
@@ -4146,6 +5928,15 @@ namespace
     void EndGrabKeyframed(heisenberg::GrabState& state, const RE::NiPoint3* throwVelocity, bool isLeft,
                           const RE::NiPoint3* throwAngularVelocity = nullptr)
     {
+        struct ClearExternalHeldBodiesOnExit
+        {
+            bool isLeft;
+            ~ClearExternalHeldBodiesOnExit() noexcept
+            {
+                rock::HostClearExternalHeldBodies(isLeft);
+            }
+        } clearExternalHeldBodiesOnExit{ isLeft };
+
         RE::TESObjectREFR* refr = state.GetRefr();
         spdlog::debug("[GRAB-KEYFRAMED] EndGrab: Releasing object {:08X}",
                      refr ? refr->formID : 0);
@@ -4183,11 +5974,16 @@ namespace
             heisenberg::Heisenberg::GetSingleton().OnGrabEnded(isLeft);
             auto& configMode = heisenberg::ItemPositionConfigMode::GetSingleton();
             configMode.OnGrabEnded(isLeft);
-            // Restore the collision filter BEFORE clearing state — otherwise the body keeps
-            // the layer-43 / 0x000B grab filter (or CSR suppression) forever and state.Clear()
+        // Restore the collision filter BEFORE clearing state — otherwise the body keeps
+        // the temporary held-object layer (or CSR suppression) forever and state.Clear()
             // wipes heldOriginalFilterInfo so it can never be undone. The helper is internally
             // guarded (null + SEH) so it's safe even if the body is partway gone.
-            TryRestoreHeldObjectCollision(state);
+            if (auto* restoreWorld =
+                    ResolveMatchingHeldBhkWorld(state)) {
+                TryRestoreHeldObjectCollision(
+                    state,
+                    restoreWorld);
+            }
             state.Clear();
             return;
         }
@@ -4208,43 +6004,50 @@ namespace
             }
         }
 
-        // Restore ROCK-style collision suppression bit (bit 14) on the held object before
-        // we let go. This is independent of motion-type/layer restoration: the bit was
-        // ORed in on grab to stop the body shoving the player, and must be cleared so the
-        // dropped object collides normally again.
+        // Restore the exact pre-grab filter before release. The temporary
+        // BIPED_NO_CC layer stops the held body from shoving the player and must
+        // not survive into a normal drop or throw.
         //
         // WORLD LOCK (Jul 20): this file's own invariant (see the *Locked wrapper comments
         // below) is that all physics modifications must go through a world write lock -
         // this cluster (filter restore + native cache rebuild + CCD look-ahead) was the one
         // release-path mutation that skipped it, racing background cell streaming or other
         // in-flight Havok tasks that hold the SAME lock while mutating the same hknpWorld.
-        // Resolve the lock target the same way the physics-restore block below does.
-        RE::bhkWorld* poserLockWorld = refr ? GetBhkWorldFromRefr(refr) : state.savedState.savedBhkWorld;
-        if (!poserLockWorld) {
-            poserLockWorld = state.savedState.savedBhkWorld;
-        }
-        {
-            std::unique_ptr<heisenberg::Physics::WorldWriteLock> poserLock;
-            if (poserLockWorld) {
-                poserLock = std::make_unique<heisenberg::Physics::WorldWriteLock>(poserLockWorld);
-            }
-
-            TryRestoreHeldObjectCollision(state);
+        // The held reference's parentCell can remain stale after it is detached
+        // for a grab. lastSyncedBhkWorld is driven from the player's live cell
+        // and is therefore the authority after a mid-hold transition.
+        RE::bhkWorld* poserLockWorld =
+            ResolveMatchingHeldBhkWorld(state);
+        if (poserLockWorld) {
+            TryRestoreHeldObjectCollision(
+                state,
+                poserLockWorld);
 
             // PAIR-CACHE POKE (Jul 18): even with byte-exact filter restore through the native
             // setter, the hand<->object narrowphase pair CREATED while the hold suppressed it
             // keeps its cached no-collide verdict as long as the two stay overlapping — the
             // "must pull my hand back a few cm before it collides" symptom. Force the pair to be
-            // destroyed+rebuilt by cycling the object's filter through the suppression bit and
-            // back via the BS setter (each transition refreshes the body's pairing).
+            // destroyed+rebuilt after restoring the exact authored filter.
             if (state.capturedHeldBodyCount > 0) {
-                RebuildCapturedHeldBodyCollisionCaches(state, 0.25f);
+                RebuildCapturedHeldBodyCollisionCaches(
+                    state,
+                    poserLockWorld,
+                    0.25f);
                 spdlog::debug(
                     "[REL-DIAG] rebuilt collision caches for {} "
                     "captured held bodies",
                     state.capturedHeldBodyCount);
-            } else if (state.collisionObject && state.collisionObject->spSystem) {
-                if (void* pokeWorld = AccessWorld(state.collisionObject)) {
+            } else if (state.collisionObject &&
+                       state.collisionObject->spSystem) {
+                auto* pokeWorld = static_cast<RE::hknpWorld*>(
+                    AccessWorld(state.collisionObject));
+                heisenberg::Physics::WorldWriteLock pokeLock(
+                    poserLockWorld);
+                if (pokeLock.IsLocked() &&
+                    LockedWorldMatchesHeldCollision(
+                        state,
+                        poserLockWorld,
+                        pokeWorld)) {
                     std::uint32_t pokeBodyId = 0x7FFFFFFF;
                     heisenberg::ConstraintFunctions::BhkPhysicsSystemGetBodyId(
                         state.collisionObject->spSystem.get(), &pokeBodyId, state.collisionObject->systemBodyIdx);
@@ -4268,22 +6071,17 @@ namespace
                     }
                 }
             }
+        } else {
+            spdlog::warn(
+                "[GRAB-KEYFRAMED] Skipped filter/cache restoration: "
+                "no bhkWorld matches the held collision object's hknpWorld");
         }
 
         // Restore physics state
         if (state.collisionObject && IsCollisionObjectValid(state.collisionObject))
         {
-            // Get bhkWorld - prefer saved, but validate current
-            RE::bhkWorld* bhkWorld = state.savedState.savedBhkWorld;
-            
-            // Validate that the saved bhkWorld is still valid by checking the cell
-            if (refr) {
-                RE::bhkWorld* currentWorld = GetBhkWorldFromRefr(refr);
-                if (currentWorld != bhkWorld) {
-                    spdlog::warn("[GRAB-KEYFRAMED] bhkWorld changed during grab! Using current world.");
-                    bhkWorld = currentWorld;
-                }
-            }
+            RE::bhkWorld* bhkWorld =
+                ResolveMatchingHeldBhkWorld(state);
             
             if (!bhkWorld) {
                 spdlog::error("[GRAB-KEYFRAMED] No valid bhkWorld for physics restoration!");
@@ -4381,17 +6179,17 @@ namespace
                 "before motion type change",
                 zeroedMultipart ? state.capturedHeldBodyCount : 1);
             
-            // Restore the same motion scope used at setup. Alternate visual
-            // wrappers sharing this physics system were never keyframed and
-            // must not be activated or released with the selected variant.
+            // Restore the exact motion scope used at setup. This persisted bit
+            // is independent of the live capture/filter ledger, so actors and
+            // a multipart set invalidated mid-hold still restore symmetrically.
             const bool selectedWrapperScope =
-                UsesSelectedCollisionWrapperMotionScope(state);
+                !state.heldMotionScopeIsReferenceSubtree;
             if (selectedWrapperScope) {
                 SetMotionTypeLocked(
                     state.collisionObject,
                     RE::hknpMotionPropertiesId::Preset::DYNAMIC,
                     bhkWorld);
-            } else if (state.capturedHeldBodyCount > 0) {
+            } else {
                 bhkWorld_SetMotionLocked(
                     state.node.get(),
                     RE::hknpMotionPropertiesId::Preset::DYNAMIC,
@@ -4399,20 +6197,13 @@ namespace
                     true,
                     true,
                     bhkWorld);
-            } else {
-                SetMotionTypeLocked(
-                    state.collisionObject,
-                    RE::hknpMotionPropertiesId::Preset::DYNAMIC,
-                    bhkWorld);
             }
             spdlog::debug(
                 "[GRAB-KEYFRAMED] Restored motion type to DYNAMIC "
                 "(scope={})",
                 selectedWrapperScope
                     ? "active collision wrapper"
-                    : (state.capturedHeldBodyCount > 0
-                           ? "reference subtree"
-                           : "primary body"));
+                    : "reference subtree");
             
             // Re-validate after SetMotionType (motion type change can affect body validity)
             if (!IsCollisionObjectValid(state.collisionObject))
@@ -4426,14 +6217,14 @@ namespace
                 return;
             }
             
-            // Restore collision layer ONLY if the grab actually changed it (kNonCollidable=15
-            // path). FAITHFULNESS FIX (2026-07-05 audit rank 7): this used to run
+            // Restore collision layer through the legacy preset path ONLY when
+            // that path changed it (kNonCollidable=15). FAITHFULNESS FIX
+            // (2026-07-05 audit rank 7): this used to run
             // unconditionally with a never-captured default of 4, clobbering the byte-exact
             // filter restore above (TryRestoreHeldObjectCollision) — SetLayerLocked rewrites
             // the filter from layer presets, wiping group/system bits, and mis-layered any
             // object whose native layer wasn't 4 (weapons=5, debris=19/20, clutter-large=29).
-            // In the bHeldObjectCollidable path the layer was never touched, so nothing to do.
-            // audit rank 7c: also skip when the 0x000B group-bit filter was applied — the
+            // audit rank 7c: also skip when the exact held-object filter was applied — the
             // byte-exact TryRestoreHeldObjectCollision above already wrote back the true
             // pre-grab filter (layer included), and this preset-based SetLayer would clobber
             // its group/system bits (both flags can co-set via a deferred-HeldBody fallback).
@@ -4572,6 +6363,9 @@ namespace
 
     RE::bhkWorld* ResolveGrabBhkWorld(heisenberg::GrabState& state)
     {
+        if (state.lastSyncedBhkWorld) {
+            return state.lastSyncedBhkWorld;
+        }
         RE::bhkWorld* bhkWorld = state.savedState.savedBhkWorld;
         if (RE::TESObjectREFR* refr = state.GetRefr()) {
             if (RE::bhkWorld* currentWorld = GetBhkWorldFromRefr(refr)) {
@@ -4824,6 +6618,66 @@ namespace heisenberg
         return false;
     }
 
+    static CollisionWrapperSet CollectCollisionWrappers(
+        RE::NiAVObject* referenceRoot)
+    {
+        CollisionWrapperSet result{};
+        if (!referenceRoot) {
+            return result;
+        }
+
+        std::function<void(RE::NiAVObject*, std::uint32_t)> visit =
+            [&](RE::NiAVObject* node, std::uint32_t depth) {
+                if (!node || depth > 64) {
+                    return;
+                }
+
+                if (auto* collision =
+                        TryResolveNpcCollisionObjectFromRaw(
+                            node->collisionObject.get())) {
+                    ++result.totalWrapperCount;
+                    const bool wrapperVisible =
+                        CollisionOwnerHasVisibleGeometry(
+                            node,
+                            node,
+                            collision,
+                            0);
+                    bool found = false;
+                    for (std::uint32_t i = 0;
+                         i < result.count;
+                         ++i) {
+                        if (result.wrappers[i] == collision) {
+                            result.visible[i] =
+                                result.visible[i] ||
+                                wrapperVisible;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        if (result.count >= result.wrappers.size()) {
+                            result.overflowed = true;
+                        } else {
+                            result.wrappers[result.count] = collision;
+                            result.visible[result.count] =
+                                wrapperVisible;
+                            ++result.count;
+                        }
+                    }
+                }
+
+                if (auto* asNode = node->IsNode()) {
+                    for (auto& child : asNode->children) {
+                        if (child) {
+                            visit(child.get(), depth + 1);
+                        }
+                    }
+                }
+            };
+        visit(referenceRoot, 0);
+        return result;
+    }
+
     // Pick the collision wrapper whose own mesh variant is currently rendered.
     // This is required for Bethesda NIFs such as 10mmAmmo.nif: AmmoSingle and
     // AmmoMultiple are alternate representations sharing one physics system,
@@ -5029,10 +6883,11 @@ namespace heisenberg
         // STEALING CHECK: Block grab if picking up this item would be stealing (unless config allows it)
         RE::TESObjectREFR* selRefr = selection.GetRefr();
 
-        // SIZE CEILING (car fix, #219/#220). This is the ONLY guard that covers
-        // StartGrabOnRef (~:8233-8245) — loot-to-hand / DropToHand build a Selection
-        // directly and never call Physics::IsGrabbable, so the check in IsGrabbable
-        // does not protect that path. Cars must not become grabbable through it.
+        // SIZE CEILING (car fix, #219/#220). Keep this at the centralized grab
+        // commit instead of Physics::IsGrabbable: the latter is also the shared
+        // eligibility predicate for proximity push, haptics and physical-contact
+        // publication. Oversized bodies must remain tactile while every route
+        // (including loot-to-hand / DropToHand) is rejected here.
         if (selRefr) {
             float oversizeMaxAxis = 0.0f;
             if (heisenberg::Physics::IsOversizedForPlayerGrab(selRefr, &oversizeMaxAxis)) {
@@ -5047,11 +6902,16 @@ namespace heisenberg
             return false;
         }
         
-        // POWER ARMOR WEAPON CHECK: Skip grabbing weapons while in Power Armor
-        // Only bypass that guard when the build-3 provider explicitly accepts this
-        // candidate form for this physical hand; merely registering is insufficient.
-        // mechanics interfere with native game behavior, causing infinite loading screens
-        if (selRefr && Utils::IsPlayerInPowerArmor()) {
+        // POWER ARMOR WEAPON CHECK: historically weapons could not be grabbed at
+        // all while in Power Armor ("mechanics interfere with native game
+        // behavior, causing infinite loading screens"). That guard dates to
+        // v0.7.0 and predates keyframed mode, the embedded ROCK engine, the
+        // held-body lease and the on-release filter restore, so it is now opt-in
+        // via bAllowWeaponGrabInPowerArmor=false rather than unconditional.
+        // The dual-wield provider escape hatch is kept for when it IS enabled:
+        // only an explicit per-hand candidate acceptance bypasses it; merely
+        // registering is insufficient.
+        if (selRefr && !g_config.allowWeaponGrabInPowerArmor && Utils::IsPlayerInPowerArmor()) {
             auto* baseObj = selRefr->data.objectReference;
             if (baseObj && baseObj->GetFormType() == RE::ENUM_FORM_ID::kWEAP) {
                 const auto physicalHand = isLeft ? HeisenbergPluginAPI::PhysicalHand::kLeft :
@@ -5063,8 +6923,11 @@ namespace heisenberg
                     physicalHand, candidate) &&
                     (candidate.flags & HeisenbergPluginAPI::kHandStateCandidateEligible) != 0;
                 if (!accepted) {
-                spdlog::debug("[GRAB] Skipping weapon in Power Armor - using native game behavior");
-                return false;  // Let native game handle PA weapon pickup
+                    // Info, not debug: this silently refuses a grab the player
+                    // is actively attempting, and at the default log level the
+                    // old debug line left no trace of why nothing happened.
+                    spdlog::info("[GRAB] Weapon grab blocked in Power Armor by bAllowWeaponGrabInPowerArmor=false - using native game behavior");
+                    return false;  // Let native game handle PA weapon pickup
                 }
             }
         }
@@ -5120,6 +6983,9 @@ namespace heisenberg
         // Keyframe mode - directly control object position via ApplyHardKeyframe
         GrabState& state = isLeft ? _leftGrab : _rightGrab;
         GrabState& otherState = isLeft ? _rightGrab : _leftGrab;
+        (void)rock::touch_grab_bridge::
+            ClearTouchGrabFingerPose(isLeft);
+        state.rockRichFingerPosePublished = false;
 
         // Clear any existing grab on THIS hand
         if (state.active)
@@ -5127,39 +6993,351 @@ namespace heisenberg
             spdlog::debug("[GRAB] {} hand: Clearing existing grab", isLeft ? "Left" : "Right");
             EndGrab(isLeft, nullptr);
         }
+        // A rejected grab can populate handles/nodes before it reaches the
+        // final active=true commit. Never carry that inactive partial state
+        // into the next attempt.
+        if (!state.active) {
+            rock::HostClearExternalHeldBodies(isLeft);
+            state.Clear();
+        }
         
         // Note: We unequipped weapon earlier if needed (unequippedWeaponForThisGrab),
         // but we don't track it anymore since the player manually re-equips if desired
         
         // Check if the OTHER hand is holding this object - hand-to-hand transfer
-        bool isTransfer = false;
-        RE::NiPointer<RE::NiNode> transferFromOriginalParent;
+        bool hasTransferContactPoint = false;
+        bool hasTransferHandFrame = false;
+        RE::NiPoint3 transferPalmPoint{};
+        RE::NiPoint3 transferContactPoint{};
+        RE::NiTransform transferHandWorld{};
+        float transferContactMeshDistance = -1.0f;
         selRefr = selection.GetRefr();
         if (otherState.active && otherState.GetRefr() == selRefr)
         {
-            // Two-handed CO-HOLD: when enabled and the other hand is the PRIMARY holder (not
-            // itself a secondary aim hand), this hand joins as the secondary aim hand instead of
-            // transferring the object. The primary keeps full physics ownership/drive; this hand
-            // is a marker only (active+refr so input/release work, coHeldSecondary so the drive
-            // skips it and the primary's drive reads our wand for the aim swing).
-            if (g_config.enableTwoHandedGrab && !otherState.coHeldSecondary)
-            {
-                spdlog::info("[GRAB] Two-handed CO-HOLD: {} hand joins as aim hand on ref {:08X}",
-                             isLeft ? "Left" : "Right", selRefr->formID);
-                state.SetRefr(selRefr);
-                state.node = selection.node;
-                state.active = true;
-                state.coHeldSecondary = true;
-                return true;
+            const bool trustedSelectionContact =
+                !otherState.coHeldSecondary &&
+                !otherState.isPulling &&
+                grab_pose_policy::
+                    ShouldAcceptSameObjectTransferContact(
+                        selection.isPhysicalTouch,
+                        selection.physicalTouchAgeFrames,
+                        selection.isHeldObjectTransferContact,
+                        selection.distance);
+            bool closeRangeTransferAttempt =
+                trustedSelectionContact;
+            if (trustedSelectionContact) {
+                hasTransferContactPoint = true;
+                transferContactPoint = selection.hitPoint;
+                transferContactMeshDistance =
+                    (std::max)(0.0f, selection.distance);
             }
-            spdlog::info("[GRAB] Hand-to-hand TRANSFER detected! {} -> {} hand",
-                         isLeft ? "Right" : "Left", isLeft ? "Left" : "Right");
-            isTransfer = true;
-            // Save the ORIGINAL world parent before we release from other hand (NiPointer keeps it alive)
-            transferFromOriginalParent = otherState.originalParent;
-            // Release from other hand (but don't throw)
-            RE::NiPoint3 zeroVel(0, 0, 0);
-            EndGrab(!isLeft, &zeroVel);  // Release with zero velocity
+            // Resolve the receiving palm against the visible mesh first. A
+            // valid grip-edge contact always permits hand-to-hand transfer.
+            // The query below enriches the pose and remains the fallback for
+            // ordinary selections, but it must not revoke a fresh native
+            // contact or Hand::TryStartGrab's exact held-mesh result merely
+            // because the clean palm and controller frames have different
+            // authored offsets.
+            if (!otherState.coHeldSecondary && !otherState.isPulling) {
+                auto* playerNodes = f4cf::f4vr::getPlayerNodes();
+                RE::NiNode* secondaryWand =
+                    playerNodes ? heisenberg::GetWandNode(playerNodes, isLeft) : nullptr;
+                RE::NiNode* primaryWand =
+                    playerNodes ? heisenberg::GetWandNode(playerNodes, !isLeft) : nullptr;
+                RE::NiNode* secondaryRenderedHand = GetSkinnedHandNode(isLeft);
+                RE::NiAVObject* objectRoot =
+                    otherState.node ? otherState.node.get() : selection.node.get();
+
+                if (secondaryWand && objectRoot) {
+                    RE::NiPoint3 secondaryPalm{};
+                    if (!GetCleanTrackedPalmPosition(
+                            secondaryWand,
+                            isLeft,
+                            secondaryPalm)) {
+                        spdlog::warn(
+                            "[GRAB] Same-object transfer unavailable: receiving "
+                            "clean tracked palm could not be resolved");
+                    } else {
+                        std::vector<TriangleData> triangles;
+                        triangles.reserve(512);
+                        GetTriangles(objectRoot, triangles, 4096);
+
+                        RE::NiPoint3 secondaryAnchorWorld{};
+                        float secondaryMeshDistance = -1.0f;
+                        const bool haveSecondaryAnchor =
+                            GetClosestMeshPointToPoint(
+                                triangles,
+                                secondaryPalm,
+                                secondaryAnchorWorld,
+                                secondaryMeshDistance);
+
+                        constexpr float kTransferMeshTolerance = 12.0f;
+                        constexpr float kCoHoldMeshTolerance = 5.0f;
+                        const bool palmWithinTransferEnvelope =
+                            haveSecondaryAnchor &&
+                            secondaryMeshDistance <=
+                                kTransferMeshTolerance;
+                        closeRangeTransferAttempt =
+                            trustedSelectionContact ||
+                            palmWithinTransferEnvelope;
+                        if (closeRangeTransferAttempt) {
+                            hasTransferHandFrame = true;
+                            transferPalmPoint = secondaryPalm;
+                            transferHandWorld =
+                                secondaryRenderedHand
+                                    ? secondaryRenderedHand->world
+                                    : secondaryWand->world;
+                            if (!hasTransferContactPoint &&
+                                haveSecondaryAnchor) {
+                                hasTransferContactPoint = true;
+                                transferContactPoint =
+                                    secondaryAnchorWorld;
+                            }
+                            if (!trustedSelectionContact) {
+                                transferContactMeshDistance =
+                                    secondaryMeshDistance;
+                            }
+                        }
+
+                        // Two-handed CO-HOLD still requires two distinct
+                        // visible-mesh contacts. When that stricter test does
+                        // not pass, the close receiving-hand contact above
+                        // falls through to a normal ownership transfer.
+                        if (g_config.enableTwoHandedGrab &&
+                            closeRangeTransferAttempt &&
+                            primaryWand)
+                        {
+                            RE::NiPoint3 primaryPalm{};
+                            RE::NiPoint3 primaryAnchorWorld{};
+                            float primaryMeshDistance = -1.0f;
+                            const bool havePrimaryPalm =
+                                GetCleanTrackedPalmPosition(
+                                    primaryWand,
+                                    !isLeft,
+                                    primaryPalm);
+                            const bool havePrimaryAnchor =
+                                havePrimaryPalm &&
+                                GetClosestMeshPointToPoint(
+                                    triangles,
+                                    primaryPalm,
+                                    primaryAnchorWorld,
+                                    primaryMeshDistance);
+                            const float anchorSeparation =
+                                havePrimaryAnchor
+                                    ? (secondaryAnchorWorld -
+                                          primaryAnchorWorld)
+                                          .Length()
+                                    : -1.0f;
+
+                            if (havePrimaryAnchor &&
+                                secondaryMeshDistance <=
+                                    kCoHoldMeshTolerance &&
+                                primaryMeshDistance <=
+                                    kCoHoldMeshTolerance &&
+                                anchorSeparation >= 6.0f)
+                            {
+                                const RE::NiTransform objectWorld =
+                                    objectRoot->world;
+                                const RE::NiTransform
+                                    secondaryHandWorld =
+                                        transferHandWorld;
+
+                                otherState.coHoldPrimaryAnchorObjectLocal =
+                                    rock::transform_math::worldPointToLocal(
+                                        objectWorld,
+                                        primaryAnchorWorld);
+                                otherState.coHoldSecondaryAnchorObjectLocal =
+                                    rock::transform_math::worldPointToLocal(
+                                        objectWorld,
+                                        secondaryAnchorWorld);
+                                otherState.coHoldSecondaryHandObjectLocal =
+                                    rock::transform_math::composeTransforms(
+                                        rock::transform_math::invertTransform(
+                                            objectWorld),
+                                        secondaryHandWorld);
+                                otherState.coHoldAnchorsValid = true;
+
+                                state.SetRefr(selRefr);
+                                state.node =
+                                    otherState.node
+                                        ? otherState.node
+                                        : selection.node;
+                                state.active = true;
+                                state.coHeldSecondary = true;
+                                state.naturalFingerPosing = true;
+
+                                std::array<float, 15>
+                                    secondaryJointCurls{};
+                                const bool richSecondaryPose =
+                                    rock::touch_grab_bridge::
+                                        SolveAndPublishTouchGrabFingerPose(
+                                            objectRoot,
+                                            secondaryHandWorld,
+                                            isLeft,
+                                            secondaryPalm,
+                                            secondaryAnchorWorld,
+                                            0.0f,
+                                            true,
+                                            &secondaryJointCurls);
+                                const bool solvedSecondaryPose =
+                                    richSecondaryPose ||
+                                    rock::touch_grab_bridge::
+                                        SolveTouchGrabFingerPose(
+                                            objectRoot,
+                                            secondaryHandWorld,
+                                            isLeft,
+                                            secondaryPalm,
+                                            secondaryAnchorWorld,
+                                            secondaryJointCurls);
+                                if (solvedSecondaryPose) {
+                                    state.SetRuntimeJointCurls(
+                                        secondaryJointCurls);
+                                    state.rockRichFingerPosePublished =
+                                        richSecondaryPose;
+                                    ApplyRuntimeFingerCurls(
+                                        state,
+                                        isLeft);
+                                } else {
+                                    state.pendingFingerCurls = true;
+                                }
+
+                                spdlog::info(
+                                    "[GRAB] Two-handed CO-HOLD: {} hand joined ref "
+                                    "{:08X} at a distinct mesh spot "
+                                    "(secondaryMesh={:.2f} primaryMesh={:.2f} "
+                                    "anchorSep={:.2f})",
+                                    isLeft ? "Left" : "Right",
+                                    selRefr->formID,
+                                    secondaryMeshDistance,
+                                    primaryMeshDistance,
+                                    anchorSeparation);
+                                // This is an internal support-hand marker, not
+                                // a second ownership grab.
+                                return true;
+                            }
+
+                            spdlog::info(
+                                "[GRAB] Two-handed CO-HOLD unavailable at this "
+                                "contact (secondaryMesh={:.2f} primaryMesh={:.2f} "
+                                "anchorSep={:.2f}); close-range transfer={}",
+                                secondaryMeshDistance,
+                                primaryMeshDistance,
+                                anchorSeparation,
+                                closeRangeTransferAttempt);
+                        }
+                    }
+                } else {
+                    if (trustedSelectionContact) {
+                        spdlog::debug(
+                            "[GRAB] Same-object transfer contact accepted "
+                            "without a receiving pose frame; finger solve "
+                            "will be deferred");
+                    } else {
+                        spdlog::warn(
+                            "[GRAB] Same-object transfer unavailable: missing "
+                            "receiving wand/object frame (secondary={} object={})",
+                            static_cast<void*>(secondaryWand),
+                            static_cast<void*>(objectRoot));
+                    }
+                }
+            }
+
+            if (!closeRangeTransferAttempt) {
+                spdlog::info(
+                    "[GRAB] {} hand: same-object grip ignored because "
+                    "the receiving palm is not within the close-range mesh "
+                    "envelope; {} hand keeps ownership",
+                    isLeft ? "Left" : "Right",
+                    isLeft ? "Right" : "Left");
+                return false;
+            }
+            spdlog::info(
+                "[GRAB] Hand-to-hand TRANSFER detected! {} -> {} hand "
+                "(receivingMesh={:.2f}, trustedGripContact={})",
+                isLeft ? "Right" : "Left",
+                isLeft ? "Left" : "Right",
+                transferContactMeshDistance,
+                trustedSelectionContact);
+            // Promote ownership in place instead of releasing the live body and
+            // starting a second grab. Besides causing a visible one-frame drop,
+            // the old EndGrab path could run equip/storage/companion-release
+            // side effects merely because the holding hand happened to be in a
+            // body zone during the handoff. The co-held promotion path already
+            // transfers the complete keyframed/physics state without restoring
+            // it, so use a short-lived secondary marker for this atomic handoff.
+            state.SetRefr(selRefr);
+            state.node =
+                otherState.node ? otherState.node : selection.node;
+            state.active = true;
+            state.coHeldSecondary = true;
+            state.naturalFingerPosing = true;
+            state.physicalTouchGrab = true;
+            otherState.coHoldAnchorsValid = false;
+
+            std::array<float, 15> transferJointCurls{};
+            RE::NiAVObject* transferObjectRoot =
+                otherState.node
+                    ? otherState.node.get()
+                    : selection.node.get();
+            bool richTransferPose = false;
+            bool solvedTransferPose = false;
+            if (transferObjectRoot &&
+                hasTransferHandFrame &&
+                hasTransferContactPoint) {
+                richTransferPose =
+                    rock::touch_grab_bridge::
+                        SolveAndPublishTouchGrabFingerPose(
+                            transferObjectRoot,
+                            transferHandWorld,
+                            isLeft,
+                            transferPalmPoint,
+                            transferContactPoint,
+                            0.0f,
+                            true,
+                            &transferJointCurls);
+                solvedTransferPose =
+                    richTransferPose ||
+                    rock::touch_grab_bridge::
+                        SolveTouchGrabFingerPose(
+                            transferObjectRoot,
+                            transferHandWorld,
+                            isLeft,
+                            transferPalmPoint,
+                            transferContactPoint,
+                            transferJointCurls);
+            }
+            if (solvedTransferPose) {
+                state.SetRuntimeJointCurls(
+                    transferJointCurls);
+                state.rockRichFingerPosePublished =
+                    richTransferPose;
+                ApplyRuntimeFingerCurls(state, isLeft);
+            } else {
+                // The promotion path requests a post-physics mesh solve when
+                // calibration or geometry is temporarily unavailable.
+                state.pendingFingerCurls = true;
+            }
+
+            EndGrab(!isLeft);
+            const bool transferCommitted =
+                state.active &&
+                !state.coHeldSecondary &&
+                state.GetRefr() == selRefr;
+            if (!transferCommitted) {
+                spdlog::error(
+                    "[GRAB] Atomic hand-to-hand transfer failed for "
+                    "{:08X}; ownership state was not promoted",
+                    selRefr ? selRefr->formID : 0);
+                return false;
+            }
+
+            spdlog::info(
+                "[GRAB] Atomic hand-to-hand transfer committed to {} "
+                "hand (fingerPose={} rich={})",
+                isLeft ? "left" : "right",
+                solvedTransferPose ? "mesh" : "deferred",
+                richTransferPose);
+            return true;
         }
 
         if (!selRefr || !selection.node)
@@ -5169,6 +7347,42 @@ namespace heisenberg
                          selRefr ? "valid" : "null",
                          selection.node ? "valid" : "null");
             return false;
+        }
+        bool validatedPhysicalTouch =
+            selection.isPhysicalTouch;
+        float currentTouchMeshDistance = -1.0f;
+        if (selection.isPhysicalTouch &&
+            selection.physicalTouchAgeFrames >
+                grab_pose_policy::kFreshTouchMaxAgeFrames) {
+            std::vector<TriangleData> currentTouchTriangles;
+            currentTouchTriangles.reserve(512);
+            GetTriangles(
+                selection.node.get(),
+                currentTouchTriangles,
+                4096);
+            RE::NiPoint3 currentTouchMeshPoint{};
+            const bool haveCurrentTouchMesh =
+                GetClosestMeshPointToPoint(
+                    currentTouchTriangles,
+                    handPos,
+                    currentTouchMeshPoint,
+                    currentTouchMeshDistance);
+            validatedPhysicalTouch =
+                haveCurrentTouchMesh &&
+                grab_pose_policy::
+                    ShouldAcceptPhysicalTouchEvidence(
+                        selection.physicalTouchAgeFrames,
+                        currentTouchMeshDistance);
+            if (!validatedPhysicalTouch) {
+                spdlog::info(
+                    "[GRAB-TOUCH] {} ref={:08X} rejected stale "
+                    "physical flag age={}f currentMeshDist={:.1f}; "
+                    "using normal close/remote selection rules",
+                    isLeft ? "L" : "R",
+                    selRefr->formID,
+                    selection.physicalTouchAgeFrames,
+                    currentTouchMeshDistance);
+            }
         }
 
         // Native contact follows the rendered/skinned FRIK hand, whereas the
@@ -5180,7 +7394,7 @@ namespace heisenberg
         RE::NiPoint3 grabHandPos = handPos;
         RE::NiMatrix3 grabHandRot = handRot;
         RE::NiNode* physicalTouchHandNode = nullptr;
-        if (selection.isPhysicalTouch) {
+        if (validatedPhysicalTouch) {
             physicalTouchHandNode = GetSkinnedHandNode(isLeft);
             if (physicalTouchHandNode) {
                 grabHandPos = physicalTouchHandNode->world.translate;
@@ -5200,26 +7414,38 @@ namespace heisenberg
         // Log the BaseFormID for debugging item variations
         auto* baseForm = selRefr->data.objectReference;
         std::uint32_t baseFormID = baseForm ? baseForm->GetFormID() : 0;
+        const bool bypassSavedPlacement =
+            grab_pose_policy::ShouldBypassSavedPlacement(baseFormID);
+        const bool bypassSavedFingerPose =
+            grab_pose_policy::ShouldBypassSavedFingerPose(baseFormID);
+        state.rockRichFingerPosePublished = false;
         spdlog::debug("[GRAB] {} hand: Grabbing ref {:08X} (BaseFormID={:08X})",
                       isLeft ? "Left" : "Right", selRefr->formID, baseFormID);
+        if (bypassSavedPlacement || bypassSavedFingerPose) {
+            spdlog::info(
+                "[GRAB-ROCK-POSE] '{}' base={:08X}: saved placement={} "
+                "saved fingers={} (ROCK mesh pose test policy)",
+                ItemOffsetManager::GetItemName(selRefr),
+                baseFormID,
+                bypassSavedPlacement ? "BYPASSED" : "kept",
+                bypassSavedFingerPose ? "BYPASSED" : "kept");
+        }
 
         // Store grab info
         state.SetRefr(selRefr);
         state.node = selection.node;  // NiPointer assignment
         state.collisionObject = nullptr;  // Will be set later
-        state.physicalTouchGrab = selection.isPhysicalTouch;
+        state.physicalTouchGrab = validatedPhysicalTouch;
         state.physicalTouchBodyId =
             selection.physicalTouchBodyId;
         state.initialHandPos = grabHandPos;
         state.initialHandRot = grabHandRot;
-        
-        // If this was a transfer, preserve the original world parent
-        if (isTransfer && transferFromOriginalParent)
-        {
-            state.originalParent = transferFromOriginalParent;
-            spdlog::debug("[GRAB] Transfer: preserving original parent '{}'",
-                         transferFromOriginalParent->name.c_str());
-        }
+
+        const auto abandonPendingGrab = [&]() {
+            (void)rock::touch_grab_bridge::ClearTouchGrabFingerPose(isLeft);
+            FRIKInterface::GetSingleton().ClearHandPoseFingerPositions(isLeft);
+            state.Clear();
+        };
         
         // Get collision object first - we need it to detect special cases
         state.collisionObject = GetCollisionObject(selRefr);
@@ -5252,7 +7478,7 @@ namespace heisenberg
                     state.isProxyCollision);
             }
         }
-        if (selection.isPhysicalTouch) {
+        if (validatedPhysicalTouch) {
             RE::NiAVObject* touchedOwner = nullptr;
             if (auto* touchedCollision =
                     ResolvePhysicalTouchCollisionObject(
@@ -5408,7 +7634,9 @@ namespace heisenberg
         
         // Check if item has an exact offset match (by FormID or name)
         auto& offsetMgr = ItemOffsetManager::GetSingleton();
-        bool hasExactOffsetMatch = offsetMgr.HasExactMatch(selRefr);
+        bool hasExactOffsetMatch =
+            offsetMgr.HasExactMatch(selRefr) &&
+            !bypassSavedPlacement;
         
         // Use extended natural grab distance for items without exact offset match
         // This prevents bad fuzzy matches (e.g., "Tire Iron" matching "Tire") from being applied
@@ -5432,7 +7660,8 @@ namespace heisenberg
         constexpr float kTouchGrabMaxDistance = 3.0f;
         const bool isActualTouchContact =
             !forceUseOffset &&
-            (selection.isPhysicalTouch || distToObject <= kTouchGrabMaxDistance);
+            (validatedPhysicalTouch ||
+             distToObject <= kTouchGrabMaxDistance);
 
         // DEBUG: Log distance calculation to diagnose natural grab issues
         spdlog::debug("[GRAB] Distance check for '{}': distToObject={:.1f}cm, naturalThresh={:.1f}cm, hasExactMatch={}, isNatural={}, isPalmSnap={}",
@@ -5457,14 +7686,6 @@ namespace heisenberg
             isNaturalGrab = false;
             spdlog::debug("[GRAB] DropToHand '{}' at {:.1f}cm — instant snap",
                         itemName, distToObject);
-        } else if (isTransfer) {
-            // Hand-to-hand transfer: receiving hand always grabs in place (telekinesis),
-            // never snaps to palm — regardless of distance or config.
-            useTelekinesis = true;
-            isNaturalGrab = true;
-            isPalmSnap = false;
-            spdlog::debug("[GRAB] TRANSFER (natural grab) for '{}' at {:.1f}cm",
-                        itemName, distToObject);
         } else if (heisenberg::g_config.enableNaturalGrab &&
                    isNaturalGrab &&
                    !isActualTouchContact) {
@@ -5483,6 +7704,7 @@ namespace heisenberg
             if (isRemoteSelection && !heisenberg::g_config.enablePalmSnap) {
                 spdlog::debug("[GRAB] REJECTED '{}' at {:.1f}cm — Object Pull disabled and selection is remote (selDist={:.1f})",
                             itemName, distToObject, selection.distance);
+                abandonPendingGrab();
                 return false;
             }
             if (isRemoteSelection) {
@@ -5540,6 +7762,7 @@ namespace heisenberg
                 // Beyond allowed range
                 spdlog::debug("[GRAB] REJECTED: MSTT '{}' at {:.1f}cm (max={:.1f}cm)",
                             itemName, distToObject, MSTT_PALM_SNAP_MAX);
+                abandonPendingGrab();
                 return false;
             }
         }
@@ -5549,16 +7772,57 @@ namespace heisenberg
         // as a fallback when no exact match exists. Telekinesis grabs still
         // ignore saved offsets (world position is preserved below).
         std::optional<ItemOffset> customOffset = std::nullopt;
+        bool hasAuthoritativeIdentityOffset = false;
         if (!useTelekinesis) {
-            customOffset = offsetMgr.GetExactOffset(selRefr, isLeft);
-            // No FormID/name match? Fall back to a 100% EXACT-dimensions match. Items that reuse
-            // another item's model (Addictol↔Jet, Buffout↔Bufftats) share identical bounds, so they
-            // inherit that item's hand-tuned offset instead of floating via geometry placement.
-            // Strictly exact dims — no fuzzy/similar matching.
-            if (!customOffset.has_value()) {
-                customOffset = offsetMgr.GetExactDimensionsOffset(selRefr, isLeft);
+            if (!bypassSavedPlacement) {
+                customOffset = offsetMgr.GetExactOffset(selRefr, isLeft);
+                hasAuthoritativeIdentityOffset =
+                    customOffset.has_value();
+                // No FormID/name match? Fall back to a 100% EXACT-dimensions match. Items that reuse
+                // another item's model (Addictol↔Jet, Buffout↔Bufftats) share identical bounds, so they
+                // inherit that item's hand-tuned offset instead of floating via geometry placement.
+                // Strictly exact dims — no fuzzy/similar matching.
+                if (!customOffset.has_value()) {
+                    customOffset = offsetMgr.GetExactDimensionsOffset(selRefr, isLeft);
+                }
+                // ARMOR DIMENSIONAL DONOR (Jul 30). Garments are the one item
+                // class where a near-identical neighbour is genuinely
+                // interchangeable: they are all authored around the same body
+                // origin, so an authored garment pose transfers. The strict
+                // dims match above misses them because it also compares HEIGHT,
+                // and a folded garment's height varies with its drape (BoS
+                // Uniform 34x42x10 vs the authored Black Vest and Slacks
+                // 34x42x12 — identical footprint, different thickness).
+                //
+                // Without this the item falls to generated placement, and
+                // generated placement is NOT trustworthy for garments: the
+                // measured object-local mesh AABB is not even reproducible
+                // between grabs of the same item (live: thinSpan 10.5 -> 34.8
+                // on one uniform), and the calibrated palm frame it seats
+                // against can itself be unreliable. Three uniforms tested live
+                // all had a donor within 2.0 XZ units — one at 0.00 — and all
+                // three were placed wrongly by the generated path.
+                if (!customOffset.has_value()) {
+                    auto donorOffset = offsetMgr.GetArmorDimensionalDonorOffset(selRefr, isLeft);
+                    if (donorOffset.has_value()) {
+                        customOffset = donorOffset;
+                        spdlog::info(
+                            "[GRAB] '{}' using authored ARMOR donor '{}' "
+                            "(XZ distance {:.2f}) — authored garment poses beat "
+                            "generated placement",
+                            itemName,
+                            customOffset->matchedName,
+                            customOffset->armorDonorXZDistance);
+                    }
+                }
+                // A donor is authored data, so it must outrank the generated
+                // palm seats exactly as an identity match does — otherwise the
+                // broad-palm seat overrides it and we are back to the
+                // unreproducible mesh measurement.
+                hasAuthoritativeIdentityOffset =
+                    hasAuthoritativeIdentityOffset || customOffset.has_value();
             }
-        } else {
+        } else if (!bypassSavedFingerPose) {
             // Natural / telekinesis grab keeps the object exactly where grabbed (no position
             // snap), but the user still wants the item's SAVED finger-curl pose rather than a
             // worse in-place geometry wrap. Pull in ONLY the offset's finger/joint curls so
@@ -5596,11 +7860,61 @@ namespace heisenberg
             wandNode = heisenberg::GetWandNode(playerNodes, isLeft);
         }
 
+        bool canonicalWeaponRuntimePlacement = false;
+        const char* canonicalWeaponPlacementReason =
+            "policySkipped";
+        if (wandNode &&
+            grab_pose_policy::
+                ShouldUseCanonicalLooseWeaponHold(
+                    customOffset.has_value(),
+                    forceUseOffset,
+                    usePullToHand,
+                    IsWeapon(selRefr),
+                    IsThrowableWeapon(selRefr))) {
+            canonicalWeaponRuntimePlacement =
+                TryCalculateCanonicalLooseWeaponPlacement(
+                    state,
+                    wandNode,
+                    isLeft,
+                    selRefr,
+                    canonicalWeaponPlacementReason);
+            if (canonicalWeaponRuntimePlacement) {
+                spdlog::info(
+                    "[GRAB-ROCK-WEAPON] {} '{}' canonical firing hold "
+                    "selected for {} arrival (source={} local=({:.2f},"
+                    "{:.2f},{:.2f}))",
+                    isLeft ? "L" : "R",
+                    itemName,
+                    forceUseOffset ? "DropToHand" : "remote-pull",
+                    canonicalWeaponPlacementReason,
+                    state.runtimeHandPlacementPosition.x,
+                    state.runtimeHandPlacementPosition.y,
+                    state.runtimeHandPlacementPosition.z);
+            } else {
+                spdlog::debug(
+                    "[GRAB-ROCK-WEAPON] {} '{}' canonical firing hold "
+                    "unavailable for {} arrival (reason={}); retaining "
+                    "the normal placement fallback",
+                    isLeft ? "L" : "R",
+                    itemName,
+                    forceUseOffset ? "DropToHand" : "remote-pull",
+                    canonicalWeaponPlacementReason);
+            }
+        }
+
         if (customOffset.has_value())
         {
             // Use saved profile offset
             state.itemOffset = customOffset.value();
             state.hasItemOffset = true;
+            if (bypassSavedFingerPose) {
+                state.itemOffset.hasFingerCurls = false;
+                state.itemOffset.hasJointCurls = false;
+                spdlog::info(
+                    "[GRAB-ROCK-POSE] '{}' retained its saved placement but "
+                    "will fit fingers to the final mesh",
+                    itemName);
+            }
             
             // Track if this is a FRIK-style offset (needs Weapon node parent transform)
             state.isFRIKOffset = state.itemOffset.isFRIKOffset;
@@ -5691,6 +8005,15 @@ namespace heisenberg
             spdlog::debug("[GRAB] Object current world rot[0]=({:.2f},{:.2f},{:.2f})",
                          worldTransform.rotate.entry[0][0], worldTransform.rotate.entry[0][1], worldTransform.rotate.entry[0][2]);
         }
+        else if (canonicalWeaponRuntimePlacement)
+        {
+            // The runtime transform already contains both the canonical
+            // firing-grip translation and rotation. Keep it separate from
+            // persisted ItemOffsets so a generated ROCK hold is never saved
+            // as a user-authored profile implicitly.
+            state.hasItemOffset = false;
+            state.isFRIKOffset = false;
+        }
         else if (wandNode)
         {
             // No profile - use palm snap or natural grab based on config and distance
@@ -5704,30 +8027,59 @@ namespace heisenberg
             
             if (heisenberg::g_config.enablePalmSnap && !withinSnapDistance)
             {
-                // PALM SNAP: Position object as close to palm as possible without touching
-                // Only triggers when object is far (>50cm), otherwise use natural grab
-                
-                // Palm is roughly at wand origin, fingers extend in +Y direction
-                // We want object centered in palm with minimal clearance
-                constexpr float palmClearance = 1.0f;  // 1cm minimum gap from palm surface
-                
-                // Position object center just in front of palm
-                // Y = forward (toward fingers): object back edge should be palmClearance from palm
-                float yOffset = palmClearance + (itemLength * 0.5f);
-                
-                // Z = up: center object vertically at palm level (slightly above wand)
-                float zOffset = 3.0f;  // Palm is roughly 3cm above wand center
-                
-                // X = left/right: centered
-                float xOffset = 0.0f;
-                
-                state.itemOffset.position = RE::NiPoint3(xOffset, yOffset, zOffset);
-                
-                spdlog::debug("[GRAB] PALM SNAP for '{}': dist={:.1f}cm, dims=({:.1f}x{:.1f}x{:.1f}), offset=({:.2f}, {:.2f}, {:.2f})",
+                // PALM SNAP: seat the object against the real palm.
+                // Only triggers when object is far (>50cm), otherwise use natural grab.
+                //
+                // The geometry-blind constant this replaces —
+                // (0, 1 + itemLength * 0.5, 3) in wand space — assumed the
+                // pivot was the object's centre and that the palm sat at the
+                // wand origin. Both are false for most meshes, which is how
+                // large clothing ended up floating beside the hand.
+                RE::NiPoint3 boundSnapLocal{};
+                const bool boundSnapped =
+                    TryCalculateBoundPalmSnapLocal(
+                        state,
+                        wandNode,
+                        isLeft,
+                        worldTransform,
+                        itemLength,
+                        itemWidth,
+                        itemHeight,
+                        boundSnapLocal);
+                if (boundSnapped) {
+                    state.itemOffset.position = boundSnapLocal;
+                } else {
+                    // No palm frame available at all (no calibration, no wand
+                    // config). Keep the object at the wand with a clearance
+                    // taken from its THINNEST dimension rather than its
+                    // longest, so a failure here cannot reproduce the float.
+                    float smallestDimension = itemLength;
+                    if (itemWidth > 0.1f && itemWidth < smallestDimension) {
+                        smallestDimension = itemWidth;
+                    }
+                    if (itemHeight > 0.1f && itemHeight < smallestDimension) {
+                        smallestDimension = itemHeight;
+                    }
+                    if (!std::isfinite(smallestDimension) || smallestDimension < 0.1f) {
+                        smallestDimension = 2.0f;
+                    }
+                    state.itemOffset.position = RE::NiPoint3(
+                        0.0f,
+                        heisenberg::grab_pose_policy::kPalmSurfaceSkin +
+                            smallestDimension * 0.5f,
+                        3.0f);
+                    spdlog::warn(
+                        "[GRAB] PALM SNAP for '{}' has no usable palm frame - "
+                        "using a thin-dimension wand clearance",
+                        itemName);
+                }
+
+                spdlog::info("[GRAB] PALM SNAP for '{}': dist={:.1f}cm, dims=({:.1f}x{:.1f}x{:.1f}), source={}, offset=({:.2f}, {:.2f}, {:.2f})",
                              itemName,
                              distToObject, itemLength, itemWidth, itemHeight,
+                             boundSnapped ? "bound-centre-palm-seat" : "no-palm-frame-fallback",
                              state.itemOffset.position.x, state.itemOffset.position.y, state.itemOffset.position.z);
-                
+
                 // F4VR row-vector convention: local.rotate = world.rotate * parent.rotate.Transpose()
                 state.itemOffset.rotation = worldTransform.rotate * wandNode->world.rotate.Transpose();
 
@@ -5846,6 +8198,7 @@ namespace heisenberg
             if (otherState.active && selRefr && otherState.GetRefr() == selRefr) {
                 spdlog::info("[GRAB] {} hand PULL refused - other hand already holds this object",
                              isLeft ? "Left" : "Right");
+                abandonPendingGrab();
                 return false;
             }
             // Pull-to-hand: animate object from current world position toward palm snap target
@@ -5884,7 +8237,7 @@ namespace heisenberg
                 // whose visible mesh is elsewhere (the Vault suit case) fails
                 // this proximity check and still uses its authored offset.
                 RE::NiAVObject* contactGeometryNode =
-                    selection.isPhysicalTouch && state.physicsNode
+                    validatedPhysicalTouch && state.physicsNode
                         ? state.physicsNode.get()
                         : state.node.get();
                 bool contactNearVisibleMesh = false;
@@ -5899,7 +8252,8 @@ namespace heisenberg
                     RE::NiPoint3 closestVisiblePoint{};
                     if (GetClosestMeshPointToPoint(
                             contactTriangles,
-                            selection.hasPhysicalTouchPoint
+                            validatedPhysicalTouch &&
+                                    selection.hasPhysicalTouchPoint
                                 ? selection.hitPoint
                                 : grabHandPos,
                             closestVisiblePoint,
@@ -5912,7 +8266,8 @@ namespace heisenberg
                         // on clothing cannot masquerade as visible contact.
                         const float
                             visibleContactToleranceGameUnits =
-                                selection.hasPhysicalTouchPoint
+                                validatedPhysicalTouch &&
+                                        selection.hasPhysicalTouchPoint
                                     ? 5.0f
                                     : 14.0f;
                         contactNearVisibleMesh =
@@ -5920,13 +8275,29 @@ namespace heisenberg
                             visibleContactToleranceGameUnits;
                     }
                 }
+                const bool richFingerPose =
+                    rock::touch_grab_bridge::
+                        SolveAndPublishTouchGrabFingerPose(
+                            contactGeometryNode,
+                            physicalTouchHandNode ? physicalTouchHandNode->world : wandNode->world,
+                            isLeft,
+                            grabHandPos,
+                            validatedPhysicalTouch &&
+                                    selection.hasPhysicalTouchPoint
+                                ? selection.hitPoint
+                                : grabHandPos,
+                            0.0f,
+                            true,
+                            &jointCurls);
                 const bool solvedFingerPose =
+                    richFingerPose ||
                     rock::touch_grab_bridge::SolveTouchGrabFingerPose(
                         contactGeometryNode,
                         physicalTouchHandNode ? physicalTouchHandNode->world : wandNode->world,
                         isLeft,
                         grabHandPos,
-                        selection.hasPhysicalTouchPoint
+                        validatedPhysicalTouch &&
+                                selection.hasPhysicalTouchPoint
                             ? selection.hitPoint
                             : grabHandPos,
                         jointCurls);
@@ -5961,6 +8332,8 @@ namespace heisenberg
                     state.itemOffset.fingerDistance = priorOffset.fingerDistance;
                     if (solvedFingerPose) {
                         state.SetRuntimeJointCurls(jointCurls);
+                        state.rockRichFingerPosePublished =
+                            richFingerPose;
                     }
                     state.itemOffset.position = localOffset;
                     state.itemOffset.rotation = localRotation;
@@ -5999,6 +8372,92 @@ namespace heisenberg
             }
         }
 
+        bool objectSpecificRuntimePlacement =
+            canonicalWeaponRuntimePlacement;
+        if (!state.isTelekinesis &&
+            wandNode &&
+            !objectSpecificRuntimePlacement) {
+            if (!touchGrabApplied &&
+                baseFormID ==
+                    grab_pose_policy::kKickballBaseFormID) {
+                objectSpecificRuntimePlacement =
+                    TryCalculateKickballPalmPlacement(
+                        state,
+                        wandNode,
+                        isLeft,
+                        worldTransform);
+                if (objectSpecificRuntimePlacement) {
+                    spdlog::info(
+                        "[GRAB-ROCK-POSE] Kickball seated by bound "
+                        "centre/radius at {:.2f}u palm clearance "
+                        "(frame={})",
+                        grab_pose_policy::kPalmSurfaceSkin,
+                        state.runtimePlacementSkinnedHand
+                            ? "skinned"
+                            : "wand");
+                }
+            } else if (
+                !touchGrabApplied &&
+                baseFormID ==
+                grab_pose_policy::kShovelBaseFormID) {
+                objectSpecificRuntimePlacement =
+                    TryCalculateSelectedSurfacePalmPlacement(
+                        state,
+                        wandNode,
+                        isLeft,
+                        worldTransform);
+                if (objectSpecificRuntimePlacement) {
+                    spdlog::info(
+                        "[GRAB-ROCK-POSE] Shovel selected shaft "
+                        "surface seated at the primary palm "
+                        "(frame={})",
+                        state.runtimePlacementSkinnedHand
+                            ? "skinned"
+                            : "wand");
+                }
+            }
+
+            // Shape-driven broad seating is deliberately below explicit
+            // sphere/shaft policies and above the generic one-point geometry
+            // snap.  A direct touch may replace its first-contact relation;
+            // a normal authored snap remains authoritative.
+            if (!objectSpecificRuntimePlacement &&
+                g_config.enableAutomaticHandPlacement &&
+                !IsWeapon(selRefr) &&
+                !IsThrowableWeapon(selRefr) &&
+                baseFormID !=
+                    grab_pose_policy::kKickballBaseFormID &&
+                baseFormID !=
+                    grab_pose_policy::kShovelBaseFormID) {
+                // usedSnapMode is set only by the far-grab PALM SNAP branch
+                // above — the geometry-blind constant that leaves large
+                // unauthored meshes floating. A natural grab clears it, and
+                // every object-specific seat sets objectSpecificRuntimePlacement
+                // (checked above), so inside this block the flag means exactly
+                // "the constant was applied and may be replaced".
+                const bool replacingGeometryBlindSeat = state.usedSnapMode;
+                const bool broadPalmPlacement =
+                    TryCalculateBroadObjectPalmPlacement(
+                        state,
+                        wandNode,
+                        isLeft,
+                        worldTransform,
+                        isHolotape,
+                        hasAuthoritativeIdentityOffset,
+                        touchGrabApplied,
+                        replacingGeometryBlindSeat);
+                if (broadPalmPlacement) {
+                    objectSpecificRuntimePlacement = true;
+                    if (touchGrabApplied) {
+                        (void)rock::touch_grab_bridge::
+                            ClearTouchGrabFingerPose(isLeft);
+                        state.rockRichFingerPosePublished = false;
+                        touchGrabApplied = false;
+                    }
+                }
+            }
+        }
+
         // Geometry-based placement runs as a fallback when the item has no
         // saved offset at all. ANY saved-offset match (FormID, name, editor-ID
         // partial, NOTE form-type default, or dims-match — Priority 1-5) wins
@@ -6018,6 +8477,7 @@ namespace heisenberg
             !state.isNaturalGrab &&
             !isRemoteSelection &&
             !state.hasItemOffset &&
+            !objectSpecificRuntimePlacement &&
             g_config.enableAutomaticHandPlacement;
 
         if (useGeometryPlacement) {
@@ -6049,9 +8509,16 @@ namespace heisenberg
                     state.grabOffsetLocal.y,
                     state.grabOffsetLocal.z);
             }
-        } else if (!touchGrabApplied) {
+        } else if (
+            !touchGrabApplied &&
+            !objectSpecificRuntimePlacement) {
             state.ClearRuntimeHandPlacement();
             spdlog::debug("[GRAB-POS] Using saved exact offset for '{}' (no geometry fallback)", itemName);
+        } else if (objectSpecificRuntimePlacement) {
+            spdlog::debug(
+                "[GRAB-POS] Preserving object-specific ROCK "
+                "placement for '{}'",
+                itemName);
         } else {
             spdlog::debug(
                 "[GRAB-POS] Preserving physical-touch placement for '{}' "
@@ -6301,8 +8768,43 @@ namespace heisenberg
         if (state.coHeldSecondary) {
             if (!state.HasValidRefr()) {
                 spdlog::debug("[GRAB] UpdateGrab: {} hand co-held secondary marker reference invalid - clearing", isLeft ? "Left" : "Right");
+                (void)rock::touch_grab_bridge::
+                    ClearTouchGrabFingerPose(isLeft);
+                HandAuthority::Clear(
+                    OBJECT_COHOLD_HAND_TAG,
+                    isLeft);
+                auto& primary =
+                    isLeft ? _rightGrab : _leftGrab;
+                primary.coHoldAnchorsValid = false;
+                FRIKInterface::GetSingleton().
+                    ClearHandPoseFingerPositions(isLeft);
+                rock::HostClearExternalHeldBodies(isLeft);
                 state.Clear();
                 Heisenberg::GetSingleton().OnGrabEnded(isLeft);
+            } else {
+                // The marker returns before the primary object-drive path.
+                // Keep its fallback (non-rich) FRIK finger pose alive and
+                // allow one deferred mesh solve if acquisition happened while
+                // calibration/geometry was temporarily unavailable.
+                auto* playerNodes =
+                    f4cf::f4vr::getPlayerNodes();
+                RE::NiNode* wandNode =
+                    playerNodes
+                        ? heisenberg::GetWandNode(
+                              playerNodes,
+                              isLeft)
+                        : nullptr;
+                if (wandNode) {
+                    if (!ResolvePendingFingerCurls(
+                            state,
+                            wandNode,
+                            isLeft,
+                            "Co-hold support")) {
+                        (void)ApplyConfiguredFingerCurls(
+                            state,
+                            isLeft);
+                    }
+                }
             }
             return;
         }
@@ -6311,7 +8813,25 @@ namespace heisenberg
         // This prevents crashes when the game deletes objects we're holding.
         if (!state.HasValidRefr()) {
             spdlog::debug("[GRAB] UpdateGrab: {} hand reference invalid (object deleted?)", isLeft ? "Left" : "Right");
+            (void)rock::touch_grab_bridge::
+                ClearTouchGrabFingerPose(isLeft);
+            GrabState& partner =
+                isLeft ? _rightGrab : _leftGrab;
+            if (partner.active && partner.coHeldSecondary) {
+                HandAuthority::Clear(
+                    OBJECT_COHOLD_HAND_TAG,
+                    !isLeft);
+                (void)rock::touch_grab_bridge::
+                    ClearTouchGrabFingerPose(!isLeft);
+                FRIKInterface::GetSingleton().
+                    ClearHandPoseFingerPositions(!isLeft);
+                rock::HostClearExternalHeldBodies(!isLeft);
+                partner.Clear();
+                Heisenberg::GetSingleton().
+                    OnGrabEnded(!isLeft);
+            }
             // Clean up grab state
+            rock::HostClearExternalHeldBodies(isLeft);
             state.Clear();
             // Reset fingers and release FRIK override
             auto& frik = FRIKInterface::GetSingleton();
@@ -6341,6 +8861,24 @@ namespace heisenberg
         // Check that the refr still has valid 3D and it matches our cached node
         if (!refr) {
             spdlog::debug("[GRAB] Reference became invalid - aborting grab");
+            (void)rock::touch_grab_bridge::
+                ClearTouchGrabFingerPose(isLeft);
+            GrabState& partner =
+                isLeft ? _rightGrab : _leftGrab;
+            if (partner.active && partner.coHeldSecondary) {
+                HandAuthority::Clear(
+                    OBJECT_COHOLD_HAND_TAG,
+                    !isLeft);
+                (void)rock::touch_grab_bridge::
+                    ClearTouchGrabFingerPose(!isLeft);
+                FRIKInterface::GetSingleton().
+                    ClearHandPoseFingerPositions(!isLeft);
+                rock::HostClearExternalHeldBodies(!isLeft);
+                partner.Clear();
+                Heisenberg::GetSingleton().
+                    OnGrabEnded(!isLeft);
+            }
+            rock::HostClearExternalHeldBodies(isLeft);
             state.Clear();
             auto& frik = FRIKInterface::GetSingleton();
             frik.SetHandPoseFingerPositions(isLeft, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f);
@@ -6359,7 +8897,26 @@ namespace heisenberg
                         reinterpret_cast<uintptr_t>(state.node.get()),
                         reinterpret_cast<uintptr_t>(currentNode));
 
+            (void)rock::touch_grab_bridge::
+                ClearTouchGrabFingerPose(isLeft);
+            GrabState& partner =
+                isLeft ? _rightGrab : _leftGrab;
+            if (partner.active && partner.coHeldSecondary) {
+                HandAuthority::Clear(
+                    OBJECT_COHOLD_HAND_TAG,
+                    !isLeft);
+                (void)rock::touch_grab_bridge::
+                    ClearTouchGrabFingerPose(!isLeft);
+                FRIKInterface::GetSingleton().
+                    ClearHandPoseFingerPositions(!isLeft);
+                rock::HostClearExternalHeldBodies(!isLeft);
+                partner.Clear();
+                Heisenberg::GetSingleton().
+                    OnGrabEnded(!isLeft);
+            }
+
             // Clear state safely (don't try to restore physics on deleted object)
+            rock::HostClearExternalHeldBodies(isLeft);
             state.Clear();
 
             // Reset fingers to extended position and release FRIK override
@@ -6500,13 +9057,19 @@ namespace heisenberg
                     spdlog::debug("[STORAGE] {:.1f}s in zone - auto-storing item!", storageHoldTime);
 
                     bool showMessage = true;
-                    bool stored = StoreGrabbedItem(refr, showMessage);
+                    RE::TESForm* storedBaseForm = nullptr;
+                    bool stored =
+                        StoreGrabbedItem(
+                            refr,
+                            showMessage,
+                            &storedBaseForm);
                     
                     if (stored)
                     {
                         spdlog::debug("[GRAB] Auto-storage succeeded after {:.1f}s", storageHoldTime);
-                        RE::TESForm* baseForm = refr ? refr->GetObjectReference() : nullptr;
-                        HeisenbergPluginAPI::InvokeStashedCallbacks(isLeft, baseForm);
+                        HeisenbergPluginAPI::InvokeStashedCallbacks(
+                            isLeft,
+                            storedBaseForm);
                         g_vrInput.TriggerHaptic(isLeft, 50000);  // Strong haptic for success
                         
                         // Start 1 second cooldown to prevent accidental re-grab
@@ -6562,13 +9125,54 @@ namespace heisenberg
                     {
                         const RE::NiPoint3& hmdPos = pn->HmdNode->world.translate;
                         const RE::NiMatrix3& hmdRot = pn->HmdNode->world.rotate;
-                        const RE::NiPoint3 toNote = handPos - hmdPos;
+                        const float readFaceDist =
+                            isReadableBook ? 20.0f : 10.0f;
+                        // Test the held readable mesh, not the controller. A
+                        // comic's saved hand offset can put its page 20+ gu
+                        // closer to the face than the wrist, which made the
+                        // intended gesture impossible despite the comic being
+                        // visibly in front of the player's eyes.
+                        RE::NiPoint3 readPoint =
+                            state.node
+                                ? state.node->worldBound.center
+                                : handPos;
+                        float meshDistance = -1.0f;
+                        const float boundRadius =
+                            state.node
+                                ? std::clamp(
+                                      state.node->worldBound.fRadius,
+                                      0.0f,
+                                      30.0f)
+                                : 0.0f;
+                        const bool meshCanReachReadZone =
+                            (readPoint - hmdPos).Length() <=
+                            readFaceDist + boundRadius + 3.0f;
+                        if (state.node && meshCanReachReadZone) {
+                            std::vector<TriangleData> readTriangles;
+                            readTriangles.reserve(256);
+                            GetTriangles(
+                                state.node.get(),
+                                readTriangles,
+                                4096);
+                            RE::NiPoint3 closestMeshPoint{};
+                            if (GetClosestMeshPointToPoint(
+                                    readTriangles,
+                                    hmdPos,
+                                    closestMeshPoint,
+                                    meshDistance)) {
+                                readPoint = closestMeshPoint;
+                            }
+                        }
+                        const RE::NiPoint3 toNote = readPoint - hmdPos;
                         const float dist = toNote.Length();
-                        // HMD forward = Y column. Require the note in FRONT of the face so
+                        // F4VR HMD forward is the negative Z column (the same
+                        // convention used by Hand's visibility test). Require
+                        // the note in FRONT of the face so
                         // the behind-head storage zone never counts as "brought to face".
-                        const float inFront = toNote.x * hmdRot.entry[0][1] +
-                                              toNote.y * hmdRot.entry[1][1] +
-                                              toNote.z * hmdRot.entry[2][1];
+                        const float inFront =
+                            -(toNote.x * hmdRot.entry[0][2] +
+                              toNote.y * hmdRot.entry[1][2] +
+                              toNote.z * hmdRot.entry[2][2]);
                         // Paper notes must be brought RIGHT UP to the face (~14cm) — a deliberate
                         // gesture — so a note that just dropped to hand isn't read the instant you
                         // glance at it (the "notes go to the world on pickup" report). Magazines /
@@ -6577,19 +9181,67 @@ namespace heisenberg
                         // and pops the vanilla "collected an issue" splash — which is exactly the
                         // bring-to-face collect the user wants (and the ONLY place it should happen;
                         // the behind-head storage zone is gated off for books below).
-                        const float readFaceDist = isReadableBook ? 20.0f : 10.0f;  // ~28cm / ~14cm
-                        if (dist < readFaceDist && inFront > 0.0f)
+                        const float grabAge =
+                            static_cast<float>(Utils::GetTime()) -
+                            state.grabStartTime;
+                        const bool inReadZone =
+                            grabAge >= 0.35f &&
+                            dist < readFaceDist &&
+                            inFront > 0.0f;
+                        if (inReadZone) {
+                            state.faceReadTimer += deltaTime;
+                            if (state.faceReadTimer <= deltaTime * 1.5f) {
+                                spdlog::debug(
+                                    "[GRAB] {} entered face-read zone "
+                                    "(meshDist={:.1f} front={:.1f} age={:.2f})",
+                                    isReadableBook ? "Magazine" : "Note",
+                                    meshDistance >= 0.0f
+                                        ? meshDistance
+                                        : dist,
+                                    inFront,
+                                    grabAge);
+                            }
+                        } else {
+                            state.faceReadTimer = 0.0f;
+                        }
+                        constexpr float kFaceReadDwellSeconds = 0.20f;
+                        if (state.faceReadTimer >=
+                            kFaceReadDwellSeconds)
                         {
                             RE::NiPointer<RE::TESObjectREFR> keep(refr);
-                            EndGrab(isLeft, nullptr, true);  // release the hold first
                             auto* player = RE::PlayerCharacter::GetSingleton();
-                            if (player && keep)
-                            {
+                            RE::TESForm* baseForm =
+                                keep ? keep->GetObjectReference() : nullptr;
+                            bool activated = false;
+                            if (player && keep) {
+                                // ActivateRef can emit a container-changed
+                                // event synchronously. Mark it first so
+                                // loot-to-hand cannot immediately re-grab the
+                                // comic we are deliberately collecting.
+                                if (baseForm) {
+                                    heisenberg::DropToHand::GetSingleton().
+                                        MarkAsRecentlyStored(
+                                            baseForm->GetFormID());
+                                }
                                 // Bypass our activate hook — we WANT the native note overlay /
                                 // magazine read here (the deliberate face gesture).
                                 heisenberg::Hooks::SetInternalActivation(true);
-                                keep->ActivateRef(player, nullptr, 1, false, false, false);
+                                activated = keep->ActivateRef(
+                                    player,
+                                    nullptr,
+                                    1,
+                                    false,
+                                    false,
+                                    false);
                                 heisenberg::Hooks::SetInternalActivation(false);
+                            }
+
+                            if (activated) {
+                                // Match the normal storage ordering: consume
+                                // while the hold is still intact, then use the
+                                // storage teardown which intentionally skips
+                                // restoring a disappearing reference.
+                                EndGrab(isLeft, nullptr, true);
                                 // ActivateRef fires the read/collect but does NOT reliably remove
                                 // the placed world reference for kNOTE/kBOOK (the exact reason
                                 // StoreGrabbedItem uses AddObjectToContainer + SafeDisableRef).
@@ -6597,13 +9249,39 @@ namespace heisenberg
                                 // the last hand position → it floats. Disable it like every other
                                 // storage path (SafeDisableRef defers for behavior-graph items).
                                 SafeDisableRef(keep.get());
+                                HeisenbergPluginAPI::InvokeStashedCallbacks(
+                                    isLeft,
+                                    baseForm);
+                                spdlog::info(
+                                    "[GRAB] {} read at face "
+                                    "(dist={:.1f}cm) - collected/opened + taken",
+                                    isReadableBook
+                                        ? "Magazine"
+                                        : "Note",
+                                    dist);
+                                return;  // grab is over
                             }
-                            spdlog::info("[GRAB] {} read at face (dist={:.1f}cm) - collected/opened + taken",
-                                         isReadableBook ? "Magazine" : "Note", dist);
-                            return;  // grab is over
+
+                            // A script or activation condition can reject the
+                            // read. Keep the object held and retain its physics
+                            // state so a failed activation never strands a
+                            // keyframed, collision-suppressed world reference.
+                            state.faceReadTimer = 0.0f;
+                            spdlog::warn(
+                                "[GRAB] {} face-read activation failed for "
+                                "{:08X}; keeping object held",
+                                isReadableBook ? "Magazine" : "Note",
+                                keep ? keep->formID : 0);
                         }
+                    } else {
+                        state.faceReadTimer = 0.0f;
                     }
+                } else {
+                    state.faceReadTimer = 0.0f;
                 }
+            }
+            else {
+                state.faceReadTimer = 0.0f;
             }
         }
 
@@ -6786,7 +9464,30 @@ namespace heisenberg
                         // This allows "handing off" a weapon to your weapon hand
                         // Only check fingertip equip when weaponEquipMode is enabled
                         if (weaponZoneEnabled) {
-                            weaponNearFingertip = CheckWeaponEquipByFingertip(handPos, state.handSpeed, isLeft);
+                            float measuredSeparation = (std::numeric_limits<float>::max)();
+                            const bool touchingWeaponHand =
+                                CheckWeaponEquipByHandContact(
+                                    state,
+                                    state.handSpeed,
+                                    isLeft,
+                                    &measuredSeparation);
+                            if (!state.weaponEquipZoneArmed) {
+                                // Edge-trigger arming: a Pip-Boy drop-to-hand can
+                                // materialise the weapon already intersecting the
+                                // weapon hand, which would equip it the instant the
+                                // player lets go. Require one confirmed CLEAR-of-the-hand
+                                // measurement, with the Pip-Boy closed, before a touch
+                                // can arm the equip. An unmeasurable frame leaves the
+                                // separation at max and does NOT arm.
+                                if (measuredSeparation > kWeaponEquipContactSkin &&
+                                    measuredSeparation < (std::numeric_limits<float>::max)() &&
+                                    !heisenberg::MenuChecker::GetSingleton().IsPipboyOpen()) {
+                                    state.weaponEquipZoneArmed = true;
+                                    spdlog::info("[WEAP-EQUIP] armed — held weapon is clear of the weapon hand (separation={:.2f}gu)", measuredSeparation);
+                                }
+                            } else {
+                                weaponNearFingertip = touchingWeaponHand;
+                            }
                             if (weaponNearFingertip) {
                                 currentZone = ArmorZoneType::Chest;  // Use Chest as placeholder zone type
                                 zoneName = "WEAPON_HAND";
@@ -6916,21 +9617,59 @@ namespace heisenberg
 
                 if (state.collisionObject && state.node)
                 {
-                    RE::bhkWorld* bhkWorld = GetBhkWorldFromRefr(refr);
+                    RE::bhkWorld* bhkWorld =
+                        ResolveMatchingHeldBhkWorld(state);
                     state.savedState.savedBhkWorld = bhkWorld;
                     state.savedState.motionType = RE::hknpMotionPropertiesId::Preset::DYNAMIC;
                     state.savedState.collisionObjectFlags = state.collisionObject->flags.flags;
                     spdlog::debug("[GRAB-KEYFRAMED] Saved collision object flags: {:X}",
                                  state.savedState.collisionObjectFlags);
 
-                    // Capture every body in the shared reference physics
-                    // system before changing motion type. The selected visible
-                    // wrapper remains placement authority, while hidden
-                    // alternates are driven in lockstep so they cannot reset
-                    // the reference root to its pre-grab pose.
-                    CaptureHeldCollisionBodyFrames(state);
+                    // Instant DropToHand placement captured before moving the
+                    // visual root. Reuse that exact set when it is still live;
+                    // recapturing now would freeze the artificial
+                    // spawn-to-hand bodyOwnerLocal delta. A failed/stale
+                    // pre-capture deliberately falls back to the selected
+                    // wrapper rather than retaining a partial body set.
+                    const bool instantPreCaptureAttempted =
+                        state.instantPreTeleportBodyCaptureAttempted;
+                    bool reusedInstantPreCapture = false;
+                    if (instantPreCaptureAttempted) {
+                        reusedInstantPreCapture =
+                            CapturedHeldBodySetStillOwned(state);
+                        if (!reusedInstantPreCapture) {
+                            const auto rejectedBodyCount =
+                                state.capturedHeldBodyCount;
+                            ClearCapturedHeldBodyFrames(state);
+                            spdlog::warn(
+                                "[GRAB-INSTANT-BODY] {:08X} rejected "
+                                "pre-teleport capture (bodies={}); not "
+                                "recapturing after visual teleport",
+                                refr ? refr->formID : 0,
+                                rejectedBodyCount);
+                        } else {
+                            spdlog::info(
+                                "[GRAB-INSTANT-BODY] {:08X} reusing {} "
+                                "pre-teleport body frame(s)",
+                                refr ? refr->formID : 0,
+                                state.capturedHeldBodyCount);
+                        }
+                    } else {
+                        CaptureHeldCollisionBodyFrames(state);
+                    }
+                    state.instantPreTeleportBodyCaptureAttempted = false;
+                    if (!PublishExternalHeldBodiesForPlayerSuppression(
+                            state,
+                            isLeft)) {
+                        spdlog::warn(
+                            "[GRAB-FILTER] Could not publish exact held-body "
+                            "identity before KEYFRAMED authority for {:08X}",
+                            refr ? refr->formID : 0);
+                    }
                     const bool selectedWrapperScope =
-                        UsesSelectedCollisionWrapperMotionScope(state);
+                        RequiresSelectedCollisionWrapperMotionScope(state);
+                    state.heldMotionScopeIsReferenceSubtree =
+                        !selectedWrapperScope;
                     if (selectedWrapperScope) {
                         SetMotionTypeLocked(
                             state.collisionObject,
@@ -7036,26 +9775,46 @@ namespace heisenberg
                     }
 
                     if (heisenberg::g_config.heldObjectCollidable) {
-                        // REVERTED (2026-05-29): Layer-43 experiment broke thrown-object damage
-                        // because SetLayerLocked also overwrites the filter's group/system bits
-                        // with layer-43 presets, and the saved "original filter info" captured
-                        // AFTER that call carried the wrong metadata back into the restored body.
-                        // Throws then landed but registered no contacts on NPCs.
-                        //
-                        // Original working approach: leave the body on its native layer (4
-                        // clutter / whatever the refr already was) and rely ONLY on OR'ing
-                        // the 0x000B hand-group bits into the filter info. The engine's pair
-                        // filter rejects player-attached pairs by GROUP, not layer, so the
-                        // player-push-back avoidance still works without a layer change.
-                        if (TryDisablePlayerHeldObjectCollision(state)) {
+                        // Preserve bits 7-31 and replace only the low layer bits
+                        // with BIPED_NO_CC. Unlike the old SetLayerLocked
+                        // experiment, this cannot clobber authored group/system
+                        // metadata and release restores the full original word.
+                        if (TryDisablePlayerHeldObjectCollision(
+                                state,
+                                bhkWorld)) {
                             state.heldPlayerFilterApplied = true;
                         }
-                        spdlog::info("[GRAB-KEYFRAMED] {:08X} held object kept COLLIDABLE (native layer + 0x000B group bits) — will push other objects",
+                        spdlog::info("[GRAB-KEYFRAMED] {:08X} held object kept COLLIDABLE on temporary BIPED_NO_CC layer — will push other objects",
                                      refr ? refr->formID : 0);
                     } else {
-                        CaptureHeldObjectLayerBeforeChange(state);  // save REAL pre-grab layer (audit rank 7)
-                        bhkUtilFunctions_SetLayerLocked(state.node.get(), 15, bhkWorld);
-                        spdlog::debug("[GRAB-KEYFRAMED] Set collision layer to kNonCollidable (15)");
+                        if (state.capturedHeldBodySetValid) {
+                            if (ApplyCapturedHeldBodyFilters(
+                                    state,
+                                    bhkWorld,
+                                    false)) {
+                                state.heldPlayerFilterApplied = true;
+                                spdlog::debug(
+                                    "[GRAB-KEYFRAMED] Set every captured "
+                                    "body to kNonCollidable (15) with "
+                                    "byte-exact per-body restore");
+                            } else {
+                                spdlog::warn(
+                                    "[GRAB-KEYFRAMED] Could not apply "
+                                    "multipart non-collidable filters; "
+                                    "leaving native filters intact rather "
+                                    "than collapsing per-body metadata");
+                            }
+                        } else {
+                            CaptureHeldObjectLayerBeforeChange(state);
+                            bhkUtilFunctions_SetLayerLocked(
+                                state.node.get(),
+                                15,
+                                bhkWorld);
+                            spdlog::debug(
+                                "[GRAB-KEYFRAMED] Set collision subtree "
+                                "to kNonCollidable (15) through scalar "
+                                "fallback");
+                        }
                     }
 
                     if (Utils::HasPhysicsBodyOffset(state.collisionObject, state.node.get()))
@@ -7116,7 +9875,9 @@ namespace heisenberg
                     auto* playerNodesPP = f4cf::f4vr::getPlayerNodes();
                     RE::NiNode* wandNodePP = playerNodesPP ? heisenberg::GetWandNode(playerNodesPP, isLeft) : nullptr;
                     // Skip the triangle extraction for saved-curl items (geometry irrelevant there).
-                    if (wandNodePP && state.node && !HasStoredFingerCurls(state)) {
+                    if (wandNodePP && state.node &&
+                        !HasStoredFingerCurls(state) &&
+                        spdlog::should_log(spdlog::level::warn)) {
                         RE::NiPoint3 palmPosPP = GetPalmPosition(wandNodePP, isLeft);
                         RE::NiPoint3 objPosPP = state.node->world.translate;
                         float pivotDist = (objPosPP - palmPosPP).Length();
@@ -7141,22 +9902,67 @@ namespace heisenberg
             }
         }
 
-        // Keep a collidable held object from shoving the player. The pair filter is applied
-        // when the body ids resolve, then re-applied at a fixed cadence (NOT every frame —
-        // throttle even on failure, otherwise an SEH-caught failure inside disableCollisionsBetween
-        // would re-fire every frame and spam the log). Cadence-frame counter ticks regardless of
-        // success/failure; we attempt at most one disable per cadence-tick.
-        if (g_config.heldObjectCollidable && !state.isPulling && state.keyframedSetupComplete &&
+        // Keep a collidable, keyframed host-held object from shoving the player.
+        // Exact body publication is level-triggered: a transient setup failure
+        // is retried and a successful snapshot is revalidated/replaced at the
+        // same low cadence as the secondary filter word. This registry path
+        // remains active during pull-in because the body can already be
+        // keyframed then; only the optional group-filter rewrite waits for pull
+        // completion.
+        if (g_config.heldObjectCollidable &&
+            state.keyframedSetupComplete &&
             state.collisionObject)
         {
-            const bool attempt = (state.heldPlayerFilterFrames++ % 30 == 0);
-            if (attempt) {
+            const bool cadence =
+                (state.heldPlayerFilterFrames++ % 30 == 0);
+            bool exactBodiesPublished = !cadence;
+            if (cadence) {
+                exactBodiesPublished =
+                    PublishExternalHeldBodiesForPlayerSuppression(
+                        state,
+                        isLeft);
+            }
+
+            if (!state.isPulling && cadence) {
                 // Drop the cached player body so resolution re-walks the proxy-first chain.
                 // Recovers if a previous success latched the wrong (ragdoll) body.
                 heisenberg::Physics::InvalidatePlayerBodyId();
-                if (TryDisablePlayerHeldObjectCollision(state)) {
+                if (auto* filterWorld =
+                        ResolveMatchingHeldBhkWorld(state);
+                    filterWorld &&
+                    TryDisablePlayerHeldObjectCollision(
+                        state,
+                        filterWorld)) {
                     state.heldPlayerFilterApplied = true;
                 }
+
+                /*
+                 * TryDisablePlayerHeldObjectCollision can discover that a
+                 * multipart capture is no longer usable and fall back to the
+                 * selected live body. If the first publication failed for that
+                 * reason, publish the fallback now instead of leaving the
+                 * character-controller filter unprotected for another
+                 * 30-frame cadence.
+                 */
+                if (!exactBodiesPublished && state.active) {
+                    exactBodiesPublished =
+                        PublishExternalHeldBodiesForPlayerSuppression(
+                            state,
+                            isLeft);
+                }
+            }
+
+            if (cadence &&
+                !exactBodiesPublished &&
+                state.active) {
+                spdlog::warn(
+                    "[GRAB-FILTER] Exact held-body publication is not "
+                    "ready for active {}-hand grab {:08X}; preserving the "
+                    "last complete snapshot and retrying",
+                    isLeft ? "left" : "right",
+                    state.GetRefr()
+                        ? state.GetRefr()->GetFormID()
+                        : 0);
             }
         }
 
@@ -7289,9 +10095,15 @@ namespace heisenberg
             state.collisionObject = GetCollisionObject(refr);
             // v2: baseline must use the SAME signal as the steady-state check (player's
             // parentCell, not the held object's — see the WORLD-CHANGE RESYNC comment).
-            if (auto* worldPlayer2 = RE::PlayerCharacter::GetSingleton()) {
-                if (auto* worldPlayerCell2 = worldPlayer2->GetParentCell()) {
-                    state.lastSyncedBhkWorld = worldPlayerCell2->GetbhkWorld();
+            // Seed it only for a brand-new grab. During a transition, leaving the old
+            // identity in place is what makes PostPhysicsGrabUpdate recapture the
+            // newly appeared wrapper instead of silently declaring it synchronized.
+            if (!state.lastSyncedBhkWorld) {
+                if (auto* worldPlayer2 = RE::PlayerCharacter::GetSingleton()) {
+                    if (auto* worldPlayerCell2 = worldPlayer2->GetParentCell()) {
+                        state.lastSyncedBhkWorld =
+                            worldPlayerCell2->GetbhkWorld();
+                    }
                 }
             }
         }
@@ -7310,10 +10122,11 @@ namespace heisenberg
         RE::NiPoint3 objPos = state.node->world.translate;
         float lag = (objPos - targetPos).Length();
         if (lag > 50.0f && state.keyframedSetupComplete) {
-            auto* bhkWorld = GetBhkWorldFromRefr(refr);
+            auto* bhkWorld =
+                ResolveMatchingHeldBhkWorld(state);
             if (bhkWorld) {
                 const bool selectedWrapperScope =
-                    UsesSelectedCollisionWrapperMotionScope(state);
+                    !state.heldMotionScopeIsReferenceSubtree;
                 if (selectedWrapperScope) {
                     SetMotionTypeLocked(
                         state.collisionObject,
@@ -7345,32 +10158,55 @@ namespace heisenberg
                 objPos.x, objPos.y, objPos.z, targetPos.x, targetPos.y, targetPos.z, lag);
         }
 
-        // Periodic held-object-to-palm distance log — surfaces "object is far
-        // from the hand" cases independent of pull animation. Once per second
-        // at 60 Hz. Only log while not pulling (so we see steady-state only).
-        // Skip for saved-curl items — the mesh extraction it does is pure overhead there.
-        if (!state.isPulling && !HasStoredFingerCurls(state)) {
-            static int heldDistCounter = 0;
-            if (++heldDistCounter >= 60) {
+        // Periodic held-object-to-palm distance diagnostic. GetTriangles plus
+        // the full closest-point walk is expensive on a high-poly held item, so
+        // this must never run merely because warning logging is enabled in an
+        // ordinary release session. Require explicit debug logging, sample each
+        // hand independently, cap traversal, and retain scratch capacity.
+        if (!state.isPulling &&
+            !HasStoredFingerCurls(state) &&
+            spdlog::should_log(spdlog::level::debug)) {
+            static std::array<std::uint16_t, 2>
+                heldDistCounters{};
+            auto& heldDistCounter =
+                heldDistCounters[isLeft ? 0u : 1u];
+            if (++heldDistCounter >= 180) {
                 heldDistCounter = 0;
                 auto* playerNodesHD = f4cf::f4vr::getPlayerNodes();
                 RE::NiNode* wandNodeHD = playerNodesHD ? heisenberg::GetWandNode(playerNodesHD, isLeft) : nullptr;
                 if (wandNodeHD) {
                     RE::NiPoint3 palmPosHD = GetPalmPosition(wandNodeHD, isLeft);
                     float pivotDistHD = (objPos - palmPosHD).Length();
-                    std::vector<heisenberg::TriangleData> trisHD;
-                    trisHD.reserve(256);
-                    heisenberg::GetTriangles(state.node.get(), trisHD);
+                    static thread_local
+                        std::vector<heisenberg::TriangleData>
+                            trisHD;
+                    trisHD.clear();
+                    if (trisHD.capacity() < 256) {
+                        trisHD.reserve(256);
+                    }
+                    heisenberg::GetTriangles(
+                        state.node.get(),
+                        trisHD,
+                        4096);
                     RE::NiPoint3 meshPtHD;
                     float meshDistHD = -1.0f;
                     if (!trisHD.empty()) {
                         heisenberg::GetClosestMeshPointToPoint(trisHD, palmPosHD, meshPtHD, meshDistHD);
                     }
-                    spdlog::warn("[HELD-DIST] '{}' palm=({:.1f},{:.1f},{:.1f}) pivot=({:.1f},{:.1f},{:.1f}) pivotDist={:.2f}cm meshDist={:.2f}cm tris={}",
-                                 state.node->name.c_str(),
-                                 palmPosHD.x, palmPosHD.y, palmPosHD.z,
-                                 objPos.x, objPos.y, objPos.z,
-                                 pivotDistHD, meshDistHD, trisHD.size());
+                    spdlog::debug(
+                        "[HELD-DIST] '{}' palm=({:.1f},{:.1f},{:.1f}) "
+                        "pivot=({:.1f},{:.1f},{:.1f}) pivotDist={:.2f}cm "
+                        "meshDist={:.2f}cm tris={}",
+                        state.node->name.c_str(),
+                        palmPosHD.x,
+                        palmPosHD.y,
+                        palmPosHD.z,
+                        objPos.x,
+                        objPos.y,
+                        objPos.z,
+                        pivotDistHD,
+                        meshDistHD,
+                        trisHD.size());
                 }
             }
         }
@@ -7381,27 +10217,220 @@ namespace heisenberg
     {
         // Get state for this hand first
         GrabState& state = isLeft ? _leftGrab : _rightGrab;
+        (void)rock::touch_grab_bridge::
+            ClearTouchGrabFingerPose(isLeft);
+        state.rockRichFingerPosePublished = false;
 
         // Two-handed grab cleanup:
         // (a) If THIS hand is the secondary aim hand, it owns no physics — just clear the
         //     marker and return; the primary keeps holding (its next drive sees no partner).
         if (state.coHeldSecondary) {
-            spdlog::info("[GRAB] Two-handed: {} aim hand released — primary keeps the object", isLeft ? "Left" : "Right");
+            GrabState& primary =
+                isLeft ? _rightGrab : _leftGrab;
+            const bool endStoredPrimary =
+                forStorage &&
+                primary.active &&
+                primary.GetRefr() == state.GetRefr();
+            primary.coHoldAnchorsValid = false;
+            HandAuthority::Clear(
+                OBJECT_COHOLD_HAND_TAG,
+                isLeft);
+            auto& frik = FRIKInterface::GetSingleton();
+            frik.ClearHandPoseFingerPositions(isLeft);
+            Heisenberg::GetSingleton().
+                SetFingerCurlValue(isLeft, 1.0f);
+            rock::HostClearExternalHeldBodies(isLeft);
             state.Clear();
+            Heisenberg::GetSingleton().OnGrabEnded(isLeft);
+
+            if (endStoredPrimary) {
+                spdlog::info(
+                    "[GRAB] Two-handed: {} support initiated storage — ending primary ownership too",
+                    isLeft ? "left" : "right");
+                EndGrab(!isLeft, nullptr, true);
+            } else {
+                spdlog::info(
+                    "[GRAB] Two-handed: {} aim hand released — primary keeps the object",
+                    isLeft ? "Left" : "Right");
+            }
             return;
         }
-        // (b) If THIS (primary) hand is releasing while the OTHER hand is its secondary aim hand,
-        //     clear that marker too so it doesn't linger pointing at a dropped object.
+        // (b) If THIS (primary) hand releases while the other hand is still
+        // gripping the same object, transfer the complete physics ownership to
+        // that hand instead of dropping the object. The object is rebased from
+        // its current world pose, so the handoff cannot snap even though the
+        // old grab placement was expressed in the releasing hand's frame.
         {
             GrabState& partner = isLeft ? _rightGrab : _leftGrab;
             if (partner.active && partner.coHeldSecondary && partner.GetRefr() == state.GetRefr()) {
-                spdlog::info("[GRAB] Two-handed: primary released — clearing {} aim-hand marker", isLeft ? "Right" : "Left");
-                partner.Clear();
+                if (forStorage) {
+                    // Inventory activation consumes the shared world object.
+                    // Do not promote the support marker into ownership of a
+                    // reference that is already being stored/consumed.
+                    HandAuthority::Clear(
+                        OBJECT_COHOLD_HAND_TAG,
+                        !isLeft);
+                    auto& frik = FRIKInterface::GetSingleton();
+                    frik.ClearHandPoseFingerPositions(!isLeft);
+                    Heisenberg::GetSingleton().
+                        SetFingerCurlValue(!isLeft, 1.0f);
+                    rock::HostClearExternalHeldBodies(!isLeft);
+                    partner.Clear();
+                    Heisenberg::GetSingleton().
+                        OnGrabEnded(!isLeft);
+                    spdlog::info(
+                        "[GRAB] Two-handed: storage ended {} support marker before primary cleanup",
+                        isLeft ? "right" : "left");
+                } else {
+                const bool promotedIsLeft = !isLeft;
+                const RE::NiTransform objectWorld =
+                    state.node ? state.node->world : RE::NiTransform{};
+
+                // Preserve the support hand's solved pose; the primary state
+                // contains the physics/lifetime data but its finger curls
+                // belong to the hand that is releasing.
+                const bool supportHasFingerCurls =
+                    partner.hasRuntimeFingerCurls;
+                const bool supportHasJointCurls =
+                    partner.hasRuntimeJointCurls;
+                const auto supportJointCurls =
+                    partner.runtimeJointCurls;
+                const float supportThumb = partner.runtimeThumbCurl;
+                const float supportIndex = partner.runtimeIndexCurl;
+                const float supportMiddle = partner.runtimeMiddleCurl;
+                const float supportRing = partner.runtimeRingCurl;
+                const float supportPinky = partner.runtimePinkyCurl;
+                const bool supportRichPose =
+                    partner.rockRichFingerPosePublished;
+                const bool supportNeedsFingerSolve =
+                    partner.pendingFingerCurls ||
+                    !supportHasFingerCurls;
+
+                std::swap(state, partner);
+                partner.coHeldSecondary = false;
+                partner.coHoldAnchorsValid = false;
+                partner.coHoldPrimaryAnchorObjectLocal = {};
+                partner.coHoldSecondaryAnchorObjectLocal = {};
+                partner.coHoldSecondaryHandObjectLocal = {};
+                partner.coHoldSecondaryHandObjectLocal.rotate.MakeIdentity();
+                partner.coHoldSecondaryHandObjectLocal.scale = 1.0f;
+
+                partner.ClearRuntimeFingerCurls();
+                if (supportHasFingerCurls) {
+                    if (supportHasJointCurls) {
+                        partner.SetRuntimeJointCurls(supportJointCurls);
+                    } else {
+                        partner.SetRuntimeFingerCurls(
+                            supportThumb,
+                            supportIndex,
+                            supportMiddle,
+                            supportRing,
+                            supportPinky);
+                    }
+                }
+                partner.rockRichFingerPosePublished =
+                    supportRichPose;
+                // A promoted support/receiving hand owns the object at its
+                // current visible-mesh contact, not at the releasing hand's
+                // authored offset. Keep mesh posing authoritative and request
+                // one final-pose solve if acquisition-time calibration was not
+                // available.
+                partner.isPulling = false;
+                partner.isNaturalGrab = true;
+                partner.isTelekinesis = true;
+                partner.naturalFingerPosing = true;
+                partner.physicalTouchGrab = true;
+                partner.pendingFingerCurls =
+                    supportNeedsFingerSolve;
+
+                RE::NiNode* promotedHand =
+                    GetSkinnedHandNode(promotedIsLeft);
+                if (!promotedHand) {
+                    if (auto* playerNodes =
+                            f4cf::f4vr::getPlayerNodes()) {
+                        promotedHand =
+                            heisenberg::GetWandNode(
+                                playerNodes,
+                                promotedIsLeft);
+                    }
+                }
+                if (promotedHand && partner.node) {
+                    RE::NiPoint3 paLocal{};
+                    if (Utils::IsPlayerInPowerArmor()) {
+                        paLocal.x = g_config.paGrabOffsetX;
+                        paLocal.y = g_config.paGrabOffsetY;
+                        paLocal.z = g_config.paGrabOffsetZ;
+                    }
+                    RE::NiPoint3 promotedLocalPos =
+                        promotedHand->world.rotate *
+                        (objectWorld.translate -
+                         promotedHand->world.translate);
+                    promotedLocalPos -= paLocal;
+                    const RE::NiMatrix3 promotedLocalRot =
+                        objectWorld.rotate *
+                        promotedHand->world.rotate.Transpose();
+                    partner.SetRigidRenderedHandPlacement(
+                        promotedLocalPos,
+                        promotedLocalRot);
+                    partner.grabOffsetLocal = promotedLocalPos;
+                    partner.lastHandPos =
+                        promotedHand->world.translate;
+                    partner.velocityTrackingInit = false;
+                }
+
+                HandAuthority::Clear(
+                    OBJECT_COHOLD_HAND_TAG,
+                    promotedIsLeft);
+
+                // Transfer the exact held-body publication before clearing the
+                // releasing hand's slot. At every instant at least one complete
+                // registry snapshot therefore protects the still-keyframed
+                // object from the player solver.
+                const bool promotedBodiesPublished =
+                    PublishExternalHeldBodiesForPlayerSuppression(
+                        partner,
+                        promotedIsLeft);
+                if (!promotedBodiesPublished) {
+                    spdlog::error(
+                        "[GRAB-FILTER] Could not transfer exact held-body "
+                        "identity to the promoted {} hand for {:08X}; "
+                        "preserving the previous hand snapshot for retry",
+                        promotedIsLeft ? "left" : "right",
+                        partner.GetRefr()
+                            ? partner.GetRefr()->GetFormID()
+                            : 0);
+                }
+
+                // `state` now contains the old marker only. Clearing it must
+                // not restore physics or emit a Dropped callback.
+                state.Clear();
+                Heisenberg::GetSingleton().OnGrabEnded(isLeft);
+
+                auto& configMode =
+                    ItemPositionConfigMode::GetSingleton();
+                configMode.OnGrabEnded(isLeft);
+                configMode.OnGrabStarted(
+                    &partner,
+                    promotedIsLeft);
+
+                spdlog::info(
+                    "[GRAB] Two-handed: {} primary released — "
+                    "{} hand promoted without dropping ref {:08X}",
+                    isLeft ? "left" : "right",
+                    promotedIsLeft ? "left" : "right",
+                    partner.GetRefr()
+                        ? partner.GetRefr()->GetFormID()
+                        : 0);
+                return;
+                }
             }
         }
+        state.coHoldAnchorsValid = false;
 
-        if (!state.active)
+        if (!state.active) {
+            rock::HostClearExternalHeldBodies(isLeft);
             return;
+        }
         
         // CRITICAL: Validate reference via handle lookup BEFORE any method calls!
         // This prevents crashes when the game deletes objects we're holding.
@@ -7428,6 +10457,7 @@ namespace heisenberg
         // If refr was deleted, just clean up state and exit
         if (!refrValid) {
             spdlog::debug("[GRAB] EndGrab: {} hand reference invalid (object deleted?)", isLeft ? "Left" : "Right");
+            rock::HostClearExternalHeldBodies(isLeft);
             state.Clear();
             // Reset fingers to extended position and release FRIK override
             auto& frik = FRIKInterface::GetSingleton();
@@ -7453,6 +10483,7 @@ namespace heisenberg
                         refr->formID);
 
             // Clear state safely (don't try to restore physics on deleted object)
+            rock::HostClearExternalHeldBodies(isLeft);
             state.Clear();
             
             // Reset fingers to extended position and release FRIK override
@@ -7602,7 +10633,9 @@ namespace heisenberg
         // A "companion" is any Actor with the kIsCommandedActor flag set.
         // Skip if hand is in storage zone — always store to player inventory in that case.
         if (!forStorage && !state.isPulling && !state.isInStorageZone &&
-            g_config.enableDropToCompanion && refr
+            (g_config.enableDropToCompanion ||
+             g_config.enableDropToContainer) &&
+            refr
             && refr->GetFormType() != RE::ENUM_FORM_ID::kACHR)  // Don't store actors to companions
         {
             auto& cfgMode = ItemPositionConfigMode::GetSingleton();
@@ -7654,7 +10687,8 @@ namespace heisenberg
                     }
                     
                     // Check if target is an Actor (kACHR)
-                    if (targetRefr->GetFormType() == RE::ENUM_FORM_ID::kACHR)
+                    if (g_config.enableDropToCompanion &&
+                        targetRefr->GetFormType() == RE::ENUM_FORM_ID::kACHR)
                     {
                         auto* actor = static_cast<RE::Actor*>(targetRefr.get());
                         if (!actor || actor == reinterpret_cast<RE::Actor*>(player)) continue;
@@ -7707,15 +10741,15 @@ namespace heisenberg
                             }
                         }
                         
-                        // 5. Non-hostile check: if actor is not hostile, accept as valid drop target
-                        //    This is the most permissive approach — player is deliberately pointing at an NPC
-                        bool isNotHostile = !actor->GetHostileToActor(reinterpret_cast<RE::Actor*>(player));
+                        spdlog::debug("[COMPANION] Actor {:08X}: cmdFlag={}, cmdByPlayer={}, inPlayerList={}, inCompFaction={}",
+                                    actor->formID, hasCommandedFlag, commandedByPlayer, inPlayerCommandList, inCompanionFaction);
                         
-                        spdlog::debug("[COMPANION] Actor {:08X}: cmdFlag={}, cmdByPlayer={}, inPlayerList={}, inCompFaction={}, notHostile={}",
-                                    actor->formID, hasCommandedFlag, commandedByPlayer, inPlayerCommandList, inCompanionFaction, isNotHostile);
-                        
-                        // Accept if ANY companion indicator matches, OR if not hostile (permissive)
-                        if (hasCommandedFlag || commandedByPlayer || inPlayerCommandList || inCompanionFaction || isNotHostile)
+                        // Inventory transfer is destructive to the world
+                        // reference. Only actual commanded/current companions
+                        // are valid targets; a merely neutral vendor or settler
+                        // must never silently receive the item.
+                        if (hasCommandedFlag || commandedByPlayer ||
+                            inPlayerCommandList || inCompanionFaction)
                         {
                             companionActor = actor;
                             break;
@@ -8048,6 +11082,7 @@ namespace heisenberg
             Heisenberg::GetSingleton().SetFingerCurlValue(isLeft, 1.0f);
             
             // Clear state and return - no physics restoration needed
+            rock::HostClearExternalHeldBodies(isLeft);
             state.Clear();
             
             // NOTE: We unequipped weapon on grab start, no need to re-holster
@@ -8097,6 +11132,7 @@ namespace heisenberg
         Heisenberg::GetSingleton().OnGrabEnded(isLeft);
         auto& configMode = ItemPositionConfigMode::GetSingleton();
         configMode.OnGrabEnded(isLeft);
+        rock::HostClearExternalHeldBodies(isLeft);
         state.Clear();
     }
 
@@ -8167,18 +11203,44 @@ namespace heisenberg
     void GrabManager::ClearAllState()
     {
         spdlog::info("[GRAB] ClearAllState - resetting all grab state");
+
+        // Direct state resets bypass EndGrab, so explicitly release every
+        // external pose/authority writer first. Otherwise a load/reset can
+        // leave a ROCK_Grab finger pose or object co-hold hand target active.
+        HandAuthority::Clear(OBJECT_COHOLD_HAND_TAG, true);
+        HandAuthority::Clear(OBJECT_COHOLD_HAND_TAG, false);
+        (void)rock::touch_grab_bridge::
+            ClearTouchGrabFingerPose(true);
+        (void)rock::touch_grab_bridge::
+            ClearTouchGrabFingerPose(false);
+        auto& frik = FRIKInterface::GetSingleton();
         
         // Clear left hand grab state
         if (_leftGrab.active) {
             spdlog::debug("[GRAB] Clearing active left grab");
+            frik.ClearHandPoseFingerPositions(true);
+            Heisenberg::GetSingleton().SetFingerCurlValue(true, 1.0f);
+            Heisenberg::GetSingleton().OnGrabEnded(true);
+            ItemPositionConfigMode::GetSingleton().OnGrabEnded(true);
             _leftGrab.Clear();
         }
         
         // Clear right hand grab state
         if (_rightGrab.active) {
             spdlog::debug("[GRAB] Clearing active right grab");
+            frik.ClearHandPoseFingerPositions(false);
+            Heisenberg::GetSingleton().SetFingerCurlValue(false, 1.0f);
+            Heisenberg::GetSingleton().OnGrabEnded(false);
+            ItemPositionConfigMode::GetSingleton().OnGrabEnded(false);
             _rightGrab.Clear();
         }
+
+        if (heisenberg::IsRockEngineHosted()) {
+            rock::HostNotifyExternalGrab(true, false);
+            rock::HostNotifyExternalGrab(false, false);
+        }
+        rock::HostClearExternalHeldBodies(true);
+        rock::HostClearExternalHeldBodies(false);
         
         // Clear any pending holster request
         _pendingHolster.pending = false;
@@ -8290,7 +11352,29 @@ namespace heisenberg
                 spdlog::debug("[GRAB] ========== INSTANT GRAB (SIMPLIFIED) ==========");
                 spdlog::debug("[GRAB] RefID: {:08X}, hasItemOffset: {}, hasFingerCurls: {}",
                             refr->formID, state.hasItemOffset, state.itemOffset.hasFingerCurls);
-                
+
+                // Capture while the rendered owner nodes and dynamic Havok
+                // bodies still describe the same spawn pose. The visual
+                // teleport below intentionally does not move physics; a first
+                // capture after that move would preserve the artificial
+                // spawn-to-hand delta as bodyOwnerLocal for the whole hold.
+                const bool capturedBeforeVisualTeleport =
+                    state.collisionObject &&
+                    state.node &&
+                    CaptureHeldCollisionBodyFrames(state);
+                state.instantPreTeleportBodyCaptureAttempted = true;
+                spdlog::info(
+                    "[GRAB-INSTANT-BODY] {:08X} pre-teleport capture "
+                    "{} (bodies={}); setup will {}",
+                    refr->formID,
+                    capturedBeforeVisualTeleport
+                        ? "succeeded"
+                        : "failed",
+                    state.capturedHeldBodyCount,
+                    capturedBeforeVisualTeleport
+                        ? "reuse this body set"
+                        : "use selected-wrapper fallback");
+
                 RE::NiTransform targetTransform;
                 ComputeHeldGrabTargetTransform(state, isLeft, handPos, handRot, targetTransform);
                 RE::NiPoint3 targetPos = targetTransform.translate;
@@ -8399,7 +11483,8 @@ namespace heisenberg
     void GrabManager::PostPhysicsGrabUpdate()
     {
         // [REL-DIAG v2] complete any pending pair-cache pokes (see EndGrab).
-        {
+        if (g_hasDeferredFilterRestores.load(
+                std::memory_order_acquire)) {
             void* tickWorld = nullptr;
             if (auto* player = RE::PlayerCharacter::GetSingleton(); player && player->parentCell) {
                 if (auto* bhk = player->parentCell->GetbhkWorld()) {
@@ -8407,6 +11492,26 @@ namespace heisenberg
                 }
             }
             if (tickWorld) { TickDeferredFilterRestores(tickWorld); }
+        }
+
+        // A live config reload may turn two-hand object grabs off while a
+        // support marker is active. End the marker immediately so neither its
+        // rendered-hand authority nor ROCK's external-grab lease can linger.
+        if (!g_config.enableTwoHandedGrab) {
+            if (_leftGrab.active && _leftGrab.coHeldSecondary) {
+                spdlog::info(
+                    "[GRAB] Two-handed object grab disabled - releasing left "
+                    "support hand");
+                EndGrab(true, nullptr);
+            }
+            if (_rightGrab.active && _rightGrab.coHeldSecondary) {
+                spdlog::info(
+                    "[GRAB] Two-handed object grab disabled - releasing right "
+                    "support hand");
+                EndGrab(false, nullptr);
+            }
+            _leftGrab.coHoldAnchorsValid = false;
+            _rightGrab.coHoldAnchorsValid = false;
         }
 
         // EMBEDDED ROCK engine (audit rank 2): publish the per-hand grab state LEVEL-triggered
@@ -8509,28 +11614,89 @@ namespace heisenberg
                 RE::NiPoint3 rotatedOffset = parentRot.Transpose() * localOffset;
                 targetPos = parentPos + rotatedOffset;
 
-                // Two-handed aim: if the OTHER hand is co-holding this same object as the
-                // secondary aim hand, swing the object's forward axis toward the line between
-                // the two hands (the HIGGS gun-style two-handed hold). Position stays anchored
-                // to this (primary) hand. TUNING NOTE: primaryFwd uses the parent's local +Y
-                // (row 1) as the object's forward — if the held object aims along a different
-                // axis in-game, change which parentRot row is read here.
+                // Two-point co-hold: swing the captured object-local vector
+                // between the two visible-mesh grab spots toward the tracked
+                // palm line, then translate about the primary mesh anchor.
+                // This works for a shovel grabbed anywhere along its shaft;
+                // it does not assume the object's +Y axis is its useful axis.
                 if (g_config.enableTwoHandedGrab && !state.isPulling) {
                     GrabState& aimPartner = isLeft ? _rightGrab : _leftGrab;
                     if (aimPartner.active && aimPartner.coHeldSecondary &&
                         aimPartner.GetRefr() == stateRefr) {
                         if (RE::NiNode* aimWand = heisenberg::GetWandNode(playerNodes, !isLeft)) {
-                            const RE::NiPoint3 primaryFwd(parentRot.entry[1][0], parentRot.entry[1][1], parentRot.entry[1][2]);
-                            const RE::NiPoint3 aimVec = aimWand->world.translate - parentPos;
-                            if (Utils::VectorLength(aimVec) > 5.0f) {  // hands ≥5cm apart
-                                // MakeVectorAlignmentRotation builds a standard COLUMN-vector
-                                // Rodrigues rotation. Composing it directly into this function's
-                                // row-vector world (targetRot = targetRot * swing) makes each
-                                // world axis transform as row*S = S^T*row = R(-theta)*row - the
-                                // object swings the WRONG way (mirrored, growing with angle).
-                                // Right-compose the transpose to get the intended R(+theta).
-                                const RE::NiMatrix3 swing = MakeVectorAlignmentRotation(primaryFwd, aimVec);
-                                targetRot = targetRot * swing.Transpose();  // F4VR row-vector compose
+                            if (state.coHoldAnchorsValid) {
+                                RE::NiTransform baseTarget{};
+                                baseTarget.rotate = targetRot;
+                                baseTarget.translate = targetPos;
+                                baseTarget.scale =
+                                    state.node->world.scale > 0.0f
+                                        ? state.node->world.scale
+                                        : 1.0f;
+                                const RE::NiPoint3 primaryAnchorWorld =
+                                    rock::transform_math::localPointToWorld(
+                                        baseTarget,
+                                        state.coHoldPrimaryAnchorObjectLocal);
+                                const RE::NiPoint3 secondaryAnchorWorld =
+                                    rock::transform_math::localPointToWorld(
+                                        baseTarget,
+                                        state.coHoldSecondaryAnchorObjectLocal);
+                                RE::NiPoint3 secondaryPalmWorld{};
+                                if (!GetCleanTrackedPalmPosition(
+                                        aimWand,
+                                        !isLeft,
+                                        secondaryPalmWorld)) {
+                                    spdlog::debug(
+                                        "[GRAB] Two-point co-hold held this "
+                                        "frame: clean support palm unavailable; "
+                                        "continuing primary drive");
+                                } else {
+                                    const RE::NiPoint3 currentAnchorVector =
+                                        secondaryAnchorWorld - primaryAnchorWorld;
+                                    const RE::NiPoint3 trackedPalmVector =
+                                        secondaryPalmWorld - primaryAnchorWorld;
+
+                                    if (Utils::VectorLength(currentAnchorVector) >
+                                            5.0f &&
+                                        Utils::VectorLength(trackedPalmVector) >
+                                            5.0f) {
+                                        const RE::NiMatrix3 swing =
+                                            MakeVectorAlignmentRotation(
+                                                currentAnchorVector,
+                                                trackedPalmVector);
+                                        targetRot =
+                                            targetRot * swing.Transpose();
+
+                                        RE::NiTransform rotatedTarget =
+                                            baseTarget;
+                                        rotatedTarget.rotate = targetRot;
+                                        const RE::NiPoint3 movedPrimaryAnchor =
+                                            rock::transform_math::
+                                                localPointToWorld(
+                                                    rotatedTarget,
+                                                    state.
+                                                        coHoldPrimaryAnchorObjectLocal);
+                                        targetPos +=
+                                            primaryAnchorWorld -
+                                            movedPrimaryAnchor;
+                                    }
+                                }
+                            } else {
+                                // Compatibility fallback for a marker captured
+                                // by an older state: retain the former +Y aim.
+                                const RE::NiPoint3 primaryFwd(
+                                    parentRot.entry[1][0],
+                                    parentRot.entry[1][1],
+                                    parentRot.entry[1][2]);
+                                const RE::NiPoint3 aimVec =
+                                    aimWand->world.translate - parentPos;
+                                if (Utils::VectorLength(aimVec) > 5.0f) {
+                                    const RE::NiMatrix3 swing =
+                                        MakeVectorAlignmentRotation(
+                                            primaryFwd,
+                                            aimVec);
+                                    targetRot =
+                                        targetRot * swing.Transpose();
+                                }
                             }
                         }
                     }
@@ -8632,6 +11798,35 @@ namespace heisenberg
             }
 
             {
+                // Keep the rendered support hand welded to the exact secondary
+                // mesh spot. Object motion is still solved exclusively from
+                // clean wand/palm input above, so this visual publication can
+                // never feed back into the two-point object solve.
+                GrabState& supportState =
+                    isLeft ? _rightGrab : _leftGrab;
+                if (g_config.enableTwoHandedGrab &&
+                    state.coHoldAnchorsValid &&
+                    supportState.active &&
+                    supportState.coHeldSecondary &&
+                    supportState.GetRefr() == stateRefr) {
+                    RE::NiTransform objectTarget{};
+                    objectTarget.rotate = targetRot;
+                    objectTarget.translate = targetPos;
+                    objectTarget.scale =
+                        state.node->world.scale > 0.0f
+                            ? state.node->world.scale
+                            : 1.0f;
+                    const RE::NiTransform supportHandTarget =
+                        rock::transform_math::composeTransforms(
+                            objectTarget,
+                            state.coHoldSecondaryHandObjectLocal);
+                    HandAuthority::Apply(
+                        OBJECT_COHOLD_HAND_TAG,
+                        !isLeft,
+                        supportHandTarget,
+                        OBJECT_COHOLD_HAND_PRIORITY);
+                }
+
                 // =================================================================
                 // VISUAL UPDATE - Update node and propagate to children (keyframed)
                 // =================================================================
@@ -8669,23 +11864,217 @@ namespace heisenberg
                     }
                     if (currentHeldWorld) {
                         const bool heldWorldChanged = state.lastSyncedBhkWorld && currentHeldWorld != state.lastSyncedBhkWorld;
+                        bool heldWorldResynced = !heldWorldChanged;
                         if (heldWorldChanged) {
-                            spdlog::info("[GRAB] {} hand: bhkWorld changed while holding (cell/worldspace transition) - resyncing held object collision",
-                                         isLeft ? "Left" : "Right");
-                            state.collisionObject = GetCollisionObject(stateRefr);
-                            if (state.collisionObject && state.collisionObject->spSystem) {
-                                if (void* heldWorldRaw = AccessWorld(state.collisionObject)) {
-                                    std::uint32_t heldBodyId = 0x7FFFFFFF;
-                                    heisenberg::ConstraintFunctions::BhkPhysicsSystemGetBodyId(
-                                        state.collisionObject->spSystem.get(), &heldBodyId, state.collisionObject->systemBodyIdx);
-                                    if (heldBodyId != 0x7FFFFFFF) {
-                                        RebuildBodyCollisionCachesNative(heldWorldRaw, heldBodyId);
-                                        heisenberg::Physics::TrySetBodyCollisionLookAhead(heldWorldRaw, heldBodyId, 0.25f);
+                            const void* previousCapturedWorld =
+                                state.capturedHeldBodiesWorld;
+                            const std::uint32_t previousCapturedCount =
+                                state.capturedHeldBodyCount;
+                            spdlog::info(
+                                "[GRAB] {} hand: bhkWorld changed while holding "
+                                "(cell/worldspace transition) - invalidating {} "
+                                "captured body id(s) from {:p} and recapturing",
+                                isLeft ? "Left" : "Right",
+                                previousCapturedCount,
+                                previousCapturedWorld);
+
+                            // hknp body IDs are scoped to one exact world. Clear the
+                            // old set before replacing collisionObject so no helper can
+                            // accidentally interpret an old ID in the new body's buffer.
+                            // The old world is being torn down; attempting to restore its
+                            // filters here would dereference precisely the stale state we
+                            // are defending against.
+                            ClearExternalHeldBodiesForPlayerSuppression(
+                                state,
+                                isLeft);
+                            ClearCapturedHeldBodyFrames(state);
+                            state.heldPlayerFilterApplied = false;
+                            state.heldPlayerFilterFrames = 0;
+                            state.heldOriginalFilterInfo = 0;
+                            state.heldScalarFilterApplied = false;
+                            state.savedState.collisionLayerChanged = false;
+
+                            // Preserve the wrapper that won acquisition when its
+                            // visual owner survived the transition. Falling back
+                            // straight to scene traversal can select a hidden
+                            // alternate wrapper and invert active/phantom roles.
+                            state.collisionObject = state.physicsNode
+                                ? TryResolveNpcCollisionObjectFromRaw(
+                                      state.physicsNode->collisionObject.get())
+                                : nullptr;
+                            if (!state.collisionObject) {
+                                state.collisionObject =
+                                    GetCollisionObject(stateRefr);
+                            }
+                            void* expectedHeldWorldRaw =
+                                heisenberg::Physics::GetHknpWorldFromBhk(
+                                    currentHeldWorld);
+                            void* actualHeldWorldRaw = nullptr;
+                            if (state.collisionObject &&
+                                state.collisionObject->spSystem &&
+                                state.node) {
+                                actualHeldWorldRaw =
+                                    AccessWorld(state.collisionObject);
+                                if (void* heldWorldRaw = actualHeldWorldRaw;
+                                    heldWorldRaw &&
+                                    heldWorldRaw == expectedHeldWorldRaw) {
+                                    // Capture in the new identity namespace before
+                                    // changing motion/filter state. If multipart
+                                    // enumeration fails, the selected-body fallback
+                                    // below remains authoritative.
+                                    CaptureHeldCollisionBodyFrames(state);
+                                    if (!PublishExternalHeldBodiesForPlayerSuppression(
+                                            state,
+                                            isLeft)) {
+                                        spdlog::warn(
+                                            "[GRAB-FILTER] Could not publish "
+                                            "new-world held-body identity "
+                                            "before KEYFRAMED authority for "
+                                            "{:08X}",
+                                            stateRefr->formID);
+                                    }
+                                    const bool selectedWrapperScope =
+                                        RequiresSelectedCollisionWrapperMotionScope(
+                                            state);
+                                    state.heldMotionScopeIsReferenceSubtree =
+                                        !selectedWrapperScope;
+                                    if (selectedWrapperScope) {
+                                        SetMotionTypeLocked(
+                                            state.collisionObject,
+                                            RE::hknpMotionPropertiesId::Preset::KEYFRAMED,
+                                            currentHeldWorld);
+                                    } else {
+                                        bhkWorld_SetMotionLocked(
+                                            state.node.get(),
+                                            RE::hknpMotionPropertiesId::Preset::KEYFRAMED,
+                                            true,
+                                            true,
+                                            true,
+                                            currentHeldWorld);
+                                    }
+
+                                    if (heisenberg::g_config.heldObjectCollidable) {
+                                        state.heldPlayerFilterApplied =
+                                            TryDisablePlayerHeldObjectCollision(
+                                                state,
+                                                currentHeldWorld);
+                                    } else {
+                                        if (state.capturedHeldBodySetValid) {
+                                            if (ApplyCapturedHeldBodyFilters(
+                                                    state,
+                                                    currentHeldWorld,
+                                                    false)) {
+                                                state.heldPlayerFilterApplied =
+                                                    true;
+                                            } else {
+                                                spdlog::warn(
+                                                    "[GRAB-MULTIBODY] "
+                                                    "Non-collidable filter "
+                                                    "apply failed after world "
+                                                    "recapture; native "
+                                                    "filters retained");
+                                            }
+                                        } else {
+                                            CaptureHeldObjectLayerBeforeChange(
+                                                state);
+                                            bhkUtilFunctions_SetLayerLocked(
+                                                state.node.get(),
+                                                15,
+                                                currentHeldWorld);
+                                        }
+                                    }
+
+                                    bool haveLiveBody =
+                                        state.capturedHeldBodySetValid;
+                                    if (haveLiveBody) {
+                                        RebuildCapturedHeldBodyCollisionCaches(
+                                            state,
+                                            currentHeldWorld,
+                                            0.25f);
+                                    } else {
+                                        // Preserve the selected-body path when
+                                        // multipart capture cannot enumerate this
+                                        // NIF. This is also the readiness check used
+                                        // before committing the new world identity.
+                                        heisenberg::Physics::WorldWriteLock
+                                            selectedBodyLock(
+                                                currentHeldWorld);
+                                        if (selectedBodyLock.IsLocked() &&
+                                            heisenberg::Physics::
+                                                    GetHknpWorldFromBhk(
+                                                        currentHeldWorld) ==
+                                                heldWorldRaw &&
+                                            AccessWorld(
+                                                state.collisionObject) ==
+                                                heldWorldRaw) {
+                                            std::uint32_t heldBodyId =
+                                                0x7FFFFFFF;
+                                            heisenberg::ConstraintFunctions::
+                                                BhkPhysicsSystemGetBodyId(
+                                                    state.collisionObject
+                                                        ->spSystem.get(),
+                                                    &heldBodyId,
+                                                    state.collisionObject
+                                                        ->systemBodyIdx);
+                                            if (heldBodyId != 0x7FFFFFFF &&
+                                                heldBodyId != 0xFFFFFFFF) {
+                                                RebuildBodyCollisionCachesNative(
+                                                    heldWorldRaw,
+                                                    heldBodyId);
+                                                heisenberg::Physics::
+                                                    TrySetBodyCollisionLookAhead(
+                                                        heldWorldRaw,
+                                                        heldBodyId,
+                                                        0.25f);
+                                                haveLiveBody = true;
+                                            }
+                                        }
+                                    }
+
+                                    if (haveLiveBody) {
+                                        state.savedState.savedBhkWorld =
+                                            currentHeldWorld;
+                                        heldWorldResynced = true;
+                                        spdlog::info(
+                                            "[GRAB] {} hand: recaptured {} "
+                                            "held body frame(s) in hknpWorld {:p} "
+                                            "(fallback={})",
+                                            isLeft ? "Left" : "Right",
+                                            state.capturedHeldBodyCount,
+                                            heldWorldRaw,
+                                            !state.capturedHeldBodySetValid
+                                                ? "selected-body"
+                                                : "multipart");
                                     }
                                 }
                             }
+
+                            if (!heldWorldResynced) {
+                                // Keep lastSyncedBhkWorld on the old identity so
+                                // this block retries next frame; collision wrappers
+                                // can appear a few frames after the player enters the
+                                // new cell. The captured set remains empty, which
+                                // keeps all per-frame paths on their safe fallback.
+                                ClearCapturedHeldBodyFrames(state);
+                                static std::uint32_t
+                                    s_worldRecaptureFailureLog = 0;
+                                if ((++s_worldRecaptureFailureLog % 60) == 1) {
+                                    spdlog::warn(
+                                        "[GRAB] {} hand: held collision is not "
+                                        "ready in new bhkWorld {:p}; will retry "
+                                        "(collisionObject={:p} actualHknp={:p} "
+                                        "expectedHknp={:p})",
+                                        isLeft ? "Left" : "Right",
+                                        static_cast<void*>(currentHeldWorld),
+                                        static_cast<void*>(state.collisionObject),
+                                        actualHeldWorldRaw,
+                                        expectedHeldWorldRaw);
+                                }
+                            }
                         }
-                        state.lastSyncedBhkWorld = currentHeldWorld;
+                        if (heldWorldResynced) {
+                            state.lastSyncedBhkWorld = currentHeldWorld;
+                        }
                     }
                 }
 
@@ -8701,19 +12090,21 @@ namespace heisenberg
                 // along that sweep is what batted world clutter over. Park the bodies for the
                 // pull — they snap to the held pose on the first post-pull frame here, and
                 // EndGrabKeyframed's release path syncs them even if the grab ends mid-pull.
-                if (state.capturedHeldBodyCount > 0 && !state.isPulling) {
+                if (state.capturedHeldBodySetValid &&
+                    !state.isPulling) {
                     RE::bhkWorld* heldBodyWorld =
-                        state.savedState.savedBhkWorld;
-                    if (stateRefr) {
-                        if (auto* currentWorld =
-                                GetBhkWorldFromRefr(stateRefr)) {
-                            heldBodyWorld = currentWorld;
-                        }
-                    }
+                        ResolveMatchingHeldBhkWorld(state);
                     if (!SyncCapturedHeldBodyFrames(
                             state,
                             desiredTransform,
                             heldBodyWorld)) {
+                        // The captured IDs no longer describe a body set we can
+                        // safely drive. Drop the exact controller-suppression
+                        // snapshot immediately; the cadence refresh will
+                        // republish only after ownership validates again.
+                        ClearExternalHeldBodiesForPlayerSuppression(
+                            state,
+                            isLeft);
                         static std::uint32_t
                             s_multibodySyncFailureLog = 0;
                         if ((++s_multibodySyncFailureLog % 60) == 1) {
@@ -8750,6 +12141,38 @@ namespace heisenberg
 
             bool suppressFingerReapply = repositionActive && state.stickyGrab;
             if ((!state.isTelekinesis || state.naturalFingerPosing) && !suppressFingerReapply) {
+                // A skeleton/Power-Armor rebuild clears FRIK's authority
+                // registry. The grab state survives that rebuild, so detect a
+                // vanished ROCK_Grab writer and solve once against the current
+                // final mesh to rebuild skeleton-specific joint/splay/local
+                // corrections. If the rich solve cannot recover, the stored
+                // joint curls below remain a safe scalar fallback.
+                if (!state.isPulling &&
+                    state.rockRichFingerPosePublished &&
+                    !rock::touch_grab_bridge::
+                        IsTouchGrabFingerPoseActive(isLeft)) {
+                    state.rockRichFingerPosePublished = false;
+                    if (!wandNode) {
+                        wandNode = heisenberg::GetWandNode(
+                            playerNodes,
+                            isLeft);
+                    }
+                    if (wandNode &&
+                        TryCalculateRuntimeFingerCurlsFromGeometry(
+                            state,
+                            wandNode,
+                            isLeft)) {
+                        spdlog::info(
+                            "[GRAB-FINGERS] {} rich mesh pose republished "
+                            "after FRIK skeleton/PA authority reset",
+                            isLeft ? "Left" : "Right");
+                    } else {
+                        spdlog::warn(
+                            "[GRAB-FINGERS] {} rich mesh pose could not be "
+                            "republished; retaining scalar joint fallback",
+                            isLeft ? "Left" : "Right");
+                    }
+                }
                 if (!ResolvePendingFingerCurls(state, wandNode, isLeft, "Keyframed post-physics")) {
                     if (!state.isPulling && HasConfiguredFingerCurls(state)) {
                         ApplyConfiguredFingerCurls(state, isLeft);
@@ -9133,26 +12556,47 @@ namespace heisenberg
     // =========================================================================
 }
 
-// Two-handed support-hand finger pose driver (Jul 19). While the embedded ROCK engine
-// holds a support grip, FRIK still renders the controller grip-fist (ROCK's v5
-// finger-pose API does not exist on pre-v5 FRIK) — fingers clip the foregrip. Drive
-// FRIK's BASE finger API (v3, present on every FRIK) instead:
-//   mode 1: ROCK's own mesh-solved grip pose (support-grip triangles, curl-disk solver)
+// Two-handed support-hand finger pose driver (Jul 19):
+//   mode 1: ROCK owns its complete mesh-solved support pose. Native FRIK v5
+//           consumes it directly; Heisenberg renders the same rich payload on
+//           stock FRIK 0.77.12 after FRIK's skeleton pass.
 //   mode 2: Heisenberg's HIGGS-table geometry solver against the whole weapon mesh,
-//           solved once at grip capture (retried while the solve fails, max 30 frames)
+//           solved once at grip capture (retried while the solve fails, max 30 frames).
+//           The old five-scalar v3 call remains only as a fail-open fallback.
 // Cleared the frame the grip disengages.
-            // mode 2: one-shot geometry solve against the weapon mesh at grip capture
 void heisenberg::UpdateTwoHandedSupportFingerPose()
 {
         const int mode = g_config.twoHandedFingerPoseMode;
         static bool s_active[2] = { false, false };
-        // Scope-mode exit (Jul 19): tracked independent of the finger-pose mode so it works
-        // even with iTwoHandedFingerPoseMode=0. On the support grip's falling edge, exit
-        // scope mode (BetterScopesVR zoom and/or the vanilla ScopeMenu).
-        static bool s_prevSupportEngaged[2] = { false, false };
+        // Scope-mode exit/re-entry gating is tracked independent of the
+        // finger-pose mode so it works even with
+        // iTwoHandedFingerPoseMode=0. Track GRIPPED rather than the broader
+        // engaged state: ROCK deliberately remains Touching after release,
+        // which would delay the falling edge indefinitely. Acquiring support
+        // while already scoped must preserve ScopeMenu; only releasing an
+        // established support grip closes it and arms leave/re-enter gating.
+        static bool s_prevAnySupportGripped = false;
         static bool s_solved[2] = { false, false };
         static int s_attempts[2] = { 0, 0 };
+        static int s_retryCooldown[2] = { 0, 0 };
         static float s_curls[2][5] = {};
+        static bool s_richMode2Active[2] = { false, false };
+        static constexpr const char* kMode2PoseTag =
+            "Heisenberg_TwoHandMode2";
+
+        const bool rockHosted = IsRockEngineHosted();
+        const bool anySupportGripped =
+            rockHosted &&
+            (rock::HostIsWeaponSupportGripped(false) ||
+                rock::HostIsWeaponSupportGripped(true));
+        if (rockHosted &&
+            rock::native_scope_reentry_policy::
+                shouldExitForSupportGripTransition(
+                    s_prevAnySupportGripped,
+                    anySupportGripped)) {
+            ExitScopeModeOnGripRelease();
+        }
+        s_prevAnySupportGripped = anySupportGripped;
 
         auto& frik = FRIKInterface::GetSingleton();
         if (!frik.IsAvailable()) {
@@ -9161,20 +12605,69 @@ void heisenberg::UpdateTwoHandedSupportFingerPose()
 
         for (int hi = 0; hi < 2; ++hi) {
             const bool isLeft = (hi == 1);
-            const bool supportEngaged = IsRockEngineHosted() && rock::HostIsWeaponSupportEngaged(isLeft);
-            if (s_prevSupportEngaged[hi] && !supportEngaged) {
-                ExitScopeModeOnGripRelease();
-            }
-            s_prevSupportEngaged[hi] = supportEngaged;
+            const bool supportGripped =
+                rockHosted &&
+                rock::HostIsWeaponSupportGripped(isLeft);
+
+            const bool supportEngaged =
+                rockHosted &&
+                rock::HostIsWeaponSupportEngaged(isLeft);
             const bool engaged = mode > 0 && supportEngaged;
-            if (!engaged) {
-                if (s_active[hi]) {
+
+            // The old five-scalar driver existed only because stock FRIK had
+            // no way to consume ROCK's complete pose. Once either native v5
+            // or Heisenberg's v3 full-finger host backend is present, another
+            // scalar write here would overwrite the fail-open baseline after
+            // ROCK's duplicate-publish cache has intentionally gone quiet.
+            // Keep the scope-release edge above. Mode 1 then leaves pose
+            // ownership to the rich ROCK -> FRIK/host bridge; mode 2 remains
+            // the user's explicit Heisenberg-solver choice below.
+            const auto* const hostFingerAuthority =
+                rock::getHostFingerPoseAuthority();
+            const bool completeHostFingerAuthority =
+                hostFingerAuthority &&
+                hostFingerAuthority->applyPose &&
+                hostFingerAuthority->buildPoseLocalTransforms &&
+                hostFingerAuthority->applyLocalTransforms &&
+                hostFingerAuthority->clear &&
+                hostFingerAuthority->isActive;
+            const bool rockOwnsFullFingerPose =
+                IsRockEngineHosted() &&
+                (rock::frikHasVisualAuthority() ||
+                    completeHostFingerAuthority);
+            // Mode 2 is an explicit request for Heisenberg's separate
+            // whole-weapon geometry solver. Preserve that user selection;
+            // only retire the old scalar adapter used by mode 1.
+            if (rockOwnsFullFingerPose && mode != 2) {
+                if (s_richMode2Active[hi]) {
+                    (void)rock::HostClearFingerPose(
+                        kMode2PoseTag,
+                        isLeft);
+                } else if (s_active[hi]) {
                     frik.ClearHandPoseFingerPositions(isLeft);
-                    spdlog::debug("[THG-FINGER] {} support grip released - finger pose cleared", isLeft ? "L" : "R");
                 }
+                s_richMode2Active[hi] = false;
                 s_active[hi] = false;
                 s_solved[hi] = false;
                 s_attempts[hi] = 0;
+                s_retryCooldown[hi] = 0;
+                continue;
+            }
+
+            if (!engaged) {
+                if (s_richMode2Active[hi]) {
+                    (void)rock::HostClearFingerPose(
+                        kMode2PoseTag,
+                        isLeft);
+                } else if (s_active[hi]) {
+                    frik.ClearHandPoseFingerPositions(isLeft);
+                    spdlog::debug("[THG-FINGER] {} support grip released - finger pose cleared", isLeft ? "L" : "R");
+                }
+                s_richMode2Active[hi] = false;
+                s_active[hi] = false;
+                s_solved[hi] = false;
+                s_attempts[hi] = 0;
+                s_retryCooldown[hi] = 0;
                 continue;
             }
 
@@ -9194,9 +12687,16 @@ void heisenberg::UpdateTwoHandedSupportFingerPose()
                 continue;
             }
 
-            // mode 2: one-shot geometry solve against the weapon mesh at grip capture
-            if (!s_solved[hi] && s_attempts[hi] < 30) {
+            // Mode 2: solve against the whole weapon mesh at grip capture.
+            // A temporarily unavailable skeleton used to trigger this full
+            // traversal on 30 consecutive frames. Space retries out so a
+            // transient readiness miss cannot create a sustained frame-time
+            // spike; a normal first-attempt success is unchanged.
+            if (!s_solved[hi] &&
+                s_attempts[hi] < 30 &&
+                s_retryCooldown[hi] == 0) {
                 ++s_attempts[hi];
+                s_retryCooldown[hi] = 4;
                 auto* player = f4cf::f4vr::getPlayer();
                 auto* playerNodes = f4cf::f4vr::getPlayerNodes();
                 RE::NiNode* wandNode = playerNodes ? heisenberg::GetWandNode(playerNodes, isLeft) : nullptr;
@@ -9223,10 +12723,35 @@ void heisenberg::UpdateTwoHandedSupportFingerPose()
                                      s_curls[hi][0], s_curls[hi][1], s_curls[hi][2], s_curls[hi][3], s_curls[hi][4]);
                     }
                 }
+            } else if (!s_solved[hi] &&
+                       s_retryCooldown[hi] > 0) {
+                --s_retryCooldown[hi];
             }
             if (s_solved[hi]) {
-                frik.SetHandPoseFingerPositions(isLeft, s_curls[hi][0], s_curls[hi][1], s_curls[hi][2], s_curls[hi][3], s_curls[hi][4]);
-                s_active[hi] = true;
+                bool published = false;
+                if (rockOwnsFullFingerPose) {
+                    published = rock::HostPublishUniformFingerPose(
+                        kMode2PoseTag,
+                        isLeft,
+                        s_curls[hi][0],
+                        s_curls[hi][1],
+                        s_curls[hi][2],
+                        s_curls[hi][3],
+                        s_curls[hi][4],
+                        110);
+                    s_richMode2Active[hi] = published;
+                }
+                if (!published) {
+                    published = frik.SetHandPoseFingerPositions(
+                        isLeft,
+                        s_curls[hi][0],
+                        s_curls[hi][1],
+                        s_curls[hi][2],
+                        s_curls[hi][3],
+                        s_curls[hi][4]);
+                    s_richMode2Active[hi] = false;
+                }
+                s_active[hi] = published;
             }
         }
 }

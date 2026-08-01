@@ -102,6 +102,14 @@ namespace heisenberg::rock_core::collision_layer_policy
         return layer == FO4_LAYER_BIPED || layer == FO4_LAYER_DEADBIP || layer == FO4_LAYER_BIPED_NO_CC;
     }
 
+    inline constexpr bool isNativeDamageDeliveryLayer(std::uint32_t layer)
+    {
+        return layer == FO4_LAYER_PROJECTILE ||
+               layer == FO4_LAYER_CONEPROJECTILE ||
+               layer == FO4_LAYER_SPELL ||
+               layer == FO4_LAYER_SPELLEXPLOSION;
+    }
+
     inline constexpr bool isWorldSurfaceLayer(std::uint32_t layer)
     {
         return layer == FO4_LAYER_STATIC || layer == FO4_LAYER_ANIMSTATIC;
@@ -151,12 +159,7 @@ namespace heisenberg::rock_core::collision_layer_policy
         }
     }
 
-    inline constexpr bool isNativePlayerCollisionSuppressionLayer(std::uint32_t layer)
-    {
-        return !isRockOwnedReusableLayer(layer) &&
-               layer != FO4_LAYER_CHARCONTROLLER &&
-               isActorOrBipedLayer(layer);
-    }
+    inline constexpr bool kAllowGlobalNativePlayerBodySuppression = false;
 
     inline constexpr PlayerCharacterControllerContactPolicyDecision evaluatePlayerCharacterControllerContact(
         const PlayerCharacterControllerContactPolicyInput& input)
@@ -169,6 +172,9 @@ namespace heisenberg::rock_core::collision_layer_policy
         }
         if (!input.targetLayerKnown) {
             return PlayerCharacterControllerContactPolicyDecision{ .suppress = false, .reason = "unknownTargetLayer" };
+        }
+        if (isNativeDamageDeliveryLayer(input.targetLayer)) {
+            return PlayerCharacterControllerContactPolicyDecision{ .suppress = false, .reason = "nativeDamageAuthority" };
         }
         if (input.targetIsMovableStatic && isPlayerCharacterControllerSupportLayer(input.targetLayer)) {
             return PlayerCharacterControllerContactPolicyDecision{ .suppress = true, .reason = "movableStaticSupportLayer" };

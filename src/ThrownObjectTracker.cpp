@@ -17,8 +17,8 @@ namespace heisenberg
 {
     namespace
     {
-        // Per-body Havok signal API — see ContactImpulseListener.cpp for the
-        // discovery story. We re-declare here to avoid leaking those internals.
+        // Per-body Havok signal API. These offsets are owned locally now that the
+        // former standalone contact-listener module has been removed.
         using GetEventSignalBodyFn = void* (*)(void* hknpWorld, int eventType, std::uint32_t bodyId);
         REL::Relocation<GetEventSignalBodyFn> g_getEventSignalBody{ REL::Offset(0x15481d0) };
 
@@ -114,39 +114,8 @@ namespace heisenberg
                 std::chrono::steady_clock::now().time_since_epoch().count());
         }
 
-        // hkContactPoint is 0x20 bytes: position at +0x00, normal at +0x10 (both hkVector4f).
-        // ProcessHurtfulBody only reads position; we synthesize one for it.
-        struct HkContactPointStub
-        {
-            float position[4];
-            float normal[4];
-        };
-        static_assert(sizeof(HkContactPointStub) == 0x20);
-
-        // VR offset for middleHighProcess->charController (0x3E8, vs CommonLibF4's 0x3E0).
-        constexpr std::size_t kMiddleHighCharControllerOffset = 0x3E8;
-
         // SEH-only helpers — __try cannot coexist with C++ unwinding in the
         // same function, so each protected operation lives in its own leaf.
-
-        RE::bhkCharacterController* ReadCharControllerSeh(void* middleHigh)
-        {
-            __try {
-                void* raw = *reinterpret_cast<void**>(
-                    reinterpret_cast<uintptr_t>(middleHigh) + kMiddleHighCharControllerOffset);
-                return reinterpret_cast<RE::bhkCharacterController*>(raw);
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                return nullptr;
-            }
-        }
-
-        RE::bhkCharacterController* GetActorCharController(RE::Actor* actor)
-        {
-            if (!actor || !actor->currentProcess || !actor->currentProcess->middleHigh) {
-                return nullptr;
-            }
-            return ReadCharControllerSeh(actor->currentProcess->middleHigh);
-        }
 
         void SetTelekinesisObjectSeh(RE::TESObjectREFR* refr, RE::PlayerCharacter* player)
         {
@@ -175,21 +144,6 @@ namespace heisenberg
         {
             __try {
                 g_enableBodyFlags(hknpWorld, bodyId, flags, 0);
-                return true;
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                return false;
-            }
-        }
-
-        // SEH-wrapped force-aggro: clear kProtected, set kAttackOnSight + kAngryWithPlayer.
-        // For Diamond City guards et al — bypasses the engine's "protected actor, ignore
-        // low-grade assault" silent rejection so they actually fight back when hit.
-        bool ForceAggroFlagsSeh(RE::Actor* actor)
-        {
-            __try {
-                actor->boolFlags.reset(RE::Actor::BOOL_FLAGS::kProtected);
-                actor->boolFlags.set(RE::Actor::BOOL_FLAGS::kAttackOnSight);
-                actor->boolFlags.set(RE::Actor::BOOL_FLAGS::kAngryWithPlayer);
                 return true;
             } __except (EXCEPTION_EXECUTE_HANDLER) {
                 return false;
@@ -251,19 +205,9 @@ namespace heisenberg
             }
         }
 
-        bool ProcessHurtfulBodySeh(void* charController, std::uint32_t& bodyIdRef, void* contactPoint)
-        {
-            __try {
-                bhkCharacterController_ProcessHurtfulBody(charController, bodyIdRef, contactPoint);
-                return true;
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                return false;
-            }
-        }
-
         // Apply a controlled amount of health damage (positive = hurt) via the
-        // engine's health-damage handler, attributed to the player. Replaces
-        // ProcessHurtfulBody so a light object can't one-shot an NPC.
+        // engine's health-damage handler, attributed to the player. This is the
+        // sole damage owner; ProcessHurtfulBody would apply native damage again.
         bool ApplyHealthDamageSeh(RE::Actor* actor, RE::Actor* attacker, float damage)
         {
             __try {
@@ -327,13 +271,25 @@ namespace heisenberg
     void ThrownObjectTracker::SetWorld(void* bhkWorld)
     {
         std::scoped_lock lock(_mutex);
+
+        void* nextHknpWorld = nullptr;
+        if (bhkWorld) {
+            nextHknpWorld =
+                Physics::GetHknpWorldFromBhk(reinterpret_cast<RE::bhkWorld*>(bhkWorld));
+        }
+
+        // Body IDs and their native signal subscriptions are scoped to one hknpWorld.
+        // Reusing this set after an interior/world transition makes a recycled body ID
+        // look "already subscribed", silently disabling thrown-object impacts there.
+        if (bhkWorld != _bhkWorld || nextHknpWorld != _hknpWorld) {
+            _subscribedBodyIds.clear();
+        }
+
+        _bhkWorld = bhkWorld;
+        _hknpWorld = nextHknpWorld;
         if (!bhkWorld) {
-            _bhkWorld = nullptr;
-            _hknpWorld = nullptr;
             return;
         }
-        _bhkWorld = bhkWorld;
-        _hknpWorld = Physics::GetHknpWorldFromBhk(reinterpret_cast<RE::bhkWorld*>(bhkWorld));
         if (_hknpWorld) {
             spdlog::info("[THROWN] World set: bhkWorld={:p}, hknpWorld={:p}", bhkWorld, _hknpWorld);
         } else {
@@ -343,14 +299,29 @@ namespace heisenberg
 
     void ThrownObjectTracker::Reset()
     {
-        std::scoped_lock lock(_mutex);
-        // We intentionally don't try to "unsubscribe" — Havok subscribeSimple
-        // has no symmetric remove API mapped, and stale callbacks check the
-        // bodyId map before doing anything.
-        _byBodyId.clear();
-        _actorHitCooldown.clear();
-        _pendingImpacts.clear();
-        _subscribedBodyIds.clear();
+        std::vector<RE::NiPointer<RE::TESObjectREFR>> taggedRefs;
+        {
+            std::scoped_lock lock(_mutex);
+            taggedRefs.reserve(_byBodyId.size());
+            for (auto& [bodyId, entry] : _byBodyId) {
+                (void)bodyId;
+                if (auto ref = entry.refrHandle.get()) {
+                    taggedRefs.push_back(std::move(ref));
+                }
+            }
+            // We intentionally don't try to "unsubscribe" — Havok subscribeSimple
+            // has no symmetric remove API mapped, and stale callbacks check the
+            // bodyId map before doing anything.
+            _byBodyId.clear();
+            _actorHitCooldown.clear();
+            _pendingImpacts.clear();
+            _subscribedBodyIds.clear();
+            _bhkWorld = nullptr;
+            _hknpWorld = nullptr;
+        }
+        for (auto& ref : taggedRefs) {
+            ClearTelekinesisObjectSeh(ref.get());
+        }
     }
 
     void ThrownObjectTracker::OnThrown(RE::TESObjectREFR* refr, std::uint32_t bodyId,
@@ -364,9 +335,36 @@ namespace heisenberg
             return;
         }
 
-        // Opportunistic GC: every throw cleans expired entries so the map can't
-        // grow unbounded if some throws never get a CONTACT_STARTED.
+        // Opportunistic GC runs BEFORE the throwable early-out below, so a
+        // session that only ever throws grenades still expires stale entries
+        // instead of letting the map grow.
         Tick();
+
+        // THROWABLES ARE VANILLA'S. A grenade/mine/Molotov already carries its
+        // own impact contract — the engine decides when it detonates, how much
+        // damage it does and who it aggros. This tracker would run a SECOND,
+        // competing pass over the same throw:
+        //   - 9999 "self damage" destructible destruction on the FIRST contact
+        //     (see the destructible block below, which explicitly handles kWEAP
+        //     base forms), so a Molotov detonates the instant it grazes
+        //     anything — reported as "molotovs explode too quickly";
+        //   - a capped impact-damage pass on top of the explosion;
+        //   - a duplicate AI detection event.
+        // None of that is wanted for something that is already a weapon, so
+        // leave the whole throw to the engine.
+        if (auto* baseForm = refr->GetObjectReference();
+            baseForm && baseForm->GetFormType() == RE::ENUM_FORM_ID::kWEAP) {
+            const auto weaponType =
+                static_cast<RE::TESObjectWEAP*>(baseForm)->weaponData.type.get();
+            if (weaponType == RE::WEAPON_TYPE::kGrenade ||
+                weaponType == RE::WEAPON_TYPE::kMine) {
+                spdlog::debug(
+                    "[THROWN] {:08X} is a throwable weapon — leaving impact handling to the game",
+                    refr->formID);
+                return;
+            }
+        }
+
         const float speedSq = throwVelocity.x * throwVelocity.x
                             + throwVelocity.y * throwVelocity.y
                             + throwVelocity.z * throwVelocity.z;
@@ -374,6 +372,24 @@ namespace heisenberg
             return;  // gentle drop, not a throw
         }
         const float speed = std::sqrt(speedSq);
+
+        // Resolve the thrown reference's current world on every release. A
+        // non-null cached world can still be stale after an interior/cell
+        // transition whose load message did not bracket this exact frame.
+        void* thrownBhkWorld = nullptr;
+        if (auto* cell = refr->GetParentCell()) {
+            thrownBhkWorld = cell->GetbhkWorld();
+        }
+        bool needsWorldRefresh = false;
+        {
+            std::scoped_lock lock(_mutex);
+            needsWorldRefresh =
+                thrownBhkWorld &&
+                thrownBhkWorld != _bhkWorld;
+        }
+        if (needsWorldRefresh) {
+            SetWorld(thrownBhkWorld);
+        }
 
         void* hknpWorld = nullptr;
         {
@@ -395,11 +411,6 @@ namespace heisenberg
         if (!hknpWorld) {
             spdlog::warn("[THROWN] OnThrown: no hknpWorld available, skipping bodyId=0x{:08X}", bodyId);
             return;
-        }
-
-        // Tag refr as a telekinesis object — engine attributes the hit to player.
-        if (auto* player = RE::PlayerCharacter::GetSingleton()) {
-            SetTelekinesisObjectSeh(refr, player);
         }
 
         // Enable the contact-modifier flag on the body. Without this, the engine never
@@ -440,6 +451,7 @@ namespace heisenberg
 
         Entry entry;
         entry.refrHandle = refr->GetHandle();
+        entry.hknpWorld = hknpWorld;
         entry.throwSpeed = speed;
         entry.thrownMass = GetFormWeight(refr);
         entry.expiryNs = NowNs() + kEntryLifetimeNs;
@@ -447,7 +459,18 @@ namespace heisenberg
 
         {
             std::scoped_lock lock(_mutex);
+            entry.generation = _nextThrowGeneration++;
+            if (_nextThrowGeneration == 0) {
+                _nextThrowGeneration = 1;
+            }
             _byBodyId[bodyId] = std::move(entry);
+        }
+
+        // Tag only after the complete tracking setup has committed. Earlier
+        // code tagged first and returned on any flag/signal/subscription
+        // failure, leaving the object permanently attributed to the player.
+        if (auto* player = RE::PlayerCharacter::GetSingleton()) {
+            SetTelekinesisObjectSeh(refr, player);
         }
 
         spdlog::info("[THROWN] Tracking refr {:08X} body 0x{:08X} speed={:.1f} u/s",
@@ -457,22 +480,60 @@ namespace heisenberg
     void ThrownObjectTracker::Tick()
     {
         const std::uint64_t now = NowNs();
-        std::scoped_lock lock(_mutex);
-        for (auto it = _byBodyId.begin(); it != _byBodyId.end();) {
-            if (it->second.expiryNs != 0 && now > it->second.expiryNs) {
-                // Best-effort: clear the telekinesis tag if the refr is still alive.
-                auto refrPtr = it->second.refrHandle.get();
-                if (refrPtr) {
-                    ClearTelekinesisObjectSeh(refrPtr.get());
+        struct ExpiredEntry
+        {
+            RE::NiPointer<RE::TESObjectREFR> refr;
+            std::uint32_t bodyId = kInvalidBodyId;
+            void* world = nullptr;
+        };
+        std::vector<ExpiredEntry> expired;
+        {
+            std::scoped_lock lock(_mutex);
+            for (auto it = _byBodyId.begin(); it != _byBodyId.end();) {
+                if (it->second.expiryNs != 0 && now > it->second.expiryNs) {
+                    expired.push_back(
+                        ExpiredEntry{
+                            it->second.refrHandle.get(),
+                            it->first,
+                            it->second.hknpWorld });
+                    it = _byBodyId.erase(it);
+                } else {
+                    ++it;
                 }
-                // CATCH FIX (Jul 18): flight is over — drop the CCD look-ahead that the
-                // release path enabled (tiny epsilon: the <=0 path doesn't write the field).
-                if (_hknpWorld) {
-                    heisenberg::Physics::TrySetBodyCollisionLookAhead(_hknpWorld, it->first, 0.001f);
+            }
+
+            // Cooldown entries need only survive beyond their configured
+            // suppression window. Expire them during the same cheap Tick so
+            // hitting new actors over a long session cannot grow the map
+            // without bound.
+            const auto cooldownRetentionNs =
+                static_cast<std::uint64_t>(
+                    (std::max)(
+                        5.0f,
+                        g_config.impactActorCooldown * 2.0f) *
+                    1'000'000'000.0f);
+            for (auto it = _actorHitCooldown.begin();
+                 it != _actorHitCooldown.end();) {
+                if (now >= it->second &&
+                    now - it->second > cooldownRetentionNs) {
+                    it = _actorHitCooldown.erase(it);
+                } else {
+                    ++it;
                 }
-                it = _byBodyId.erase(it);
-            } else {
-                ++it;
+            }
+        }
+
+        for (auto& entry : expired) {
+            if (entry.refr) {
+                ClearTelekinesisObjectSeh(entry.refr.get());
+            }
+            // CATCH FIX (Jul 18): flight is over — drop the CCD look-ahead that the
+            // release path enabled (tiny epsilon: the <=0 path doesn't write the field).
+            if (entry.world && entry.bodyId != kInvalidBodyId) {
+                heisenberg::Physics::TrySetBodyCollisionLookAhead(
+                    entry.world,
+                    entry.bodyId,
+                    0.001f);
             }
         }
     }
@@ -483,7 +544,7 @@ namespace heisenberg
             return;
         }
 
-        // Layout matches ContactImpulseListener::ParseEvent: bodyIds at +8/+0xC,
+        // ParseEventSeh owns the native callback layout: bodyIds at +8/+0xC,
         // worldPtr is hknpWorld** (one indirection to the actual hknpWorld).
         std::uint32_t bodyA = 0;
         std::uint32_t bodyB = 0;
@@ -502,17 +563,24 @@ namespace heisenberg
         // bodies should not arrive — but be defensive).
         std::uint32_t thrownId = kInvalidBodyId;
         std::uint32_t otherId  = kInvalidBodyId;
+        std::uint64_t throwGeneration = 0;
         {
             std::scoped_lock lock(self._mutex);
             auto itA = self._byBodyId.find(bodyA);
             auto itB = self._byBodyId.find(bodyB);
-            if (itA != self._byBodyId.end() && !itA->second.dispatched) {
+            if (itA != self._byBodyId.end() &&
+                itA->second.hknpWorld == hknpWorld &&
+                !itA->second.dispatched) {
                 thrownId = bodyA;
                 otherId  = bodyB;
+                throwGeneration = itA->second.generation;
                 itA->second.dispatched = true;
-            } else if (itB != self._byBodyId.end() && !itB->second.dispatched) {
+            } else if (itB != self._byBodyId.end() &&
+                       itB->second.hknpWorld == hknpWorld &&
+                       !itB->second.dispatched) {
                 thrownId = bodyB;
                 otherId  = bodyA;
+                throwGeneration = itB->second.generation;
                 itB->second.dispatched = true;
             }
         }
@@ -548,7 +616,12 @@ namespace heisenberg
         // drain re-looks-up the refr (LookupByID is game-thread-safe) and applies effects.
         {
             std::scoped_lock lock(self._mutex);
-            self._pendingImpacts.push_back(PendingImpact{ thrownId, targetFormId });
+            self._pendingImpacts.push_back(
+                PendingImpact{
+                    hknpWorld,
+                    thrownId,
+                    throwGeneration,
+                    targetFormId });
         }
     }
 
@@ -566,18 +639,28 @@ namespace heisenberg
             pending.swap(_pendingImpacts);
         }
         for (const auto& imp : pending) {
-            HandleContact(imp.thrownBodyId, imp.targetFormId);
+            HandleContact(
+                imp.hknpWorld,
+                imp.thrownBodyId,
+                imp.throwGeneration,
+                imp.targetFormId);
         }
     }
 
-    void ThrownObjectTracker::HandleContact(std::uint32_t thrownBodyId, std::uint32_t targetFormId)
+    void ThrownObjectTracker::HandleContact(
+        void* hknpWorld,
+        std::uint32_t thrownBodyId,
+        std::uint64_t throwGeneration,
+        std::uint32_t targetFormId)
     {
         // Snapshot the entry under the lock, but do all engine calls outside it.
         Entry entrySnapshot;
         {
             std::scoped_lock lock(_mutex);
             auto it = _byBodyId.find(thrownBodyId);
-            if (it == _byBodyId.end()) {
+            if (it == _byBodyId.end() ||
+                it->second.hknpWorld != hknpWorld ||
+                it->second.generation != throwGeneration) {
                 return;
             }
             entrySnapshot = it->second;
@@ -608,6 +691,10 @@ namespace heisenberg
                                              float thrownMass,
                                              std::uint32_t thrownBodyId)
     {
+        // The body ID is used to select and retire the tracked throw before
+        // dispatch.  Impact mutation intentionally uses the retained reference.
+        (void)thrownBodyId;
+
         if (!thrownRefr) {
             return;
         }
@@ -625,47 +712,15 @@ namespace heisenberg
         // / currentProcess null-checks, so disabling impact damage — or a null charController
         // / process — silently suppressed aggro. Now: outer gate is just "hit an actor";
         // damage is sub-gated; aggro always runs.
-        // Resolve the victim actor. The contact body frequently resolves to world geometry
-        // (the thrown object's first registered contact is the floor/wall beside the NPC) or
-        // to a body that doesn't map back to an actor refr — so the assault path never saw
-        // the NPC and nothing aggroed (every logged impact showed target=world). Fall back to
-        // the closest live actor within a tight radius of the impact point.
+        // Resolve the victim only from the body that actually participated in this contact.
+        // A former proximity fallback selected the nearest live actor after a floor/wall
+        // impact and then applied the complete damage/knockback/assault pipeline to an NPC
+        // the object never touched.
         RE::Actor* actor = targetRefr ? targetRefr->As<RE::Actor>() : nullptr;
         if (actor && (actor == player || actor->IsDead(true))) actor = nullptr;
 
         if (!actor) {
-            // Documented-but-missing fallback (the contact frequently resolves to world
-            // geometry - the thrown object's first registered contact is the floor/wall
-            // beside the NPC, and OnContactStartedCallback's dispatched-latch means no
-            // LATER contact for this throw ever gets a second chance to resolve the real
-            // target). Scan the thrown object's own cell for the closest live actor within
-            // a tight radius of the impact point instead of giving up on "no valid target".
-            constexpr float kFallbackActorRadiusGameUnits = 100.0f;  // ~2.5m
-            if (auto* cell = thrownRefr->GetParentCell()) {
-                RE::Actor* closest = nullptr;
-                float closestDistSq = kFallbackActorRadiusGameUnits * kFallbackActorRadiusGameUnits;
-                for (const auto& ref : cell->references) {
-                    if (!ref) continue;
-                    auto* candidate = ref->As<RE::Actor>();
-                    if (!candidate || candidate == player || candidate->IsDead(true)) continue;
-                    const RE::NiPoint3 delta = candidate->data.location - contactPos;
-                    const float distSq = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
-                    if (distSq < closestDistSq) {
-                        closestDistSq = distSq;
-                        closest = candidate;
-                    }
-                }
-                if (closest) {
-                    spdlog::info("[THROWN] impact resolved to {} - fell back to closest live actor {:08X} ({:.1f}gu away)",
-                                 targetRefr ? "a non-actor refr" : "world geometry",
-                                 closest->formID, std::sqrt(closestDistSq));
-                    actor = closest;
-                }
-            }
-        }
-
-        if (!actor) {
-            spdlog::info("[THROWN] impact hit no live actor (contact resolved to {}) — no aggro",
+            spdlog::info("[THROWN] impact has no directly contacted live actor (resolved to {}) — no actor mutation",
                          targetRefr ? "a non-actor refr" : "world geometry");
         } else if (g_config.impactActorCooldown > 0.0f && [&] {
             // Per-actor cooldown: don't re-process the same NPC when a single thrown object
@@ -684,61 +739,44 @@ namespace heisenberg
             spdlog::debug("[THROWN] actor {:08X} on cooldown ({:.2f}s) — skipping",
                           actor->formID, g_config.impactActorCooldown);
         } else {
-                // --- DAMAGE + physics reaction (only when bImpactDamageEnabled) ---
+                // --- DAMAGE + explicit physics reaction (only when bImpactDamageEnabled) ---
                 if (g_config.impactDamageEnabled) {
-                    auto* charController = GetActorCharController(actor);
-                    if (!charController) {
-                        spdlog::warn("[THROWN] actor {:08X} has no charController (middleHigh+0x{:X})",
-                                     actor->formID, kMiddleHighCharControllerOffset);
+                    // Controlled impact damage. Native ProcessHurtfulBody is
+                    // velocity-dominated and also applies health damage, so it
+                    // must not run after this capped manual path.
+                    const float kMaxImpactDamage = 50.0f;
+                    float damage =
+                        thrownMass * impactSpeed * 0.01f *
+                        g_config.impactDamageMult;
+                    if (damage < 1.0f) damage = 1.0f;
+                    const float cap =
+                        kMaxImpactDamage *
+                        g_config.impactDamageMult;
+                    if (damage > cap) damage = cap;
+
+                    if (ApplyHealthDamageSeh(
+                            actor,
+                            player,
+                            damage)) {
+                        spdlog::info(
+                            "[THROWN] Impact damage {:.1f} → actor {:08X} "
+                            "(mass={:.2f} speed={:.1f})",
+                            damage,
+                            actor->formID,
+                            thrownMass,
+                            impactSpeed);
                     } else {
-                        // Controlled impact damage. The native ProcessHurtfulBody is
-                        // velocity-dominated and ignores how light the object is, so a
-                        // tossed fan/bucket could one-shot an NPC. Instead scale damage
-                        // by mass × speed and cap it, so light objects only hurt while
-                        // heavy/fast ones can do real damage. Tunable via fImpactDamageMult.
-                        //   fan   ~1kg @ 800 u/s → ~8 dmg
-                        //   bucket ~2kg @ 800 u/s → ~16 dmg
-                        //   heavy  5kg @ 1000 u/s → capped at 50
-                        const float kMaxImpactDamage = 50.0f;
-                        float damage = thrownMass * impactSpeed * 0.01f * g_config.impactDamageMult;
-                        if (damage < 1.0f) damage = 1.0f;
-                        float cap = kMaxImpactDamage * g_config.impactDamageMult;
-                        if (damage > cap) damage = cap;
-
-                        if (ApplyHealthDamageSeh(actor, player, damage)) {
-                            spdlog::info("[THROWN] Impact damage {:.1f} → actor {:08X} (mass={:.2f} speed={:.1f})",
-                                         damage, actor->formID, thrownMass, impactSpeed);
-                        } else {
-                            spdlog::warn("[THROWN] HandleHealthDamage threw for actor {:08X}", actor->formID);
-                        }
-
-                        // Engine-native impact dispatch — fires OnHit + the engine's hit-
-                        // reaction pipeline. DispatchImpact now runs on the game thread
-                        // (drained from HookPostPhysics), so the contact point is a plain
-                        // stack local rather than a worker-shared static.
-                        {
-                            struct alignas(16) ContactPoint4 { float pos[4]; };
-                            ContactPoint4 cp{};
-                            cp.pos[0] = thrownRefr->data.location.x * kHavokWorldScale;
-                            cp.pos[1] = thrownRefr->data.location.y * kHavokWorldScale;
-                            cp.pos[2] = thrownRefr->data.location.z * kHavokWorldScale;
-                            cp.pos[3] = 0.0f;
-                            std::uint32_t bodyIdCopy = thrownBodyId;
-                            if (ProcessHurtfulBodySeh(charController, bodyIdCopy, &cp)) {
-                                spdlog::info("[THROWN] ProcessHurtfulBody fired (engine hit pipeline) for actor {:08X}",
-                                             actor->formID);
-                            } else {
-                                spdlog::warn("[THROWN] ProcessHurtfulBody AV for actor {:08X}", actor->formID);
-                            }
-                        }
+                        spdlog::warn(
+                            "[THROWN] HandleHealthDamage threw for actor {:08X}",
+                            actor->formID);
                     }
 
                     // Force a visible reaction via AIProcess::KnockExplosion — the native
                     // function `Game.PushActorAway` calls internally. Engine computes the
                     // push direction as (actor_pos - source_pos), so we pass the thrown
-                    // object's location as the source. ProcessHurtfulBody alone leaves
-                    // protected/essential NPCs unmoved when its mass×speed gate doesn't
-                    // trip; this guarantees a stagger or ragdoll on every solid hit.
+                    // object's location as the source. This is deliberately
+                    // separate from health damage and cannot apply a second
+                    // native physics-damage pass.
                     //
                     // Magnitude scaling (Bethesda convention from PushActorAway docs):
                     //   <1.0   = no visible reaction
@@ -804,40 +842,27 @@ namespace heisenberg
                     // the player WITHOUT permanently mutating boolFlags (which was leaving
                     // NPCs killable). ProcessHurtfulBody attributes no aggressor, which is why
                     // the old path never escalated. Runs on the game thread (drain context).
-                    if (SendAssaultAlarmSeh(actor, player)) {
+                    const bool assaultAlarmSent =
+                        SendAssaultAlarmSeh(actor, player);
+                    if (assaultAlarmSent) {
                         spdlog::info("[THROWN] Assault alarm filed (kAttack crime) vs actor {:08X} — guards/faction will aggro player",
                                      actor->formID);
                     } else {
                         spdlog::warn("[THROWN] AV in SendAssaultAlarm for actor {:08X} — falling back to StartCombat only", actor->formID);
                     }
 
-                    if (auto* tq = RE::TaskQueueInterface::GetSingleton()) {
-                        TaskQueueInterface_QueueActorStartCombat(tq, actor, player, true);
-                        spdlog::info("[THROWN] Aggro: queued StartCombat actor {:08X} vs player", actor->formID);
-
-                        // FACTION-MATE PROPAGATION — queue StartCombat for nearby actors so
-                        // witnesses engage. Do NOT mutate their boolFlags: ForceAggroFlags
-                        // permanently clears kProtected + sets kAttackOnSight, which left
-                        // unrelated settlers/companions hostile and killable even when they
-                        // never actually engaged. Let the engine's combat-engagement rules
-                        // decide who actually fights.
-                        auto* processLists = GetProcessListsSingleton();
-                        if (processLists) {
-                            RE::NiPoint3 victimPos = actor->data.location;
-                            RE::BSScrapArray<RE::NiPointer<RE::Actor>> nearby;
-                            ProcessLists_GetActorsWithinRangeOfPoint(processLists, victimPos, 1750.0f, nearby);
-                            int aggroedAllies = 0;
-                            for (auto& nh : nearby) {
-                                RE::Actor* nearActor = nh.get();
-                                if (!nearActor || nearActor == actor || nearActor == player) continue;
-                                if (nearActor->IsDead(true)) continue;
-                                TaskQueueInterface_QueueActorStartCombat(tq, nearActor, player, true);
-                                ++aggroedAllies;
-                            }
-                            if (aggroedAllies > 0) {
-                                spdlog::info("[THROWN] Aggro propagated to {} actor(s) within 25m of victim {:08X}",
-                                             aggroedAllies, actor->formID);
-                            }
+                    // AttackAlarm performs the engine's witness/faction
+                    // propagation. Only fall back to direct combat for the
+                    // actual victim if that path faulted; never start combat
+                    // on every unrelated actor in a radius.
+                    if (!assaultAlarmSent) {
+                        if (auto* tq =
+                                RE::TaskQueueInterface::GetSingleton()) {
+                            TaskQueueInterface_QueueActorStartCombat(
+                                tq, actor, player, true);
+                            spdlog::info(
+                                "[THROWN] Aggro: queued StartCombat actor {:08X} vs player",
+                                actor->formID);
                         }
                     }
                 }
@@ -885,8 +910,16 @@ namespace heisenberg
                              baseObj ? static_cast<int>(baseObj->GetFormType()) : -1,
                              destForm != nullptr, hasDestData);
 
-                // Damage the THROWN object (glass bottles shatter).
-                if (QueueDestructibleSeh(taskQueue, thrownRefr, selfDamage)) {
+                // Damage the THROWN object (glass bottles shatter). Gated on
+                // hasDestData: with no destruction data the engine queue is a
+                // guaranteed no-op, and the unconditional call made the log
+                // claim "Queued destruction ... damage=9999.0" for objects that
+                // could never break — which misled a live investigation into
+                // treating it as a detonation mechanism.
+                if (!hasDestData) {
+                    spdlog::debug("[THROWN] thrown refr {:08X} has no destruction data — skipping self-destruction queue",
+                                  thrownRefr->formID);
+                } else if (QueueDestructibleSeh(taskQueue, thrownRefr, selfDamage)) {
                     spdlog::info("[THROWN] Queued destruction on thrown refr {:08X} damage={:.1f}",
                                  thrownRefr->formID, selfDamage);
                 } else {
@@ -950,9 +983,9 @@ namespace heisenberg
                           impactSpeed, g_config.impactMinDetectionSpeed);
         }
 
-        // 4. HIT EVENT — engine dispatches OnHit naturally inside ProcessHurtfulBody.
-        //    The impactHitEvent flag is reserved for future manual TESHitEvent
-        //    dispatch in cases where damage is disabled; currently a no-op.
+        // 4. HIT EVENT — reserved for a future manual TESHitEvent dispatch.
+        // Native ProcessHurtfulBody is intentionally not used because it would
+        // apply uncapped health damage in addition to the manual path above.
 
         // Done — clear the tag so AI doesn't keep treating the bottle as a
         // telekinesis object after it lands.

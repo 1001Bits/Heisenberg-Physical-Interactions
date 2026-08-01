@@ -1,5 +1,4 @@
 #include "OpenVRHook.h"
-#include "Config.h"
 #include <spdlog/spdlog.h>
 #include <Windows.h>
 #include <DbgHelp.h>
@@ -45,7 +44,7 @@ namespace heisenberg
     };
     
     // Global pointer to FO4VRTools API (if available)
-    static OpenVRHookManagerAPI* g_fo4vrToolsAPI = nullptr;
+    static std::atomic<OpenVRHookManagerAPI*> g_fo4vrToolsAPI{nullptr};
     static std::mutex g_fo4vrToolsApiMutex;
     
     static std::atomic<vr::TrackedDeviceIndex_t> g_leftControllerIndex{vr::k_unTrackedDeviceIndexInvalid};
@@ -69,11 +68,29 @@ namespace heisenberg
             std::condition_variable drainCondition;
         };
 
-        static std::mutex g_registryMutex;
-        static std::vector<std::shared_ptr<Entry>> g_entries;
+        // Shutdown runs from atexit as well as normal teardown. ExitProcess may
+        // already have terminated a polling thread while it owned this lock, so
+        // the shutdown path must be able to give up instead of waiting forever.
+        // Normal registry operations retain ordinary blocking lock semantics.
+        static std::timed_mutex g_registryMutex;
+        using EntryList = std::vector<std::shared_ptr<Entry>>;
+        static EntryList g_entries;
+        // Dispatch is a controller-poll hot path. Writers retain the mutex and
+        // publish an immutable copy-on-write list; readers atomically acquire
+        // it without taking the registry mutex or allocating a vector.
+        static std::atomic<std::shared_ptr<const EntryList>> g_entrySnapshot;
         static std::atomic<std::uint64_t> g_nextHandle{1};
         static std::atomic<std::uint64_t> g_nextSequence{1};
         static thread_local std::uint64_t g_currentHandle = 0;
+
+        void PublishEntrySnapshotLocked()
+        {
+            std::shared_ptr<const EntryList> published =
+                std::make_shared<const EntryList>(g_entries);
+            g_entrySnapshot.store(
+                std::move(published),
+                std::memory_order_release);
+        }
 
         static bool EntryOrder(const std::shared_ptr<Entry>& lhs, const std::shared_ptr<Entry>& rhs)
         {
@@ -109,9 +126,10 @@ namespace heisenberg
             entry->ownerName = registration->ownerName ? registration->ownerName : "unnamed";
 
             {
-                std::lock_guard<std::mutex> lock(g_registryMutex);
+                std::lock_guard<std::timed_mutex> lock(g_registryMutex);
                 g_entries.push_back(entry);
                 std::stable_sort(g_entries.begin(), g_entries.end(), EntryOrder);
+                PublishEntrySnapshotLocked();
             }
 
             *handle = entry->handle;
@@ -125,7 +143,7 @@ namespace heisenberg
         {
             std::shared_ptr<Entry> entry;
             {
-                std::lock_guard<std::mutex> lock(g_registryMutex);
+                std::lock_guard<std::timed_mutex> lock(g_registryMutex);
                 const auto it = std::find_if(g_entries.begin(), g_entries.end(),
                     [handle](const auto& candidate) { return candidate->handle == handle; });
                 if (it == g_entries.end()) {
@@ -134,14 +152,26 @@ namespace heisenberg
                 entry = *it;
                 entry->enabled.store(false, std::memory_order_release);
                 g_entries.erase(it);
+                PublishEntrySnapshotLocked();
             }
 
-            // A callback cannot synchronously drain itself. Removal still prevents all
-            // future dispatches and shared ownership keeps its state alive until return.
-            if (drainInFlight && g_currentHandle != handle) {
+            if (drainInFlight) {
+                // A callback can unregister itself, but its userData may still
+                // be in use by another polling thread. Drain every concurrent
+                // invocation while excluding this thread's one active frame;
+                // the current callback cannot reach zero until unregister
+                // returns. Non-self unregister retains the normal zero-reader
+                // lifetime boundary.
+                const std::uint32_t remainingSelfFrames =
+                    g_currentHandle == handle ? 1u : 0u;
                 std::unique_lock<std::mutex> lock(entry->drainMutex);
-                entry->drainCondition.wait(lock, [&entry] {
-                    return entry->inFlight.load(std::memory_order_acquire) == 0;
+                // This is the lifetime boundary promised by unregister: callers
+                // may destroy userData or unload callback code as soon as this
+                // function returns. Unlike process-exit teardown below, an
+                // ordinary unregister therefore cannot safely time out.
+                entry->drainCondition.wait(lock, [&entry, remainingSelfFrames] {
+                    return entry->inFlight.load(std::memory_order_acquire) <=
+                           remainingSelfFrames;
                 });
             }
 
@@ -163,11 +193,8 @@ namespace heisenberg
                 return ~std::uint64_t{0};
             }
 
-            std::vector<std::shared_ptr<Entry>> snapshot;
-            {
-                std::lock_guard<std::mutex> lock(g_registryMutex);
-                snapshot = g_entries;
-            }
+            const auto snapshot =
+                g_entrySnapshot.load(std::memory_order_acquire);
 
             controller_bridge::CallbackContext context{
                 sizeof(controller_bridge::CallbackContext),
@@ -182,7 +209,10 @@ namespace heisenberg
             };
 
             std::uint64_t combinedMask = ~std::uint64_t{0};
-            for (const auto& entry : snapshot) {
+            if (!snapshot) {
+                return combinedMask;
+            }
+            for (const auto& entry : *snapshot) {
                 if (entry->phase != phase ||
                     (entry->consumerMask & consumer) == 0 ||
                     !entry->enabled.load(std::memory_order_acquire)) {
@@ -213,7 +243,11 @@ namespace heisenberg
                 state->ulButtonPressed &= mask;
                 state->ulButtonTouched &= mask;
 
-                if (entry->inFlight.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                const auto previousInFlight =
+                    entry->inFlight.fetch_sub(1, std::memory_order_acq_rel);
+                // Zero-reader unregister waits for 1->0; self-unregister waits
+                // for the last concurrent reader's 2->1 transition.
+                if (previousInFlight <= 2) {
                     entry->drainCondition.notify_all();
                 }
             }
@@ -222,28 +256,57 @@ namespace heisenberg
 
         std::uint32_t Count()
         {
-            std::lock_guard<std::mutex> lock(g_registryMutex);
-            return static_cast<std::uint32_t>(g_entries.size());
+            const auto snapshot =
+                g_entrySnapshot.load(std::memory_order_acquire);
+            return snapshot
+                ? static_cast<std::uint32_t>(snapshot->size())
+                : 0u;
         }
 
         void DisableAndDrainAll()
         {
             std::vector<std::shared_ptr<Entry>> entries;
             {
-                std::lock_guard<std::mutex> lock(g_registryMutex);
+                constexpr auto kRegistryLockTimeout =
+                    std::chrono::milliseconds(500);
+                std::unique_lock<std::timed_mutex> lock(
+                    g_registryMutex,
+                    std::defer_lock);
+                if (!lock.try_lock_for(kRegistryLockTimeout)) {
+                    // Do not inspect or mutate g_entries without the lock. At
+                    // process exit, retaining this process-lifetime registry is
+                    // safer than racing a surviving callback, and (critically)
+                    // it cannot leave Fallout4VR.exe stuck as a zombie.
+                    spdlog::warn(
+                        "[OpenVRHook] Process-exit registry lock timed out after "
+                        "{} ms; preserving callback registry as process-lifetime state",
+                        kRegistryLockTimeout.count());
+                    return;
+                }
                 entries.swap(g_entries);
                 for (const auto& entry : entries) {
                     entry->enabled.store(false, std::memory_order_release);
                 }
+                PublishEntrySnapshotLocked();
             }
             for (const auto& entry : entries) {
                 if (g_currentHandle == entry->handle) {
                     continue;
                 }
                 std::unique_lock<std::mutex> lock(entry->drainMutex);
-                entry->drainCondition.wait(lock, [&entry] {
-                    return entry->inFlight.load(std::memory_order_acquire) == 0;
-                });
+                if (!entry->drainCondition.wait_for(
+                        lock,
+                        std::chrono::milliseconds(500),
+                        [&entry] {
+                            return entry->inFlight.load(std::memory_order_acquire) == 0;
+                        })) {
+                    spdlog::warn(
+                        "[OpenVRHook] Process-exit drain timed out after 500 ms for "
+                        "owner='{}', handle={}, inFlight={}; proceeding with process-lifetime state",
+                        entry->ownerName,
+                        entry->handle,
+                        entry->inFlight.load(std::memory_order_acquire));
+                }
             }
         }
     }
@@ -263,11 +326,12 @@ namespace heisenberg
         
         auto left = g_leftControllerIndex.load(std::memory_order_acquire);
         auto right = g_rightControllerIndex.load(std::memory_order_acquire);
-        if (g_fo4vrToolsAPI &&
+        auto* fo4vrToolsAPI = g_fo4vrToolsAPI.load(std::memory_order_acquire);
+        if (fo4vrToolsAPI &&
             (left == vr::k_unTrackedDeviceIndexInvalid ||
              right == vr::k_unTrackedDeviceIndexInvalid ||
              (unControllerDeviceIndex != left && unControllerDeviceIndex != right))) {
-            vr::IVRSystem* vrSystem = g_fo4vrToolsAPI->GetVRSystem();
+            vr::IVRSystem* vrSystem = fo4vrToolsAPI->GetVRSystem();
             if (vrSystem) {
                 left = vrSystem->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_LeftHand);
                 right = vrSystem->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
@@ -397,9 +461,9 @@ namespace heisenberg
             // address and skips filtering to avoid double-application. So the wrapper is the
             // single point that must apply the game-facing callbacks (A+Grip block, A/X
             // hold-to-grab, sticky-grab, holotape/throwable strips). The wrapper's own
-            // m_callbacks is empty whenever the vtable hook succeeded (registration is skipped
+            // the wrapper callback list is empty whenever the vtable hook succeeded (registration is skipped
             // then), and populated only in the vtable-hook-failed fallback — but every callback
-            // is ALSO in OpenVRHook::m_callbacks, so the shared list is correct in both cases.
+            // is ALSO in OpenVRHook's published callback snapshot, so the shared list is correct in both cases.
             const auto role = GetControllerRole(unControllerDeviceIndex);
             if (role != controller_bridge::kRoleUnknown) {
                 OpenVRHook::GetSingleton().ApplyCallbacksToState(
@@ -852,9 +916,10 @@ namespace heisenberg
         m_shuttingDown.store(true, std::memory_order_release);
         bridge_detail::DisableAndDrainAll();
         
+        auto* fo4vrToolsAPI = g_fo4vrToolsAPI.load(std::memory_order_acquire);
         if (m_fo4vrToolsCallbackRegistered.exchange(false, std::memory_order_acq_rel) &&
-            g_fo4vrToolsAPI) {
-            g_fo4vrToolsAPI->UnregisterControllerStateCB(FO4VRToolsControllerStateCallback);
+            fo4vrToolsAPI) {
+            fo4vrToolsAPI->UnregisterControllerStateCB(FO4VRToolsControllerStateCallback);
             spdlog::info("[OpenVRHook] Unregistered from FO4VRTools");
         }
         RestoreIAT();
@@ -864,7 +929,9 @@ namespace heisenberg
         
         {
             std::lock_guard<std::mutex> lock(m_callbackMutex);
-            m_callbacks.clear();
+            m_callbackSnapshot.store(
+                std::shared_ptr<const ControllerStateCallbackList>{},
+                std::memory_order_release);
         }
 
         // The game or another plugin may have cached the wrapper returned by
@@ -879,20 +946,22 @@ namespace heisenberg
             return false;
         }
         std::lock_guard<std::mutex> apiLock(g_fo4vrToolsApiMutex);
-        if (!g_fo4vrToolsAPI || !g_fo4vrToolsAPI->IsInitialized()) {
-            g_fo4vrToolsAPI = RequestFO4VRToolsAPI();
+        auto* fo4vrToolsAPI = g_fo4vrToolsAPI.load(std::memory_order_acquire);
+        if (!fo4vrToolsAPI || !fo4vrToolsAPI->IsInitialized()) {
+            fo4vrToolsAPI = RequestFO4VRToolsAPI();
+            g_fo4vrToolsAPI.store(fo4vrToolsAPI, std::memory_order_release);
         }
-        if (!g_fo4vrToolsAPI || !g_fo4vrToolsAPI->IsInitialized()) {
+        if (!fo4vrToolsAPI || !fo4vrToolsAPI->IsInitialized()) {
             return false;
         }
 
         m_usingFO4VRTools.store(true, std::memory_order_release);
         if (!m_fo4vrToolsCallbackRegistered.exchange(true, std::memory_order_acq_rel)) {
-            g_fo4vrToolsAPI->RegisterControllerStateCB(FO4VRToolsControllerStateCallback);
+            fo4vrToolsAPI->RegisterControllerStateCB(FO4VRToolsControllerStateCallback);
             spdlog::info("[OpenVRHook] Registered FO4VRTools fallback callback");
         }
 
-        if (auto* realSystem = g_fo4vrToolsAPI->GetVRSystem()) {
+        if (auto* realSystem = fo4vrToolsAPI->GetVRSystem()) {
             HookRealVRSystemVtable(realSystem);
         }
         const bool operational =
@@ -912,8 +981,10 @@ namespace heisenberg
             self->m_usingFO4VRTools.store(true, std::memory_order_release);
             self->TryActivateFO4VRToolsBackend();
             std::lock_guard<std::mutex> apiLock(g_fo4vrToolsApiMutex);
-            if (g_fo4vrToolsAPI && g_fo4vrToolsAPI->IsInitialized()) {
-                return g_fo4vrToolsAPI->GetVRSystem();
+            auto* fo4vrToolsAPI =
+                g_fo4vrToolsAPI.load(std::memory_order_acquire);
+            if (fo4vrToolsAPI && fo4vrToolsAPI->IsInitialized()) {
+                return fo4vrToolsAPI->GetVRSystem();
             }
         }
         return m_realVRSystem ? m_realVRSystem :
@@ -945,12 +1016,26 @@ namespace heisenberg
         // Always add to our internal callback list (used by vtable hook)
         {
             std::lock_guard<std::mutex> lock(m_callbackMutex);
-            m_callbacks.push_back(callback);
-            spdlog::info("[OpenVRHook] Registered controller state callback, total: {}", m_callbacks.size());
+            const auto current =
+                m_callbackSnapshot.load(std::memory_order_acquire);
+            auto next =
+                current
+                    ? std::make_shared<ControllerStateCallbackList>(*current)
+                    : std::make_shared<ControllerStateCallbackList>();
+            next->push_back(callback);
+            const auto callbackCount = next->size();
+            std::shared_ptr<const ControllerStateCallbackList> published =
+                std::move(next);
+            m_callbackSnapshot.store(
+                std::move(published),
+                std::memory_order_release);
+            spdlog::info(
+                "[OpenVRHook] Registered controller state callback, total: {}",
+                callbackCount);
         }
         
         // Register in secondary callback lists ONLY if vtable hook is NOT active.
-        // When vtable is hooked, ApplyCallbacksToState (using m_callbacks) already runs
+        // When vtable is hooked, ApplyCallbacksToState (using the published callback snapshot) already runs
         // on every GetControllerState call. Adding to the bridge/wrapper list too would
         // cause double-execution: vtable hook modifies state (strips A, injects grip),
         // then bridge/wrapper applies the same callback on the modified state, seeing
@@ -998,45 +1083,61 @@ namespace heisenberg
             consumer,
             nullptr);
 
-        // Copy-under-lock: snapshot callbacks to avoid holding mutex during execution
-        std::vector<ControllerStateCallback> callbacksCopy;
-        {
-            std::lock_guard<std::mutex> lock(m_callbackMutex);
-            callbacksCopy = m_callbacks;
-        }
-        for (auto& callback : callbacksCopy) {
-            const auto before = heisenbergState;
-            uint64_t mask = callback(
-                role == controller_bridge::kRoleLeft, &heisenbergState);
-            heisenbergState.ulButtonPressed &= mask;
-            heisenbergState.ulButtonTouched &= mask;
-
-            // Merge only changes made by Heisenberg itself. Bits injected solely
-            // into the private interaction state by a bridge callback remain
-            // private when Heisenberg leaves them unchanged.
-            const auto pressedChanges =
-                before.ulButtonPressed ^ heisenbergState.ulButtonPressed;
-            const auto touchedChanges =
-                before.ulButtonTouched ^ heisenbergState.ulButtonTouched;
-            state->ulButtonPressed =
-                (state->ulButtonPressed & ~pressedChanges) |
-                (heisenbergState.ulButtonPressed & pressedChanges);
-            state->ulButtonTouched =
-                (state->ulButtonTouched & ~touchedChanges) |
-                (heisenbergState.ulButtonTouched & touchedChanges);
-
-            for (std::size_t axis = 0; axis < std::size(state->rAxis); ++axis) {
-                if (before.rAxis[axis].x != heisenbergState.rAxis[axis].x ||
-                    before.rAxis[axis].y != heisenbergState.rAxis[axis].y) {
-                    state->rAxis[axis] = heisenbergState.rAxis[axis];
+        // This hook is polled for both controllers every rendered frame. The
+        // former copy-under-mutex path allocated a vector and contended on that
+        // mutex for every poll even though registration happens only at init.
+        // Writers publish an immutable copy; readers acquire one shared
+        // snapshot with no heap allocation or callback-list mutex.
+        const auto callbacks =
+            m_callbackSnapshot.load(std::memory_order_acquire);
+        if (callbacks) {
+            for (const auto& callback : *callbacks) {
+                const auto before = heisenbergState;
+                uint64_t mask = ~std::uint64_t{0};
+                try {
+                    mask = callback(
+                        role == controller_bridge::kRoleLeft, &heisenbergState);
+                } catch (...) {
+                    // Never unwind a controller filter through OpenVR or the
+                    // game executable.
+                    static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+                    if (!logged.test_and_set(std::memory_order_relaxed)) {
+                        spdlog::error(
+                            "[OpenVRHook] Internal controller-state callback threw; "
+                            "allowing samples unchanged (further reports suppressed)");
+                    }
+                    heisenbergState = before;
                 }
+                heisenbergState.ulButtonPressed &= mask;
+                heisenbergState.ulButtonTouched &= mask;
+
+                // Merge only changes made by Heisenberg itself. Bits injected solely
+                // into the private interaction state by a bridge callback remain
+                // private when Heisenberg leaves them unchanged.
+                const auto pressedChanges =
+                    before.ulButtonPressed ^ heisenbergState.ulButtonPressed;
+                const auto touchedChanges =
+                    before.ulButtonTouched ^ heisenbergState.ulButtonTouched;
+                state->ulButtonPressed =
+                    (state->ulButtonPressed & ~pressedChanges) |
+                    (heisenbergState.ulButtonPressed & pressedChanges);
+                state->ulButtonTouched =
+                    (state->ulButtonTouched & ~touchedChanges) |
+                    (heisenbergState.ulButtonTouched & touchedChanges);
+
+                for (std::size_t axis = 0; axis < std::size(state->rAxis); ++axis) {
+                    if (before.rAxis[axis].x != heisenbergState.rAxis[axis].x ||
+                        before.rAxis[axis].y != heisenbergState.rAxis[axis].y) {
+                        state->rAxis[axis] = heisenbergState.rAxis[axis];
+                    }
+                }
+                state->ulButtonPressed &= mask;
+                state->ulButtonTouched &= mask;
             }
-            state->ulButtonPressed &= mask;
-            state->ulButtonTouched &= mask;
         }
 
         // THUMB-TWITCH FIX (Jul 19): see the FO4VRTools-path strip above — same rationale.
-        if (g_config.suppressThumbstickTouch) {
+        if (m_suppressThumbstickTouch.load(std::memory_order_acquire)) {
             state->ulButtonTouched &= ~vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Touchpad);
         }
 

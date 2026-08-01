@@ -1,0 +1,7 @@
+ROCK HEAD pinned:
+edbaed3b899f935a4e0a9c327f76a5e9d8eeb98f (github.com/brunocatani/ROCK origin/main, 2026-07-06) — Jul-2..6 upstream merge (117 commits) integrated 2026-07-10.
+Embed adaptations preserved: host seams (HostLoad/host grab pump/HostSetHandAuthority), old-FRIK path,
+rockGrab/Selection/SuppressDominantHandCollision config masters, TwoHandedGrip liveness+SEH, RE-API
+adaptations (no F4SEVR private SDK: equippedItems walk, TESFullName static, cameraRoot).
+Input-remap: upstream files vendored for compilation; behavior kept inert via bInputRemapEnabled=false.
+Previous pin: 0c2f1a7d8e662cdfcfcfa139482657c71301faf3 (2026-06-03).

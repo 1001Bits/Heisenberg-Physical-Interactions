@@ -10439,10 +10439,10 @@ inline constexpr std::array<OffsetData, 887> kOffsets = {{
         5.00000000f,
         { 0.70000000f, 0.70000000f, 0.70000000f, 0.70000000f, 0.70000000f },
         "WEAP",
-        "",
-        false,
+        "00171B2B",
         true,
-        true, false, false
+        true,
+        false, false, false
     },
     {
         "Deathclaw Gauntlet",
@@ -11280,9 +11280,9 @@ inline constexpr std::array<OffsetData, 887> kOffsets = {{
         { 0.70000000f, 0.70000000f, 0.70000000f, 0.70000000f, 0.70000000f },
         "WEAP",
         "",
-        false,
         true,
-        true, true, false
+        true,
+        true, false, false
     },
     {
         "Deliverer",
@@ -12182,17 +12182,17 @@ inline constexpr std::array<OffsetData, 887> kOffsets = {{
     },
     {
         "Cryolator",
-        0.00000000f, 0.00000000f, 0.00000000f,
-        { 0.89950037f, 0.42465928f, 0.10279168f, 0.00000000f, -0.41837639f, 0.90496129f, -0.07753532f, 0.00000000f, -0.12594834f, 0.02673818f, 0.99167639f, 0.00000000f },
-        1.00000000f,
+        7.28200722f, -4.02415609f, -5.78915596f,
+        { -0.12200000f, 0.99000001f, 0.06900000f, 0.00000000f, 0.98699999f, 0.11400000f, 0.10900000f, 0.00000000f, 0.10000000f, 0.08100000f, -0.99199998f, 0.00000000f },
+        0.99999994f,
         0.00000000f, 0.00000000f, 0.00000000f,
         5.00000000f,
         { 0.70000000f, 0.70000000f, 0.70000000f, 0.70000000f, 0.70000000f },
         "WEAP",
         "",
-        false,
         true,
-        true, true, true
+        true,
+        false, true, false
     },
     {
         "Fat Man",

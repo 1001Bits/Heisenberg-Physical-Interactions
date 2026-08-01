@@ -1,4 +1,7 @@
 
+#include "ROCKMain.h"
+
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -19,16 +22,23 @@
 #include "physics-interaction/input/DebugControllerRuntime.h"
 #include "physics-interaction/input/InputRemapRuntime.h"
 #include "physics-interaction/core/PhysicsInteraction.h"
+#include "physics-interaction/grab/ExternalHeldBodyRegistry.h"
 #include "physics-interaction/grab/FrikWeaponOffsetCache.h"
 #include "physics-interaction/grab/SavedGrabOffsetStore.h"
 #include "physics-interaction/performance/PerformanceProfiler.h"
+#include "physics-interaction/visual/FrikCompatibilityPolicy.h"
 #include "physics-interaction/visual/FrikVisualAuthorityBridge.h"
 #include "physics-interaction/weapon/SeeThroughScopesCompatibility.h"
+#include "physics-interaction/weapon/NativeScopeReentryPolicy.h"
 #include "physics-interaction/RockLoggingPolicy.h"
 
 #include "RE/Bethesda/PlayerCharacter.h"
 #include "RE/Bethesda/TESForms.h"
 #include "RE/Bethesda/TESObjectREFRs.h"
+
+// AFTER every RE/CommonLibF4 header on purpose: this header pulls in <Windows.h>, and from
+// higher up in the block the Win32 macros (GetObject, near/far, min/max) would reach them.
+#include "physics-interaction/native/HookAddressDiagnostics.h"
 
 namespace
 {
@@ -42,6 +52,12 @@ namespace
     bool s_frikAvailable = false;
     std::uint32_t s_frikApiVersion = 0;                        // latched loaded FRIK API version
     const rock::HostHandAuthority* s_hostHandAuthority = nullptr;  // plugin-side hand placement (old FRIK)
+    const rock::HostFingerPoseAuthority* s_hostFingerPoseAuthority = nullptr;  // full finger posing (FRIK v3)
+    std::atomic<int> s_hostTwoHandedFingerPoseMode{ -1 };
+    std::atomic<bool> s_nativeScopeReentryBlocked{ false };
+    std::atomic<bool> s_nativeScopeGeometryHookInstalled{ false };
+    rock::external_held_body_registry::Registry<64>
+        s_externalHeldBodyRegistry;
 
     bool s_pluginLoaded = false;
     // NOTE (Jul 20 audit): a per-frame SEH fault-containment flag (s_rockFrameFaulted) and
@@ -67,6 +83,15 @@ namespace
     std::atomic<std::uint32_t> s_physicsCreationReadyDeferralFrames{ 0 };
     physics_creation_gate_policy::WorldStabilityState s_physicsCreationWorldStability{};
     std::uint32_t s_physicsCreationGateLogCounter = 0;
+
+    struct PolledSkeletonObservation
+    {
+        bool ready = false;
+        std::uintptr_t skeleton = 0;
+        std::uintptr_t boneTree = 0;
+        bool inPowerArmor = false;
+    };
+    PolledSkeletonObservation s_polledSkeleton{};
 
     struct PlayerPhysicsWorlds
     {
@@ -103,6 +128,11 @@ namespace
     {
         physics_creation_gate_policy::resetWorldStability(s_physicsCreationWorldStability);
         s_physicsCreationGateLogCounter = 0;
+    }
+
+    void resetPolledSkeletonObservation()
+    {
+        s_polledSkeleton = {};
     }
 
     void requestDeferredPhysicsCreation()
@@ -182,11 +212,19 @@ namespace
          * this narrow recovery path instead of forcing users to reload a save
          * to receive a second skeleton-ready message.
          */
+        const bool interactionExists = s_physicsInteraction != nullptr;
+        const bool interactionInitialized =
+            interactionExists && s_physicsInteraction->isInitialized();
         if (!s_physicsCreationRequested.load(std::memory_order_acquire) &&
-            !s_physicsInteraction &&
-            g_rockConfig.rockEnabled &&
-            runtime.visualAuthorityAvailable &&
-            runtime.localSkeletonReady) {
+            frik_compatibility_policy::shouldRequestCollisionCreation({
+                .rockEnabled = g_rockConfig.rockEnabled,
+                .frikProviderAvailable = s_frikAvailable,
+                .localSkeletonReady =
+                    runtime.localSkeletonReady &&
+                    runtime.visualSkeletonReadyHint,
+                .interactionExists = interactionExists,
+                .interactionInitialized = interactionInitialized,
+            })) {
             s_physicsCreationRequested.store(true, std::memory_order_release);
             s_physicsCreationReadyDeferralFrames.store(0, std::memory_order_release);
         }
@@ -199,8 +237,10 @@ namespace
         const auto readyDeferralFrames = s_physicsCreationReadyDeferralFrames.load(std::memory_order_acquire);
         const physics_creation_gate_policy::CreationGateInput gateInput{
             .rockEnabled = g_rockConfig.rockEnabled,
-            .providerAvailable = s_frikAvailable && runtime.visualAuthorityAvailable,
-            .skeletonReady = runtime.localSkeletonReady,
+            .providerAvailable = s_frikAvailable,
+            .skeletonReady =
+                runtime.localSkeletonReady &&
+                runtime.visualSkeletonReadyHint,
             .runtimeMenuBlocking = runtime.localMenuBlocking,
             .compatibilityConfigBlocking = runtime.compatibilityConfigBlocking,
             .bhkWorld = reinterpret_cast<std::uintptr_t>(worlds.bhk),
@@ -258,23 +298,10 @@ namespace
         logger::info("ROCK: Destroying PhysicsInteraction (skeleton released)...");
 
         PhysicsInteraction::s_hooksEnabled.store(false, std::memory_order_release);
-        s_physicsInteraction->noteProviderLifecycle(
-            s_providerGeneration.load(std::memory_order_acquire),
-            reason);
-        s_physicsInteraction->shutdown(reason);
-        rock::provider::dispatchFrameCallbacks(*s_physicsInteraction);
-
-        rock::provider::setPhysicsInteractionInstance(nullptr);
-        rock::provider::clearExternalBodiesForProviderLoss();
-        s_physicsPublished = false;
-
         // Drain in-flight physics-thread callbacks (hookedProcessConstraintsCallback,
-        // native contact events) before freeing the instance they dereference. Both
-        // already checked s_hooksEnabled==false above will exit without ever incrementing
-        // s_inFlightCallbacks; any that passed the check a moment earlier are still
-        // counted and this spins until they finish. Bounded: physics-thread callbacks are
-        // single, bounded pieces of work (no blocking calls), so this is a short spin in
-        // practice, never an unbounded wait.
+        // native contact events) before lifecycle teardown mutates the instance
+        // they dereference. Callbacks that observe hooks disabled exit without
+        // entering; callbacks that passed the gate first remain counted here.
         {
             int spinCount = 0;
             while (PhysicsInteraction::s_inFlightCallbacks.load(std::memory_order_acquire) > 0) {
@@ -285,33 +312,129 @@ namespace
             }
         }
 
+        /*
+         * Close the provider read gate before mutating PhysicsInteraction.
+         * setPhysicsInteractionInstance(nullptr) also drains API readers that
+         * already acquired a lease.
+         */
+        rock::provider::setPhysicsInteractionInstance(nullptr);
+        s_physicsPublished = false;
+
+        s_physicsInteraction->noteProviderLifecycle(
+            s_providerGeneration.load(std::memory_order_acquire),
+            reason);
+        s_physicsInteraction->shutdown(reason);
+        rock::provider::dispatchFrameCallbacks(*s_physicsInteraction);
+        rock::provider::clearExternalBodiesForProviderLoss();
+
         delete s_physicsInteraction;
         s_physicsInteraction = nullptr;
 
         logger::info("ROCK: PhysicsInteraction destroyed.");
     }
 
+    void observePolledSkeletonLifecycle(
+        const runtime_state::RuntimeFrameSnapshot& runtime)
+    {
+        const bool ready =
+            runtime.visualSkeletonReadyHint &&
+            runtime.localSkeletonReady &&
+            runtime.localSkeletonIdentity != 0 &&
+            runtime.localSkeletonBoneTreeIdentity != 0;
+
+        if (!ready) {
+            if (s_polledSkeleton.ready) {
+                const auto generation = bumpGeneration(s_skeletonGeneration);
+                logger::info(
+                    "ROCK: Polled FRIK skeleton became unavailable; invalidating generation {}.",
+                    generation);
+                s_physicsCreationRequested.store(false, std::memory_order_release);
+                s_physicsCreationReadyDeferralFrames.store(0, std::memory_order_release);
+                resetPhysicsCreationGate();
+                if (s_physicsInteraction) {
+                    s_physicsInteraction->noteSkeletonLifecycle(
+                        generation,
+                        rock::provider::RockProviderLifecycleReason::SkeletonDestroying);
+                }
+                destroyPhysicsInteraction(
+                    rock::provider::RockProviderLifecycleReason::SkeletonDestroying);
+            }
+            resetPolledSkeletonObservation();
+            return;
+        }
+
+        const PolledSkeletonObservation next{
+            .ready = true,
+            .skeleton = runtime.localSkeletonIdentity,
+            .boneTree = runtime.localSkeletonBoneTreeIdentity,
+            .inPowerArmor = runtime.localSkeletonInPowerArmor,
+        };
+        if (!s_polledSkeleton.ready) {
+            s_polledSkeleton = next;
+            logger::debug(
+                "ROCK: Polled FRIK skeleton ready skeleton={} boneTree={} powerArmor={}.",
+                reinterpret_cast<const void*>(next.skeleton),
+                reinterpret_cast<const void*>(next.boneTree),
+                next.inPowerArmor ? "yes" : "no");
+            return;
+        }
+
+        const bool identityChanged =
+            next.skeleton != s_polledSkeleton.skeleton ||
+            next.boneTree != s_polledSkeleton.boneTree;
+        const bool powerArmorChanged =
+            next.inPowerArmor != s_polledSkeleton.inPowerArmor;
+        if (!identityChanged && !powerArmorChanged) {
+            return;
+        }
+
+        const auto generation = bumpGeneration(s_skeletonGeneration);
+        logger::info(
+            "ROCK: Polled FRIK skeleton replacement detected (identityChanged={} powerArmorChanged={}); rebuilding generation {}.",
+            identityChanged ? "yes" : "no",
+            powerArmorChanged ? "yes" : "no",
+            generation);
+        const auto reason =
+            powerArmorChanged ?
+            rock::provider::RockProviderLifecycleReason::PowerArmorChanged :
+            rock::provider::RockProviderLifecycleReason::SkeletonDestroying;
+        if (s_physicsInteraction) {
+            s_physicsInteraction->noteSkeletonLifecycle(generation, reason);
+        }
+        destroyPhysicsInteraction(reason);
+        s_polledSkeleton = next;
+        requestDeferredPhysicsCreation();
+    }
+
     void onFrameUpdate()
     {
+        if (s_pluginLoaded && s_frikAvailable) {
+            g_rockConfig.processPendingConfigReload();
+        }
         performance_profiler::refreshSettings(
             g_rockConfig.rockPerformanceProfilerEnabled,
             g_rockConfig.rockPerformanceProfilerLogIntervalFrames,
             g_rockConfig.rockPerformanceProfilerWarmupFrames,
             g_rockConfig.rockPerformanceProfilerOverlayText);
+        performance_profiler::refreshBenchmarkSettings(
+            g_rockConfig.rockPerformanceBenchmarkMode,
+            g_rockConfig.rockPerformanceProfilerLogIntervalFrames,
+            g_rockConfig.rockPerformanceProfilerWarmupFrames);
         performance_profiler::FrameScope profilerFrame;
 
         if (!s_pluginLoaded || !s_frikAvailable) {
             input_remap_runtime::setGameplayInputAllowed(false);
             input_remap_runtime::setWeaponDrawn(false);
-            input_remap_runtime::setRightHandHeldWeapon(false);
-            input_remap_runtime::setEquippedWeaponPrimaryDetachInputActive(false);
+            input_remap_runtime::setHandHeldWeapon(false, false);
+            input_remap_runtime::setEquippedWeaponFiringGripInputActive(false);
             input_remap_runtime::setEquippedWeaponPrimaryDetached(false);
             return;
         }
 
-        g_rockConfig.processPendingConfigReload();
         input_remap_runtime::installInputRemapHooks();
 
+        const bool performanceBenchmarkBaseline =
+            g_rockConfig.rockPerformanceBenchmarkMode == 2;
         const bool menuInputActive = input_remap_runtime::isMenuInputActive();
         runtime_state::updateFrame(runtime_state::RuntimeFrameInput{
             .menuInputBlocking = menuInputActive,
@@ -320,8 +443,10 @@ namespace
             .compatibilityConfigBlocking = frik_visual_authority::isCompatibilityConfigBlocking(),
         });
         const auto& runtime = runtime_state::currentFrame();
+        observePolledSkeletonLifecycle(runtime);
         const bool gameplayInputAllowed =
             g_rockConfig.rockEnabled &&
+            !performanceBenchmarkBaseline &&
             runtime.localSkeletonReady &&
             !runtime.localMenuBlocking &&
             !runtime.compatibilityConfigBlocking;
@@ -329,7 +454,8 @@ namespace
         input_remap_runtime::setGameplayInputAllowed(gameplayInputAllowed);
         debug_controller_runtime::update(gameplayInputAllowed, runtime.deltaSeconds);
 
-        if (!g_rockConfig.rockEnabled) {
+        if (!g_rockConfig.rockEnabled ||
+            performanceBenchmarkBaseline) {
             s_physicsCreationRequested.store(false, std::memory_order_release);
             s_physicsCreationReadyDeferralFrames.store(0, std::memory_order_release);
             resetPhysicsCreationGate();
@@ -375,6 +501,164 @@ namespace
 
     using GameLoopFunc = void (*)(std::uint64_t rcx);
     GameLoopFunc s_originalGameLoopFunc = nullptr;
+    using NativeScopeStateTransitionFunc =
+        void (*)(RE::PlayerCharacter*, bool);
+    NativeScopeStateTransitionFunc s_originalNativeScopeStateTransition =
+        nullptr;
+
+    bool tryReadNativeScopeRequestState(bool& outActive)
+    {
+        using GetScopeRequestState = bool (*)(const void*);
+        static REL::Relocation<GetScopeRequestState> getScopeRequestState{
+            REL::Offset(
+                rock::offsets::kFunc_NativeScopeRequestStateGet) };
+        static REL::Relocation<std::uintptr_t> rendererState{
+            REL::Offset(
+                rock::offsets::kData_NativeScopeRendererState) };
+        if (!getScopeRequestState.address() ||
+            !rendererState.address()) {
+            return false;
+        }
+
+        outActive = getScopeRequestState(
+            reinterpret_cast<const void*>(
+                rendererState.address()));
+        return true;
+    }
+
+    bool onNativeScopeGeometryDecision(
+        RE::PlayerCharacter* player,
+        const bool nativeGeometryDecision)
+    {
+        const auto decision =
+            rock::native_scope_reentry_policy::filter(
+                s_nativeScopeReentryBlocked.load(
+                    std::memory_order_acquire),
+                nativeGeometryDecision);
+        if (decision.rearmedThisFrame) {
+            s_nativeScopeReentryBlocked.store(
+                false,
+                std::memory_order_release);
+            logger::info(
+                "ROCK(host): native scope re-entry rearmed after "
+                "the optic left its activation cone");
+        }
+
+        if (s_originalNativeScopeStateTransition) {
+            s_originalNativeScopeStateTransition(
+                player,
+                decision.nativeScopeRequested);
+        }
+        /*
+         * The caller's adjacent TEST is patched to consume AL. In Bethesda's
+         * original routine that TEST does not change scope state a second
+         * time: it selects the near-eye approach-blackout path. While an armed
+         * latch consumes an inside-cone activation we deliberately return true
+         * here, despite sending false to the state transition above. That
+         * keeps the scope closed without leaving the normal world black until
+         * the physical optic moves away. The first real outside-cone sample
+         * still returns false and rearms exactly as before.
+         */
+        return decision.bypassNativeApproachFade;
+    }
+
+    bool hookNativeScopeGeometryDecision()
+    {
+        REL::Relocation<std::uintptr_t> callSite{
+            REL::Offset(
+                rock::offsets::
+                    kHookSite_NativeScopeGeometryDecision) };
+        const auto callSiteAddress = callSite.address();
+        const auto* callBytes =
+            reinterpret_cast<const std::uint8_t*>(
+                callSiteAddress);
+        if (!callBytes || callBytes[0] != 0xE8) {
+            logger::critical(
+                "ROCK(host): native scope geometry hook validation "
+                "failed at 0x{:X}: expected CALL rel32, found "
+                "0x{:02X}",
+                callSiteAddress,
+                callBytes ? callBytes[0] : 0u);
+            return false;
+        }
+
+        const auto relativeTarget =
+            *reinterpret_cast<const std::int32_t*>(
+                callBytes + 1);
+        const auto decodedTarget =
+            callSiteAddress + 5u + relativeTarget;
+        const auto expectedTarget =
+            REL::Offset(
+                rock::offsets::
+                    kFunc_NativeScopeStateTransition)
+                .address();
+        if (decodedTarget != expectedTarget) {
+            logger::critical(
+                "ROCK(host): native scope geometry hook validation "
+                "failed at 0x{:X}: target 0x{:X}, expected 0x{:X}",
+                callSiteAddress,
+                decodedTarget,
+                expectedTarget);
+            return false;
+        }
+
+        REL::Relocation<std::uintptr_t> postDecisionTest{
+            REL::Offset(
+                rock::offsets::
+                    kPatchSite_NativeScopePostDecisionTest) };
+        const auto postDecisionTestAddress =
+            postDecisionTest.address();
+        const auto* postDecisionTestBytes =
+            reinterpret_cast<const std::uint8_t*>(
+                postDecisionTestAddress);
+        constexpr std::array<std::uint8_t, 2>
+            kExpectedNativeDecisionTest{ 0x84, 0xDB };
+        if (!postDecisionTestBytes ||
+            postDecisionTestBytes[0] !=
+                kExpectedNativeDecisionTest[0] ||
+            postDecisionTestBytes[1] !=
+                kExpectedNativeDecisionTest[1]) {
+            logger::critical(
+                "ROCK(host): native scope fade-decision "
+                "validation failed at 0x{:X}: expected TEST BL,BL",
+                postDecisionTestAddress);
+            return false;
+        }
+
+        auto& trampoline = F4SE::GetTrampoline();
+        const auto original = trampoline.write_call<5>(
+            callSiteAddress,
+            &onNativeScopeGeometryDecision);
+        s_originalNativeScopeStateTransition =
+            reinterpret_cast<
+                NativeScopeStateTransitionFunc>(original);
+        if (!s_originalNativeScopeStateTransition) {
+            logger::critical(
+                "ROCK(host): native scope geometry hook original "
+                "target is null");
+            return false;
+        }
+
+        // The wrapper returns an independently filtered approach-fade decision
+        // in AL. It normally mirrors BL, but blocked-inside scope requests must
+        // close scope state while bypassing the near-eye blackout calculation.
+        constexpr std::array<std::uint8_t, 2>
+            kRockDecisionTest{ 0x84, 0xC0 };
+        REL::safe_write(
+            postDecisionTestAddress,
+            kRockDecisionTest.data(),
+            kRockDecisionTest.size());
+
+        logger::info(
+            "ROCK(host): native scope geometry/re-entry hook "
+            "installed at 0x{:X}, original 0x{:X}",
+            callSiteAddress,
+            original);
+        s_nativeScopeGeometryHookInstalled.store(
+            true,
+            std::memory_order_release);
+        return true;
+    }
 
     // ROCK applies weapon visual/collision authority after the chained frame update
     // so FRIK finishes its skeleton and weapon pass before ROCK writes final state.
@@ -385,6 +669,27 @@ namespace
         }
 
         onFrameUpdate();
+
+        const int benchmarkMode =
+            performance_profiler::benchmarkMode();
+        const auto& runtime = runtime_state::currentFrame();
+        const bool commonBenchmarkEligibility =
+            s_pluginLoaded &&
+            s_frikAvailable &&
+            runtime.localSkeletonReady &&
+            runtime.visualSkeletonReadyHint &&
+            !runtime.localMenuBlocking &&
+            !runtime.compatibilityConfigBlocking;
+        const bool benchmarkEligible =
+            commonBenchmarkEligibility &&
+            ((benchmarkMode == 1 &&
+                 g_rockConfig.rockEnabled &&
+                 s_physicsInteraction &&
+                 s_physicsInteraction->isInitialized()) ||
+                (benchmarkMode == 2 &&
+                    s_physicsInteraction == nullptr));
+        performance_profiler::observeFrameBoundary(
+            benchmarkEligible);
     }
 
     bool hookMainLoop()
@@ -405,8 +710,13 @@ namespace
         // no diagnostic.
         const auto* siteBytes = reinterpret_cast<const std::uint8_t*>(hookCallSite.address());
         if (siteBytes[0] != 0xE8) {
-            logger::critical("ROCK: main loop hook site 0x{:X} prefix validation failed (expected 0xE8 call, found 0x{:02X}) - another mod or framework version likely changed this shared hook site; aborting ROCK init",
-                hookCallSite.address(), siteBytes[0]);
+            // Findings only: address + owning module + the bytes actually present.
+            // The previous wording ("another mod or framework version likely changed
+            // this shared hook site") asserted a cause nothing had checked.
+            logger::critical("ROCK: main loop hook site 0x{:X} ({}) prefix validation FAILED: expected a CALL rel32 (opcode 0xE8), found bytes [{}]; aborting ROCK init",
+                hookCallSite.address(),
+                rock::hook_diagnostics::describeAddress(hookCallSite.address()),
+                rock::hook_diagnostics::formatBytes(siteBytes, 5));
             return false;
         }
 
@@ -434,6 +744,7 @@ namespace
         switch (static_cast<LE>(msg->type)) {
         case LE::kSkeletonReady:
             logger::info("ROCK: Received kSkeletonReady from FRIK.");
+            resetPolledSkeletonObservation();
             bumpGeneration(s_skeletonGeneration);
             if (!g_rockConfig.rockEnabled) {
                 logger::info("ROCK: Physics disabled in config, skipping creation.");
@@ -447,6 +758,7 @@ namespace
 
         case LE::kSkeletonDestroying:
             logger::info("ROCK: Received kSkeletonDestroying from FRIK.");
+            resetPolledSkeletonObservation();
             bumpGeneration(s_skeletonGeneration);
             s_physicsCreationRequested.store(false, std::memory_order_release);
             s_physicsCreationReadyDeferralFrames.store(0, std::memory_order_release);
@@ -460,6 +772,7 @@ namespace
             break;
 
         case LE::kPowerArmorChanged:
+            resetPolledSkeletonObservation();
             bumpGeneration(s_skeletonGeneration);
             if (msg->data && msg->dataLen >= sizeof(bool)) {
                 const bool isInPA = *static_cast<const bool*>(msg->data);
@@ -486,6 +799,7 @@ namespace
 
         if (msg->type == F4SE::MessagingInterface::kGameLoaded) {
             logger::info("ROCK: GameLoaded -- initializing FRIKApi and loading config...");
+            resetPolledSkeletonObservation();
             const auto providerGeneration = bumpGeneration(s_providerGeneration);
             if (s_physicsInteraction) {
                 s_physicsInteraction->noteProviderLifecycle(
@@ -493,26 +807,18 @@ namespace
                     rock::provider::RockProviderLifecycleReason::GameLoaded);
             }
 
-            // Jul 6: require only the v2 CORE (was FRIK_API_VERSION=5). The v5-only visual-authority
-            // functions (applyExternalHandWorldTransform etc.) are routed to the host's plugin-side
-            // HandAuthority when the loaded FRIK is < v5 (see frikHasVisualAuthority + the bridge), so
-            // ROCK now RUNS on older FRIK instead of disabling entirely. CAUTION: on old FRIK the
-            // v5-tail fn-ptrs are past the end of the returned struct (OOB) — NEVER call them; the
-            // bridge gates on the latched version below, not a null-check.
-            // Jul 7: require any FRIK API version (initialize(0)) — the v5-only visual-authority
-            // functions are routed to the host's plugin-side HandAuthority when FRIK is < v5 (see
-            // frikHasVisualAuthority + the bridge), so ROCK RUNS on ANY FRIK (even pre-v5 / no-API-
-            // features) instead of disabling. On a too-old FRIK the v5-tail fn-ptrs are OOB — the
-            // bridge gates on the latched version below (frikHasVisualAuthority), NOT a null-check, so
-            // they are never called; only errors 1-3 (FRIK.dll genuinely absent) disable ROCK.
-            const int frikErr = frik::api::FRIKApi::initialize(0);
+            // Stock FRIK 0.77.12 ships API v3. Retain that exact, known-compatible
+            // prefix for readiness/config/scalar-pose operations. The appended
+            // visual-authority table is read only after a v5 version check; on v3,
+            // hand-world operations route through Heisenberg's host callbacks.
+            const int frikErr = frik::api::FRIKApi::initialize(
+                frik_compatibility_policy::kStockFrik07712ApiVersion);
             if (frikErr != 0) {
-                // frikErr 1/2/3 = FRIK.dll not loaded / export missing / null api → the body itself
-                // won't render; ROCK cannot run. (Version-too-old can't occur at min=0.)
                 switch (frikErr) {
                 case 1: logger::critical("ROCK: FRIKApi init FAILED (1). FRIK.dll not loaded. ROCK DISABLED."); break;
                 case 2: logger::critical("ROCK: FRIKApi init FAILED (2). FRIKAPI_GetApi export missing. ROCK DISABLED."); break;
                 case 3: logger::critical("ROCK: FRIKApi init FAILED (3). FRIKAPI_GetApi returned null. ROCK DISABLED."); break;
+                case 4: logger::critical("ROCK: FRIKApi init FAILED (4). API v3 or newer is required. ROCK DISABLED."); break;
                 default: logger::critical("ROCK: FRIKApi init FAILED ({}). ROCK DISABLED.", frikErr); break;
                 }
                 s_frikAvailable = false;
@@ -521,23 +827,24 @@ namespace
 
             // Latch the loaded FRIK API version once (getVersion is member 0, always present).
             s_frikApiVersion = frik::api::FRIKApi::inst->getVersion();
-            // SAFETY (Jul 7): if the API is < 5, NULL out inst. The FRIKApi struct is append-only, so
-            // an older FRIK returns a SHORTER struct — dereferencing any v5-tail fn-ptr (finger poses,
-            // hand-world) is an out-of-bounds read. With inst==nullptr every frik_visual_authority
-            // bridge function is null-safe: the 3 hand-placement functions route to the host plugin-side
-            // authority (which needs no FRIK API), and the finger-pose functions return false (default
-            // curl). Physics/collision/two-handing/dynamic grab do NOT use the FRIK API and run fully.
-            const bool nativeAuthority = (s_frikApiVersion >= 5);
-            if (!nativeAuthority) {
-                frik::api::FRIKApi::inst = nullptr;
-            }
-            logger::info("ROCK: FRIK API v{} initialized. Native visual-authority {} (host hand-authority shim {}).",
+            // Never null the v3 core pointer: doing so made visualAuthorityAvailable
+            // false and permanently blocked PhysicsInteraction creation. All reads
+            // beyond the v3 table boundary are centralized behind the version-aware
+            // bridge.
+            const bool nativeAuthority =
+                frik_compatibility_policy::mayReadNativeVisualAuthorityTail(
+                    true,
+                    s_frikApiVersion);
+            logger::info("ROCK: FRIK API v{} initialized. Native visual-authority {} "
+                         "(host hand-world shim {}, host full-finger-pose shim {}).",
                          s_frikApiVersion,
                          nativeAuthority ? "AVAILABLE" : "ABSENT",
-                         nativeAuthority ? "idle" : "ACTIVE");
+                         nativeAuthority ? "idle" : "ACTIVE",
+                         nativeAuthority ? "idle" :
+                             (s_hostFingerPoseAuthority ? "ACTIVE" : "MISSING"));
 
             // Upstream Jul-6: canonical 22-float hand-pose contract check. EMBED ADAPTATION: only
-            // enforce when the NATIVE v5 authority is in use — on older FRIK (inst nulled above) the
+            // enforce when the NATIVE v5 authority is in use — on older FRIK the
             // host plugin-side hand authority replaces these functions, so ROCK must keep running.
             if (nativeAuthority) {
                 const auto* frikApi = frik::api::FRIKApi::inst;
@@ -549,10 +856,8 @@ namespace
                     frikApi->applyExternalHandWorldTransform != nullptr &&
                     frikApi->clearExternalHandWorldTransform != nullptr;
                 if (!hasCanonicalHandPoseContract) {
-                    logger::critical(
-                        "ROCK: FRIKApi v5 contract mismatch. Loaded FRIK.dll does not expose the canonical 22-float hand-pose contract required by this ROCK build. Deploy the matching rebuilt FRIK.dll. ROCK is now DISABLED.");
-                    s_frikAvailable = false;
-                    return;
+                    logger::error(
+                        "ROCK: FRIKApi v5 contract mismatch. Optional native hand-pose/visual operations will fail closed or use the host authority; collision remains enabled.");
                 }
             }
 
@@ -573,8 +878,11 @@ namespace
             // to a second listener under the same plugin handle, so this registration was
             // dead-on-arrival — kSkeletonReady never arrived, the engine sat "waiting for skeleton",
             // and no hand/weapon colliders were ever built. Instead Heisenberg forwards every FRIK
-            // "F4VRBody" message to rock::HostOnFRIKMessage() (see Heisenberg.cpp OnExternalPluginMessage).
-            logger::info("ROCK: FRIK lifecycle events arrive via host forward (rock::HostOnFRIKMessage), sender '{}'.",
+            // "F4VRBody" message to rock::HostOnFRIKMessage() (see Heisenberg.cpp
+            // OnExternalPluginMessage). Stock 0.77.12 sends no lifecycle messages,
+            // so local/API readiness polling below is authoritative and forwarded
+            // events from newer builds are only a fast path.
+            logger::info("ROCK: FRIK lifecycle uses authoritative readiness polling plus optional host-forwarded events, sender '{}'.",
                 frik::api::FRIKApi::FRIK_F4SE_MOD_NAME);
 
             logger::info("ROCK: Initialization complete. Waiting for skeleton...");
@@ -582,11 +890,14 @@ namespace
 
         if (msg->type == F4SE::MessagingInterface::kPostLoadGame || msg->type == F4SE::MessagingInterface::kNewGame) {
             logger::info("ROCK: New game session -- resetting PhysicsInteraction...");
+            resetPolledSkeletonObservation();
             const auto providerGeneration = bumpGeneration(s_providerGeneration);
             s_physicsCreationRequested.store(false, std::memory_order_release);
             s_physicsCreationReadyDeferralFrames.store(0, std::memory_order_release);
             resetPhysicsCreationGate();
             runtime_state::resetTransientState();
+            s_externalHeldBodyRegistry.clear(true);
+            s_externalHeldBodyRegistry.clear(false);
             if (s_physicsInteraction) {
                 s_physicsInteraction->noteProviderLifecycle(
                     providerGeneration,
@@ -609,6 +920,34 @@ namespace rock
 {
     const F4SE::MessagingInterface* getROCKMessaging() { return s_messaging; }
 
+    bool dispatchOptionalROCKMessage(
+        std::uint32_t a_messageType,
+        void* a_data,
+        std::uint32_t a_dataLen,
+        const char* a_receiver)
+    {
+        if (!s_messaging) {
+            return false;
+        }
+
+        // MessagingInterface is CommonLibF4's facade over this exact F4SE
+        // proxy (its own GetProxy() performs the same reinterpret_cast).
+        // Calling the native proxy preserves dispatch semantics while avoiding
+        // the wrapper's warning for the documented, benign no-listener case.
+        const auto& proxy =
+            reinterpret_cast<const F4SE::detail::F4SEMessagingInterface&>(*s_messaging);
+        if (!proxy.Dispatch) {
+            return false;
+        }
+
+        return proxy.Dispatch(
+            F4SE::GetPluginHandle(),
+            a_messageType,
+            a_data,
+            a_dataLen,
+            a_receiver);
+    }
+
     // Host forwarder: Heisenberg owns the single F4SE-core listener for this DLL, so it forwards every
     // F4SE message here. Takes void* to keep ROCKMain.h dependency-free; cast back to the real type.
     // This is how ROCK receives kGameLoaded / kPostLoadGame / kNewGame in the embed.
@@ -627,6 +966,16 @@ namespace rock
         onFRIKMessage(static_cast<F4SE::MessagingInterface::Message*>(a_msg));
     }
 
+    bool HostIsPhysicsInteractionReady()
+    {
+        return s_physicsInteraction && s_physicsInteraction->isInitialized();
+    }
+
+    bool HostIsPerformanceBenchmarkBaseline()
+    {
+        return g_rockConfig.rockPerformanceBenchmarkMode == 2;
+    }
+
     // EMBEDDED-HOST SEAM (audit rank 2) — see ROCKMain.h. Routes the host's grab lifecycle into
     // PhysicsInteraction's request slots; the engine applies them inside update() with a valid
     // world (suppress on grab start, config-delayed collider restore on release).
@@ -635,6 +984,47 @@ namespace rock
         if (s_physicsInteraction && s_physicsInteraction->isInitialized()) {
             s_physicsInteraction->hostNotifyExternalGrab(a_isLeft, a_active);
         }
+    }
+
+    void HostPublishExternalHeldBodies(
+        const bool a_isLeft,
+        const void* const a_hknpWorld,
+        const std::uint32_t* const a_bodyIds,
+        const std::uint32_t a_count)
+    {
+        s_externalHeldBodyRegistry.publish(
+            a_isLeft,
+            a_hknpWorld,
+            a_bodyIds,
+            a_count);
+    }
+
+    void HostClearExternalHeldBodies(const bool a_isLeft)
+    {
+        s_externalHeldBodyRegistry.clear(a_isLeft);
+    }
+
+    bool HostHasExternalHeldBodies()
+    {
+        return s_externalHeldBodyRegistry.any();
+    }
+
+    bool HostIsExternalHeldBody(
+        const void* const a_hknpWorld,
+        const std::uint32_t a_bodyId)
+    {
+        return s_externalHeldBodyRegistry.contains(
+            a_hknpWorld,
+            a_bodyId);
+    }
+
+    std::uint8_t HostExternalHeldBodyOwnerMask(
+        const void* const a_hknpWorld,
+        const std::uint32_t a_bodyId)
+    {
+        return s_externalHeldBodyRegistry.ownerMask(
+            a_hknpWorld,
+            a_bodyId);
     }
 
     void HostNotifyExternalRelease(bool a_isLeft, RE::TESObjectREFR* a_releasedRef)
@@ -649,6 +1039,60 @@ namespace rock
     // Plugin-side hand-authority seam (see ROCKMain.h). The bridge uses these when FRIK lacks v5.
     void HostSetHandAuthority(const HostHandAuthority* a_cbs) { s_hostHandAuthority = a_cbs; }
     const HostHandAuthority* getHostHandAuthority() { return s_hostHandAuthority; }
+    void HostSetFingerPoseAuthority(const HostFingerPoseAuthority* a_cbs)
+    {
+        s_hostFingerPoseAuthority = a_cbs;
+        logger::info(
+            "ROCK(host): legacy full-finger-pose authority {}",
+            a_cbs ? "registered" : "cleared");
+    }
+    const HostFingerPoseAuthority* getHostFingerPoseAuthority()
+    {
+        return s_hostFingerPoseAuthority;
+    }
+    void HostSetTwoHandedFingerPoseMode(const int a_mode)
+    {
+        const int sanitized = a_mode >= 0 && a_mode <= 2 ?
+            a_mode :
+            -1;
+        s_hostTwoHandedFingerPoseMode.store(
+            sanitized,
+            std::memory_order_release);
+    }
+    int HostGetTwoHandedFingerPoseMode()
+    {
+        return s_hostTwoHandedFingerPoseMode.load(
+            std::memory_order_acquire);
+    }
+    bool HostPublishUniformFingerPose(
+        const char* const a_tag,
+        const bool a_isLeft,
+        const float a_thumb,
+        const float a_index,
+        const float a_middle,
+        const float a_ring,
+        const float a_pinky,
+        const int a_priority)
+    {
+        return frik_visual_authority::setHandPoseCustomWithPriority(
+            a_tag,
+            frik_visual_authority::handFromBool(a_isLeft),
+            frik_visual_authority::makeUniformHandPoseData(
+                a_thumb,
+                a_index,
+                a_middle,
+                a_ring,
+                a_pinky),
+            a_priority);
+    }
+    bool HostClearFingerPose(
+        const char* const a_tag,
+        const bool a_isLeft)
+    {
+        return frik_visual_authority::clearHandPose(
+            a_tag,
+            frik_visual_authority::handFromBool(a_isLeft));
+    }
     bool frikHasVisualAuthority() { return s_frikApiVersion >= 5; }
 
     // ── EMBEDDED HOST ENTRY ──────────────────────────────────────────────────
@@ -659,7 +1103,7 @@ namespace rock
     bool HostLoad(const F4SE::LoadInterface* /*a_f4se*/)
     {
         // CRITICAL: every ROCK engine TU does `using namespace f4cf`, so all ROCK `logger::*`
-        // calls route through f4cf::logger::internal::_logger — a shared_ptr that is NULL until
+        // calls route through f4cf::logger::internal::loggerInstance — a shared_ptr that is NULL until
         // f4cf::logger::init() runs. Heisenberg sets up its OWN spdlog logger via F4SE::Init and
         // never inits the framework logger, so the standalone ROCK's `logger::init("ROCK")` (which
         // lived in the F4SEPlugin_Query we deleted) is still required here — otherwise the very
@@ -669,12 +1113,21 @@ namespace rock
         // ROCK.log via its own internal::_logger, independent of the default logger).
         {
             auto prevDefault = spdlog::default_logger();
+            // The host reads the launch-time logging policy before entering
+            // HostLoad. Inherit that decision instead of silently promoting
+            // the embedded engine to Debug. This also leaves one deliberate
+            // escape hatch for verbose launch diagnostics: the host can select
+            // Debug before calling HostLoad and both loggers will agree.
+            const auto startupLogLevel =
+                prevDefault ? prevDefault->level() : spdlog::level::err;
             logger::init("ROCK");
-            // DIAGNOSTIC: right after init, the ROCK logger is the default. Force flush-on-every-
-            // line so a hard CTD (which bypasses the crash logger) can't swallow the tail — the
-            // last ROCK.log line then reliably marks the crash point. ROCK's own internal::_logger
-            // is this same object, so the policy persists after we restore Heisenberg's default.
+            // Right after init, the ROCK logger is the default. Apply the
+            // host-selected launch level while retaining warn-and-higher
+            // flushing for useful crash tails without per-line frame cost.
+            // ROCK's own internal logger is this same object, so both policies
+            // persist after the Heisenberg default logger is restored.
             if (auto rockLogger = spdlog::default_logger()) {
+                rockLogger->set_level(startupLogLevel);
                 // PERF (Jul 5): was flush_on(trace) — an fflush per LINE, a deliberate
                 // CTD-diagnostic so the last ROCK.log line marks the crash point. The embed
                 // now creates cleanly and WER minidump + dmp.py/sym.py cover crashes, so trade
@@ -693,12 +1146,12 @@ namespace rock
             // already self-tagging ([ROCK::...] / ROCK(host):). Keep the engine's level and
             // the warn-flush CTD policy from above; do NOT set a pattern (the host sink's
             // formatter stays authoritative).
-            if (prevDefault && !prevDefault->sinks().empty() && logger::internal::_logger) {
+            if (prevDefault && !prevDefault->sinks().empty() && logger::internal::loggerInstance) {
                 auto merged = std::make_shared<spdlog::logger>(
                     "ROCK", prevDefault->sinks().begin(), prevDefault->sinks().end());
-                merged->set_level(logger::internal::_logger->level());
+                merged->set_level(startupLogLevel);
                 merged->flush_on(spdlog::level::warn);
-                logger::internal::_logger = merged;
+                logger::internal::loggerInstance = merged;
                 // BUGFIX (Jul 21): "do NOT set a pattern" above only means this block itself
                 // skips calling setLogLevelAndPattern - it does NOT stop RockConfig::load()
                 // from calling it moments later (onF4SEMessage, right after HostLoad returns).
@@ -716,7 +1169,7 @@ namespace rock
                 // to ROCK's own default so that near-certain first load is a true no-op; a
                 // genuine user sLogPattern= override in Heisenberg_F4VR.ini still differs and
                 // still applies normally.
-                logger::internal::_logPattern = logging_policy::DefaultLogPattern;
+                logger::internal::logPattern = logging_policy::DefaultLogPattern;
                 logger::info("ROCK(host): engine log merged into HeisenbergF4VR.log (single-log mode)");
             }
         }
@@ -739,17 +1192,46 @@ namespace rock
         // leaves its already-installed hook stubs dangling → execute-AV the moment a per-frame hook
         // (e.g. a PlayerUpdateEvent sink) first fires after the player spawns. ROCK's hooks below
         // append to the existing shared trampoline via F4SE::GetTrampoline().
-        // Upstream Jul-5 (grenade-grab): loose grenade equip hook — appends to the shared trampoline.
-        // EMBED (Jul 10): NON-FATAL. The hook's byte-prefix validation fails when another mod
-        // (e.g. VirtualReloads) already patched ActorEquipManager::EquipObject — observed live:
-        // "native bytes changed, hook not installed". Standalone ROCK aborts load; in the embed
-        // that killed the ENTIRE engine (HostLoad FAILED → fallback physics). Degrade instead:
-        // grenade-grab interception stays off, everything else runs.
+        // Upstream Jul-5 (grenade-grab): loose grenade equip interception.
+        //
+        // 2026-07-28 — ARBITRATION, NOT A SECOND HOOK. This used to install ROCK's own raw entry
+        // detour on ActorEquipManager::EquipObject (0x0E6FEA0). That could never work in the embed:
+        // Heisenberg's HookEquipObject already owns that entry (Hooks::Install runs before
+        // HostLoad), an entry holds exactly ONE raw detour, and ROCK's installer then memcmp'd the
+        // prologue the host had itself overwritten and failed — so grenade interception had never
+        // once executed. That is the "grenades drop at my feet" report. Heisenberg's detour now
+        // CALLS rock::HostTryInterceptEquipObject; installEquipHook() only registers that seam and
+        // reports what is on the entry. Order-swapping is NOT an alternative: the host's installer
+        // only recognises pristine prologue patterns, so if ROCK patched first the host would log
+        // "Unknown prologue pattern! Hook NOT installed" and holotape/consumable-to-hand would break.
+        //
+        // EMBED (Jul 10): NON-FATAL. Standalone ROCK aborts load when this fails; in the embed that
+        // killed the ENTIRE engine (HostLoad FAILED → fallback physics). Degrade instead:
+        // installEquipHook() latches only the interception feature OFF and everything else runs.
+        //
+        // The message that used to live here asserted "another mod likely hooks EquipObject".
+        // NOTHING in this path had probed for another mod — it was a hardcoded guess, and it was
+        // twice mistaken for evidence, sending investigations after a plugin that was not loaded on
+        // either the dev or the tester machine. installEquipHook() now reports the address, the
+        // found bytes, the expected pristine bytes and the module the entry branches into; this call
+        // site adds no theory of its own about who or what changed them.
         if (!rock::loose_grenade_runtime::installEquipHook()) {
-            ROCK_LOG_WARN(Init, "Loose-grenade equip hook not installed (prefix validation failed — another mod likely hooks EquipObject); continuing WITHOUT grenade-grab interception");
+            ROCK_LOG_WARN(Init,
+                "Continuing WITHOUT loose-grenade equip interception. The preceding report states the target address, the bytes "
+                "found there, the bytes a pristine entry has, and the module the entry branches into. User-visible consequence: "
+                "grenades equipped from the Pip-Boy or favourites use the game's native equip instead of becoming a physical "
+                "loose grenade in the hand; the rest of the engine is unaffected.");
         }
         if (!hookMainLoop()) {
             return false;
+        }
+        if (!hookNativeScopeGeometryDecision()) {
+            // Scope re-entry suppression is isolated from the physics engine.
+            // Preserve every other interaction feature if another scope mod
+            // already owns this verified call site.
+            logger::warn(
+                "ROCK(host): continuing without native scope "
+                "re-entry suppression");
         }
         // See-Through-Scopes late-culling hook: ONLY install when the STS mod is actually present.
         // It is a RENDER-path hook (late culling pass) whose sole purpose is scope-rendering compat;
@@ -758,7 +1240,10 @@ namespace rock
         // (e.g. Inventory3DFix) for zero benefit — observed as a CTD on save-load in the embed.
         // Mirroring ROCK's own detection at the hook-install level keeps behavior identical when STS
         // IS present and removes all render-path risk when it isn't.
-        if (f4cf::common::isDLLModLoaded("FO4VR_better_scopes.dll")) {
+        // NOTE (embed): the pinned F4VRCommonFramework no longer exports
+        // f4cf::common::isDLLModLoaded. Same semantics via the module table, which
+        // is what the rest of the tree already uses for DLL-presence probes.
+        if (GetModuleHandleA("FO4VR_better_scopes.dll") != nullptr) {
             if (!rock::see_through_scopes::installLateCullingHook()) {
                 return false;
             }
@@ -770,8 +1255,45 @@ namespace rock
         return true;
     }
 
+    // ── EQUIP-OBJECT DETOUR ARBITRATION (grenade fix, 2026-07-28) ────────────────────────
+    // Thin forwarding to loose_grenade_runtime. Declared in ROCKMain.h so the host does not
+    // have to include an internal physics-interaction header. See that header for why ROCK
+    // installs no detour of its own at ActorEquipManager::EquipObject.
+    HostEquipInterception HostTryInterceptEquipObject(
+        RE::Actor* a_actor,
+        const RE::BGSObjectInstance* a_object,
+        std::uint32_t a_stackID,
+        std::uint32_t a_number)
+    {
+        switch (rock::loose_grenade_runtime::tryInterceptEquipObject(a_actor, a_object, a_stackID, a_number)) {
+        case rock::loose_grenade_runtime::EquipInterceptionResult::ConsumedEquipped:
+            return HostEquipInterception::ConsumedEquipped;
+        case rock::loose_grenade_runtime::EquipInterceptionResult::ConsumedBlocked:
+            return HostEquipInterception::ConsumedBlocked;
+        case rock::loose_grenade_runtime::EquipInterceptionResult::NotIntercepted:
+        default:
+            return HostEquipInterception::NotIntercepted;
+        }
+    }
+
+    void HostSetEquipObjectDetourInstalled(bool a_installed, const char* a_reasonWhenAbsent)
+    {
+        rock::loose_grenade_runtime::setHostEquipObjectDetourInstalled(a_installed, a_reasonWhenAbsent);
+    }
+
+    void HostEquipObjectPassThroughBegin()
+    {
+        rock::loose_grenade_runtime::beginHostEquipPassThrough();
+    }
+
+    void HostEquipObjectPassThroughEnd()
+    {
+        rock::loose_grenade_runtime::endHostEquipPassThrough();
+    }
+
     void HostSetGrabOwnership(bool a_rockOwnsGrab)
     {
+        auto configMutation = g_rockConfig.pauseNativeReadsForMutation();
         g_rockConfig.rockHostGrabOwnershipConfigured = true;
         g_rockConfig.rockHostGrabOwnershipForced = a_rockOwnsGrab;
         g_rockConfig.rockGrabEnabled = a_rockOwnsGrab;
@@ -930,12 +1452,36 @@ namespace rock
         if (!std::isfinite(a_padding)) {
             return;
         }
-        const float clamped = std::clamp(a_padding, 0.0f, 1.0f);
+        // Ceiling is 3.0, not 1.0: the host raised its own clamp (src/Config.cpp
+        // fHandColliderRadiusPadding) from 1.0 to 3.0 on Jul 27 because measured
+        // finger-vs-token intersections reached 1.26gu, i.e. DEEPER than the largest
+        // padding a 1.0 cap would accept - the symptom was untunable by construction.
+        // Keep this in step with src/Config.cpp, RockConfig.cpp's INI clamp, the
+        // in-function clamps in HandBoneColliderSet/BodyBoneColliderSet, and the MCM
+        // slider max, or the host's ceiling silently cannot reach the engine.
+        const float clamped = std::clamp(a_padding, 0.0f, 3.0f);
+        auto configMutation = g_rockConfig.pauseNativeReadsForMutation();
         if (g_rockConfig.rockHandBoneColliderRadiusPadding != clamped) {
             logger::info("ROCK(host): hand collider radius padding {} -> {} via host API (colliders will rebuild)",
                 g_rockConfig.rockHandBoneColliderRadiusPadding, clamped);
         }
         g_rockConfig.rockHandBoneColliderRadiusPadding = clamped;
+    }
+
+    void HostSetTwoHandedMinSteeringAuthority(float a_authority)
+    {
+        if (!std::isfinite(a_authority)) {
+            return;
+        }
+        // The standalone engine accepts 0..1. Heisenberg deliberately starts at 0.35,
+        // making the bottom of its slider identical to the pre-slider behavior.
+        const float clamped = std::clamp(a_authority, 0.35f, 1.0f);
+        auto configMutation = g_rockConfig.pauseNativeReadsForMutation();
+        if (g_rockConfig.rockTwoHandedMinSteeringAuthority != clamped) {
+            logger::info("ROCK(host): minimum off-hand steering authority {} -> {} via host API",
+                g_rockConfig.rockTwoHandedMinSteeringAuthority, clamped);
+        }
+        g_rockConfig.rockTwoHandedMinSteeringAuthority = clamped;
     }
 
     bool HostIsLargeObjectGrabBlockEnabled()
@@ -956,6 +1502,47 @@ namespace rock
     bool HostIsWeaponSupportGripped(bool a_isLeft)
     {
         return s_physicsInteraction && s_physicsInteraction->hostIsWeaponSupportGripped(a_isLeft);
+    }
+
+    bool HostArmNativeScopeReentryBlockIfActive(
+        const bool a_hostObservedScopeActive)
+    {
+        bool nativeScopeActive = false;
+        const bool nativeStateAvailable =
+            tryReadNativeScopeRequestState(
+                nativeScopeActive);
+        if (!a_hostObservedScopeActive &&
+            (!nativeStateAvailable || !nativeScopeActive)) {
+            return false;
+        }
+
+        if (!s_nativeScopeGeometryHookInstalled.load(
+                std::memory_order_acquire)) {
+            // Still report an active presentation so the host performs the
+            // immediate close. Do not create a block that has no geometry
+            // hook available to observe its rearm condition.
+            return true;
+        }
+
+        const bool wasBlocked =
+            s_nativeScopeReentryBlocked.exchange(
+                true,
+                std::memory_order_acq_rel);
+        if (!wasBlocked) {
+            logger::info(
+                "ROCK(host): native scope re-entry blocked until "
+                "the optic leaves its activation cone "
+                "(hostObserved={}, nativeActive={})",
+                a_hostObservedScopeActive,
+                nativeScopeActive);
+        }
+        return true;
+    }
+
+    bool HostIsNativeScopeReentryBlocked()
+    {
+        return s_nativeScopeReentryBlocked.load(
+            std::memory_order_acquire);
     }
 
     bool HostGetLiveGripHandWorld(bool a_isLeft, RE::NiTransform& a_out)

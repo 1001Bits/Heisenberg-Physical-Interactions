@@ -2,26 +2,27 @@
 #include "F4VROffsets.h"
 #include "f4vr/F4VRUtils.h"
 #include <spdlog/spdlog.h>
+#include <mutex>
 
 namespace heisenberg::Utils
 {
-    static LARGE_INTEGER g_frequency;
-    static LARGE_INTEGER g_startTime;
-    static bool g_timerInitialized = false;
-
     double GetTime()
     {
-        if (!g_timerInitialized) {
-            QueryPerformanceFrequency(&g_frequency);
-            QueryPerformanceCounter(&g_startTime);
-            g_timerInitialized = true;
-        }
+        static std::once_flag initializeClock;
+        static LARGE_INTEGER frequency{};
+        static LARGE_INTEGER start{};
+        // Explicit call_once remains correct even if a downstream build changes
+        // MSVC's local-static initialization switch.
+        std::call_once(initializeClock, [] {
+            QueryPerformanceFrequency(&frequency);
+            QueryPerformanceCounter(&start);
+        });
 
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
 
-        return static_cast<double>(now.QuadPart - g_startTime.QuadPart) / 
-               static_cast<double>(g_frequency.QuadPart);
+        return static_cast<double>(now.QuadPart - start.QuadPart) /
+               static_cast<double>(frequency.QuadPart);
     }
 
     // Check if player is in Power Armor

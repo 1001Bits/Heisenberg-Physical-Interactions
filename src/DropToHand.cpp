@@ -198,8 +198,11 @@ namespace heisenberg
             return RE::BSEventNotifyControl::kContinue;
         }
 
-        // ===== DIAGNOSTIC: Log ALL container change events =====
-        {
+        // Full form/name diagnostics are deliberately debug-only. Container
+        // events are extremely hot during Take All, crafting and ammo transfer;
+        // resolving names/editor IDs and writing an info line for every event
+        // caused avoidable main-thread stalls in release sessions.
+        if (spdlog::should_log(spdlog::level::debug)) {
             std::string formName;
             const char* editorID = "";
             auto* baseForm = RE::TESForm::GetFormByID(a_event.baseObjectFormID);
@@ -209,8 +212,8 @@ namespace heisenberg
                 editorID = baseForm->GetFormEditorID();
                 if (!editorID) editorID = "";
             }
-            spdlog::info("[ContainerEvent] base={:08X} '{}' edID='{}' old={:08X} new={:08X} ref={:08X} count={}"
-                         " | dropMode={} lootMode={} harvestTH={} pipOpen={} containerOpen={}",
+            spdlog::debug("[ContainerEvent] base={:08X} '{}' edID='{}' old={:08X} new={:08X} ref={:08X} count={}"
+                          " | dropMode={} lootMode={} harvestTH={} pipOpen={} containerOpen={}",
                 a_event.baseObjectFormID, formName, editorID,
                 a_event.oldContainerFormID, a_event.newContainerFormID,
                 a_event.referenceFormID, a_event.itemCount,
@@ -768,8 +771,12 @@ namespace heisenberg
             }
         }
 
-        // WEAPON EXCLUSION IN POWER ARMOR ONLY: Skip weapons when in PA - PA has special weapon mounts
-        if (baseObj && baseObj->GetFormType() == RE::ENUM_FORM_ID::kWEAP && Utils::IsPlayerInPowerArmor()) {
+        // WEAPON EXCLUSION IN POWER ARMOR: legacy guard, now opt-in via
+        // bAllowWeaponGrabInPowerArmor=false (see Config.h). Kept as one switch
+        // with the world-grab guard in Grab.cpp so a weapon cannot be grabbable
+        // off the ground but un-droppable to the same hand.
+        if (baseObj && baseObj->GetFormType() == RE::ENUM_FORM_ID::kWEAP &&
+            !g_config.allowWeaponGrabInPowerArmor && Utils::IsPlayerInPowerArmor()) {
             spdlog::debug("[DropToHand] Skipping weapon {:08X} in Power Armor - using native behavior", drop.referenceFormID);
             return true;  // Remove from queue, let native system handle it
         }
@@ -860,13 +867,26 @@ namespace heisenberg
             return true;  // Remove from queue
         }
         
-        // Determine target hand.
-        // HOLOTAPES always go to the right hand (for Pip-Boy deck insertion) regardless of
-        // forceHand. Paper notes are ordinary clutter — choose a hand normally.
+        // Determine target hand. A holotape normally goes to the right hand for
+        // Pip-Boy insertion, but never displace a drawn weapon to make that happen.
+        // Put it in the physical offhand instead; the player can hand it over after
+        // holstering if they want to insert it into a left-wrist Pip-Boy.
+        const bool isHolotape = baseObj && IsHolotapeNote(baseObj);
+        auto* drawnState = f4vr::getPlayer();
+        const bool hasDrawnWeaponOrHands =
+            drawnState && drawnState->GetWeaponMagicDrawn();
         bool isLeft = true;
-        if (baseObj && IsHolotapeNote(baseObj)) {
+        if (isHolotape && hasDrawnWeaponOrHands) {
+            const bool primaryIsLeft =
+                VRInput::GetSingleton().IsLeftHandedMode();
+            isLeft = !primaryIsLeft;
+            spdlog::debug(
+                "[DropToHand] Holotape with weapon/hands drawn -> {} offhand "
+                "(preserving equipped weapon)",
+                isLeft ? "left" : "right");
+        } else if (isHolotape) {
             isLeft = false;
-            spdlog::debug("[DropToHand] Holotape -> right hand (always)");
+            spdlog::debug("[DropToHand] Holotape -> right hand");
         } else if (drop.forceHand) {
             isLeft = drop.forcedIsLeft;
             spdlog::debug("[DropToHand] Using forced hand: {} (from QueueStoreAndGrab)", isLeft ? "left" : "right");
@@ -902,16 +922,14 @@ namespace heisenberg
             return true;  // Remove from queue, let item fall naturally
         }
 
-        // HOLSTER-FIRST: when this drop targets the WEAPON hand and a weapon is drawn, sheathe
-        // it and WAIT (re-queue) until it's holstered before placing the item — otherwise the
-        // item appears in hand while the weapon is still drawn (the holotape, always the
-        // right/weapon hand, is the visible case). Must run BEFORE _grabsInProgress.insert below,
-        // or the re-queued drop would be dropped by the "grab already in progress" guard above.
-        // Frame cap is a failsafe so the queue can never stick.
+        // HOLSTER-FIRST remains for ordinary drops explicitly targeting the weapon
+        // hand. Holotapes are excluded: picking one up must never holster/unequip the
+        // player's weapon. The hand selection above normally routes them to the
+        // offhand; the explicit exclusion is a safety invariant if hand state changes.
         {
             auto* pc = f4vr::getPlayer();  // F4SEVR::PlayerCharacter — has actorState
             const bool targetIsWeaponHand = (isLeft == VRInput::GetSingleton().IsLeftHandedMode());
-            if (pc && targetIsWeaponHand && pc->GetWeaponMagicDrawn()) {
+            if (!isHolotape && pc && targetIsWeaponHand && pc->GetWeaponMagicDrawn()) {
                 int& waited = _weaponSheatheWait[drop.referenceFormID];
                 if (waited == 0) {
                     if (auto* rePc = RE::PlayerCharacter::GetSingleton())
@@ -927,18 +945,25 @@ namespace heisenberg
             _weaponSheatheWait.erase(drop.referenceFormID);
         }
         
-        // Log match quality for debugging (no filtering - all items go to hand)
+        // Log match quality for debugging (no filtering - all items go to hand).
+        //
+        // Deliberately uses the SAME lookups StartGrab will use. The old code
+        // called GetOffsetWithFallback here, whose fuzzy tail is never consumed
+        // for placement — so the log advertised an "ARMOR XZ-match -> <donor>"
+        // that was then thrown away, and reading it as the applied placement
+        // sent an earlier investigation down the wrong path entirely.
         if (!drop.skipWeaponFilter && baseObj) {
             auto& offsetMgr = ItemOffsetManager::GetSingleton();
-            auto offset = offsetMgr.GetOffsetWithFallback(refr, isLeft);
-            if (offset.has_value()) {
-                std::string itemName = ItemOffsetManager::GetItemName(refr);
-                const char* qualityStr =
-                    offset->matchQuality == OffsetMatchQuality::Exact ? "Exact" :
-                    offset->matchQuality == OffsetMatchQuality::Dimensions ? "Dimensions" :
-                    offset->matchQuality == OffsetMatchQuality::Partial ? "Partial" :
-                    offset->matchQuality == OffsetMatchQuality::Fuzzy ? "Fuzzy" : "None";
-                spdlog::debug("[DropToHand] Item '{}' has {} match quality - grabbing", itemName, qualityStr);
+            const std::string itemName = ItemOffsetManager::GetItemName(refr);
+            if (auto exact = offsetMgr.GetExactOffset(refr, isLeft); exact.has_value()) {
+                spdlog::debug("[DropToHand] Item '{}' has an exact authored offset - grabbing", itemName);
+            } else if (auto donor = offsetMgr.GetArmorDimensionalDonorOffset(refr, isLeft);
+                       donor.has_value()) {
+                spdlog::debug("[DropToHand] Item '{}' will borrow armor donor '{}' - grabbing",
+                              itemName, donor->matchedName);
+            } else {
+                spdlog::debug("[DropToHand] Item '{}' has no authored offset; generated placement - grabbing",
+                              itemName);
             }
         }
         
@@ -946,20 +971,16 @@ namespace heisenberg
         // This prevents race conditions where the same item is processed twice
         _grabsInProgress.insert(drop.referenceFormID);
 
-        // IMMEDIATE TELEPORT: Move item to hand position BEFORE starting grab
-        // This prevents the item from being visible at its spawn location (falling from sky)
-        // for even a single frame. StartGrabOnRef's instantGrab will finalize positioning.
-        RE::NiNode* wandNode = heisenberg::GetWandNode(playerNodes, isLeft);
-        if (wandNode && node) {
-            RE::NiPoint3 handPos = wandNode->world.translate;
-            node->local.translate = handPos;
-            node->world.translate = handPos;
-            refr->data.location.x = handPos.x;
-            refr->data.location.y = handPos.y;
-            refr->data.location.z = handPos.z;
-            spdlog::debug("[DropToHand] Pre-teleported {:08X} to hand ({:.1f},{:.1f},{:.1f})",
-                drop.referenceFormID, handPos.x, handPos.y, handPos.z);
-        }
+        // StartGrabOnRef runs synchronously below and performs the same instant
+        // visual placement before this update returns. Leave the freshly
+        // materialized scene graph at its physics-authored pose until then so
+        // Grab can capture body->owner frames before moving the visual root.
+        // Moving only node->world here freezes the spawn-to-hand delta into
+        // bodyOwnerLocal on the first hold (the immediate-drop floor bug).
+        spdlog::debug(
+            "[DropToHand] Deferring visual teleport of {:08X} until "
+            "pre-teleport collision frames are captured",
+            drop.referenceFormID);
 
         // Log item info before grab
         spdlog::debug("[DropToHand] ========== GRABBING DROPPED ITEM ==========");
@@ -1010,7 +1031,8 @@ namespace heisenberg
 
         } else {
             spdlog::warn("[DropToHand] FAILED to start grab on dropped item {:08X}", refr->formID);
-            // Clear the in-progress flag on failure so it can be retried
+            // No pre-teleport occurred, so a bounded retry leaves the
+            // materialized object at its native physics pose.
             _grabsInProgress.erase(drop.referenceFormID);
         }
         spdlog::debug("[DropToHand] =========================================");
@@ -1019,7 +1041,7 @@ namespace heisenberg
         // The actual grab state (leftGrab.active) will be true now
         _grabsInProgress.erase(drop.referenceFormID);
         
-        return true;  // Remove from queue even if grab failed
+        return grabStarted;
     }
     
     bool DropToHand::TryDropPendingLoot(PendingLoot& loot)
@@ -1040,8 +1062,9 @@ namespace heisenberg
             return true;  // Remove from queue
         }
         
-        // Skip weapons in Power Armor - PA has special weapon handling
-        if (baseForm->GetFormType() == RE::ENUM_FORM_ID::kWEAP && Utils::IsPlayerInPowerArmor()) {
+        // Skip weapons in Power Armor - legacy guard, now opt-in (see Config.h).
+        if (baseForm->GetFormType() == RE::ENUM_FORM_ID::kWEAP &&
+            !g_config.allowWeaponGrabInPowerArmor && Utils::IsPlayerInPowerArmor()) {
             spdlog::debug("[LootToHand] Skipping weapon {:08X} in Power Armor - using native behavior", loot.baseFormID);
             return true;  // Remove from queue
         }
@@ -1083,13 +1106,25 @@ namespace heisenberg
             return false;  // Keep in queue, try again
         }
         
-        // Determine which hand to use
-        // HOLOTAPES always go to the right hand (for Pip-Boy deck insertion). Paper notes are
-        // ordinary clutter — choose a hand normally.
+        // Determine which hand to use. Preserve any drawn weapon by sending a
+        // holotape to the physical offhand; only default it to the right hand
+        // when no weapon/hands are drawn.
+        const bool isHolotape = IsHolotapeNote(boundObj);
+        auto* drawnState = f4vr::getPlayer();
+        const bool hasDrawnWeaponOrHands =
+            drawnState && drawnState->GetWeaponMagicDrawn();
         bool isLeft = true;
-        if (IsHolotapeNote(boundObj)) {
+        if (isHolotape && hasDrawnWeaponOrHands) {
+            const bool primaryIsLeft =
+                VRInput::GetSingleton().IsLeftHandedMode();
+            isLeft = !primaryIsLeft;
+            spdlog::debug(
+                "[LootToHand] Holotape with weapon/hands drawn -> {} offhand "
+                "(preserving equipped weapon)",
+                isLeft ? "left" : "right");
+        } else if (isHolotape) {
             isLeft = false;
-            spdlog::debug("[LootToHand] Holotape -> right hand (always)");
+            spdlog::debug("[LootToHand] Holotape -> right hand");
         } else if (loot.forceHand) {
             isLeft = loot.forcedIsLeft;
             spdlog::debug("[LootToHand] Using forced hand: {}", isLeft ? "left" : "right");
@@ -1169,8 +1204,12 @@ namespace heisenberg
         heisenberg::Hooks::SetSuppressHUDMessages(false);
         
         if (droppedHandle) {
-            // Get the actual reference from the handle
-            auto* droppedRefr = droppedHandle.get().get();
+            // Retain the resolved reference for every use below. Taking the raw
+            // pointer from `droppedHandle.get().get()` destroys the temporary
+            // NiPointer at the end of the expression.
+            RE::NiPointer<RE::TESObjectREFR> droppedRefHolder =
+                droppedHandle.get();
+            auto* droppedRefr = droppedRefHolder.get();
             if (droppedRefr) {
                 spdlog::debug("[LootToHand] SUCCESS: Dropped item {:08X}, RefID: {:08X}", 
                     loot.baseFormID, droppedRefr->formID);
@@ -1279,6 +1318,9 @@ namespace heisenberg
         // pending loots by burstId below.
         _lootBurstId++;
 
+        bool hasPendingLoots = false;
+        bool hasPendingDrops = false;
+
         // Cleanup expired RecentlyStored entries
         {
             std::lock_guard<std::mutex> lock(_mutex);
@@ -1301,6 +1343,16 @@ namespace heisenberg
                     ++lootIt;
                 }
             }
+            hasPendingLoots = !_pendingLoots.empty();
+            hasPendingDrops = !_pendingDrops.empty();
+        }
+
+        // The normal live path has no inventory transfer queued. One lock is
+        // still required to age the short-lived feedback guards, but avoid the
+        // two additional queue locks and temporary-vector setup on every idle
+        // frame.
+        if (!hasPendingLoots && !hasPendingDrops) {
+            return;
         }
 
         // =====================================================================
