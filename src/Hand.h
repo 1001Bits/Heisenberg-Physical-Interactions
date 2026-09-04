@@ -100,6 +100,7 @@ namespace heisenberg
 
         // Grab/release helpers
         bool TryStartGrab();
+        bool TryUnequipWeaponForStorageZoneSwap();
         void Release(bool throw_object);
 
         // Selection helpers

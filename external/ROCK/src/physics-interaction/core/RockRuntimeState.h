@@ -36,6 +36,8 @@ namespace rock::runtime_state
         bool playerAvailable = false;
         bool weaponDrawn = false;
         bool localMenuBlocking = false;
+        bool localFavoritesMenuOpen = false;
+        bool localPipboyMenuOpen = false;
         bool localScopeMenuOpen = false;
         bool localLoadingMenuOpen = false;
         bool localGameStopped = false;

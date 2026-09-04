@@ -40,6 +40,9 @@ namespace RE
 namespace rock
 {
 
+    class DynamicHandCollisionRuntime;
+    class Hand;
+
     inline constexpr std::uint32_t ROCK_WEAPON_LAYER = 44;
 
     struct WeaponVisualKeyStats
@@ -65,6 +68,23 @@ namespace rock
             std::uint64_t generationKey{ 0 };
             std::uint32_t count{ 0 };
             std::array<std::uint32_t, MAX_WEAPON_COLLISION_BODIES> bodyIds{};
+        };
+
+        /*
+         * Main-thread snapshot of the exact package-root segment most recently
+         * queued to the generated weapon bodies.  Physics contact produced by
+         * that queue is consumed on the following game update, so its previous
+         * endpoint is the last pre-contact weapon pose; scene/sweep history
+         * sampled during the consumer frame is already one pose too new.
+         */
+        struct WeaponRootDriveSegmentSnapshot
+        {
+            bool valid{ false };
+            std::uint64_t generationKey{ 0 };
+            std::uint64_t sequence{ 0 };
+            RE::NiTransform previousRootWorld{};
+            RE::NiTransform currentRootWorld{};
+            float sourceDeltaSeconds{ 0.0f };
         };
 
         struct ReleaseGeometrySnapshot
@@ -166,6 +186,9 @@ namespace rock
 
         WeaponBodySnapshot getWeaponBodySnapshotAtomic() const;
 
+        WeaponRootDriveSegmentSnapshot
+            getWeaponRootDriveSegmentSnapshot() const;
+
         bool isWeaponBodyIdAtomic(std::uint32_t bodyId) const;
 
         bool tryGetWeaponContactAtomic(std::uint32_t bodyId, WeaponInteractionContact& outContact) const;
@@ -201,13 +224,108 @@ namespace rock
 
         /*
          * EMBEDDED-HOST SEAM: generated weapon hull sample points (world) + convex
-         * radii for the host's own contact reasoning.
+         * radii for the host's own contact reasoning. Optional identities remain
+         * stable within a collision generation; optional critical flags mark the
+         * bounded weapon-root extrema that require per-frame CCD.
          */
         std::uint32_t copyInteractionCollisionSamples(
             const RE::NiAVObject* weaponNode,
             RE::NiPoint3* outWorldPoints,
             float* outRadiiGame,
-            std::uint32_t maxSamples) const;
+            std::uint32_t maxSamples,
+            std::uint64_t* outSampleIdentities = nullptr,
+            std::uint8_t* outCriticalSweepFlags = nullptr,
+            std::uint32_t* outSourceBodyIds = nullptr,
+            RE::NiPoint3* outAnchorLocals = nullptr,
+            std::uint8_t* outAnchorUsesSourceLocal = nullptr) const;
+
+        // Keep the two independent static-world planes used for corner
+        // blocking, plus one separately arbitrated eligible free-hand hit.
+        // Sharing two slots let the firing hand crowd out the offhand; simply
+        // reserving one of those slots for a hand instead could discard an
+        // earlier wall hit.
+        static constexpr std::size_t kMaxInteractionWorldSweepHits = 3;
+
+        struct InteractionWorldSweepHit
+        {
+            bool valid{ false };
+            bool targetIsDynamicHandProxy{ false };
+            bool targetIsGeneratedHandCollider{ false };
+            std::uint32_t targetCollisionLayer{ 0 };
+            std::uint32_t sourceBodyId{ INVALID_BODY_ID };
+            std::uint32_t targetBodyId{ INVALID_BODY_ID };
+            RE::NiPoint3 surfacePointWorld{};
+            RE::NiPoint3 surfaceNormalWorld{};
+            RE::NiPoint3 weaponPointWorld{};
+            float weaponProbeRadiusGame{ 0.0f };
+            float penetrationGame{ 0.0f };
+            float approachSpeedGameUnits{ 0.0f };
+            float sweepFraction{ 1.0f };
+            float safeSweepFraction{ 1.0f };
+            bool validatedContinuousEntry{ false };
+            bool hasBlockedWeaponWorld{ false };
+            RE::NiTransform blockedWeaponWorld{};
+        };
+
+        struct InteractionWorldSweepResult
+        {
+            std::array<InteractionWorldSweepHit,
+                kMaxInteractionWorldSweepHits>
+                hits{};
+            std::uint32_t hitCount{ 0 };
+            std::uint32_t bodiesAttempted{ 0 };
+            std::uint32_t castsAttempted{ 0 };
+            std::uint32_t castsRun{ 0 };
+            std::uint32_t rotationSubstepsRequested{ 0 };
+            std::uint32_t rotationSubstepsRun{ 0 };
+            // Aggregate admission telemetry.  Keep this on the returned
+            // snapshot so the higher-level candidate/stop publisher can add
+            // its own stage without repeating or guessing the native query
+            // result.  These are per-call counts, not persistent state.
+            std::uint32_t rawHits{ 0 };
+            std::uint32_t rawGeneratedHandHits{ 0 };
+            std::uint32_t rawDynamicHandProxyHits{ 0 };
+            std::uint32_t handOwnershipResolvedHits{ 0 };
+            std::uint32_t handFreeSideHits{ 0 };
+            std::uint32_t handHitsAdmitted{ 0 };
+            std::uint32_t validatedHandHits{ 0 };
+            std::uint32_t blockedHandHits{ 0 };
+            float rootTranslationGameUnits{ 0.0f };
+            float rootRotationDegrees{ 0.0f };
+            bool budgetLimited{ false };
+            bool queryFailed{ false };
+            bool staleAuthorityRejected{ false };
+            bool rebasedForRootDiscontinuity{ false };
+            bool rootHistoryCurrent{ false };
+            bool rootHasMotion{ false };
+            bool nearFreeHand{ false };
+            bool hasPreviousClearWeaponWorld{ false };
+            RE::NiTransform previousClearWeaponWorld{};
+        };
+
+        /*
+         * Exact generated-hull CCD for weapon/static-world visual authority.
+         * Translation casts the native convex shape. Rotation/non-convex
+         * motion uses a conservative oriented local-bounds envelope, with a
+         * fixed global budget that reserves at least one cast per published
+         * hull. Results are accepted only for this exact generation and live
+         * source basis.
+         */
+        InteractionWorldSweepResult
+            sweepInteractionCollisionAgainstWorld(
+                RE::hknpWorld* world,
+                const RE::NiAVObject* weaponNode,
+                float deltaSeconds,
+                float contactEnvelopeGameUnits,
+                bool contactEpisodeActive,
+                bool rightHandFreeForWeaponStop,
+                bool leftHandFreeForWeaponStop,
+                const Hand& rightHand,
+                const Hand& leftHand,
+                const DynamicHandCollisionRuntime*
+                    dynamicHandCollision) const;
+
+        void resetInteractionCollisionWorldSweepHistory() const;
 
         /*
          * Event-driven weapon/world contact anchor. Native Havok evidence
@@ -341,6 +459,20 @@ namespace rock
             std::uint32_t publicationIndex{ INVALID_BODY_ID };
         };
 
+        struct InteractionWorldSweepBodyHistory
+        {
+            bool valid{ false };
+            std::uint64_t generationKey{ 0 };
+            std::uint32_t bodyId{ INVALID_BODY_ID };
+            const RE::hknpShape* shape{ nullptr };
+            const RE::NiAVObject* sourceBasis{ nullptr };
+            RE::NiTransform previousTargetWorld{};
+            RE::NiPoint3 localBoundsMinGame{};
+            RE::NiPoint3 localBoundsMaxGame{};
+            float boundsRadiusGame{ 0.0f };
+            bool localBoundsValid{ false };
+        };
+
         struct RetiredWeaponBodyPayload
         {
             RetiredBethesdaPhysicsBodyPayload bodyPayload{};
@@ -371,6 +503,11 @@ namespace rock
             float pointDedupGrid{ -1.0f };
             int supportFitTargetPoints{ -1 };
             float supportFitMaxErrorGameUnits{ -1.0f };
+            bool maxSourceDistanceEnabled{ false };
+            float maxSourceDistanceMelee{ -1.0f };
+            float maxSourceDistancePistol{ -1.0f };
+            float maxSourceDistanceRifle{ -1.0f };
+            float maxSourceDistanceHeavy{ -1.0f };
             std::vector<GeneratedHullSource> sources;
             weapon_generated_source_completeness_policy::GeneratedSourceCompleteness summary{};
         };
@@ -392,6 +529,11 @@ namespace rock
             float pointDedupGrid{ -1.0f };
             int supportFitTargetPoints{ -1 };
             float supportFitMaxErrorGameUnits{ -1.0f };
+            bool maxSourceDistanceEnabled{ false };
+            float maxSourceDistanceMelee{ -1.0f };
+            float maxSourceDistancePistol{ -1.0f };
+            float maxSourceDistanceRifle{ -1.0f };
+            float maxSourceDistanceHeavy{ -1.0f };
             std::size_t nextSourceIndex{ 0 };
             std::size_t createdCount{ 0 };
             std::vector<GeneratedHullSource> sources;
@@ -430,6 +572,7 @@ namespace rock
         void clearWeaponBodyInstance(WeaponBodyInstance& instance, bool releaseShapeRef);
         void clearAtomicBodyIds();
         void resetWeaponBodySetGeneration();
+        void resetWeaponRootDriveSegmentHistory();
         void publishWeaponBodySetGeneration(const weapon_generated_source_completeness_policy::GeneratedSourceCompleteness& sourceCompleteness);
         void publishAtomicBodyIds(WeaponBodyBank& bank);
         void unpublishAtomicBodyIds();
@@ -530,6 +673,7 @@ namespace rock
         PhysicsCallbackQuiescenceGate* _physicsCallbackGate{ nullptr };
         std::uint64_t _cachedWeaponKey{ 0 };
         std::uint64_t _cachedWeaponVisualKey{ 0 };
+        std::uint32_t _cachedWeaponVisibleTriShapeCount{ 0 };
         std::uint64_t _cachedWeaponIdentityKey{ 0 };
         // Body-associated ownership witnesses. Unlike the observed fields
         // below, these remain bound to the currently published body set.
@@ -608,6 +752,11 @@ namespace rock
         float _cachedPointDedupGrid{ -1.0f };
         int _cachedSupportFitTargetPoints{ -1 };
         float _cachedSupportFitMaxErrorGameUnits{ -1.0f };
+        bool _cachedMaxSourceDistanceEnabled{ false };
+        float _cachedMaxSourceDistanceMelee{ -1.0f };
+        float _cachedMaxSourceDistancePistol{ -1.0f };
+        float _cachedMaxSourceDistanceRifle{ -1.0f };
+        float _cachedMaxSourceDistanceHeavy{ -1.0f };
         std::uint64_t _pendingWeaponVisualRebuildKey{ 0 };
         std::uint64_t _pendingWeaponVisualWitnessKey{ 0 };
         std::size_t _pendingWeaponVisualVisibleTriShapeCount{ 0 };
@@ -617,6 +766,23 @@ namespace rock
         int _visualSourceUnavailableRetainFrames{ 0 };
         int _weaponAnimNodeDumpFrameCounter{ 0 };
         std::uint64_t _lastWeaponAnimNodeDumpKey{ 0 };
+
+        mutable std::array<InteractionWorldSweepBodyHistory,
+            MAX_WEAPON_BODIES>
+            _interactionWorldSweepBodyHistory{};
+        mutable std::uint64_t _interactionWorldSweepGenerationKey{ 0 };
+        mutable const RE::NiAVObject* _interactionWorldSweepRoot{ nullptr };
+        mutable RE::NiTransform _interactionWorldSweepPreviousRootWorld{};
+        mutable bool _interactionWorldSweepRootHistoryValid{ false };
+        mutable RE::NiTransform _interactionWorldSweepPreviousPlayerSpaceWorld{};
+        mutable bool _interactionWorldSweepPlayerSpaceHistoryValid{ false };
+
+        WeaponRootDriveSegmentSnapshot _weaponRootDriveSegment{};
+        const RE::NiAVObject* _weaponRootDriveHistoryRoot{ nullptr };
+        RE::NiTransform _weaponRootDrivePreviousWorld{};
+        std::uint64_t _weaponRootDriveHistoryGenerationKey{ 0 };
+        std::uint64_t _weaponRootDriveSequence{ 0 };
+        bool _weaponRootDriveHistoryValid{ false };
 
     };
 

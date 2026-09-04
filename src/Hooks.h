@@ -166,5 +166,9 @@ namespace heisenberg
          * internal code that intentionally calls ActivateRef on held items.
          */
         void SetInternalActivation(bool active);
+        // Suppress the consumable-to-hand redirect for one EquipObject call. Needed because
+        // the CONSUME path itself now equips the item (that is what Survival watches for), and
+        // without this our own hook would bounce it straight back to the hand.
+        void SetInternalEquip(bool active);
     }
 }

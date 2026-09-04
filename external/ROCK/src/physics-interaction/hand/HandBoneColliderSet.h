@@ -81,13 +81,15 @@ namespace rock
             std::uint32_t maxSamples) const;
 
         /*
-         * Stage A dynamic-twin publication (main thread only): the exact palm
-         * anchor and fingertip role frames this set drives its keyframed bodies
-         * with, refreshed every update. buildDynamicTwinShape builds the same
-         * hull the keyframed twin uses for those dimensions.
+         * Complete dynamic-twin publication (main thread only): the exact
+         * frame for every palm/pad/finger role this set drives, refreshed every
+         * update. buildDynamicTwinShape uses that role's production geometry,
+         * so solver response and native contact evidence cover the same hand.
          */
         const dynamic_hand_twin::TwinTargets& dynamicTwinTargets() const { return _dynamicTwinTargets; }
-        RE::hknpShape* buildDynamicTwinShape(const dynamic_hand_twin::TwinSlotFrame& slotFrame, bool isPalm) const;
+        RE::hknpShape* buildDynamicTwinShape(
+            const dynamic_hand_twin::TwinSlotFrame& slotFrame,
+            hand_collider_semantics::HandColliderRole role) const;
 
     private:
         static constexpr std::size_t MAX_SEGMENT_BODIES = hand_collider_semantics::kHandSegmentColliderBodyCountPerHand;

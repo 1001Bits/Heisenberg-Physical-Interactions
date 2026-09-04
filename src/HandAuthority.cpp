@@ -48,6 +48,8 @@ namespace heisenberg
             const bool weaponPrimaryGrip =
                 rock::two_handed_weapon_policy::
                     isPrimaryGripHandAuthorityTag(tag);
+            const bool weaponWorldContact =
+                tag.starts_with("ROCK_WeaponWorldContact_");
             const bool objectCoHold =
                 tag == "Heisenberg_ObjectCoHold";
             return AuthorityWriterTagPolicy{
@@ -56,7 +58,11 @@ namespace heisenberg
                     reachLimitedWeaponSupport || objectCoHold,
                 .sameFrameSupportPin =
                     weaponSupportGrip || objectCoHold,
-                .sameFramePrimaryPin = weaponPrimaryGrip,
+                // Wall stops are transient post-FRIK pins. Latching them into
+                // the next FRIK pass contaminates the next raw weapon sample,
+                // producing a stopped/raw every-other-frame oscillation.
+                .sameFramePrimaryPin =
+                    weaponPrimaryGrip || weaponWorldContact,
                 // Object co-hold is already published from the final object
                 // target. The ROCK callback below is weapon-specific.
                 .rederiveFromLiveWeapon = weaponTarget,
@@ -89,6 +95,15 @@ namespace heisenberg
             !classifyAuthorityWriterTag(
                 rock::two_handed_weapon_policy::
                     kPrimaryGripHandAuthorityTag).sameFrameSupportPin);
+        static_assert(
+            classifyAuthorityWriterTag(
+                "ROCK_WeaponWorldContact_Right").rigidTarget);
+        static_assert(
+            classifyAuthorityWriterTag(
+                "ROCK_WeaponWorldContact_Right").sameFramePrimaryPin);
+        static_assert(
+            classifyAuthorityWriterTag(
+                "ROCK_WeaponWorldContact_Right").rederiveFromLiveWeapon);
 
         // ---- small vector/matrix helpers (self-contained; Grab.cpp's are file-static) ----
         inline float vlen(const RE::NiPoint3& v) { return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z); }

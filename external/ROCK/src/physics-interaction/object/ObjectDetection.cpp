@@ -3,6 +3,7 @@
 #include "physics-interaction/grab/GrabInteractionPolicy.h"
 #include "physics-interaction/object/ObjectPhysicsBodySet.h"
 #include "physics-interaction/object/PhysicsBodyClassifier.h"
+#include "physics-interaction/object/ViewCasterSelectionPolicy.h"
 #include "physics-interaction/hand/HandFrame.h"
 #include "physics-interaction/native/HavokRuntime.h"
 #include "physics-interaction/native/PhysicsShapeCast.h"
@@ -205,17 +206,11 @@ namespace rock
 
         bool isLooseGrabbableBaseType(RE::TESBoundObject* baseForm)
         {
-            return baseForm &&
-                   (baseForm->Is(RE::ENUM_FORM_ID::kMISC) ||
-                       baseForm->Is(RE::ENUM_FORM_ID::kWEAP) ||
-                       baseForm->Is(RE::ENUM_FORM_ID::kAMMO) ||
-                       baseForm->Is(RE::ENUM_FORM_ID::kALCH) ||
-                       baseForm->Is(RE::ENUM_FORM_ID::kBOOK) ||
-                       baseForm->Is(RE::ENUM_FORM_ID::kKEYM) ||
-                       baseForm->Is(RE::ENUM_FORM_ID::kNOTE) ||
-                       baseForm->Is(RE::ENUM_FORM_ID::kARMO) ||
-                       baseForm->Is(RE::ENUM_FORM_ID::kFLOR) ||
-                       baseForm->Is(RE::ENUM_FORM_ID::kACTI));
+            const char* formType =
+                baseForm ? baseForm->GetFormTypeString() : nullptr;
+            return formType &&
+                   viewcaster_selection_policy::
+                       isSupportedLoosePickupFormType(formType);
         }
 
         bool hasDynamicDeadBipedBodyEvidence(RE::hknpWorld* hknpWorld, RE::hknpBodyId bodyId)
@@ -527,11 +522,13 @@ namespace rock
             const FarSelectionHmdConeGate* farHmdConeGate,
             float nearPromotionDistance,
             int& outDuplicateBodies,
-            bool logRejectTelemetry)
+            bool logRejectTelemetry,
+            RE::TESObjectREFR* preferredRef)
         {
             SelectedObject result;
             std::array<RankedSelectionCandidate, selection_query_policy::kMaxShapeCastPrecisionCandidates> rankedCandidates{};
             std::size_t rankedCandidateCount = 0;
+            RankedSelectionCandidate preferredCandidate{};
             int loggedRejectTelemetry = 0;
             const char* queryName = isFarSelection ? "far" : "near";
             std::unordered_set<std::uint32_t> seenBodyIds;
@@ -728,10 +725,22 @@ namespace rock
 
                 candidate.hitNode = hitNode;
                 candidate.visualNode = classification.actorEquipment.visualNode ? classification.actorEquipment.visualNode : ref->Get3D();
+                if (viewcaster_selection_policy::acceptsImportedCandidate(
+                        preferredRef != nullptr,
+                        candidate.isValid(),
+                        ref == preferredRef) &&
+                    (!preferredCandidate.selection.isValid() ||
+                        selection_query_policy::isBetterShapeCastCandidateScore(
+                            candidateScore,
+                            preferredCandidate.score))) {
+                    preferredCandidate = { candidate, candidateScore };
+                }
                 insertRankedSelectionCandidate(rankedCandidates, rankedCandidateCount, candidate, candidateScore);
             }
 
-            if (rankedCandidateCount > 0) {
+            if (preferredCandidate.selection.isValid()) {
+                result = preferredCandidate.selection;
+            } else if (rankedCandidateCount > 0) {
                 result = rankedCandidates[0].selection;
             }
             return result;
@@ -788,7 +797,7 @@ namespace rock
         int rejectedHmdCone = 0;
         int duplicateBodies = 0;
         result = chooseShapeCastSelection(bhkWorld, hknpWorld, palmPos, direction, collector, false, otherHandContext, candidatesChecked, rejectedInvalidBody, rejectedNoRef,
-            rejectedNotGrabbable, rejectedBehindPalm, rejectedHmdCone, nullptr, 0.0f, duplicateBodies, logNearMetric);
+            rejectedNotGrabbable, rejectedBehindPalm, rejectedHmdCone, nullptr, 0.0f, duplicateBodies, logNearMetric, nullptr);
 
         if (logNearMetric) {
             ROCK_LOG_DEBUG(Hand,
@@ -807,7 +816,8 @@ namespace rock
 
     SelectedObject findFarObject(RE::bhkWorld* bhkWorld, RE::hknpWorld* hknpWorld, const RE::NiPoint3& handPos, const RE::NiPoint3& pointingDir, float farRange,
         const FarSelectionHmdConeGate& hmdConeGate,
-        const OtherHandSelectionContext& otherHandContext)
+        const OtherHandSelectionContext& otherHandContext,
+        RE::TESObjectREFR* preferredRef)
     {
         SelectedObject result;
 
@@ -861,7 +871,7 @@ namespace rock
             }
         }
         result = chooseShapeCastSelection(bhkWorld, hknpWorld, handPos, direction, collector, true, otherHandContext, candidatesChecked, rejectedInvalidBody, rejectedNoRef,
-            rejectedNotGrabbable, rejectedBehindPalm, rejectedHmdCone, &hmdConeGate, configuredNearReach, duplicateBodies, logFarMetric);
+            rejectedNotGrabbable, rejectedBehindPalm, rejectedHmdCone, &hmdConeGate, configuredNearReach, duplicateBodies, logFarMetric, preferredRef);
 
         // Near reach remains collision-query based even when the directional close cast misses.
         // Released objects can rest beside or partly behind the palm, where the far sphere cast

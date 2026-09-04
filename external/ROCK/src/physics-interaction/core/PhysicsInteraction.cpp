@@ -1,4 +1,5 @@
 #include "physics-interaction/core/PhysicsInteraction.h"
+#include "physics-interaction/core/PostHostGeneratedDriveFinalizePolicy.h"
 
 #include "ROCKMain.h"
 #include "api/ProviderDebugOverlayRuntime.h"
@@ -33,8 +34,10 @@
 #include "physics-interaction/consume/MouthConsumeDetector.h"
 #include "physics-interaction/consume/MouthConsumePolicy.h"
 #include "physics-interaction/consume/MouthConsumeTransfer.h"
+#include "physics-interaction/consume/ConsumeCommitPolicy.h"
 #include "physics-interaction/feedback/FeedbackHaptics.h"
 #include "physics-interaction/hand/HandSkeleton.h"
+#include "physics-interaction/hand/DynamicHandCollisionAuthorityPolicy.h"
 #include "physics-interaction/native/HavokOffsets.h"
 #include "physics-interaction/native/HookAddressDiagnostics.h"
 #include "physics-interaction/debug/DebugBodyOverlay.h"
@@ -46,6 +49,7 @@
 #include "physics-interaction/grab/GrabEvent.h"
 #include "physics-interaction/grab/GrabTelemetry.h"
 #include "physics-interaction/grab/GrabHeldObject.h"
+#include "physics-interaction/grab/DynamicGrabPolicy.h"
 #include "physics-interaction/grab/GrabLocomotionAuthorityBridge.h"
 #include "physics-interaction/grab/HeldPlayerSpaceRegistry.h"
 #include "physics-interaction/grab/GrabMassPolicy.h"
@@ -60,6 +64,7 @@
 #include "physics-interaction/input/InputRemapPolicy.h"
 #include "physics-interaction/input/InputRemapRuntime.h"
 #include "physics-interaction/input/GrabInputIntentPolicy.h"
+#include "physics-interaction/input/HostGrabInputEdgePolicy.h"
 #include "physics-interaction/object/ObjectDetection.h"
 #include "physics-interaction/object/ObjectPhysicsBodySet.h"
 #include "physics-interaction/stash/ShoulderStashDetector.h"
@@ -74,6 +79,8 @@
 #include "physics-interaction/weapon/WeaponEquipTransfer.h"
 #include "physics-interaction/weapon/WeaponInteraction.h"
 #include "physics-interaction/weapon/WeaponPartContactAcquisitionPolicy.h"
+#include "physics-interaction/weapon/WeaponWallLocomotionPolicy.h"
+#include "physics-interaction/weapon/WeaponWallSweepPolicy.h"
 #include "physics-interaction/hand/HandFrame.h"
 #include "physics-interaction/core/PhysicsHooks.h"
 #include "physics-interaction/core/RockRuntimeState.h"
@@ -125,6 +132,92 @@ namespace rock
             "Crafting Menu",
             "CraftingMenu",
         };
+
+        template <std::size_t Count>
+        hand_collision_suppression_math::SuppressionTopologyReconcileResult
+        reconcileWeaponHandSuppressionTopology(
+            RE::hknpWorld* world,
+            const Hand& hand,
+            hand_collision_suppression_math::SuppressionSet<Count>&
+                suppressionSet,
+            collision_suppression_registry::CollisionSuppressionOwner owner,
+            const char* context)
+        {
+            using namespace hand_collision_suppression_math;
+
+            if (!world) {
+                return {};
+            }
+
+            std::array<std::uint32_t, Count> currentBodies{};
+            currentBodies.fill(kInvalidBodyId);
+            std::size_t currentBodyCount = 0;
+            if (hand.hasCollisionBody()) {
+                const std::uint32_t colliderCount =
+                    hand.getHandColliderBodyCount();
+                if (colliderCount > 0) {
+                    const auto boundedCount = (std::min)(
+                        static_cast<std::size_t>(colliderCount),
+                        currentBodies.size());
+                    for (std::size_t index = 0;
+                         index < boundedCount;
+                         ++index) {
+                        const auto bodyId =
+                            hand.getHandColliderBodyIdAtomic(index);
+                        if (bodyId != kInvalidBodyId) {
+                            currentBodies[currentBodyCount++] = bodyId;
+                        }
+                    }
+                } else {
+                    const auto bodyId = hand.getCollisionBodyId().value;
+                    if (bodyId != kInvalidBodyId) {
+                        currentBodies[currentBodyCount++] = bodyId;
+                    }
+                }
+            }
+
+            const auto result = reconcileSuppressionTopology(
+                suppressionSet,
+                [&](const std::uint32_t bodyId) {
+                    return std::find(
+                               currentBodies.begin(),
+                               currentBodies.begin() + currentBodyCount,
+                               bodyId) !=
+                           currentBodies.begin() + currentBodyCount;
+                },
+                [&](const std::uint32_t bodyId) {
+                    const auto releaseResult =
+                        collision_suppression_registry::
+                            globalCollisionSuppressionRegistry()
+                                .release(
+                                    world,
+                                    bodyId,
+                                    owner,
+                                    context,
+                                    collision_suppression_registry::
+                                        RuntimeSuppressionLogMode::
+                                            CallerAggregates);
+                    return !releaseResult.readFailed;
+                });
+
+            if (result.deferredCount > 0) {
+                ROCK_LOG_WARN(
+                    Weapon,
+                    "{} topology reconciliation deferred stale={} released={} deferred={}",
+                    context ? context : "weapon-hand-suppression",
+                    result.staleCount,
+                    result.releasedCount,
+                    result.deferredCount);
+            } else if (result.releasedCount > 0) {
+                ROCK_LOG_DEBUG(
+                    Weapon,
+                    "{} topology reconciled stale={} released={}",
+                    context ? context : "weapon-hand-suppression",
+                    result.staleCount,
+                    result.releasedCount);
+            }
+            return result;
+        }
 
         std::atomic<bool> s_weaponCollisionWorkbenchExitMenuSinkRegistered{ false };
         std::atomic<bool> s_weaponCollisionWorkbenchExitMenuSinkMissingUILogged{ false };
@@ -1570,6 +1663,7 @@ namespace rock
 
         using generated_body_contact_registry::Entry;
         using generated_body_contact_registry::GeneratedBodyKind;
+        using generated_body_contact_registry::kFlagDynamicHandProxy;
         using generated_body_contact_registry::kFlagPowerArmor;
         using generated_body_contact_registry::kFlagPrimaryAnchor;
         using generated_body_contact_registry::kFlagSampledVelocity;
@@ -1616,6 +1710,48 @@ namespace rock
 
         addHandEntries(_rightHand, false);
         addHandEntries(_leftHand, true);
+
+        auto addDynamicHandEntries = [&](bool isLeft) {
+            for (std::size_t bodyIndex = 0;
+                 bodyIndex < DynamicHandCollisionRuntime::kFirstForearmSlot;
+                 ++bodyIndex) {
+                DynamicHandCollisionContactBodySnapshot snapshot{};
+                if (!_dynamicHandCollision.tryGetContactBodySnapshot(
+                        isLeft,
+                        bodyIndex,
+                        snapshot) ||
+                    !snapshot.valid) {
+                    continue;
+                }
+
+                Entry entry{};
+                entry.bodyId = snapshot.bodyId;
+                entry.kind = isLeft ? GeneratedBodyKind::LeftHand :
+                                      GeneratedBodyKind::RightHand;
+                entry.role = static_cast<std::uint32_t>(snapshot.role);
+                entry.partKind = static_cast<std::uint32_t>(
+                    hand_collider_semantics::fingerForRole(snapshot.role));
+                entry.subRole = static_cast<std::uint32_t>(
+                    hand_collider_semantics::segmentForRole(snapshot.role));
+                entry.flags = kFlagDynamicHandProxy;
+                if (snapshot.primaryPalmAnchor) {
+                    entry.flags |= kFlagPrimaryAnchor;
+                }
+                if (snapshot.sampledVelocityValid) {
+                    entry.flags |= kFlagSampledVelocity;
+                    entry.sampledVelocityHavokX =
+                        snapshot.sampledVelocityHavok.x;
+                    entry.sampledVelocityHavokY =
+                        snapshot.sampledVelocityHavok.y;
+                    entry.sampledVelocityHavokZ =
+                        snapshot.sampledVelocityHavok.z;
+                }
+                addEntry(entry);
+            }
+        };
+
+        addDynamicHandEntries(false);
+        addDynamicHandEntries(true);
 
         const auto weaponSnapshot = _weaponCollision.getWeaponBodySnapshotAtomic();
         for (std::uint32_t i = 0; i < weaponSnapshot.count && i < MAX_WEAPON_COLLISION_BODIES; ++i) {
@@ -2116,6 +2252,11 @@ namespace rock
         _feedbackHaptics.reset();
         _grabInputIntentStates = {};
         _peerHeldJoinRetryStates = {};
+        for (auto& consumedEdge : _hostConsumedGrabInputEdge) {
+            consumedEdge.store(false, std::memory_order_release);
+        }
+        _hostConsumedWeaponInputFrameMask = {};
+        _hostConsumedNormalGrabInputFrameMask = {};
         _heldWeaponTriggerEquipIntents = {};
         _forceGrabCommittedThisFrame = {};
         _bareFistGuardState = {};
@@ -2256,11 +2397,48 @@ namespace rock
         performance_profiler::ScopedTimer profilerTimer(
             performance_profiler::Scope::PhysicsInteractionUpdate);
 
+        // finalizeWeaponAuthorityAfterHostHands() consumes this only when the
+        // current update reaches its normal tail. Any early-return frame must
+        // not re-register the previous frame's generated-body targets.
+        _postHostGeneratedDriveFinalize = {};
+        _firingHandGrabButtonFrameState = {};
+        _hostConsumedWeaponInputFrameMask = {};
+        _hostConsumedNormalGrabInputFrameMask = {};
+
+        /*
+         * Capture the host one-shots before ANY early return. Raw controller
+         * edge bits persist until consumed, so a frame that cannot reach the
+         * first ROCK input boundary must put its ownership token back. That
+         * pairs the eventual drain with the host edge instead of allowing the
+         * stale Acid drop press/release to replay unmasked.
+         */
+        std::array<bool, 2> hostConsumedGrabEdgeThisFrame{};
+        for (std::size_t handIndex = 0;
+             handIndex < hostConsumedGrabEdgeThisFrame.size();
+             ++handIndex) {
+            hostConsumedGrabEdgeThisFrame[handIndex] =
+                _hostConsumedGrabInputEdge[handIndex].exchange(
+                    false,
+                    std::memory_order_acq_rel);
+        }
+
         ensureWeaponCollisionWorkbenchExitMenuSinkRegistered();
 
         const auto& runtime = runtime_state::currentFrame();
         refreshEquippedWeaponHandlingSettings();
         if (!runtime.visualAuthorityAvailable) {
+            for (std::size_t handIndex = 0;
+                 handIndex < hostConsumedGrabEdgeThisFrame.size();
+                 ++handIndex) {
+                if (host_grab_input_edge_policy::
+                        shouldRetainPendingEdgeForNextConsumableFrame(
+                            hostConsumedGrabEdgeThisFrame[handIndex],
+                            false)) {
+                    _hostConsumedGrabInputEdge[handIndex].store(
+                        true,
+                        std::memory_order_release);
+                }
+            }
             restoreHeldMassMovementSlowdown("frik-unavailable");
             _shoulderStashStates = {};
             _mouthConsumeStates = {};
@@ -2272,6 +2450,87 @@ namespace rock
         // primary wand and left is the secondary wand. Weapon handedness is a
         // separate ROCK role and never remaps buttons/controllers.
         vrcf::VRControllers.update(false);
+
+        /*
+         * Resolve host-owned grip edges at the FIRST ROCK input boundary.
+         * Equipped firing/support ownership runs before updateGrabInput(), so
+         * draining there allowed an Acid drop press to affect the weapon first.
+         * Drain raw state exactly once here and publish independent per-hand
+         * masks. Weapon consumers are always neutralized. An existing ROCK
+         * object or provider touch grab retains the raw edge exclusively for
+         * its normal-grab release path as the transient dual-owner fail-safe.
+         */
+        for (const bool isLeft : { false, true }) {
+            const std::size_t handIndex = isLeft ? 1u : 0u;
+            const bool hostConsumedEdge =
+                hostConsumedGrabEdgeThisFrame[handIndex];
+            const Hand& hand = isLeft ? _leftHand : _rightHand;
+            const auto decision =
+                host_grab_input_edge_policy::resolve(
+                    hostConsumedEdge,
+                    hand.isHolding(),
+                    _touchGrabRuntime.isHandActive(isLeft));
+            _hostConsumedWeaponInputFrameMask[handIndex] =
+                decision.suppressWeaponInputThisFrame;
+            _hostConsumedNormalGrabInputFrameMask[handIndex] =
+                decision.suppressNormalGrabInputThisFrame;
+            if (host_grab_input_edge_policy::shouldDrainRawStateAtStage(
+                    decision,
+                    host_grab_input_edge_policy::ConsumptionStage::
+                        BeforeWeaponOwnership)) {
+                static_cast<void>(readGrabButtonState(
+                    isLeft,
+                    g_rockConfig.rockGrabButtonID));
+                ROCK_LOG_DEBUG(
+                    Hand,
+                    "{} hand drained host-owned grip edge before weapon ownership",
+                    hand.handName());
+            }
+        }
+
+        const auto handHasActiveWeaponGrip = [this](const bool isLeft) {
+            return _twoHandedGrip.isHandPartGripping(isLeft) ||
+                   (_twoHandedGrip.isFiringGripOccupied() &&
+                       _twoHandedGrip.isFiringHandLeft() == isLeft);
+        };
+        const auto readEffectiveWeaponGripHeld =
+            [&](const bool isLeft) {
+                if (_hostConsumedWeaponInputFrameMask[
+                        isLeft ? 1u : 0u]) {
+                    // Neutral masked level: keep an existing weapon grip, but
+                    // never acquire a new one from the host-owned edge.
+                    return host_grab_input_edge_policy::
+                        resolveWeaponGripHeldLevel(
+                            true,
+                            handHasActiveWeaponGrip(isLeft),
+                            false);
+                }
+                return host_grab_input_edge_policy::
+                    resolveWeaponGripHeldLevel(
+                        false,
+                        handHasActiveWeaponGrip(isLeft),
+                        readGrabButtonHeld(
+                            isLeft,
+                            g_rockConfig.rockGrabButtonID));
+            };
+        const auto readEffectiveWeaponGripPhysicallyHeld =
+            [&](const bool isLeft) {
+                if (_hostConsumedWeaponInputFrameMask[
+                        isLeft ? 1u : 0u]) {
+                    return host_grab_input_edge_policy::
+                        resolveWeaponGripHeldLevel(
+                            true,
+                            handHasActiveWeaponGrip(isLeft),
+                            false);
+                }
+                return host_grab_input_edge_policy::
+                    resolveWeaponGripHeldLevel(
+                        false,
+                        handHasActiveWeaponGrip(isLeft),
+                        input_remap_runtime::isRawButtonPhysicallyHeld(
+                            isLeft,
+                            g_rockConfig.rockGrabButtonID));
+            };
 
         // Before any early return below: a skipped consume would let a stale
         // accept-button press replay as a reload frames later (see the API doc).
@@ -2574,9 +2833,9 @@ namespace rock
             const bool firingHandIsLeft = _twoHandedGrip.isFiringGripOccupied() ?
                 _twoHandedGrip.isFiringHandLeft() :
                 _fixedFiringHandIsLeft;
-            const bool primaryGrabHeld = input_remap_runtime::isRawButtonPhysicallyHeld(
-                firingHandIsLeft,
-                g_rockConfig.rockGrabButtonID);
+            const bool primaryGrabHeld =
+                readEffectiveWeaponGripPhysicallyHeld(
+                    firingHandIsLeft);
             _pendingEquippedWeaponPrimaryOnlyGripStart = PendingEquippedWeaponPrimaryOnlyGripStart{
                 .pending = _equippedWeaponHandlingSettings.primaryDetachEnabled &&
                     primaryGrabHeld,
@@ -2592,7 +2851,7 @@ namespace rock
 
         if (_collisionLayerRegistered &&
             (_expectedHandLayerMask != 0 || _expectedWeaponLayerMask != 0 || _expectedReloadLayerMask != 0 || _expectedBodyLayerMask != 0 ||
-                _nativeCharacterControllerLayerPolicyCaptured)) {
+                _expectedDynamicHandProxyLayerMask != 0 || _nativeCharacterControllerLayerPolicyCaptured)) {
             const auto desiredHandMask = collision_layer_policy::buildRockHandExpectedMask(true, g_rockConfig.rockHandCollisionStaticWorldEnabled);
             const auto desiredWeaponMask = collision_layer_policy::buildRockWeaponExpectedMask(
                 g_rockConfig.rockWeaponCollisionBlocksProjectiles,
@@ -2604,10 +2863,17 @@ namespace rock
                 g_rockConfig.rockWeaponCollisionBlocksSpells,
                 g_rockConfig.rockHandCollisionStaticWorldEnabled);
             const auto desiredBodyMask = collision_layer_policy::buildRockBodyExpectedMask(g_rockConfig.rockBodyBoneCollisionStaticWorldEnabled);
+            const auto desiredDynamicHandProxyMask =
+                collision_layer_policy::buildRockDynamicHandProxyExpectedMask(
+                    g_rockConfig.
+                        rockHandCollisionStaticWorldEnabled);
             if (!collision_layer_policy::matrixLayerMaskMatches(_expectedHandLayerMask, desiredHandMask) ||
                 !collision_layer_policy::matrixLayerMaskMatches(_expectedWeaponLayerMask, desiredWeaponMask) ||
                 !collision_layer_policy::matrixLayerMaskMatches(_expectedReloadLayerMask, desiredReloadMask) ||
-                !collision_layer_policy::matrixLayerMaskMatches(_expectedBodyLayerMask, desiredBodyMask)) {
+                !collision_layer_policy::matrixLayerMaskMatches(_expectedBodyLayerMask, desiredBodyMask) ||
+                !collision_layer_policy::matrixLayerMaskMatches(
+                    _expectedDynamicHandProxyLayerMask,
+                    desiredDynamicHandProxyMask)) {
                 ROCK_LOG_INFO(Config, "ROCK collision layer config changed; re-registering matrix policy");
                 _collisionLayerRegistered = false;
                 registerCollisionLayer(hknp);
@@ -2618,23 +2884,35 @@ namespace rock
                 const auto currentWeaponMask = matrix[collision_layer_policy::ROCK_LAYER_WEAPON];
                 const auto currentReloadMask = matrix[collision_layer_policy::ROCK_LAYER_RELOAD];
                 const auto currentBodyMask = matrix[collision_layer_policy::ROCK_LAYER_BODY];
+                const auto currentDynamicHandProxyMask =
+                    matrix[collision_layer_policy::ROCK_LAYER_DYNAMIC_HAND_PROXY];
                 const bool handMaskDrifted = _expectedHandLayerMask != 0 && !collision_layer_policy::matrixLayerMaskMatches(currentHandMask, _expectedHandLayerMask);
                 const bool weaponMaskDrifted = _expectedWeaponLayerMask != 0 && !collision_layer_policy::matrixLayerMaskMatches(currentWeaponMask, _expectedWeaponLayerMask);
                 const bool reloadMaskDrifted = _expectedReloadLayerMask != 0 && !collision_layer_policy::matrixLayerMaskMatches(currentReloadMask, _expectedReloadLayerMask);
                 const bool bodyMaskDrifted = _expectedBodyLayerMask != 0 && !collision_layer_policy::bodyManagedLayerMaskMatches(currentBodyMask, _expectedBodyLayerMask);
+                const bool dynamicHandProxyMaskDrifted =
+                    _expectedDynamicHandProxyLayerMask != 0 &&
+                    !collision_layer_policy::matrixLayerMaskMatches(
+                        currentDynamicHandProxyMask,
+                        _expectedDynamicHandProxyLayerMask);
                 const bool actorToolPairsDrifted =
                     _expectedHandLayerMask != 0 && _expectedWeaponLayerMask != 0 &&
                     !collision_layer_policy::rockToolActorPairsMatch(matrix, _expectedHandLayerMask, _expectedWeaponLayerMask);
                 const bool bodyPairsDrifted = _expectedBodyLayerMask != 0 && !collision_layer_policy::rockBodyManagedPairsMatch(matrix, _expectedBodyLayerMask);
+                const bool dynamicHandProxyPairsDrifted =
+                    _expectedDynamicHandProxyLayerMask != 0 &&
+                    !collision_layer_policy::rockDynamicHandProxyPairsMatch(
+                        matrix,
+                        _expectedDynamicHandProxyLayerMask);
                 const bool nativeControllerObjectPairsDrifted =
                     _nativeCharacterControllerLayerPolicyCaptured &&
                     !collision_layer_policy::nativeCharacterControllerObjectPairsMatch(matrix, _expectedNativeCharacterControllerLayerMask);
-                if (handMaskDrifted || weaponMaskDrifted || reloadMaskDrifted || bodyMaskDrifted || actorToolPairsDrifted || bodyPairsDrifted ||
-                    nativeControllerObjectPairsDrifted) {
+                if (handMaskDrifted || weaponMaskDrifted || reloadMaskDrifted || bodyMaskDrifted || dynamicHandProxyMaskDrifted ||
+                    actorToolPairsDrifted || bodyPairsDrifted || dynamicHandProxyPairsDrifted || nativeControllerObjectPairsDrifted) {
                     const auto currentNativeCharacterControllerMask =
                         _nativeCharacterControllerLayerPolicyCaptured ? matrix[collision_layer_policy::FO4_LAYER_CHARCONTROLLER] : 0;
                     ROCK_LOG_WARN(Config,
-                        "ROCK configured layer mask drift detected; hand expected=0x{:016X} current=0x{:016X}, weapon expected=0x{:016X} current=0x{:016X}, reload expected=0x{:016X} current=0x{:016X}, body expected=0x{:016X} current=0x{:016X}, nativeController expected=0x{:016X} current=0x{:016X}, actorToolPairs={}, bodyManagedPairs={}, nativeControllerObjects={}; re-registering",
+                        "ROCK configured layer mask drift detected; hand expected=0x{:016X} current=0x{:016X}, weapon expected=0x{:016X} current=0x{:016X}, reload expected=0x{:016X} current=0x{:016X}, body expected=0x{:016X} current=0x{:016X}, dynamicHandProxy expected=0x{:016X} current=0x{:016X}, nativeController expected=0x{:016X} current=0x{:016X}, actorToolPairs={}, bodyManagedPairs={}, dynamicHandProxyPairs={}, nativeControllerObjects={}; re-registering",
                         collision_layer_policy::matrixAddressableMask(_expectedHandLayerMask),
                         collision_layer_policy::matrixAddressableMask(currentHandMask),
                         collision_layer_policy::matrixAddressableMask(_expectedWeaponLayerMask),
@@ -2643,10 +2921,13 @@ namespace rock
                         collision_layer_policy::matrixAddressableMask(currentReloadMask),
                         collision_layer_policy::matrixAddressableMask(_expectedBodyLayerMask),
                         collision_layer_policy::matrixAddressableMask(currentBodyMask),
+                        collision_layer_policy::matrixAddressableMask(_expectedDynamicHandProxyLayerMask),
+                        collision_layer_policy::matrixAddressableMask(currentDynamicHandProxyMask),
                         collision_layer_policy::matrixAddressableMask(_expectedNativeCharacterControllerLayerMask),
                         collision_layer_policy::matrixAddressableMask(currentNativeCharacterControllerMask),
                         actorToolPairsDrifted ? "drifted" : "ok",
                         bodyPairsDrifted ? "drifted" : "ok",
+                        dynamicHandProxyPairsDrifted ? "drifted" : "ok",
                         nativeControllerObjectPairsDrifted ? "drifted" : "ok");
                     _collisionLayerRegistered = false;
                     registerCollisionLayer(hknp);
@@ -2691,21 +2972,28 @@ namespace rock
         if (rightHandWeaponEquipped && _twoHandedGrip.isFiringHandLeft() && _twoHandedGrip.isFiringGripOccupied()) {
             rightHandWeaponAuthorityActive = false;
         }
-        const bool rightHandWeaponAuthorityActiveBeforeGrip = rightHandWeaponAuthorityActive;
         bool leftSupportGripActive = false;
         bool rightPartGripActive = _twoHandedGrip.isHandPartGripping(false);
-        if (rightHandWeaponAuthorityActive) {
-            suppressRightHandCollisionForDominantWeapon(hknp);
-        } else {
-            restoreRightHandCollisionAfterDominantWeapon(hknp);
-        }
         // A part-gripping free hand is a transform driver like the support hand
-        // and must not also solve contacts against the weapon package.
-        if (rightPartGripActive) {
-            suppressHandCollisionForWeaponSupport(hknp, false);
-        } else {
-            restoreHandCollisionAfterWeaponSupport(hknp, false);
-        }
+        // and must not also solve contacts against the weapon package. Acquire
+        // either incoming owner before releasing the outgoing one so a
+        // dominant<->part-grip transfer never clears bit 14 between calls.
+        hand_collision_suppression_math::
+            reconcileOverlappingSuppressionOwners(
+                rightHandWeaponAuthorityActive,
+                rightPartGripActive,
+                [&] {
+                    suppressRightHandCollisionForDominantWeapon(hknp);
+                },
+                [&] {
+                    suppressHandCollisionForWeaponSupport(hknp, false);
+                },
+                [&] {
+                    restoreRightHandCollisionAfterDominantWeapon(hknp);
+                },
+                [&] {
+                    restoreHandCollisionAfterWeaponSupport(hknp, false);
+                });
 
         updateHandCollisions(frame);
         logPalmClockSampleForHand("game-after-hand-collider-queue",
@@ -3245,10 +3533,10 @@ namespace rock
                 (_twoHandedGrip.isPartCarryActive() || firingHandIsLeft);
             (void)consumeWeaponContactForHand(false, frame.right, rightWeaponContactProbeAllowed, rightWeaponContact);
 
-            const bool gripPressed = readGrabButtonHeld(true, g_rockConfig.rockGrabButtonID);
-            const bool rightGripHeld = readGrabButtonHeld(false, g_rockConfig.rockGrabButtonID);
-            const bool gripConfirmPressed = readGrabButtonPressedEdge(true, g_rockConfig.rockGrabButtonID);
-            (void)gripConfirmPressed;
+            const bool gripPressed =
+                readEffectiveWeaponGripHeld(true);
+            const bool rightGripHeld =
+                readEffectiveWeaponGripHeld(false);
 
             WeaponInteractionRuntimeState providerInteractionState{};
 
@@ -3327,21 +3615,40 @@ namespace rock
             _firingHandGrabButtonFrameState = {};
             auto readPrimaryGrabState = [&]() -> const GrabButtonState& {
                 if (!primaryGrabStateRead) {
-                    primaryGrabState = readGrabButtonState(firingHandIsLeft, g_rockConfig.rockGrabButtonID);
+                    const bool hostInputMasked =
+                        _hostConsumedWeaponInputFrameMask[
+                            firingHandIsLeft ? 1u : 0u];
+                    primaryGrabState = hostInputMasked ?
+                        GrabButtonState{
+                            .held = handHasActiveWeaponGrip(
+                                firingHandIsLeft),
+                        } :
+                        readGrabButtonState(
+                            firingHandIsLeft,
+                            g_rockConfig.rockGrabButtonID);
                     // Menu rearm intentionally masks gameplay edges, but
                     // firing-grip ownership still follows the physical hand
                     // state after the menu closes.
-                    primaryGrabState.held = input_remap_runtime::isRawButtonPhysicallyHeld(firingHandIsLeft, g_rockConfig.rockGrabButtonID);
+                    primaryGrabState.held = hostInputMasked ?
+                        handHasActiveWeaponGrip(firingHandIsLeft) :
+                        readEffectiveWeaponGripPhysicallyHeld(
+                            firingHandIsLeft);
                     primaryGrabStateRead = true;
-                    // Publish the consumed snapshot so the normal grab pipeline
-                    // sees the same edges instead of re-consuming cleared ones.
-                    _firingHandGrabButtonFrameState = SharedGrabButtonFrameState{
-                        .valid = true,
-                        .isLeft = firingHandIsLeft,
-                        .held = primaryGrabState.held,
-                        .pressed = primaryGrabState.pressed,
-                        .released = primaryGrabState.released,
-                    };
+                    if (!hostInputMasked) {
+                        // Publish the consumed snapshot so the normal grab
+                        // pipeline sees the same edges instead of re-consuming
+                        // cleared ones. A weapon-only host mask deliberately
+                        // leaves this invalid: a transient existing ROCK/touch
+                        // owner must consume its preserved raw release itself.
+                        _firingHandGrabButtonFrameState =
+                            SharedGrabButtonFrameState{
+                                .valid = true,
+                                .isLeft = firingHandIsLeft,
+                                .held = primaryGrabState.held,
+                                .pressed = primaryGrabState.pressed,
+                                .released = primaryGrabState.released,
+                            };
+                    }
                 }
                 return primaryGrabState;
             };
@@ -3379,7 +3686,9 @@ namespace rock
                 !equipped_weapon_manual_ownership_policy::shouldKeepPendingPrimaryOnlyStart(
                     equipped_weapon_manual_ownership_policy::PendingPrimaryOnlyStartInput{
                         .pending = _pendingEquippedWeaponPrimaryOnlyGripStart.pending,
-                        .gripHeld = input_remap_runtime::isRawButtonPhysicallyHeld(firingHandIsLeft, g_rockConfig.rockGrabButtonID),
+                        .gripHeld =
+                            readEffectiveWeaponGripPhysicallyHeld(
+                                firingHandIsLeft),
                         .ownershipModeEnabled = _equippedWeaponHandlingSettings.firingGripOwnershipEnabled,
                         .primaryPoseBlockerAvailable = primaryPoseBlockerAvailable,
                         .virtualHolstersOwnsInput = firingGripDeferredForVirtualHolsters,
@@ -3532,7 +3841,8 @@ namespace rock
                     equippedWeaponStashCommitDecisions[stashHandIndex] = stashDecision;
 
                     const bool gripPhysicallyHeld =
-                        input_remap_runtime::isRawButtonPhysicallyHeld(stashHandIsLeft, g_rockConfig.rockGrabButtonID);
+                        readEffectiveWeaponGripPhysicallyHeld(
+                            stashHandIsLeft);
                     if (gripPhysicallyHeld) {
                         commitLease = {};
                     } else if (!stashDecision.confirmedForCommit) {
@@ -3907,22 +4217,30 @@ namespace rock
             if (rightHandWeaponEquipped && leftHandFiringActiveAfterGrip) {
                 rightHandWeaponAuthorityActiveAfterGrip = false;
             }
-            if (rightHandWeaponAuthorityActiveAfterGrip != rightHandWeaponAuthorityActiveBeforeGrip) {
-                if (rightHandWeaponAuthorityActiveAfterGrip) {
-                    suppressRightHandCollisionForDominantWeapon(hknp);
-                } else {
-                    restoreRightHandCollisionAfterDominantWeapon(hknp);
-                }
-            }
-            rightHandWeaponAuthorityActive = rightHandWeaponAuthorityActiveAfterGrip;
+            /*
+             * Reconcile again after updateHandCollisions. A skeleton/body-bank
+             * rebuild can replace all twenty hand IDs in that call without
+             * changing weapon authority; transition-only suppression would
+             * then leave the replacement bank collidable for one solve.
+             */
             const bool rightPartGripActiveAfterGrip = _twoHandedGrip.isHandPartGripping(false);
-            if (rightPartGripActiveAfterGrip != rightPartGripActive) {
-                if (rightPartGripActiveAfterGrip) {
-                    suppressHandCollisionForWeaponSupport(hknp, false);
-                } else {
-                    restoreHandCollisionAfterWeaponSupport(hknp, false);
-                }
-            }
+            hand_collision_suppression_math::
+                reconcileOverlappingSuppressionOwners(
+                    rightHandWeaponAuthorityActiveAfterGrip,
+                    rightPartGripActiveAfterGrip,
+                    [&] {
+                        suppressRightHandCollisionForDominantWeapon(hknp);
+                    },
+                    [&] {
+                        suppressHandCollisionForWeaponSupport(hknp, false);
+                    },
+                    [&] {
+                        restoreRightHandCollisionAfterDominantWeapon(hknp);
+                    },
+                    [&] {
+                        restoreHandCollisionAfterWeaponSupport(hknp, false);
+                    });
+            rightHandWeaponAuthorityActive = rightHandWeaponAuthorityActiveAfterGrip;
             rightPartGripActive = rightPartGripActiveAfterGrip;
 
             if (g_rockConfig.rockDebugShowWeaponNotifications) {
@@ -3967,18 +4285,6 @@ namespace rock
                 restoreHandCollisionAfterWeaponSupport(hknp, true);
             }
 
-            if (weaponNode) {
-                performance_profiler::ScopedTimer profilerTimer(performance_profiler::Scope::WeaponCollisionTransforms);
-                _weaponCollision.updateBodiesFromCurrentSourceTransforms(
-                    hknp,
-                    weaponNode,
-                    frame.deltaSeconds,
-                    drivenSourceNodes.data(),
-                    drivenSourceNodeCount);
-            }
-            if (f4vr::isNodeVisible(weaponNode)) {
-                applyFinalWeaponMuzzleAuthority();
-            }
         }
         refreshGeneratedBodyContactRegistry();
         updateSelection(frame);
@@ -4016,27 +4322,73 @@ namespace rock
          * grab, pull, support-grip, or weapon owner for this frame can gate its
          * lower-priority visual authority without delaying proxy tracking.
          */
-        _dynamicHandCollision.updateFrame(
+        const bool firingGripOccupied =
+            _twoHandedGrip.isFiringGripOccupied();
+        const bool firingHandIsLeft =
+            _twoHandedGrip.isFiringHandLeft();
+        const bool rightHandWeaponVisualAuthorityActive =
+            dynamic_hand_collision_authority::weaponOwnsHand({
+                .isLeft = false,
+                .dominantWeaponAuthority =
+                    rightHandWeaponAuthorityActive,
+                .partGripActive =
+                    _twoHandedGrip.isHandPartGripping(false),
+                .firingGripOccupied = firingGripOccupied,
+                .firingHandIsLeft = firingHandIsLeft,
+            });
+        const bool leftHandWeaponVisualAuthorityActive =
+            dynamic_hand_collision_authority::weaponOwnsHand({
+                .isLeft = true,
+                .dominantWeaponAuthority = leftSupportGripActive,
+                .partGripActive =
+                    _twoHandedGrip.isHandPartGripping(true),
+                .firingGripOccupied = firingGripOccupied,
+                .firingHandIsLeft = firingHandIsLeft,
+            });
+        bool priorWeaponHandStopTargetIsLeft = false;
+        const bool priorWeaponHandStopActive =
+            _softContactRuntime.getWeaponHandStopTarget(
+                priorWeaponHandStopTargetIsLeft);
+        const bool rightWeaponHandStopVisualOwner =
+            dynamic_hand_collision_authority::
+                reciprocalWeaponStopOwnsHand({
+                    .stopActive = priorWeaponHandStopActive,
+                    .targetIsDynamicHand =
+                        priorWeaponHandStopActive,
+                    .targetHandIsLeft =
+                        priorWeaponHandStopTargetIsLeft,
+                    .handIsLeft = false,
+                });
+        const bool leftWeaponHandStopVisualOwner =
+            dynamic_hand_collision_authority::
+                reciprocalWeaponStopOwnsHand({
+                    .stopActive = priorWeaponHandStopActive,
+                    .targetIsDynamicHand =
+                        priorWeaponHandStopActive,
+                    .targetHandIsLeft =
+                        priorWeaponHandStopTargetIsLeft,
+                    .handIsLeft = true,
+                });
+        const auto dynamicHandReadiness =
+            _dynamicHandCollision.updateFrame(
             frame,
             physicsWritesAllowedForWorld(frame.hknpWorld),
             _rightHand,
             _leftHand,
             _bodyBoneColliders,
-            rightHandWeaponAuthorityActive,
-            leftSupportGripActive,
-            _rightHand.isGrabVisualReturnActive() || _twoHandedGrip.isHandVisualReturnActive(false),
-            _leftHand.isGrabVisualReturnActive() || _twoHandedGrip.isHandVisualReturnActive(true));
+            rightHandWeaponVisualAuthorityActive,
+            leftHandWeaponVisualAuthorityActive,
+            _rightHand.isGrabVisualReturnActive() ||
+                _twoHandedGrip.isHandVisualReturnActive(false) ||
+                rightWeaponHandStopVisualOwner,
+            _leftHand.isGrabVisualReturnActive() ||
+                _twoHandedGrip.isHandVisualReturnActive(true) ||
+                leftWeaponHandStopVisualOwner);
+        // updateFrame may create/retire the layer-48 proxy bank.  Publish those
+        // exact IDs before the next native solve so weapon+proxy callbacks can
+        // become evidence in the same game frame.
+        refreshGeneratedBodyContactRegistry();
         const auto dynamicHandHapticEvents = _dynamicHandCollision.consumeHapticEvents();
-        for (const auto& pulse : dynamicHandHapticEvents.hands) {
-            if (!pulse.fire) {
-                continue;
-            }
-            (void)_feedbackHaptics.queue(
-                pulse.isLeft ? feedback_haptics::FeedbackHand::Left : feedback_haptics::FeedbackHand::Right,
-                g_rockConfig.rockHandCollisionDynamicHapticDurationSeconds,
-                pulse.intensity);
-        }
-        updateFeedbackHaptics(frame.deltaSeconds);
 
         /*
          * Heisenberg-preserved soft-contact runtime (upstream removed it in
@@ -4059,38 +4411,272 @@ namespace rock
             frame,
             _rightHand,
             _leftHand,
-            rightHandWeaponAuthorityActive,
-            leftSupportGripActive,
+            dynamicHandReadiness.
+                rightWorldStopOperational,
+            dynamicHandReadiness.
+                leftWorldStopOperational,
+            rightHandWeaponVisualAuthorityActive,
+            leftHandWeaponVisualAuthorityActive,
+            _rightHand.isGrabVisualReturnActive() ||
+                _twoHandedGrip.
+                    isHandVisualReturnActive(false),
+            _leftHand.isGrabVisualReturnActive() ||
+                _twoHandedGrip.
+                    isHandVisualReturnActive(true),
             _twoHandedGrip.isFiringHandLeft(),
+            &_dynamicHandCollision,
             &_weaponCollision,
             weaponNode,
             nativeContactEvidence);
 
+        /*
+         * Dynamic-hand presentation ran before reciprocal weapon arbitration.
+         * On the acquisition frame, remove the losing hand writer immediately;
+         * on retained frames the pre-update gate above prevents it from being
+         * republished.  Proxy bodies and their evidence remain operational.
+        */
+        bool weaponHandStopTargetIsLeft = false;
+        const bool weaponHandStopActive =
+            _softContactRuntime.getWeaponHandStopTarget(
+                weaponHandStopTargetIsLeft);
+        if (weaponHandStopActive) {
+            // Visual-return lerps are presentation writers, not physical hand
+            // ownership.  Reciprocal CCD is allowed to acquire through them;
+            // once it wins, cancel both possible return publishers before the
+            // blocked weapon pose is applied so no stale hand target competes
+            // with the clean contact stop.
+            _twoHandedGrip.cancelHandVisualReturn(
+                weaponHandStopTargetIsLeft,
+                "reciprocal weapon/hand stop");
+            Hand& stoppedHand = weaponHandStopTargetIsLeft
+                ? _leftHand
+                : _rightHand;
+            stoppedHand.cancelGrabVisualReturn(
+                "reciprocal weapon/hand stop");
+            _dynamicHandCollision.clearVisualForStrongerOwner(
+                weaponHandStopTargetIsLeft);
+            _softContactRuntime.clearHandForStrongerOwner(
+                weaponHandStopTargetIsLeft,
+                "reciprocal weapon/hand stop");
+        }
+
+        RE::NiTransform blockedWeaponWorld{};
         RE::NiPoint3 weaponWorldCorrection{};
         bool weaponCorrectionHandIsLeft = false;
-        if (weaponNode &&
-            _softContactRuntime.
-                getWeaponWorldCorrection(
-                    weaponWorldCorrection,
-                    weaponCorrectionHandIsLeft) &&
-            _twoHandedGrip.
-                applyWeaponWorldContactTranslation(
+        RE::NiPoint3 weaponStopSurfacePoint{};
+        RE::NiPoint3 weaponStopSurfaceNormal{};
+        bool weaponStopTargetIsDynamicHand = false;
+        const bool weaponWorldStopActive =
+            _softContactRuntime.getWeaponWorldStopSurface(
+                weaponStopSurfacePoint,
+                weaponStopSurfaceNormal,
+                weaponStopTargetIsDynamicHand);
+        const bool weaponWorldStopPoseAvailable =
+            weaponNode &&
+            _softContactRuntime.getWeaponWorldStopPose(
+                blockedWeaponWorld,
+                weaponCorrectionHandIsLeft);
+        const bool immutableWallStopAuthority =
+            weapon_wall_sweep_policy::
+                immutableWallStopOwnsFiringHandWriters(
+                    weaponWorldStopPoseAvailable,
+                    weaponWorldStopActive,
+                    weaponStopTargetIsDynamicHand);
+        if (immutableWallStopAuthority) {
+            // A static-world stop is one immutable weapon + firing-hand pose.
+            // Remove every lower presentation writer before TwoHandedGrip
+            // captures or republishes that rigid relation. This is deliberately
+            // wall-only; reciprocal offhand contact keeps its directional
+            // arbitration and cleanup above.
+            _twoHandedGrip.cancelHandVisualReturn(
+                weaponCorrectionHandIsLeft,
+                "immutable weapon-wall full-pose stop");
+            Hand& firingHand = weaponCorrectionHandIsLeft
+                ? _leftHand
+                : _rightHand;
+            firingHand.cancelGrabVisualReturn(
+                "immutable weapon-wall full-pose stop");
+            _dynamicHandCollision.clearVisualForStrongerOwner(
+                weaponCorrectionHandIsLeft);
+            _softContactRuntime.clearHandForStrongerOwner(
+                weaponCorrectionHandIsLeft,
+                "immutable weapon-wall full-pose stop");
+        }
+
+        /*
+         * Directional weapon/hand arbitration runs after the dynamic proxy
+         * solver. Do not publish its contact pulse before that winner exists:
+         * when the moving weapon owns the stop, the offhand visual writer is
+         * cleared below and its already-queued buzz would falsely report that
+         * the hand was pushed. World contacts and hand-driven weapon contacts
+         * retain their normal dynamic-hand haptics.
+         */
+        for (const auto& pulse : dynamicHandHapticEvents.hands) {
+            if (!pulse.fire ||
+                (weaponHandStopActive &&
+                 pulse.isLeft == weaponHandStopTargetIsLeft) ||
+                (immutableWallStopAuthority &&
+                 pulse.isLeft == weaponCorrectionHandIsLeft)) {
+                continue;
+            }
+            (void)_feedbackHaptics.queue(
+                pulse.isLeft ? feedback_haptics::FeedbackHand::Left : feedback_haptics::FeedbackHand::Right,
+                g_rockConfig.rockHandCollisionDynamicHapticDurationSeconds,
+                pulse.intensity);
+        }
+        updateFeedbackHaptics(frame.deltaSeconds);
+
+        bool weaponWorldContactApplied = false;
+        bool weaponWorldStopPoseApplied = false;
+        if (weaponWorldStopPoseAvailable) {
+            weaponWorldContactApplied =
+                _twoHandedGrip.applyWeaponWorldContactPose(
                     weaponNode,
-                    weaponWorldCorrection,
+                    blockedWeaponWorld,
                     weaponCorrectionHandIsLeft,
                     currentWeaponGenerationKey,
-                    currentEquippedWeaponOwnershipKey)) {
-            // The wall correction is applied after the normal grip solve.
-            // Refresh projectile/scope publication from that final visual
-            // frame; host post-FRIK republish also retains the same absolute
-            // correction for ROCK-owned two-hand weapon authority.
-            if (f4vr::isNodeVisible(weaponNode)) {
-                applyFinalWeaponMuzzleAuthority();
-            }
-        } else {
+                    currentEquippedWeaponOwnershipKey,
+                    immutableWallStopAuthority);
+            weaponWorldStopPoseApplied =
+                weaponWorldContactApplied;
+        } else if (weaponNode &&
+                   _softContactRuntime.getWeaponWorldCorrection(
+                       weaponWorldCorrection,
+                       weaponCorrectionHandIsLeft)) {
+            weaponWorldContactApplied =
+                _twoHandedGrip.
+                    applyWeaponWorldContactTranslation(
+                        weaponNode,
+                        weaponWorldCorrection,
+                        weaponCorrectionHandIsLeft,
+                        currentWeaponGenerationKey,
+                        currentEquippedWeaponOwnershipKey);
+        }
+        if (!weaponWorldContactApplied) {
             _twoHandedGrip.
                 clearWeaponWorldContactTranslation(
-                    weaponNode);
+                    weaponNode,
+                    currentWeaponGenerationKey,
+                    currentEquippedWeaponOwnershipKey);
+        }
+
+        const auto& playerSpace =
+            runtime_state::currentFrame().playerSpace;
+        const std::uint32_t currentWorldGeneration =
+            _worldGenerationAtomic.load(std::memory_order_acquire);
+        weapon_wall_locomotion_policy::RoomScaleHistory
+            roomScaleHistory{
+                .valid = _weaponWallHmdHistoryValid &&
+                         _weaponWallHmdHistoryWorldGeneration ==
+                             currentWorldGeneration,
+                .previousHmdPlayerLocal = {
+                    _weaponWallPreviousHmdPlayerLocal.x,
+                    _weaponWallPreviousHmdPlayerLocal.y,
+                    _weaponWallPreviousHmdPlayerLocal.z,
+                },
+            };
+        RE::NiPoint3 hmdPlayerLocal{};
+        if (playerSpace.valid && frame.hasHmdFrame) {
+            hmdPlayerLocal = transform_math::worldPointToLocal(
+                playerSpace.world,
+                frame.hmdPositionWorld);
+        }
+        const auto roomScaleSample =
+            weapon_wall_locomotion_policy::sampleRoomScaleMotion(
+                roomScaleHistory,
+                playerSpace.valid,
+                frame.hasHmdFrame,
+                {
+                    hmdPlayerLocal.x,
+                    hmdPlayerLocal.y,
+                    hmdPlayerLocal.z,
+                });
+        _weaponWallHmdHistoryValid = roomScaleHistory.valid;
+        _weaponWallHmdHistoryWorldGeneration =
+            currentWorldGeneration;
+        _weaponWallPreviousHmdPlayerLocal = RE::NiPoint3(
+            roomScaleHistory.previousHmdPlayerLocal.x,
+            roomScaleHistory.previousHmdPlayerLocal.y,
+            roomScaleHistory.previousHmdPlayerLocal.z);
+
+        RE::NiPoint3 roomScaleDeltaWorld{};
+        if (roomScaleSample.deltaValid) {
+            roomScaleDeltaWorld = transform_math::localVectorToWorld(
+                playerSpace.world,
+                RE::NiPoint3(
+                    roomScaleSample.deltaPlayerLocalGameUnits.x,
+                    roomScaleSample.deltaPlayerLocalGameUnits.y,
+                    roomScaleSample.deltaPlayerLocalGameUnits.z));
+        }
+        RE::NiPoint3 locomotionVelocityGameUnitsPerSecond{};
+        const bool locomotionVelocityValid =
+            character_controller_runtime::
+                tryGetPlayerLocomotionVelocityRawGameUnits(
+                    locomotionVelocityGameUnitsPerSecond);
+        const float playerDeltaLengthSquared =
+            playerSpace.deltaGameUnits.x *
+                playerSpace.deltaGameUnits.x +
+            playerSpace.deltaGameUnits.y *
+                playerSpace.deltaGameUnits.y +
+            playerSpace.deltaGameUnits.z *
+                playerSpace.deltaGameUnits.z;
+        const float playerDiscontinuityDistance =
+            weapon_wall_sweep_policy::
+                kPlayerSpaceDiscontinuityDistanceGameUnits;
+        const bool playerSpaceDiscontinuous =
+            !std::isfinite(playerDeltaLengthSquared) ||
+            playerDeltaLengthSquared >
+                playerDiscontinuityDistance *
+                    playerDiscontinuityDistance ||
+            roomScaleSample.discontinuous;
+        const auto locomotionStop =
+            weapon_wall_locomotion_policy::evaluate(
+                weapon_wall_locomotion_policy::Input{
+                    .stopActive = weaponWorldStopActive,
+                    .targetIsDynamicHand =
+                        weaponStopTargetIsDynamicHand,
+                    .stopPoseApplied =
+                        weaponWorldStopPoseApplied,
+                    .playerSpaceValid = playerSpace.valid,
+                    .playerSpaceDiscontinuous =
+                        playerSpaceDiscontinuous,
+                    // +0x250 is the controller's intended velocity; the
+                    // native stop modifier lives in a separate field. Using
+                    // this source avoids feeding our own outward cancellation
+                    // back into the next frame. Physical HMD travel is sampled
+                    // separately in room-local space and rotated into world.
+                    .locomotionVelocityValid =
+                        locomotionVelocityValid,
+                    .roomScaleDeltaValid =
+                        roomScaleSample.deltaValid,
+                    .locomotionVelocityGameUnitsPerSecond = {
+                        locomotionVelocityGameUnitsPerSecond.x,
+                        locomotionVelocityGameUnitsPerSecond.y,
+                        locomotionVelocityGameUnitsPerSecond.z,
+                    },
+                    .roomScaleDeltaWorldGameUnits = {
+                        roomScaleDeltaWorld.x,
+                        roomScaleDeltaWorld.y,
+                        roomScaleDeltaWorld.z,
+                    },
+                    .wallNormalWorld = {
+                        weaponStopSurfaceNormal.x,
+                        weaponStopSurfaceNormal.y,
+                        weaponStopSurfaceNormal.z,
+                    },
+                    .deltaSeconds = frame.deltaSeconds,
+                });
+        if (locomotionStop.apply) {
+            (void)character_controller_runtime::
+                tryApplyPlayerDisplacementModifierGameUnits(
+                    RE::NiPoint3(
+                        locomotionStop.
+                            correctionDisplacementGameUnits.x,
+                        locomotionStop.
+                            correctionDisplacementGameUnits.y,
+                        locomotionStop.
+                            correctionDisplacementGameUnits.z),
+                    locomotionStop.durationSeconds);
         }
 
         publishDebugBodyOverlay(frame);
@@ -4132,9 +4718,26 @@ namespace rock
         }
 
         ::rock::provider::dispatchFrameCallbacks(*this);
-        // Publish callback ownership only after every main-thread collider
-        // mutation and target update for this frame has committed.
-        _generatedBodyStepDrive.registerForNextStep(bhk, hknp);
+        // Host hand authority can still move a firing-hand-owned weapon after
+        // update() returns. Defer the single final weapon queue and listener
+        // registration until that winner has landed.
+        _postHostGeneratedDriveFinalize.weaponNode.reset(weaponNode);
+        _postHostGeneratedDriveFinalize.bhkWorld = bhk;
+        _postHostGeneratedDriveFinalize.hknpWorld = hknp;
+        _postHostGeneratedDriveFinalize.gameFrameIndex =
+            _palmClockGameFrameIndex.load(std::memory_order_acquire);
+        _postHostGeneratedDriveFinalize.weaponGenerationKey =
+            currentWeaponGenerationKey;
+        _postHostGeneratedDriveFinalize.worldGeneration =
+            _worldGenerationAtomic.load(std::memory_order_acquire);
+        _postHostGeneratedDriveFinalize.skeletonGeneration =
+            _skeletonGenerationAtomic.load(std::memory_order_acquire);
+        _postHostGeneratedDriveFinalize.providerGeneration =
+            _providerGenerationAtomic.load(std::memory_order_acquire);
+        _postHostGeneratedDriveFinalize.collisionGeneration =
+            _collisionGenerationAtomic.load(std::memory_order_acquire);
+        _postHostGeneratedDriveFinalize.deltaSeconds = frame.deltaSeconds;
+        _postHostGeneratedDriveFinalize.pending = true;
     }
 
     void PhysicsInteraction::updateAuthoredPrimaryFiringGrip()
@@ -4307,8 +4910,16 @@ namespace rock
          * contacts can push props or feed semantic touch. ROCK treats owned
          * tool states as collision-filter ownership, so it uses the shared
          * suppression lease here instead of a visual-only gate.
-         */
+        */
         _rightDominantWeaponCollisionSuppressed.store(true, std::memory_order_release);
+
+        (void)reconcileWeaponHandSuppressionTopology(
+            world,
+            _rightHand,
+            _rightDominantWeaponCollisionSuppression,
+            collision_suppression_registry::
+                CollisionSuppressionOwner::WeaponDominantHand,
+            "dominant-weapon-hand");
 
         if (!world || !_rightHand.hasCollisionBody()) {
             return;
@@ -4487,39 +5098,14 @@ namespace rock
         auto& suppressedFlag = isLeft ? _leftWeaponSupportCollisionSuppressed : _rightWeaponSupportCollisionSuppressed;
         suppressedFlag.store(true, std::memory_order_release);
 
-        auto bodyAlreadySuppressed = [&](std::uint32_t bodyId) {
-            return bodyId == INVALID_CONTACT_BODY_ID ||
-                   hand_collision_suppression_math::findSuppressionState(suppressionSet, bodyId) != nullptr;
-        };
-
-        auto currentHandBodiesAlreadySuppressed = [&]() {
-            if (!hand.hasCollisionBody()) {
-                return false;
-            }
-
-            bool sawValidBody = false;
-            const std::uint32_t colliderCount = hand.getHandColliderBodyCount();
-            if (colliderCount > 0) {
-                for (std::uint32_t i = 0; i < colliderCount; ++i) {
-                    const std::uint32_t bodyId = hand.getHandColliderBodyIdAtomic(i);
-                    if (bodyId == INVALID_CONTACT_BODY_ID) {
-                        continue;
-                    }
-                    sawValidBody = true;
-                    if (!bodyAlreadySuppressed(bodyId)) {
-                        return false;
-                    }
-                }
-                return sawValidBody;
-            }
-
-            const std::uint32_t bodyId = hand.getCollisionBodyId().value;
-            return bodyId != INVALID_CONTACT_BODY_ID && bodyAlreadySuppressed(bodyId);
-        };
-
-        if (currentHandBodiesAlreadySuppressed()) {
-            return;
-        }
+        (void)reconcileWeaponHandSuppressionTopology(
+            world,
+            hand,
+            suppressionSet,
+            collision_suppression_registry::
+                CollisionSuppressionOwner::WeaponSupportHand,
+            isLeft ? "left-weapon-support-hand" :
+                     "right-weapon-support-hand");
 
         if (!world || !hand.hasCollisionBody()) {
             return;
@@ -5386,6 +5972,7 @@ namespace rock
         _expectedWeaponLayerMask = 0;
         _expectedReloadLayerMask = 0;
         _expectedBodyLayerMask = 0;
+        _expectedDynamicHandProxyLayerMask = 0;
         _originalNativeCharacterControllerLayerMask = 0;
         _expectedNativeCharacterControllerLayerMask = 0;
         _nativeCharacterControllerLayerPolicyCaptured = false;
@@ -5406,6 +5993,11 @@ namespace rock
         _feedbackHaptics.reset();
         _grabInputIntentStates = {};
         _peerHeldJoinRetryStates = {};
+        for (auto& consumedEdge : _hostConsumedGrabInputEdge) {
+            consumedEdge.store(false, std::memory_order_release);
+        }
+        _hostConsumedWeaponInputFrameMask = {};
+        _hostConsumedNormalGrabInputFrameMask = {};
         _heldWeaponTriggerEquipIntents = {};
         _forceGrabCommittedThisFrame = {};
         _bareFistGuardState = {};
@@ -5722,6 +6314,7 @@ namespace rock
         ROCK_LOG_DEBUG(Config, "Layer {} pre-set mask=0x{:016X}", collision_layer_policy::ROCK_LAYER_WEAPON, matrix[collision_layer_policy::ROCK_LAYER_WEAPON]);
         ROCK_LOG_DEBUG(Config, "Layer {} pre-set mask=0x{:016X}", collision_layer_policy::ROCK_LAYER_RELOAD, matrix[collision_layer_policy::ROCK_LAYER_RELOAD]);
         ROCK_LOG_DEBUG(Config, "Layer {} pre-set mask=0x{:016X}", collision_layer_policy::ROCK_LAYER_BODY, matrix[collision_layer_policy::ROCK_LAYER_BODY]);
+        ROCK_LOG_DEBUG(Config, "Layer {} pre-set mask=0x{:016X}", collision_layer_policy::ROCK_LAYER_DYNAMIC_HAND_PROXY, matrix[collision_layer_policy::ROCK_LAYER_DYNAMIC_HAND_PROXY]);
         ROCK_LOG_DEBUG(Config, "Layer {} pre-set mask=0x{:016X}", collision_layer_policy::FO4_LAYER_CHARCONTROLLER, matrix[collision_layer_policy::FO4_LAYER_CHARCONTROLLER]);
 
         if (!_nativeCharacterControllerLayerPolicyCaptured) {
@@ -5754,6 +6347,10 @@ namespace rock
                 g_rockConfig.rockWeaponCollisionBlocksSpells,
                 g_rockConfig.rockHandCollisionStaticWorldEnabled);
         _expectedBodyLayerMask = collision_layer_policy::buildRockBodyExpectedMask(g_rockConfig.rockBodyBoneCollisionStaticWorldEnabled);
+        _expectedDynamicHandProxyLayerMask =
+            collision_layer_policy::buildRockDynamicHandProxyExpectedMask(
+                g_rockConfig.
+                    rockHandCollisionStaticWorldEnabled);
         _expectedNativeCharacterControllerLayerMask =
             collision_layer_policy::nativeCharacterControllerExpectedMask(
                 _originalNativeCharacterControllerLayerMask,
@@ -5766,7 +6363,7 @@ namespace rock
             nativeControllerObjectPairsMatch ? "native" : "bad";
 
         ROCK_LOG_INFO(Config,
-            "Registered ROCK collision layers: hand={} mask=0x{:016X}, weapon={} mask=0x{:016X}, reload={} mask=0x{:016X}, body={} mask=0x{:016X}, actorPairs(biped={},deadbip={},bipedNoCC={}), bodyPairs(hand={},weapon={},self={},static={},animstatic={},clutter={},query={},charController={}), handStaticWorld={}, weaponStaticWorld={}, bodyStaticWorld={}, projectiles={}, spells={}, nativePlayerObjectPairs={} (smallPropsAndCars={})",
+            "Registered ROCK collision layers: hand={} mask=0x{:016X}, weapon={} mask=0x{:016X}, reload={} mask=0x{:016X}, body={} mask=0x{:016X}, dynamicHandProxy={} mask=0x{:016X} pairs={}, actorPairs(biped={},deadbip={},bipedNoCC={}), bodyPairs(hand={},weapon={},self={},static={},animstatic={},clutter={},query={},charController={}), handStaticWorld={}, weaponStaticWorld={}, bodyStaticWorld={}, projectiles={}, spells={}, nativePlayerObjectPairs={} (smallPropsAndCars={})",
             collision_layer_policy::ROCK_LAYER_HAND,
             matrix[collision_layer_policy::ROCK_LAYER_HAND],
             collision_layer_policy::ROCK_LAYER_WEAPON,
@@ -5775,6 +6372,11 @@ namespace rock
             matrix[collision_layer_policy::ROCK_LAYER_RELOAD],
             collision_layer_policy::ROCK_LAYER_BODY,
             matrix[collision_layer_policy::ROCK_LAYER_BODY],
+            collision_layer_policy::ROCK_LAYER_DYNAMIC_HAND_PROXY,
+            matrix[collision_layer_policy::ROCK_LAYER_DYNAMIC_HAND_PROXY],
+            collision_layer_policy::rockDynamicHandProxyPairsMatch(
+                matrix,
+                _expectedDynamicHandProxyLayerMask) ? "ok" : "bad",
             collision_layer_policy::layerPairSymmetricMatches(
                 matrix,
                 collision_layer_policy::ROCK_LAYER_HAND,
@@ -5900,6 +6502,179 @@ namespace rock
         return true;
     }
 
+    bool PhysicsInteraction::hostGetHeldObjectSnapshot(
+        bool isLeft,
+        RE::TESObjectREFR*& outRef,
+        RE::NiAVObject*& outHeldNode,
+        float& outHeldSeconds,
+        float& outHandSpeedMetersPerSecond,
+        std::uint64_t& outGrabTraceId) const
+    {
+        outRef = nullptr;
+        outHeldNode = nullptr;
+        outHeldSeconds = 0.0f;
+        outHandSpeedMetersPerSecond = 0.0f;
+        outGrabTraceId = 0;
+
+        if (!_initialized.load(std::memory_order_acquire)) {
+            return false;
+        }
+
+        const auto& hand = isLeft ? _leftHand : _rightHand;
+        auto* heldRef = hand.isHolding() ? hand.getHeldRef() : nullptr;
+        if (!heldRef || heldRef->IsDeleted() || heldRef->IsDisabled() ||
+            hand.getGrabTraceId() == 0) {
+            return false;
+        }
+
+        outRef = heldRef;
+        outHeldNode = hand.getHeldNode();
+        if (!outHeldNode) {
+            outHeldNode = heldRef->Get3D();
+        }
+        outHeldSeconds = hand.getGrabElapsedSeconds();
+        outHandSpeedMetersPerSecond =
+            hand.getHeldHandSpeedMetersPerSecond();
+        outGrabTraceId = hand.getGrabTraceId();
+        return true;
+    }
+
+    bool PhysicsInteraction::hostReleaseHeldObjectForInventory(
+        bool isLeft,
+        RE::TESObjectREFR* expectedRef,
+        std::uint64_t expectedGrabTraceId)
+    {
+        if (!_initialized.load(std::memory_order_acquire) ||
+            !expectedRef || expectedGrabTraceId == 0) {
+            return false;
+        }
+
+        Hand& requestedHand = isLeft ? _leftHand : _rightHand;
+        if (!requestedHand.isHolding() ||
+            requestedHand.getHeldRef() != expectedRef ||
+            requestedHand.getGrabTraceId() != expectedGrabTraceId) {
+            ROCK_LOG_WARN(Hand,
+                "ROCK(host): exact inventory release rejected for {} hand; held reference or grab trace changed",
+                isLeft ? "left" : "right");
+            return false;
+        }
+
+        auto* bhk = getPlayerBhkWorld();
+        auto* hknp = bhk ? getHknpWorld(bhk) : nullptr;
+        if (!hknp) {
+            ROCK_LOG_WARN(Hand,
+                "ROCK(host): exact inventory release rejected; live physics world unavailable");
+            return false;
+        }
+
+        struct ReleasedHand
+        {
+            bool isLeft = false;
+            std::uint32_t primaryBodyId = INVALID_BODY_ID;
+            GrabReleaseOutcome outcome{};
+        };
+        std::array<ReleasedHand, 2> releasedHands{};
+        std::size_t releasedCount = 0;
+        Hand& peerHand = isLeft ? _rightHand : _leftHand;
+        const std::size_t expectedReleaseCount =
+            1u + ((peerHand.isHolding() &&
+                       peerHand.getHeldRef() == expectedRef) ?
+                       1u :
+                       0u);
+
+        auto releaseMatchingHand = [&](Hand& hand, bool releaseIsLeft) {
+            if (!hand.isHolding() || hand.getHeldRef() != expectedRef ||
+                releasedCount >= releasedHands.size()) {
+                return;
+            }
+
+            auto releaseContext =
+                makeGrabReleaseContext(hand, releaseIsLeft);
+            releaseContext.disposition =
+                GrabReleaseDisposition::TransferToInventory;
+            releaseContext.applyCapturedReleaseVelocity = false;
+            releaseContext.reason = "host-scripted-inventory-transfer";
+
+            ReleasedHand& record = releasedHands[releasedCount];
+            record.isLeft = releaseIsLeft;
+            record.primaryBodyId =
+                hand.getSavedObjectState().bodyId.value;
+            record.outcome = hand.releaseGrabbedObject(
+                hknp,
+                GrabReleaseCollisionRestoreMode::Immediate,
+                releaseContext);
+            if (!record.outcome.released) {
+                return;
+            }
+
+            releaseObject(
+                expectedRef,
+                claimOwnerForHand(releaseIsLeft));
+            shoulder_stash::resetRuntime(
+                _shoulderStashStates[releaseIsLeft ? 1u : 0u]);
+            mouth_consume::resetRuntime(
+                _mouthConsumeStates[releaseIsLeft ? 1u : 0u]);
+            hand.cancelStashCandidate();
+            hand.cancelConsumeCandidate();
+            input_remap_runtime::setHandHeldWeapon(
+                releaseIsLeft,
+                false);
+            input_remap_runtime::setHeldObjectFormId(
+                releaseIsLeft,
+                0u);
+            ++releasedCount;
+        };
+
+        // Release the exact requested session first. makeGrabReleaseContext
+        // observes a peer co-hold and makes only the second release final.
+        releaseMatchingHand(requestedHand, isLeft);
+        releaseMatchingHand(peerHand, !isLeft);
+
+        const std::uint32_t formID = expectedRef->GetFormID();
+        for (std::size_t i = 0; i < releasedCount; ++i) {
+            const auto& record = releasedHands[i];
+            dispatchPhysicsMessage(
+                kPhysMsg_OnRelease,
+                record.isLeft,
+                expectedRef,
+                formID,
+                0);
+            dispatchSimpleGrabEvent(
+                GrabEventType::Released,
+                record.isLeft,
+                expectedRef,
+                record.primaryBodyId);
+        }
+
+        ROCK_LOG_INFO(Hand,
+            "ROCK(host): scripted inventory transfer released formID={:08X} hands={} requestedHand={} trace={}",
+            formID,
+            releasedCount,
+            isLeft ? "left" : "right",
+            expectedGrabTraceId);
+        const bool requestedStillHolds =
+            requestedHand.isHolding() &&
+            requestedHand.getHeldRef() == expectedRef;
+        const bool peerStillHolds =
+            peerHand.isHolding() &&
+            peerHand.getHeldRef() == expectedRef;
+        const bool complete =
+            releasedCount == expectedReleaseCount &&
+            !requestedStillHolds &&
+            !peerStillHolds;
+        if (!complete) {
+            ROCK_LOG_ERROR(Hand,
+                "ROCK(host): scripted inventory transfer INCOMPLETE formID={:08X} released={}/{} requestedStillHolds={} peerStillHolds={} trace={}",
+                formID,
+                releasedCount,
+                expectedReleaseCount,
+                requestedStillHolds ? "yes" : "no",
+                peerStillHolds ? "yes" : "no",
+                expectedGrabTraceId);
+        }
+        return complete;
+    }
+
     std::uint32_t PhysicsInteraction::hostCopyHandCollisionSamples(
         bool isLeft,
         RE::NiPoint3* outWorldPoints,
@@ -5953,35 +6728,142 @@ namespace rock
 
     void PhysicsInteraction::finalizeWeaponAuthorityAfterHostHands()
     {
+        PostHostGeneratedDriveFinalize pending =
+            std::move(_postHostGeneratedDriveFinalize);
+        _postHostGeneratedDriveFinalize = {};
+        if (!pending.pending) {
+            return;
+        }
+
         if (!_initialized.load(std::memory_order_acquire)) {
             return;
         }
 
-        RE::NiNode* weaponNode = resolveEquippedWeaponInteractionNode();
-        const bool republishedOwnedWeapon =
-            _twoHandedGrip.
-                republishOwnedWeaponTransform(
-                    weaponNode);
-        RE::NiPoint3 wallCorrection{};
-        bool wallCorrectionHandIsLeft = false;
-        const bool nativeWeaponMovedWithCorrectedHand =
-            _softContactRuntime.
-                getWeaponWorldCorrection(
-                    wallCorrection,
-                    wallCorrectionHandIsLeft);
-        if (!republishedOwnedWeapon &&
-            !nativeWeaponMovedWithCorrectedHand) {
+        auto* currentBhkWorld = getPlayerBhkWorld();
+        auto* currentHknpWorld = currentBhkWorld ?
+                                     getHknpWorld(currentBhkWorld) :
+                                     nullptr;
+        RE::NiNode* weaponNode =
+            resolveEquippedWeaponInteractionNode();
+        const std::uint64_t currentWeaponGenerationKey =
+            _weaponCollision.getCurrentWeaponGenerationKey();
+        const bool sameFrame =
+            pending.gameFrameIndex ==
+            _palmClockGameFrameIndex.load(std::memory_order_acquire);
+        const bool sameLifecycle =
+            pending.worldGeneration ==
+                _worldGenerationAtomic.load(std::memory_order_acquire) &&
+            pending.skeletonGeneration ==
+                _skeletonGenerationAtomic.load(std::memory_order_acquire) &&
+            pending.providerGeneration ==
+                _providerGenerationAtomic.load(std::memory_order_acquire) &&
+            pending.collisionGeneration ==
+                _collisionGenerationAtomic.load(std::memory_order_acquire);
+        const bool sameWorld =
+            currentBhkWorld && currentHknpWorld &&
+            pending.bhkWorld == currentBhkWorld &&
+            pending.hknpWorld == currentHknpWorld;
+        const bool sameWeapon =
+            pending.weaponGenerationKey ==
+                currentWeaponGenerationKey &&
+            pending.weaponNode.get() == weaponNode;
+        const bool finalizeRecordCurrent =
+            post_host_generated_drive_finalize_policy::isCurrent(
+                pending.pending,
+                true,
+                post_host_generated_drive_finalize_policy::Identity{
+                    .gameFrameIndex = pending.gameFrameIndex,
+                    .weaponGenerationKey = pending.weaponGenerationKey,
+                    .worldGeneration = pending.worldGeneration,
+                    .skeletonGeneration = pending.skeletonGeneration,
+                    .providerGeneration = pending.providerGeneration,
+                    .collisionGeneration = pending.collisionGeneration,
+                    .bhkWorld = reinterpret_cast<std::uintptr_t>(pending.bhkWorld),
+                    .hknpWorld = reinterpret_cast<std::uintptr_t>(pending.hknpWorld),
+                    .weaponNode = reinterpret_cast<std::uintptr_t>(pending.weaponNode.get()),
+                },
+                post_host_generated_drive_finalize_policy::Identity{
+                    .gameFrameIndex = _palmClockGameFrameIndex.load(std::memory_order_acquire),
+                    .weaponGenerationKey = currentWeaponGenerationKey,
+                    .worldGeneration = _worldGenerationAtomic.load(std::memory_order_acquire),
+                    .skeletonGeneration = _skeletonGenerationAtomic.load(std::memory_order_acquire),
+                    .providerGeneration = _providerGenerationAtomic.load(std::memory_order_acquire),
+                    .collisionGeneration = _collisionGenerationAtomic.load(std::memory_order_acquire),
+                    .bhkWorld = reinterpret_cast<std::uintptr_t>(currentBhkWorld),
+                    .hknpWorld = reinterpret_cast<std::uintptr_t>(currentHknpWorld),
+                    .weaponNode = reinterpret_cast<std::uintptr_t>(weaponNode),
+                });
+        if (!finalizeRecordCurrent) {
+            ROCK_LOG_SAMPLE_WARN(
+                Weapon,
+                1000,
+                "Post-host generated-drive finalize rejected stale frame/world/weapon record frame={} currentFrame={} lifecycle={} world={} weapon={} pendingGeneration={} currentGeneration={}",
+                pending.gameFrameIndex,
+                _palmClockGameFrameIndex.load(std::memory_order_acquire),
+                sameLifecycle ? "same" : "changed",
+                sameWorld ? "same" : "changed",
+                sameWeapon ? "same" : "changed",
+                pending.weaponGenerationKey,
+                currentWeaponGenerationKey);
             return;
         }
 
-        // Collision targets were already queued from the raw controller/grip
-        // frame at update() tail. Queueing again would erase sampled velocity;
-        // only the final post-host projectile/fire-node seam needs publication.
-        if (weaponNode &&
-            f4vr::isNodeVisible(weaponNode)) {
+        // The host hand winner has now moved a native firing-hand-owned weapon.
+        // ROCK-owned two-hand/part-carry authority is absolute, so reassert it
+        // once before sampling any final weapon output.
+        (void)_twoHandedGrip.republishOwnedWeaponTransform(weaponNode);
+
+        // Projectiles/optics and collision must observe this exact post-host
+        // pose. Queue the weapon bodies once, then register the physics-step
+        // listener last so no callback can consume the prior target.
+        if (weaponNode && f4vr::isNodeVisible(weaponNode)) {
             applyFinalWeaponMuzzleAuthority();
         }
-        (void)wallCorrectionHandIsLeft;
+        if (weaponNode) {
+            std::array<
+                const RE::NiAVObject*,
+                ::rock::provider::
+                    ROCK_PROVIDER_MAX_WEAPON_PART_DRIVES_V1>
+                drivenSourceNodes{};
+            std::size_t drivenSourceNodeCount = 0;
+            if (_providerWeaponPartDriveGenerationKey ==
+                currentWeaponGenerationKey) {
+                for (const auto& state :
+                     _providerWeaponPartDriveNodeStates) {
+                    if (!state.activeThisFrame || !state.node ||
+                        drivenSourceNodeCount >=
+                            drivenSourceNodes.size() ||
+                        !actor_equipment_grab::nodeContainsNode(
+                            weaponNode,
+                            state.node,
+                            64)) {
+                        continue;
+                    }
+                    drivenSourceNodes[drivenSourceNodeCount++] =
+                        state.node;
+                }
+            }
+
+            performance_profiler::ScopedTimer profilerTimer(
+                performance_profiler::Scope::
+                    WeaponCollisionTransforms);
+            _weaponCollision.
+                updateBodiesFromCurrentSourceTransforms(
+                    currentHknpWorld,
+                    weaponNode,
+                    pending.deltaSeconds,
+                    drivenSourceNodes.data(),
+                    drivenSourceNodeCount);
+            // The just-queued target velocities belong to the segment that
+            // the next physics solve will contact. Publish them before the
+            // step listener runs; an earlier registry snapshot would compare
+            // hand motion against the weapon's previous segment.
+            refreshGeneratedBodyContactRegistry();
+        }
+
+        _generatedBodyStepDrive.registerForNextStep(
+            currentBhkWorld,
+            currentHknpWorld);
     }
 
     void PhysicsInteraction::destroyHandCollisions(void* bhkWorld)
@@ -6210,10 +7092,17 @@ namespace rock
 
         const auto gameFrameIndex = _palmClockGameFrameIndex.load(std::memory_order_acquire);
         const auto gameDeltaSeconds = _palmClockGameDeltaSeconds.load(std::memory_order_acquire);
+        GrabRoomMotionFrame roomMotionFrame{};
+        roomMotionFrame.gameFrameIndex = gameFrameIndex;
+        if (g_rockConfig.rockGrabRoomVelocityFeedForward || g_rockConfig.rockGrabLocomotionTransport) {
+            roomMotionFrame.velocityUsable =
+                character_controller_runtime::tryGetPlayerLocomotionVelocityRawGameUnits(
+                    roomMotionFrame.velocityGameUnitsPerSecond);
+        }
         logPalmClockSampleForHand("physics-between-before-grab-flush", _rightHand, world, nullptr, gameFrameIndex, gameDeltaSeconds, &timing);
         logPalmClockSampleForHand("physics-between-before-grab-flush", _leftHand, world, nullptr, gameFrameIndex, gameDeltaSeconds, &timing);
-        _rightHand.flushPendingCustomGrabAuthority(world, timing);
-        _leftHand.flushPendingCustomGrabAuthority(world, timing);
+        _rightHand.flushPendingCustomGrabAuthority(world, timing, roomMotionFrame);
+        _leftHand.flushPendingCustomGrabAuthority(world, timing, roomMotionFrame);
     }
 
     void PhysicsInteraction::observeCustomGrabAuthorityAfterSolve(RE::hknpWorld* world, const havok_physics_timing::PhysicsTimingSample& timing)
@@ -6288,6 +7177,10 @@ namespace rock
             _leftHand,
             _pendingForceGrabCommits[1].active ? leftPendingTargetPtr.get() : nullptr);
         const auto farHmdConeGate = makeFarSelectionHmdConeGate(frame);
+        auto* rightHostViewCasterTarget =
+            HostGetViewCasterGrabCandidate(false);
+        auto* leftHostViewCasterTarget =
+            HostGetViewCasterGrabCandidate(true);
 
         if (_pendingForceGrabCommits[0].active) {
             if (_rightHand.hasSelection()) {
@@ -6307,7 +7200,8 @@ namespace rock
                 g_rockConfig.rockNearDetectionRange,
                 g_rockConfig.rockFarDetectionRange,
                 frame.deltaSeconds,
-                leftHandContext);
+                leftHandContext,
+                rightHostViewCasterTarget);
             _rightHand.updateSelectionBeam(frame.hknpWorld, frame.right.grabAnchorWorld);
         } else {
             _rightHand.stopSelectionBeam();
@@ -6331,7 +7225,8 @@ namespace rock
                 g_rockConfig.rockNearDetectionRange,
                 g_rockConfig.rockFarDetectionRange,
                 frame.deltaSeconds,
-                rightHandContext);
+                rightHandContext,
+                leftHostViewCasterTarget);
             _leftHand.updateSelectionBeam(frame.hknpWorld, frame.left.grabAnchorWorld);
         } else {
             _leftHand.stopSelectionBeam();
@@ -6363,6 +7258,7 @@ namespace rock
             .peerSavedObjectState = &peer.getSavedObjectState(),
             .peerActiveGrabLifecycle = &peer.getActiveGrabLifecycle(),
             .peerHeldBodyIds = &peer.getHeldBodyIds(),
+            .peerHeldObjectRuntime = peer.getSharedHeldObjectRuntime(),
         };
     }
 
@@ -8722,7 +9618,7 @@ namespace rock
              * of falling back to a contaminated visual/proxy transform.
              */
             RE::NiTransform preAuthorityHandWorld{};
-            if (!rock::HostGetPreAuthorityHandWorld(isLeft, preAuthorityHandWorld) ||
+            if (!rock::HostGetCleanPreAuthorityHandWorld(isLeft, preAuthorityHandWorld) ||
                 !finiteNiTransform(preAuthorityHandWorld)) {
                 ROCK_LOG_SAMPLE_WARN(Weapon,
                     g_rockConfig.rockLogSampleMilliseconds,
@@ -8882,7 +9778,14 @@ namespace rock
             _grabLocomotionAuthorityBridge,
             grab_locomotion_authority_bridge::Input{
                 .config = grab_locomotion_authority_bridge::Config{
-                    .enabled = g_rockConfig.rockGrabLocomotionAuthorityBridgeEnabled,
+                    .enabled = dynamic_grab_policy::
+                        shouldUseLegacyLocomotionAuthorityBridge(
+                            g_rockConfig.
+                                rockGrabLocomotionAuthorityBridgeEnabled,
+                            g_rockConfig.
+                                rockGrabRoomVelocityFeedForward,
+                            g_rockConfig.
+                                rockGrabLocomotionTransport),
                     .maxLeadSeconds = g_rockConfig.rockGrabLocomotionAuthorityMaxLeadSeconds,
                     .smoothingHz = g_rockConfig.rockGrabLocomotionAuthoritySmoothingHz,
                     .maxOffsetGameUnits = g_rockConfig.rockGrabLocomotionAuthorityMaxOffsetGameUnits,
@@ -8891,7 +9794,11 @@ namespace rock
                 .playerSpaceValid = playerSpace.valid,
                 .playerMoving = playerSpace.moving,
                 .heldObjectActive = anyHandHolding,
-                .worldOrMenuReset = !worldReady || runtime.localMenuBlocking || runtime.localLoadingMenuOpen || runtime.localGameStopped || runtime.compatibilityConfigBlocking,
+                // localGameStopped is the engine's broad menu bit and is also
+                // asserted by the gameplay-transparent Favorites/Pip-Boy
+                // overlays. Reset transport only for ROCK's filtered blocking
+                // menu state (loading remains an explicit hard reset).
+                .worldOrMenuReset = !worldReady || runtime.localMenuBlocking || runtime.localLoadingMenuOpen || runtime.compatibilityConfigBlocking,
                 .playerPositionGame = toGrabLocomotionAuthorityVec(playerSpace.world.translate),
                 .playerDeltaGameUnits = toGrabLocomotionAuthorityVec(playerSpace.deltaGameUnits),
                 .deltaSeconds = deltaSeconds,
@@ -8983,20 +9890,20 @@ namespace rock
                 g_rockConfig.rockGrabPlayerSpaceWarpMinRotationDegrees);
         }
         /*
-         * Continuous locomotion compensation: warp held bodies through the
-         * player-space delta EVERY frame, not only on teleport/snap-turn scale
-         * jumps. Velocity-level compensation alone leaves a speed-proportional
-         * trail against the finite-force grab motors during smooth locomotion
-         * (the visual hand then follows the trailing body and the arm IK
-         * stretches). The per-frame warp moves held bodies with the player
-         * exactly, so the motors only ever solve hand-relative grip error.
+         * Transform warps bypass Havok collision. The physical locomotion
+         * transport path therefore excludes the old every-frame warp and keeps
+         * transform warps only for large distance/rotation discontinuities.
+         * The legacy continuous mode remains available only when transport is
+         * explicitly disabled.
          */
         const float playerDeltaSq =
             frame.deltaGameUnits.x * frame.deltaGameUnits.x +
             frame.deltaGameUnits.y * frame.deltaGameUnits.y +
             frame.deltaGameUnits.z * frame.deltaGameUnits.z;
         const bool warpByContinuous =
-            g_rockConfig.rockGrabPlayerSpaceContinuousWarp &&
+            dynamic_grab_policy::allowContinuousPlayerSpaceWarp(
+                g_rockConfig.rockGrabPlayerSpaceContinuousWarp,
+                g_rockConfig.rockGrabLocomotionTransport) &&
             _hasHeldPlayerSpacePosition &&
             frame.hasWarpTransforms &&
             playerDeltaSq > 1.0e-6f;
@@ -9026,14 +9933,19 @@ namespace rock
     void PhysicsInteraction::applyHeldPlayerSpaceVelocity(RE::hknpWorld* hknp)
     {
         /*
-         * Held object motion has one velocity authority while the grab is active:
-         * the grab constraint targets plus this single player-space compensation
-         * pass. Per-hand held loops only sample local velocity for throw history,
-         * avoiding two hands or connected bodies writing the same Havok motion
-         * more than once.
-         */
+         * Exactly one standing player-space velocity authority is active. The
+         * per-motion locomotion transport owns it in the default physical path;
+         * this central pass becomes transform-only for genuine discontinuities.
+         * If transport is disabled, the legacy central velocity writer resumes.
+        */
+        _heldObjectPlayerSpaceFrame.runtimeTransformWarpApplied = false;
+        _heldObjectPlayerSpaceFrame.rightHandRuntimeTransformWarpApplied = false;
+        _heldObjectPlayerSpaceFrame.leftHandRuntimeTransformWarpApplied = false;
+        _heldObjectPlayerSpaceFrame.rightHandRuntimeTransformWarpRetryPending = false;
+        _heldObjectPlayerSpaceFrame.leftHandRuntimeTransformWarpRetryPending = false;
         if (!hknp) {
             _lastCentralHeldPlayerSpaceVelocityHavok = {};
+            _heldPlayerSpaceWarpRetryCount = 0;
             return;
         }
 
@@ -9045,6 +9957,7 @@ namespace rock
         // write a motion.
         if (!_rightHand.isHolding() && !_leftHand.isHolding()) {
             _lastCentralHeldPlayerSpaceVelocityHavok = {};
+            _heldPlayerSpaceWarpRetryCount = 0;
             return;
         }
 
@@ -9069,6 +9982,17 @@ namespace rock
         appendHandBodies(_rightHand);
         appendHandBodies(_leftHand);
 
+        std::vector<std::uint32_t> proxyBodyIds;
+        proxyBodyIds.reserve(2);
+        if (_rightHand.isHolding()) {
+            proxyBodyIds.push_back(
+                _rightHand.getGrabAuthorityProxyBodyId().value);
+        }
+        if (_leftHand.isHolding()) {
+            proxyBodyIds.push_back(
+                _leftHand.getGrabAuthorityProxyBodyId().value);
+        }
+
         const float keep = g_rockConfig.rockGrabResidualVelocityDamping ?
                                held_object_damping_math::velocityKeepFactor(g_rockConfig.rockGrabVelocityDamping) :
                                1.0f;
@@ -9076,6 +10000,10 @@ namespace rock
             g_rockConfig.rockGrabPlayerSpaceTransformWarpEnabled,
             _heldObjectPlayerSpaceFrame.warp,
             _heldObjectPlayerSpaceFrame.hasWarpTransforms);
+        const bool centralOwnsVelocity =
+            dynamic_grab_policy::centralPlayerSpaceOwnsVelocity(
+                _heldObjectPlayerSpaceFrame.enabled,
+                g_rockConfig.rockGrabLocomotionTransport);
 
         const auto result = held_player_space_registry::applyCentralPlayerSpaceVelocity(
             hknp,
@@ -9084,14 +10012,132 @@ namespace rock
             _lastCentralHeldPlayerSpaceVelocityHavok,
             keep,
             _heldObjectPlayerSpaceFrame.enabled,
+            centralOwnsVelocity,
             runtimeTransformWarp,
             runtimeTransformWarp ? &_heldObjectPlayerSpaceFrame.previousPlayerSpaceWorld : nullptr,
-            runtimeTransformWarp ? &_heldObjectPlayerSpaceFrame.currentPlayerSpaceWorld : nullptr);
+            runtimeTransformWarp ? &_heldObjectPlayerSpaceFrame.currentPlayerSpaceWorld : nullptr,
+            runtimeTransformWarp ? &proxyBodyIds : nullptr);
 
-        if (held_player_space_registry::shouldCarryPreviousPlayerVelocity(
-                _heldObjectPlayerSpaceFrame.enabled,
-                runtimeTransformWarp,
-                result.motionsWritten)) {
+        auto warpTransactionInput = result.warpTransaction;
+        held_player_space_warp_policy::Decision warpTransactionDecision{};
+        if (runtimeTransformWarp) {
+            constexpr std::uint32_t kMaxSafeWarpRetries = 3;
+            const bool nativeBatchComplete =
+                warpTransactionInput.preflightComplete &&
+                warpTransactionInput.queuedTransformWrites ==
+                    warpTransactionInput.requiredTransformWrites &&
+                warpTransactionInput.queuedVelocityWrites ==
+                    warpTransactionInput.requiredVelocityWrites;
+            if (nativeBatchComplete) {
+                _heldPlayerSpaceWarpRetryCount = 0;
+            } else if (_heldPlayerSpaceWarpRetryCount <
+                       (std::numeric_limits<std::uint32_t>::max)()) {
+                ++_heldPlayerSpaceWarpRetryCount;
+            }
+            warpTransactionInput.consecutiveRetryCount =
+                _heldPlayerSpaceWarpRetryCount;
+            warpTransactionInput.maxSafeRetries = kMaxSafeWarpRetries;
+            warpTransactionDecision =
+                held_player_space_warp_policy::evaluate(
+                    warpTransactionInput);
+
+            if (warpTransactionDecision.action ==
+                held_player_space_warp_policy::Action::Retry) {
+                // sampleHeldObjectPlayerSpaceFrame advanced these baselines
+                // before native preflight. The complete batch either queued no
+                // writes or queued compensating rollback commands, so retain
+                // the old basis and retry the same old->new warp next frame.
+                _prevHeldPlayerSpacePosition =
+                    _heldObjectPlayerSpaceFrame.
+                        previousPlayerSpaceWorld.translate;
+                _prevHeldPlayerSpaceTransform =
+                    _heldObjectPlayerSpaceFrame.previousPlayerSpaceWorld;
+                _hasHeldPlayerSpacePosition = true;
+                _hasHeldPlayerSpaceTransform = true;
+                _heldObjectPlayerSpaceFrame.
+                    rightHandRuntimeTransformWarpRetryPending =
+                    _rightHand.isHolding();
+                _heldObjectPlayerSpaceFrame.
+                    leftHandRuntimeTransformWarpRetryPending =
+                    _leftHand.isHolding();
+                _rightHand.prepareHeldPlayerSpaceWarpRetry();
+                _leftHand.prepareHeldPlayerSpaceWarpRetry();
+            } else if (warpTransactionDecision.action ==
+                       held_player_space_warp_policy::Action::FailClosed) {
+                _heldPlayerSpaceWarpRetryCount = 0;
+                _rightHand.invalidateGrabAfterPlayerSpaceWarpFailure();
+                _leftHand.invalidateGrabAfterPlayerSpaceWarpFailure();
+            }
+        } else {
+            _heldPlayerSpaceWarpRetryCount = 0;
+        }
+
+        const auto handHasWarpedMotion = [&](const Hand& hand) {
+            if (!hand.isHolding()) {
+                return false;
+            }
+            const auto bodyMotionWasWarped = [&](const std::uint32_t bodyId) {
+                if (bodyId == INVALID_BODY_ID) {
+                    return false;
+                }
+                auto* body = havok_runtime::getBody(
+                    hknp,
+                    RE::hknpBodyId{ bodyId });
+                return body && result.motionWasWarped(body->motionIndex);
+            };
+            if (bodyMotionWasWarped(
+                    hand.getSavedObjectState().bodyId.value)) {
+                return true;
+            }
+            return std::any_of(
+                hand.getHeldBodyIds().begin(),
+                hand.getHeldBodyIds().end(),
+                bodyMotionWasWarped);
+        };
+        const bool warpTransactionCommitted =
+            runtimeTransformWarp &&
+            warpTransactionDecision.action ==
+                held_player_space_warp_policy::Action::Commit;
+        _heldObjectPlayerSpaceFrame.rightHandRuntimeTransformWarpApplied =
+            warpTransactionCommitted && handHasWarpedMotion(_rightHand);
+        _heldObjectPlayerSpaceFrame.leftHandRuntimeTransformWarpApplied =
+            warpTransactionCommitted && handHasWarpedMotion(_leftHand);
+        _heldObjectPlayerSpaceFrame.runtimeTransformWarpApplied =
+            _heldObjectPlayerSpaceFrame.rightHandRuntimeTransformWarpApplied ||
+            _heldObjectPlayerSpaceFrame.leftHandRuntimeTransformWarpApplied;
+        if (_heldObjectPlayerSpaceFrame.runtimeTransformWarpApplied) {
+            ++_heldPlayerSpaceWarpSequence;
+            if (_heldPlayerSpaceWarpSequence == 0) {
+                ++_heldPlayerSpaceWarpSequence;
+            }
+            if (_heldObjectPlayerSpaceFrame.
+                    rightHandRuntimeTransformWarpApplied) {
+                _rightHand.rebaseHeldMotionAfterPlayerSpaceWarp(
+                    hknp,
+                    _heldObjectPlayerSpaceFrame.previousPlayerSpaceWorld,
+                    _heldObjectPlayerSpaceFrame.currentPlayerSpaceWorld,
+                    _heldPlayerSpaceWarpSequence,
+                    result.warpedMotionIndices);
+            }
+            if (_heldObjectPlayerSpaceFrame.
+                    leftHandRuntimeTransformWarpApplied) {
+                _leftHand.rebaseHeldMotionAfterPlayerSpaceWarp(
+                    hknp,
+                    _heldObjectPlayerSpaceFrame.previousPlayerSpaceWorld,
+                    _heldObjectPlayerSpaceFrame.currentPlayerSpaceWorld,
+                    _heldPlayerSpaceWarpSequence,
+                    result.warpedMotionIndices);
+            }
+        }
+
+        if (runtimeTransformWarp &&
+            warpTransactionDecision.action ==
+                held_player_space_warp_policy::Action::Retry) {
+            // Preserve the pre-transaction contribution until commit.
+        } else if (held_player_space_registry::shouldCarryPreviousPlayerVelocity(
+                       centralOwnsVelocity,
+                       runtimeTransformWarp,
+                       result.motionsWritten)) {
             _lastCentralHeldPlayerSpaceVelocityHavok = _heldObjectPlayerSpaceFrame.velocityHavok;
         } else {
             _lastCentralHeldPlayerSpaceVelocityHavok = {};
@@ -9100,14 +10146,36 @@ namespace rock
         if (g_rockConfig.rockDebugGrabFrameLogging && !bodyIds.empty()) {
             ROCK_LOG_SAMPLE_DEBUG(Hand,
                 g_rockConfig.rockLogSampleMilliseconds,
-                "Held player-space central writer: beforeHeld=yes diagWarp={} runtimeWarp={} distWarp={} rotWarp={} bodies={} registered={} motionsWritten={} transformsWarped={} duplicateMotions={} writerMask=0x{:02X}",
+                "Held player-space central writer: beforeHeld=yes velocityOwner={} diagWarp={} runtimeWarp={} warpAction={} warpReason={} retryCount={} warpApplied={} rightWarp={} leftWarp={} rightRetry={} leftRetry={} distWarp={} rotWarp={} bodies={} proxies={} registered={} txTransforms={}/{} txVelocities={}/{} rollback={}/{}+{}/{} motionsWritten={} motionsReoriented={} transformsWarped={} duplicateMotions={} writerMask=0x{:02X}",
+                centralOwnsVelocity ? "central" : "transport",
                 _heldObjectPlayerSpaceFrame.warp ? "yes" : "no",
                 runtimeTransformWarp ? "yes" : "no",
+                runtimeTransformWarp ?
+                    (warpTransactionDecision.action == held_player_space_warp_policy::Action::Commit ? "commit" :
+                         (warpTransactionDecision.action == held_player_space_warp_policy::Action::Retry ? "retry" : "failClosed")) :
+                    "none",
+                runtimeTransformWarp ? warpTransactionDecision.reason : "none",
+                _heldPlayerSpaceWarpRetryCount,
+                _heldObjectPlayerSpaceFrame.runtimeTransformWarpApplied ? "yes" : "no",
+                _heldObjectPlayerSpaceFrame.rightHandRuntimeTransformWarpApplied ? "yes" : "no",
+                _heldObjectPlayerSpaceFrame.leftHandRuntimeTransformWarpApplied ? "yes" : "no",
+                _heldObjectPlayerSpaceFrame.rightHandRuntimeTransformWarpRetryPending ? "yes" : "no",
+                _heldObjectPlayerSpaceFrame.leftHandRuntimeTransformWarpRetryPending ? "yes" : "no",
                 _heldObjectPlayerSpaceFrame.warpByDistance ? "yes" : "no",
                 _heldObjectPlayerSpaceFrame.warpByRotation ? "yes" : "no",
                 bodyIds.size(),
+                proxyBodyIds.size(),
                 result.registeredBodies,
+                result.warpTransaction.queuedTransformWrites,
+                result.warpTransaction.requiredTransformWrites,
+                result.warpTransaction.queuedVelocityWrites,
+                result.warpTransaction.requiredVelocityWrites,
+                result.warpTransaction.rollbackTransformWritesQueued,
+                result.warpTransaction.queuedTransformWrites,
+                result.warpTransaction.rollbackVelocityWritesQueued,
+                result.warpTransaction.queuedVelocityWrites,
                 result.motionsWritten,
+                result.motionsReoriented,
                 result.transformsWarped,
                 result.duplicateMotionSkips,
                 result.writerMask);
@@ -9438,6 +10506,30 @@ namespace rock
             };
 
             const auto handIndex = isLeft ? 1u : 0u;
+            if (_hostConsumedNormalGrabInputFrameMask[handIndex]) {
+                /*
+                 * A host-side DropToHand/SmartGrab object consumed this exact
+                 * physical edge before weapon ownership. Raw state was already
+                 * drained exactly once there; reset delayed intent here so the
+                 * just-released object cannot be acquired by a synthetic
+                 * leeway press next frame.
+                 */
+                if (_firingHandGrabButtonFrameState.valid &&
+                    _firingHandGrabButtonFrameState.isLeft == isLeft) {
+                    _firingHandGrabButtonFrameState.valid = false;
+                }
+                inputSuppressionState.deferredGrabRelease = false;
+                grab_input_intent_policy::reset(inputIntentState);
+                cancelPeerHeldJoinRetry(
+                    "host-active-grab-consumed-edge",
+                    true);
+                clearGameplayCandidatesForHand(hand, isLeft);
+                ROCK_LOG_DEBUG(
+                    Hand,
+                    "{} hand discarded grip edge consumed by active host grab",
+                    hand.handName());
+                return;
+            }
             if (_forceGrabCommittedThisFrame[handIndex]) {
                 /*
                  * Consume, but do not apply, the physical button edges from
@@ -10470,8 +11562,36 @@ namespace rock
                     }
                 }
 
+                const bool hostBlocksPlayerConsume =
+                    HostShouldBlockPlayerConsume(heldRefForGameplay);
+                HostPlayerConsumeProfile consumeProfile{
+                    .route = HostPlayerConsumeRoute::Mouth,
+                    .autoConsumeWhileHeld = false,
+                    .zoneOffsetXGameUnits = g_rockConfig.rockMouthConsumeHmdOffsetGameUnits.x,
+                    .zoneOffsetYGameUnits = g_rockConfig.rockMouthConsumeHmdOffsetGameUnits.y,
+                    .zoneOffsetZGameUnits = g_rockConfig.rockMouthConsumeHmdOffsetGameUnits.z,
+                    .zoneRadiusGameUnits = g_rockConfig.rockMouthConsumeRadiusGameUnits,
+                };
+                const bool consumeProfileResolved =
+                    !hostBlocksPlayerConsume &&
+                    HostResolvePlayerConsumeProfile(
+                        heldRefForGameplay,
+                        isLeft,
+                        consumeProfile);
+                const bool consumeProfileGeometryValid =
+                    std::isfinite(consumeProfile.zoneOffsetXGameUnits) &&
+                    std::isfinite(consumeProfile.zoneOffsetYGameUnits) &&
+                    std::isfinite(consumeProfile.zoneOffsetZGameUnits) &&
+                    std::isfinite(consumeProfile.zoneRadiusGameUnits) &&
+                    consumeProfile.zoneRadiusGameUnits > 0.0f;
+                const bool consumeRouteEnabled =
+                    consumeProfileResolved &&
+                    consumeProfileGeometryValid &&
+                    consumeProfile.route != HostPlayerConsumeRoute::Blocked;
                 const auto consumeEligibility = mouth_consume::evaluateEligibility(mouth_consume::EligibilityInput{
-                    .enabled = g_rockConfig.rockMouthConsumeEnabled,
+                    .enabled = g_rockConfig.rockMouthConsumeEnabled &&
+                               !hostBlocksPlayerConsume &&
+                               consumeRouteEnabled,
                     .allowPoison = g_rockConfig.rockMouthConsumeAllowPoison,
                     .peerHoldingSameObject = peerHoldingSameObject,
                     .heldRef = heldRefForGameplay,
@@ -10480,7 +11600,17 @@ namespace rock
 
                 mouth_consume::Decision consumeDecision{};
                 if (consumeEligibility.eligible) {
-                    consumeDecision = mouth_consume::evaluate(mouth_consume::DetectorInput{
+                    auto detectorConfig = makeMouthConsumeDetectorConfig();
+                    detectorConfig.mouthRadiusGameUnits =
+                        consumeProfile.zoneRadiusGameUnits;
+                    const RE::NiPoint3 routeOffset{
+                        consumeProfile.zoneOffsetXGameUnits,
+                        consumeProfile.zoneOffsetYGameUnits,
+                        consumeProfile.zoneOffsetZGameUnits,
+                    };
+                    if (consumeProfile.route == HostPlayerConsumeRoute::Mouth) {
+                        detectorConfig.hmdMouthOffsetGameUnits = routeOffset;
+                        consumeDecision = mouth_consume::evaluate(mouth_consume::DetectorInput{
                             .hasHmdFrame = frame.hasHmdFrame,
                             .hmdPositionWorld = frame.hmdPositionWorld,
                             .hmdForwardWorld = frame.hmdForwardWorld,
@@ -10489,9 +11619,34 @@ namespace rock
                             .handProbe = makeMouthConsumeHandProbe(handInput),
                             .hasHandProbe = true,
                             .deltaSeconds = frame.deltaSeconds,
-                            .config = makeMouthConsumeDetectorConfig(),
-                        },
-                        mouthConsumeState);
+                            .config = detectorConfig,
+                            },
+                            mouthConsumeState);
+                    } else if (consumeProfile.route ==
+                               HostPlayerConsumeRoute::OppositeWrist) {
+                        const auto& oppositeHandInput =
+                            isLeft ? frame.right : frame.left;
+                        const RE::NiPoint3 wristCenter =
+                            oppositeHandInput.rawHandWorld.translate +
+                            (oppositeHandInput.rawHandWorld.rotate * routeOffset);
+                        consumeDecision = mouth_consume::evaluateCenteredZone(
+                            mouth_consume::CenteredDetectorInput{
+                                .hasCenter = !oppositeHandInput.disabled,
+                                .centerGame = wristCenter,
+                                .objectProbe = makeMouthConsumeObjectProbe(
+                                    hknp,
+                                    hand,
+                                    handInput),
+                                .hasObjectProbe = true,
+                                .handProbe = makeMouthConsumeHandProbe(handInput),
+                                .hasHandProbe = true,
+                                .deltaSeconds = frame.deltaSeconds,
+                                .config = detectorConfig,
+                            },
+                            mouthConsumeState);
+                    } else {
+                        clearMouthConsumeForHand(hand, isLeft);
+                    }
                 } else {
                     clearMouthConsumeForHand(hand, isLeft);
                 }
@@ -10575,20 +11730,38 @@ namespace rock
                     hand.cancelStashCandidate();
                 }
 
-                if (grabInput.released) {
+                const auto consumeCommitDecision =
+                    consume_commit_policy::decide(
+                        consume_commit_policy::Input{
+                            .eligible = consumeEligibility.eligible,
+                            .spatiallyInsideCoreZone =
+                                consumeDecision.spatiallyEligibleForRelease,
+                            .detectorConfirmed =
+                                consumeDecision.confirmedForCommit,
+                            .gripReleased = grabInput.released,
+                            .autoConsumeWhileHeld =
+                                consumeProfile.autoConsumeWhileHeld,
+                        });
+
+                if (grabInput.released || consumeCommitDecision.shouldCommit()) {
                     hand.captureHeldReleaseMotion(hknp, handInput.rawHandWorld, frame.deltaSeconds);
                     auto* heldRef = hand.getHeldRef();
                     std::uint32_t heldFormID = heldRef ? heldRef->GetFormID() : 0u;
-                    if (consumeEligibility.eligible && consumeDecision.confirmedForCommit && hand.getState() == HandState::ConsumeCandidate) {
+                    if (consumeCommitDecision.shouldCommit()) {
                         /*
-                         * Mouth consume mirrors shoulder stash's two-phase release:
+                         * Player consume mirrors shoulder stash's two-phase release:
                          * detach the grab without throw velocity first, then let the
                          * native consume/activation path take ownership. Only failures
                          * that leave a world ref behind get the captured throw velocity.
                          */
                         auto releaseContext = makeGrabReleaseContext(hand, isLeft);
                         releaseContext.disposition = GrabReleaseDisposition::PendingConsumeTransfer;
-                        releaseContext.reason = "mouth-consume-pending-transfer";
+                        const bool wristRoute =
+                            consumeProfile.route ==
+                            HostPlayerConsumeRoute::OppositeWrist;
+                        releaseContext.reason = wristRoute ?
+                            "wrist-consume-pending-transfer" :
+                            "mouth-consume-pending-transfer";
                         const std::uint32_t primaryBodyId = hand.getSavedObjectState().bodyId.value;
                         auto releaseOutcome = hand.releaseGrabbedObject(hknp, GrabReleaseCollisionRestoreMode::Immediate, releaseContext);
                         if (heldRef) {
@@ -10615,8 +11788,13 @@ namespace rock
                             dispatchHeldObjectEventByFormID(GrabEventType::Released, postConsumeRef, heldFormID, primaryBodyId);
                         }
                         ROCK_LOG_INFO(Hand,
-                            "{} hand mouth consume release formID={:08X} success={} consumeReason={} count={} confidence={:.2f} distance={:.1f} speed={:.1f}",
+                            "{} hand {} consume {} formID={:08X} success={} consumeReason={} count={} confidence={:.2f} distance={:.1f} speed={:.1f}",
                             hand.handName(),
+                            wristRoute ? "wrist" : "mouth",
+                            consumeCommitDecision.trigger ==
+                                    consume_commit_policy::Trigger::GripRelease ?
+                                "release" :
+                                "auto",
                             heldFormID,
                             consumeResult.success ? "yes" : "no",
                             mouth_consume::consumeReasonName(consumeResult.reason),
@@ -10697,7 +11875,17 @@ namespace rock
                         g_rockConfig.rockGrabForceFadeInTime,
                         g_rockConfig.rockGrabTauMin,
                         &_bodyBoneColliders,
-                        makeGrabReleaseContext(hand, isLeft));
+                        makeGrabReleaseContext(hand, isLeft),
+                        isLeft ?
+                            _heldObjectPlayerSpaceFrame.
+                                leftHandRuntimeTransformWarpApplied :
+                            _heldObjectPlayerSpaceFrame.
+                                rightHandRuntimeTransformWarpApplied,
+                        isLeft ?
+                            _heldObjectPlayerSpaceFrame.
+                                leftHandRuntimeTransformWarpRetryPending :
+                            _heldObjectPlayerSpaceFrame.
+                                rightHandRuntimeTransformWarpRetryPending);
                     if (heldRef && !hand.isHolding()) {
                         releaseObject(heldRef, claimOwnerForHand(isLeft));
                         dispatchPhysicsMessage(kPhysMsg_OnRelease, isLeft, heldRef, heldFormID, 0);
@@ -10731,14 +11919,23 @@ namespace rock
                         releaseObject(pullCatchRef, claimOwnerForHand(isLeft));
                         return;
                     }
-                    if (!hand.advancePullCatchCommit(frame.deltaSeconds, g_rockConfig.rockPullCatchRetryMaxTimeSeconds)) {
+                    const auto pullCatchRetryDecision = hand.advancePullCatchCommit(
+                        frame.deltaSeconds,
+                        g_rockConfig.rockPullCatchRetryMaxTimeSeconds,
+                        handInput.rawHandWorld);
+                    if (pullCatchRetryDecision.expired() ||
+                        pullCatchRetryDecision.status == pull_catch_retry_policy::Status::Inactive) {
                         ROCK_LOG_DEBUG(Hand,
-                            "{} hand cancelled pull catch commit because retry window expired ({:.3f}s)",
+                            "{} hand cancelled pull catch commit: reason={} retryWindow={:.3f}s",
                             hand.handName(),
+                            pullCatchRetryDecision.reason,
                             g_rockConfig.rockPullCatchRetryMaxTimeSeconds);
                         hand.finishPullPrepAsPhysicalDropIfActive("pull-catch-retry-expired");
                         hand.clearSelectionState(true);
                         releaseObject(pullCatchRef, claimOwnerForHand(isLeft));
+                        return;
+                    }
+                    if (!pullCatchRetryDecision.shouldAttempt()) {
                         return;
                     }
                 }
@@ -10941,7 +12138,7 @@ namespace rock
                             hand.handName());
                     }
                     if (!grabbed && pullCatchCommitPending) {
-                        hand.notePullCatchCommitAttemptFailed();
+                        hand.notePullCatchCommitAttemptFailed(handInput.rawHandWorld);
                         ROCK_LOG_SAMPLE_DEBUG(Hand,
                             g_rockConfig.rockLogSampleMilliseconds,
                             "{} hand retaining pull catch commit after grab attempt failed; grip still held",
@@ -10990,7 +12187,7 @@ namespace rock
                         hand.clearSelectionState(true);
                         releaseObject(pulledRef, claimOwnerForHand(isLeft));
                     } else if (!grabbed) {
-                        hand.notePullCatchCommitAttemptFailed();
+                        hand.notePullCatchCommitAttemptFailed(transform);
                         ROCK_LOG_SAMPLE_DEBUG(Hand,
                             g_rockConfig.rockLogSampleMilliseconds,
                             "{} hand pull arrived but grab commit did not accept yet; retaining catch intent while grip is held",
@@ -11000,10 +12197,22 @@ namespace rock
             }
         };
 
-        processHand(_rightHand, false);
-        publishHandInputOwnership(_rightHand, false);
-        processHand(_leftHand, true);
-        publishHandInputOwnership(_leftHand, true);
+        const auto processingOrder =
+            dynamic_grab_policy::chooseHandProcessingOrder(
+                _rightHand.isHolding(),
+                _leftHand.isHolding());
+        if (processingOrder ==
+            dynamic_grab_policy::HandProcessingOrder::LeftThenRight) {
+            processHand(_leftHand, true);
+            publishHandInputOwnership(_leftHand, true);
+            processHand(_rightHand, false);
+            publishHandInputOwnership(_rightHand, false);
+        } else {
+            processHand(_rightHand, false);
+            publishHandInputOwnership(_rightHand, false);
+            processHand(_leftHand, true);
+            publishHandInputOwnership(_leftHand, true);
+        }
 
         if (_rightHand.isHolding() ||
             _touchGrabRuntime.isHandActive(false)) {

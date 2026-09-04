@@ -487,6 +487,80 @@ namespace rock::hand_collision_suppression_math
         return nullptr;
     }
 
+    struct SuppressionTopologyReconcileResult
+    {
+        std::size_t staleCount = 0;
+        std::size_t releasedCount = 0;
+        std::size_t deferredCount = 0;
+    };
+
+    /*
+     * A generated hand can replace its complete body bank without ending the
+     * grab/weapon-owner episode. SuppressionSet has intentionally fixed
+     * capacity, so retired body IDs must release their owner lease and vacate
+     * their slot before the replacement bank is acquired. A failed release is
+     * retained for the next frame; clearing it would lose the only retry state
+     * capable of restoring that body's filter.
+     *
+     * The callbacks keep this topology policy independent of Havok. Runtime
+     * supplies exact current-body membership and the shared-registry release;
+     * host tests can exercise full-bank replacement and deferred retries.
+     */
+    template <std::size_t Count, class IsCurrentBody, class ReleaseBody>
+    inline SuppressionTopologyReconcileResult reconcileSuppressionTopology(
+        SuppressionSet<Count>& set,
+        IsCurrentBody&& isCurrentBody,
+        ReleaseBody&& releaseBody)
+    {
+        SuppressionTopologyReconcileResult result{};
+        for (auto& entry : set.entries) {
+            if (!entry.active || entry.bodyId == kInvalidBodyId ||
+                isCurrentBody(entry.bodyId)) {
+                continue;
+            }
+
+            ++result.staleCount;
+            if (!releaseBody(entry.bodyId)) {
+                ++result.deferredCount;
+                continue;
+            }
+
+            clear(entry);
+            ++result.releasedCount;
+        }
+        return result;
+    }
+
+    /*
+     * Two logical owners can suppress the same generated hand body while
+     * weapon authority changes. Always acquire every desired owner before
+     * releasing an undesired owner: dominant->part-grip and the reverse must
+     * keep at least one registry lease (and therefore bit 14) continuously.
+     */
+    template <class AcquirePrimary, class AcquireSecondary,
+        class ReleasePrimary, class ReleaseSecondary>
+    inline void reconcileOverlappingSuppressionOwners(
+        bool primaryDesired,
+        bool secondaryDesired,
+        AcquirePrimary&& acquirePrimary,
+        AcquireSecondary&& acquireSecondary,
+        ReleasePrimary&& releasePrimary,
+        ReleaseSecondary&& releaseSecondary)
+    {
+        if (primaryDesired) {
+            acquirePrimary();
+        }
+        if (secondaryDesired) {
+            acquireSecondary();
+        }
+        if (!primaryDesired) {
+            releasePrimary();
+        }
+        if (!secondaryDesired) {
+            releaseSecondary();
+        }
+    }
+
     template <std::size_t Count>
     inline SuppressionBeginResult beginSuppression(SuppressionSet<Count>& set, std::uint32_t bodyId, std::uint32_t currentFilter)
     {

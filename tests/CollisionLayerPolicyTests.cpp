@@ -1,4 +1,5 @@
 #include "physics-interaction/collision/CollisionLayerPolicy.h"
+#include "physics-interaction/collision/ContactPipelinePolicy.h"
 #include "physics-interaction/grab/ExternalHeldBodyRegistry.h"
 #include "physics-interaction/NativeMeleeSuppressionPolicy.h"
 
@@ -22,6 +23,19 @@ namespace
 int main()
 {
     using namespace rock::collision_layer_policy;
+
+    Require(
+        withCollisionLayer(0x000B002Du, ROCK_LAYER_WEAPON) ==
+            0x000B002Cu,
+        "weapon CCD queries must preserve their collision group while using the generated-weapon layer");
+    Require(isWeaponSweepHandTargetLayer(ROCK_LAYER_HAND),
+        "weapon CCD must admit the production hand hull used by hand-to-weapon collision");
+    Require(isWeaponSweepHandTargetLayer(
+                ROCK_LAYER_DYNAMIC_HAND_PROXY),
+        "weapon CCD must also admit the solver-backed dynamic hand proxy");
+    Require(!isWeaponSweepHandTargetLayer(ROCK_LAYER_WEAPON) &&
+                !isWeaponSweepHandTargetLayer(FO4_LAYER_BIPED),
+        "weapon CCD hand admission must remain limited to ROCK-owned hand hulls");
 
     {
         rock::external_held_body_registry::Registry<4> registry;
@@ -235,6 +249,148 @@ int main()
         true,
         ~std::uint64_t{ 0 },
         true);
+
+    Require(maskEnablesLayer(
+                buildRockDynamicHandProxyExpectedMask(),
+                ROCK_LAYER_WEAPON),
+        "the dynamic hand proxy mask must include generated weapon hulls");
+    Require(maskEnablesLayer(
+                buildRockHandExpectedMask(true),
+                ROCK_LAYER_WEAPON),
+        "the legacy generated hand mask must include equipped-weapon hulls");
+    Require(maskEnablesLayer(
+                buildRockWeaponExpectedMask(false, false, true, true),
+                ROCK_LAYER_HAND),
+        "the weapon mask must symmetrically include legacy generated hands");
+    Require(layerPairSymmetricMatches(
+                matrix.data(),
+                ROCK_LAYER_HAND,
+                ROCK_LAYER_WEAPON,
+                true),
+        "free legacy hand bodies must collide with generated equipped-weapon hulls");
+    {
+        using namespace rock::contact_pipeline_policy;
+        const ContactEndpoint hand{
+            .bodyId = 4301u,
+            .layer = ROCK_LAYER_HAND,
+            .kind = ContactEndpointKind::RightHand,
+        };
+        const ContactEndpoint weapon{
+            .bodyId = 4401u,
+            .layer = ROCK_LAYER_WEAPON,
+            .kind = ContactEndpointKind::Weapon,
+        };
+        for (const auto route : {
+                 classifyContact(hand, weapon),
+                 classifyContact(weapon, hand),
+             }) {
+            Require(
+                route.route == ContactRoute::HandWeapon &&
+                    route.sourceBodyId == hand.bodyId &&
+                    route.targetBodyId == weapon.bodyId,
+                "legacy hand/weapon contacts must normalize to the hand-to-weapon route in either callback order");
+            Require(
+                route.recordHandSemanticContact &&
+                    route.recordHandWeaponEvidence &&
+                    route.drivesWeaponSupportContact,
+                "a free legacy hand/weapon manifold must feed semantic touch, visual-stop evidence, and weapon-grip acquisition");
+        }
+    }
+    Require(
+        maskEnablesLayer(
+            buildRockDynamicHandProxyExpectedMask(false),
+            ROCK_LAYER_WEAPON) &&
+            !maskEnablesLayer(
+                buildRockDynamicHandProxyExpectedMask(false),
+                FO4_LAYER_STATIC),
+        "disabling hand/static collision must retain hand/weapon contact while removing proxy/world pairs");
+    Require(maskEnablesLayer(
+                buildRockWeaponExpectedMask(false, false, true, true),
+                ROCK_LAYER_DYNAMIC_HAND_PROXY),
+        "the weapon mask must symmetrically include the dynamic hand proxy");
+    Require(layerPairSymmetricMatches(
+                matrix.data(),
+                ROCK_LAYER_DYNAMIC_HAND_PROXY,
+                ROCK_LAYER_WEAPON,
+                true),
+        "free dynamic hand proxies must collide with generated equipped-weapon hulls");
+
+    for (const std::uint32_t worldLayer : {
+             FO4_LAYER_STATIC,
+             FO4_LAYER_ANIMSTATIC,
+             FO4_LAYER_TERRAIN,
+             FO4_LAYER_GROUND,
+             FO4_LAYER_INVISIBLE_WALL,
+         }) {
+        Require(layerPairSymmetricMatches(
+                    matrix.data(),
+                    ROCK_LAYER_DYNAMIC_HAND_PROXY,
+                    worldLayer,
+                    true),
+            "dynamic hand proxies must retain static-world collision");
+    }
+
+    for (const std::uint32_t excludedLayer : {
+             FO4_LAYER_CLUTTER,
+             FO4_LAYER_CLUTTER_LARGE,
+             FO4_LAYER_BIPED,
+             FO4_LAYER_DEADBIP,
+             FO4_LAYER_PROJECTILE,
+             FO4_LAYER_CONEPROJECTILE,
+             FO4_LAYER_SPELL,
+             ROCK_LAYER_HAND,
+             ROCK_LAYER_BODY,
+             ROCK_LAYER_DYNAMIC_HAND_PROXY,
+         }) {
+        Require(layerPairSymmetricMatches(
+                    matrix.data(),
+                    ROCK_LAYER_DYNAMIC_HAND_PROXY,
+                    excludedLayer,
+                    false),
+            "dynamic hand proxies must remain isolated from non-world/non-weapon bodies");
+    }
+
+    const auto expectedDynamicHandProxyMask =
+        buildRockDynamicHandProxyExpectedMask();
+    Require(
+        matrixLayerMaskMatches(
+            matrix[ROCK_LAYER_DYNAMIC_HAND_PROXY],
+            expectedDynamicHandProxyMask),
+        "the registered dynamic hand proxy row must match its complete extended-layer policy");
+    Require(
+        rockDynamicHandProxyPairsMatch(
+            matrix.data(), expectedDynamicHandProxyMask),
+        "the dynamic hand proxy watchdog must accept the registered symmetric matrix");
+
+    {
+        auto proxyRowDrift = matrix;
+        proxyRowDrift[ROCK_LAYER_DYNAMIC_HAND_PROXY] &=
+            ~layerBitOrZero(ROCK_LAYER_WEAPON);
+        Require(
+            !matrixLayerMaskMatches(
+                proxyRowDrift[ROCK_LAYER_DYNAMIC_HAND_PROXY],
+                expectedDynamicHandProxyMask),
+            "the dynamic hand proxy row watchdog must detect a lost weapon bit");
+        Require(
+            !rockDynamicHandProxyPairsMatch(
+                proxyRowDrift.data(), expectedDynamicHandProxyMask),
+            "the dynamic hand proxy pair watchdog must detect proxy-row drift");
+    }
+
+    {
+        auto proxyColumnDrift = matrix;
+        proxyColumnDrift[ROCK_LAYER_WEAPON] &=
+            ~layerBitOrZero(ROCK_LAYER_DYNAMIC_HAND_PROXY);
+        Require(
+            matrixLayerMaskMatches(
+                proxyColumnDrift[ROCK_LAYER_DYNAMIC_HAND_PROXY],
+                expectedDynamicHandProxyMask),
+            "one-sided weapon-column drift must not masquerade as proxy-row drift");
+        Require(
+            !rockDynamicHandProxyPairsMatch(
+                proxyColumnDrift.data(), expectedDynamicHandProxyMask),
+            "the symmetric pair watchdog must detect a lost weapon-to-proxy bit");
+    }
 
     Require(layerPairSymmetricMatches(
                 matrix.data(),

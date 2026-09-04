@@ -190,6 +190,20 @@ namespace heisenberg
             RE::TESObjectREFR* refr,
             bool isLeft) const;
 
+        // MESH-IDENTITY DONOR. If this item has no authored offset of its own
+        // but renders the SAME NIF as an item that does, borrow that pose.
+        //
+        // This is not a similarity guess like the armor donor above: an
+        // identical model means identical geometry AND an identical pivot, so
+        // the authored hold is correct by construction. It is what makes a
+        // modded aid item that reuses Stimpak.nif sit in the hand exactly like
+        // a Stimpak, including in non-English games where the display name
+        // never matches. Restricted to donors of the SAME form type, so a
+        // MISC prop cannot borrow a weapon's grip semantics.
+        std::optional<ItemOffset> GetSharedModelDonorOffset(
+            RE::TESObjectREFR* refr,
+            bool isLeft) const;
+
         // Check if an item has an EXACT dimensions match (for armor grab filtering)
         // Returns true only if there's an offset with EXACTLY the same L/W/H dimensions (no tolerance)
         // This is used to allow armor grabbing ONLY when we have a perfect offset for it
@@ -247,6 +261,13 @@ namespace heisenberg
             const std::string& lookupName);
         std::optional<std::string> FindStableLookupName(
             RE::TESObjectREFR* refr) const;
+
+        // Lazily-built map: lowercased model path -> authored offset key.
+        // Built once on first miss; a form only contributes if it already owns
+        // an authored offset, so this cannot invent poses.
+        void BuildModelPathDonorIndex() const;
+        mutable std::unordered_map<std::string, std::string> _modelPathToName;
+        mutable bool _modelPathIndexBuilt = false;
 
         // Stored offsets by item name
         std::unordered_map<std::string, ItemOffset> _offsets;

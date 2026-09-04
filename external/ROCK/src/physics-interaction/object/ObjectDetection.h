@@ -214,5 +214,6 @@ namespace rock
 
     SelectedObject findFarObject(RE::bhkWorld* bhkWorld, RE::hknpWorld* hknpWorld, const RE::NiPoint3& handPos, const RE::NiPoint3& pointingDir, float farRange,
         const FarSelectionHmdConeGate& hmdConeGate,
-        const OtherHandSelectionContext& otherHandContext = {});
+        const OtherHandSelectionContext& otherHandContext = {},
+        RE::TESObjectREFR* preferredRef = nullptr);
 }

@@ -1,6 +1,7 @@
 #include "Hooks.h"
 
 #include "Heisenberg.h"
+#include "PostConsumeActivationPolicy.h"
 #include "HandBumpHook.h"
 #include "HavokTimingFix.h"
 #include "VRInput.h"
@@ -9,6 +10,7 @@
 #include "MenuChecker.h"
 #include "DropToHand.h"
 #include "PipboyInteraction.h"
+#include "SS2Integration.h"
 #include "rock/RockBridge.h"
 #include "Utils.h"
 #include "F4VROffsets.h"
@@ -375,7 +377,9 @@ namespace heisenberg::Hooks
                     RE::NiTransform preL, preR;
                     if (heisenberg::HandAuthority::GetSkinnedHandWorld(true, preL) &&
                         heisenberg::HandAuthority::GetSkinnedHandWorld(false, preR)) {
-                        rock::HostSetPreAuthorityHandWorlds(preL, preR);
+                        rock::HostSetFallbackPreAuthorityHandWorlds(
+                            preL,
+                            preR);
                         RE::NiPoint3 shoulder{};
                         float maxReach = 0.0f;
                         if (heisenberg::HandAuthority::GetArmReachSphere(true, shoulder, maxReach)) {
@@ -1694,10 +1698,16 @@ namespace heisenberg::Hooks
 
     // Bypass flag for internal ActivateRef calls (storage, consume, etc.)
     static std::atomic<bool> g_internalActivation{false};
+    static std::atomic<bool> g_internalEquip{ false };
 
     void SetInternalActivation(bool active)
     {
         g_internalActivation.store(active, std::memory_order_relaxed);
+    }
+
+    void SetInternalEquip(bool active)
+    {
+        g_internalEquip.store(active, std::memory_order_relaxed);
     }
 
     void RecordDroppedRef(uint32_t formID)
@@ -1772,6 +1782,26 @@ namespace heisenberg::Hooks
             return false;
         }
 
+        // Input-enable flags cover the native handler, but SteamVR action
+        // paths can reach ActivateRef directly. Block only non-script player
+        // activations during the short post-consume grip-release tail.
+        if (refr && activator) {
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            const bool playerInitiated =
+                activator == reinterpret_cast<RE::TESObjectREFR*>(player);
+            if (post_consume_activation_policy::
+                    shouldBlockPlayerActivation(
+                        Heisenberg::GetSingleton().
+                            IsPostConsumeActivationSuppressed(),
+                        false,
+                        playerInitiated,
+                        fromScript)) {
+                spdlog::debug(
+                    "[ActivateHook] BLOCKED player activation during post-consume tail");
+                return false;
+            }
+        }
+
         // Only block player-initiated activations on grabbable item types.
         // Skip furniture (power armor frames), NPCs, activators, doors, etc.
         if (refr && activator && !fromScript) {
@@ -1779,6 +1809,39 @@ namespace heisenberg::Hooks
             if (activator == reinterpret_cast<RE::TESObjectREFR*>(player)) {
                 // Only apply blocking to item types our grab system can target
                 auto* baseObj = refr->GetObjectReference();
+
+                // IDENTIFY WHAT THE PLAYER JUST ACTIVATED.
+                //
+                // Adding something to the touch-activator whitelist needs its BASE form ID,
+                // and there is otherwise no way to read one in VR - the console is not usable
+                // with a headset on. Pressing the native activate key on the object and reading
+                // this line back is the whole workflow.
+                //
+                // Player-initiated only, so the volume is exactly "things the player pressed" -
+                // no per-frame cost and nothing to sample. ACTI/DOOR/TERM/FURN are called out
+                // because those are the interactable classes worth whitelisting; everything
+                // else logs at debug so ordinary looting does not fill the file.
+                if (baseObj) {
+                    const auto ft = baseObj->GetFormType();
+                    const bool interactable =
+                        ft == RE::ENUM_FORM_ID::kACTI || ft == RE::ENUM_FORM_ID::kDOOR ||
+                        ft == RE::ENUM_FORM_ID::kTERM || ft == RE::ENUM_FORM_ID::kFURN;
+
+                    const auto nameView = RE::TESFullName::GetFullName(*baseObj, false);
+                    const std::string name = nameView.empty() ? "<no name>" : std::string(nameView);
+                    const char* edId = baseObj->GetFormEditorID();
+
+                    if (interactable) {
+                        spdlog::info("[ACTIVATED] base={:08X} '{}' edID='{}' type={} ref={:08X} "
+                                     "-- add to HeisenbergActivators.ini [Whitelist] as: {}=0x{:08X}",
+                            baseObj->GetFormID(), name, edId ? edId : "<none>",
+                            static_cast<int>(ft), refr->GetFormID(),
+                            name, baseObj->GetFormID());
+                    } else {
+                        spdlog::debug("[ACTIVATED] base={:08X} '{}' type={} ref={:08X}",
+                            baseObj->GetFormID(), name, static_cast<int>(ft), refr->GetFormID());
+                    }
+                }
                 bool isGrabbableType = false;
                 if (baseObj) {
                     auto ft = baseObj->GetFormType();
@@ -1816,11 +1879,11 @@ namespace heisenberg::Hooks
                     return false;
                 }
 
-                // Block native activation when Heisenberg has a valid grab target or active grab.
-                // Prevents Grip>A binding from picking items to inventory instead of grabbing.
+                // Block native activation only for the reference already held
+                // by Heisenberg. A mere selection in either hand must not own
+                // Grip/A input.
                 uint32_t targetFormID = refr->formID;
                 auto& grabMgr = GrabManager::GetSingleton();
-                auto& heisenberg = Heisenberg::GetSingleton();
 
                 // Check if either hand is currently grabbing this item
                 if (grabMgr.IsGrabbing(true) || grabMgr.IsGrabbing(false)) {
@@ -1835,23 +1898,6 @@ namespace heisenberg::Hooks
                     }
                 }
 
-                // Check if either hand has this item as a selected grab target.
-                // GATED (default OFF): blocking A/activate just because you're AIMING at a
-                // grabbable item breaks A-button looting and mod secondary actions (Tune The
-                // Radios, Sentinel PA). The held-item block above already handles the Grip>A
-                // binding case (the item is held by the time grip-release sends A), so this is
-                // only needed for that specific binding — opt-in via bBlockActivateOnGrabSelection.
-                if (g_config.blockActivateOnGrabSelection) {
-                    auto checkSelection = [&](Hand* hand) -> bool {
-                        if (!hand) return false;
-                        auto* selRefr = hand->GetSelection().GetRefr();
-                        return selRefr && selRefr->formID == targetFormID;
-                    };
-                    if (checkSelection(heisenberg.GetLeftHand()) || checkSelection(heisenberg.GetRightHand())) {
-                        spdlog::debug("[ActivateHook] BLOCKED activation of grab target {:08X}", targetFormID);
-                        return false;
-                    }
-                }
             }
         }
 
@@ -2079,6 +2125,8 @@ namespace heisenberg::Hooks
         if (actor == player && instance) {
             // Access the base form from BGSObjectInstance (first member is TESForm*)
             RE::TESForm* baseForm = *reinterpret_cast<RE::TESForm**>(instance);
+            const bool isDiseaseCure =
+                baseForm && heisenberg::ss2::IsDiseaseCureForm(baseForm);
 
             // Block weapon auto-equip after storage zone unequip.
             // This lets DrawWeaponMagicHands(true) fall through to unarmed (fists)
@@ -2104,8 +2152,63 @@ namespace heisenberg::Hooks
             // effect to drop-to-hand. Since these items have no 3D model, the
             // TryGrabPendingDrop queue loops forever "waiting for 3D" and the pickup
             // sound spams continuously.
+            // GetPlayable() ALONE IS NOT ENOUGH - this is the third recurrence of the same bug.
+            //
+            // Some Survival status tokens are PLAYABLE ALCH with an empty editor ID (DropToHand
+            // learned this the hard way; see its own guard stack in OnContainerChanged). They
+            // pass the GetPlayable() test above, get redirected to drop-to-hand, and because
+            // they are invisible they never load 3D: the queue times out, re-adds the token -
+            // RE-APPLYING ITS EFFECT - and re-queues, forever. With a Hunger token caught in
+            // that loop the tier can never fall, so the player is permanently Starving and
+            // eating appears to do nothing. Confirmed by the owner: turning Consume To Hand
+            // off makes it stop, which is exactly this interception.
+            //
+            // A model-less item can never be held, so redirecting one to the hand is always
+            // wrong regardless of what it is. Testing capability rather than identity is what
+            // stops this recurring - the identity tests (non-playable, HC_ prefix) have now
+            // been defeated twice by tokens shaped slightly differently.
+            // Our own CONSUME path equips the item deliberately (that is the signal Survival
+            // watches for). Never bounce that back to the hand - it is already in the hand.
+            if (g_internalEquip.load(std::memory_order_relaxed)) {
+                if (isDiseaseCure) {
+                    spdlog::error(
+                        "[EquipHook] Blocked internal PlayerRef use of SS2 Disease Cure {:08X}",
+                        baseForm->formID);
+                    ShowHUDMessageDirect(
+                        "Disease Cure can only be used on a settler");
+                    return true;
+                }
+                if (g_originalEquipObject) {
+                    return g_originalEquipObject(equipManager, actor, instance, stackID, number,
+                                                 slot, queueEquip, forceEquip, playSounds,
+                                                 applyNow, locked);
+                }
+                return false;
+            }
+
+            const bool alchHasModel = [&]() -> bool {
+                if (!baseForm) return false;
+                auto* asModel = baseForm->As<RE::TESModel>();
+                if (!asModel) return false;
+                const char* modelPath = asModel->GetModel();
+                return modelPath && modelPath[0] != char(0);
+            }();
+
+            // Witness: a PLAYABLE, model-less ALCH arriving here is a survival status token
+            // that would have been redirected before this guard existed. Logging it proves the
+            // guard is doing real work rather than sitting inert, and names the token so a
+            // future variant can be identified from a log instead of another bug report.
+            if (baseForm && baseForm->GetFormType() == RE::ENUM_FORM_ID::kALCH
+                && baseForm->GetPlayable(nullptr) && !alchHasModel) {
+                spdlog::info("[EquipHook] Not redirecting model-less ALCH {:08X} '{}' edID='{}' "
+                             "- playable but cannot be held (survival status token)",
+                    baseForm->formID,
+                    RE::TESFullName::GetFullName(*baseForm, false),
+                    baseForm->GetFormEditorID() ? baseForm->GetFormEditorID() : "<none>");
+            }
+
             if (baseForm && baseForm->GetFormType() == RE::ENUM_FORM_ID::kALCH && !blockPA
-                && baseForm->GetPlayable(nullptr)) {
+                && baseForm->GetPlayable(nullptr) && alchHasModel) {
                 // Guard: skip if we just redirected this same item (game may call EquipObject twice)
                 static RE::TESFormID s_lastRedirectedFormID = 0;
                 static ULONGLONG s_lastRedirectedTick = 0;
@@ -2179,6 +2282,20 @@ namespace heisenberg::Hooks
                     s_lastRedirectedTick = now;
                     return true;  // Skip original equip (prevents consumption)
                 }
+            }
+
+            // If the cure was not redirected to a free hand above (feature
+            // disabled, both hands occupied, Power Armor, or a non-menu equip),
+            // swallow the native player-use call. SS2's settler treatment path
+            // removes the inventory item through Papyrus and never equips it,
+            // so this cannot block a valid NPC cure.
+            if (isDiseaseCure) {
+                spdlog::warn(
+                    "[EquipHook] Blocked native PlayerRef use of SS2 Disease Cure {:08X}",
+                    baseForm->formID);
+                ShowHUDMessageDirect(
+                    "Disease Cure can only be used on a settler; free a hand");
+                return true;
             }
 
             // Holotapes: redirect to right hand instead of playing.
@@ -2784,6 +2901,13 @@ namespace heisenberg::Hooks
     // the hook reads one atomic.
     static std::atomic<bool> g_wandOnTrackedActivator[2] = { false, false };
 
+    // Pre-write state of the rollover prompt fields, per wand, recorded on the render thread
+    // and drained on the main thread. Bit31 = observed at all, bit0 = activateText populated,
+    // bit1 = secondaryText populated, bit2 = play flag. Answers "where do the TWO prompts on
+    // one elevator actually live" without guessing: both fields on one widget, or one field on
+    // each wand's widget.
+    static std::atomic<std::uint32_t> g_rolloverFieldWitness[2] = { 0u, 0u };
+
     // One-shot drain of the render-thread witnesses. Runs on the MAIN thread, never under any
     // engine lock, which is the only place logging is allowed for this hook family.
     static void DrainRolloverWitnesses()
@@ -2810,6 +2934,23 @@ namespace heisenberg::Hooks
                          static_cast<uint32_t>(detail >> 32), static_cast<uint32_t>(detail),
                          g_rolloverRestoreDeclines.load(std::memory_order_relaxed));
         }
+        // Which prompt fields the engine had populated when we intervened, per wand.
+        static std::uint32_t fieldsLogged[2] = { 0u, 0u };
+        for (int w = 0; w < 2; ++w) {
+            const std::uint32_t bits = g_rolloverFieldWitness[w].load(std::memory_order_relaxed);
+            if ((bits & 0x80000000u) == 0 || bits == fieldsLogged[w]) {
+                continue;
+            }
+            fieldsLogged[w] = bits;
+            spdlog::info("[ROLLOVER-FIELDS] wand={} pre-write: activateText={} secondaryText={} "
+                         "playFlag={} — a second visible prompt means BOTH were populated here; "
+                         "if only activateText was, the other message belongs to the other wand",
+                         w,
+                         (bits & 1u) ? "SET" : "empty",
+                         (bits & 2u) ? "SET" : "empty",
+                         (bits & 4u) ? "SET" : "empty");
+        }
+
         if (!faultLogged && g_rolloverOrigFaults.load(std::memory_order_relaxed) > 0) {
             faultLogged = true;
             spdlog::error("[HUDRollover] Native ShowRollover faulted and was contained "
@@ -2848,17 +2989,117 @@ namespace heisenberg::Hooks
             bool onTracked = false;
 
             RE::ObjectRefHandle handle = heisenberg::GetVRWandTargetHandle(physicalIsLeft);
-            if (handle) {
+
+            // PROXIMITY IS THE ONLY SIGNAL. The prompt answers "what happens if I reach out?",
+            // so it must track the HAND, not the VR wand's ray.
+            //
+            // Two failures came from keying on the ray. It fired when it should not: pointing
+            // at a tracked activator from across the room advertised "Touch to activate" for
+            // something out of arm's reach. And it stayed silent when it should have fired: at
+            // an elevator the ray resolves to the DOOR (a kDOOR ref, deliberately excluded from
+            // tracking because doors keep native VR interaction) while the pressable button
+            // beside it is a separate ACTI that IS tracked - so the prompt still read "press X"
+            // on a button the player could already push. Proven by [ROLLOVER-WHYNOT]:
+            // 'target ref=000C4485 base=000E8DCA type=32 NOT in tracked list' logged repeatedly
+            // while button 000E8DC9 (type 27) was being touch-activated successfully.
+            //
+            // IsHandInPointingRange is the handler's own latch, derived from the CLOSEST
+            // activator's freshly measured distance and explicitly reset when the tracked list
+            // empties. Deliberately NOT a scan over the per-activator isLeft/isRightHandInRange
+            // flags: those are skipped for any activator whose 3D is unloaded, so a stale true
+            // survives and claims proximity to something no longer even loaded.
+            //
+            // Consequence worth knowing: the prompt is about the hand, so standing at a button
+            // while pointing the ray elsewhere still reads "Touch to activate". That is correct
+            // - reaching out WOULD press it.
+            onTracked = actHandler.IsHandInPointingRange(physicalIsLeft);
+
+            // ALSO: is the thing being POINTED AT touch-operable?
+            //
+            // Proximity alone is too narrow. Looking at an elevator from a step back, hands
+            // down, the prompt read "press X to activate" even though the panel beside the
+            // door is a button the player can simply push. The rollover belongs to the DOOR
+            // (kDOOR, excluded from tracking because doors keep native VR interaction) while
+            // the pressable ACTI is a separate, nearby reference - so a direct-hit test alone
+            // never fires there either.
+            //
+            // Two tests, cheap, only when proximity has not already answered:
+            //   1. the pointed-at reference IS a tracked activator (a button dead ahead), or
+            //   2. a tracked activator sits right beside it - the elevator case, where the
+            //      panel and the door are parts of one assembly.
+            //
+            // The co-location radius is deliberately assembly-sized, not room-sized: it must
+            // cover a panel next to its door without claiming every activator down a corridor
+            // is what you are pointing at.
+            if (!onTracked && handle) {
                 RE::NiPointer<RE::TESObjectREFR> refr = handle.get();
                 if (refr) {
+                    const std::uint32_t targetId = refr->formID;
+                    const RE::NiPoint3 targetPos = refr->GetPosition();
+                    constexpr float kAssemblyRadius = 150.0f;          // ~2m
+                    const float radiusSq = kAssemblyRadius * kAssemblyRadius;
+
+                    const auto nearTarget = [&](const auto& tracked) {
+                        if (tracked.formID == targetId) return true;   // pointed straight at it
+                        RE::NiPointer<RE::TESObjectREFR> actRef = tracked.refrHandle.get();
+                        if (!actRef) return false;
+                        const RE::NiPoint3 d = actRef->GetPosition() - targetPos;
+                        return (d.x * d.x + d.y * d.y + d.z * d.z) <= radiusSq;
+                    };
+
                     for (const auto& tracked : actHandler.GetTrackedActivators()) {
-                        if (tracked.formID == refr->formID) { onTracked = true; break; }
+                        if (nearTarget(tracked)) { onTracked = true; break; }
                     }
                     if (!onTracked) {
                         for (const auto& tracked : actHandler.GetTrackedTerminals()) {
-                            if (tracked.formID == refr->formID) { onTracked = true; break; }
+                            if (tracked.formID == targetId) { onTracked = true; break; }
                         }
                     }
+                }
+            }
+
+            // WHY-NOT WITNESS. The owner can touch-activate a button while its rollover still
+            // reads "press X to activate", which means this flag was false for a target that is
+            // demonstrably a working activator. Only two things can cause that: the tracked list
+            // does not contain it (scan never ran, ran in another cell, or dropped it), or the
+            // wand's target handle is a different reference than the one we tracked. Logging
+            // both the target and the list size distinguishes those without guessing.
+            // Sampled hard - this runs every frame, for both wands.
+            if (!onTracked && handle) {
+                static std::uint32_t s_lastUntrackedRef[2] = { 0, 0 };
+                RE::NiPointer<RE::TESObjectREFR> refr = handle.get();
+                if (refr && refr->formID != s_lastUntrackedRef[wand]) {
+                    s_lastUntrackedRef[wand] = refr->formID;
+                    auto* baseObj = refr->GetObjectReference();
+                    spdlog::info("[ROLLOVER-WHYNOT] wand={} target ref={:08X} base={:08X} type={} "
+                                 "NOT in tracked list (activators={} terminals={})",
+                        wand,
+                        refr->formID,
+                        baseObj ? baseObj->GetFormID() : 0,
+                        baseObj ? static_cast<int>(baseObj->GetFormType()) : -1,
+                        actHandler.GetTrackedActivators().size(),
+                        actHandler.GetTrackedTerminals().size());
+                }
+            }
+
+            // DECISIVE WITNESS for "this button still shows the X glyph". ROLLOVER-FIELDS only
+            // fires when the pre-write field bits CHANGE, so it cannot answer "did the
+            // replacement run while I was pointing at the lift panel". This logs the resolved
+            // target and the tracked decision per wand, on change, so a specific complaint can
+            // be matched to a specific line.
+            {
+                static std::uint32_t s_lastTarget[2] = { 0, 0 };
+                static bool s_lastTracked[2] = { false, false };
+                std::uint32_t curTarget = 0;
+                if (handle) {
+                    RE::NiPointer<RE::TESObjectREFR> r = handle.get();
+                    if (r) curTarget = r->formID;
+                }
+                if (curTarget != s_lastTarget[wand] || onTracked != s_lastTracked[wand]) {
+                    s_lastTarget[wand] = curTarget;
+                    s_lastTracked[wand] = onTracked;
+                    spdlog::info("[ROLLOVER-DECIDE] wand={} target={:08X} tracked={}",
+                                 wand, curTarget, onTracked);
                 }
             }
 
@@ -2924,7 +3165,7 @@ namespace heisenberg::Hooks
     // Returns true if any replacement was made (caller must RestoreRolloverButtons after).
     // `onTrackedActivator` is the main-thread snapshot from RefreshWandActivatorTargets — this
     // runs with the params spinlock held, so it must not walk containers or resolve handles.
-    static bool ReplaceRolloverPrompts(void* thisPtr, bool onTrackedActivator, RolloverSaveState& save)
+    static bool ReplaceRolloverPrompts(void* thisPtr, bool onTrackedActivator, bool isLeftWand, RolloverSaveState& save)
     {
         auto base = reinterpret_cast<uintptr_t>(thisPtr);
         auto* activateText  = reinterpret_cast<uintptr_t*>(base + 0x618);
@@ -2949,15 +3190,59 @@ namespace heisenberg::Hooks
             return true;
         }
 
-        // Tracked activator: replace "[A] Activate" with "[A] Touch".
-        // Only activateText is written, so only activateText is tracked/restored - pass-through
-        // fields must not participate in the mismatch veto (they would false-positive).
+        // Tracked activator: "Elevator  [A] Activate"  ->  "Elevator  Touch to activate".
+        //
+        // The button GLYPH is not a separate field - the engine draws it because activateText
+        // is non-empty (FUN_141bc1a80 is a string-length test on that pointer). So writing the
+        // hint INTO activateText, as this used to, keeps the [A] pictogram and produces the
+        // nonsense "Elevator [A] Touch to activate": a button prompt telling you not to press
+        // a button. Nulling activateText removes the glyph, and the hint moves to secondaryText,
+        // which renders as plain text - exactly the arrangement the holotape branch above
+        // already uses for "Insert to Play", and proven by it.
+        //
+        // itemName (+0x610) is untouched, so the object keeps its name.
         if (*activateText != 0 && onTrackedActivator) {
-            save.activateText = *activateText;
-            *activateText     = g_touchHintEntry;
+            // WITNESS: which fields actually carried a prompt before we wrote anything.
+            // The owner reports TWO prompts on one elevator - "Touch to activate" AND a
+            // separate "X/A Push". Only two arrangements can produce that: both fields
+            // populated on THIS widget (secondary survived because the old code never wrote
+            // it), or the other wand's rollover showing its own untouched prompt. Recording
+            // the pre-write state of both fields, per wand, distinguishes them without
+            // another round of guessing. Fires only on change, so it cannot spam.
+            {
+                const std::uint32_t bits =
+                    0x80000000u |
+                    (*activateText != 0 ? 1u : 0u) |
+                    (*secondaryText != 0 ? 2u : 0u) |
+                    (*playFlag != 0 ? 4u : 0u);
+                g_rolloverFieldWitness[isLeftWand ? 1 : 0].store(
+                    bits, std::memory_order_relaxed);
+            }
 
-            save.wroteMask         = RolloverSaveState::kWroteActivate;
-            save.wroteActivateText = g_touchHintEntry;
+            // Both hint slots blanked (no pictogram of any kind) and itemName replaced with a
+            // bare "Touch to activate" - the object's own name is deliberately NOT shown.
+            //
+            // itemName is the only plain-text field in the struct (-> UIUtils::SetText); the
+            // other two are ButtonHintData slots whose glyph is baked into the widget and
+            // cannot be suppressed while keeping their text. Using the pre-cached static entry
+            // means nothing is composed per object, so there is no per-name cache, no
+            // allocation, and no string built anywhere near the render thread.
+            save.activateText  = *activateText;
+            save.secondaryText = *secondaryText;
+            *activateText  = 0;                  // no [A]/[X] button hint
+            *secondaryText = 0;                  // no grab hint
+            save.wroteMask = RolloverSaveState::kWroteActivate |
+                             RolloverSaveState::kWroteSecondary;
+            save.wroteActivateText  = 0;
+            save.wroteSecondaryText = 0;
+
+            if (g_touchHintEntry != 0) {
+                auto* itemName = reinterpret_cast<uintptr_t*>(base + 0x610);
+                save.itemName = *itemName;
+                *itemName     = g_touchHintEntry;
+                save.wroteMask |= RolloverSaveState::kWroteItemName;
+                save.wroteItemName = g_touchHintEntry;
+            }
             return true;
         }
 
@@ -3093,7 +3378,7 @@ namespace heisenberg::Hooks
             } else if (g_config.hideWandHUD) {
                 HideWandButtons(thisPtr, save);
             } else {
-                ReplaceRolloverPrompts(thisPtr, onTrackedActivator, save);
+                ReplaceRolloverPrompts(thisPtr, onTrackedActivator, isLeft, save);
             }
         }
 
@@ -3157,7 +3442,10 @@ namespace heisenberg::Hooks
 
         static RE::BSFixedString sHolotape("Insert to Play");
         g_holotapeHintEntry = *reinterpret_cast<uintptr_t*>(&sHolotape);
-        static RE::BSFixedString sTouch("Touch");
+        // The engine renders this next to the button glyph, so it reads as the whole prompt.
+        // "Touch" alone was ambiguous - it sat where "Activate" had been and looked like a
+        // relabelled button press rather than an instruction to reach out and touch the thing.
+        static RE::BSFixedString sTouch("Touch to activate");
         g_touchHintEntry = *reinterpret_cast<uintptr_t*>(&sTouch);
 
         // We hand these raw pointers to the engine without an addref, so they must not be

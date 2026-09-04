@@ -3611,6 +3611,10 @@ namespace heisenberg
             _deckRemovalHandGuard -= deltaTime;
         }
 
+        if (_deckPushCloseLockout > 0.0f) {
+            _deckPushCloseLockout -= deltaTime;
+        }
+
         if (_slamCooldown > 0.0f) {
             _slamCooldown -= deltaTime;
         }
@@ -4280,7 +4284,11 @@ namespace heisenberg
     {
         // Route through the game's own BSAudioManager to avoid WASAPI conflicts.
         // Files must be deployed to Sound/FX/Heisenberg/ in the mod's Data folder.
-        auto handle = BSPlayGameSound(GetGameSoundPath(filename).c_str(), 0.75f);
+        //
+        // 0.5625 = the previous 0.75 lowered by 25% (owner request). Every tape-deck action
+        // sound — eject press, tray open/close, tape in/out, slam — routes through here, so
+        // this one constant is the deck's master volume.
+        auto handle = BSPlayGameSound(GetGameSoundPath(filename).c_str(), 0.5625f);
         if (handle.soundID == static_cast<std::uint32_t>(-1) && fallbackFormID != 0) {
             PlaySound(fallbackFormID);
         }
@@ -4520,6 +4528,9 @@ namespace heisenberg
                 _tapeDeckOpen = true;
                 _tapeDeckState = TapeDeckState::Opening;
                 _deckOpenedByEject = true;
+                // The finger that pressed the button has not moved yet, and the button is
+                // right beside the tray — without this it pushes the deck shut on the way out.
+                _deckPushCloseLockout = DECK_PUSH_CLOSE_LOCKOUT;
                 _holotapeGrabCooldown = 0.5f;  // Prevent immediate insertion when deck opens
                 _holotapeRemovalCooldown = 0.0f; // Eject means the player may take the loaded tape immediately
                 _holotapeRemovalRequiresGripRelease = false; // This is a deliberate new removal cycle
@@ -4769,6 +4780,7 @@ namespace heisenberg
                         frikClear.ClearHandPoseFingerPositions(_insertionOpenHandIsLeft);
                     _insertionOpenHandActive = false;
                 }
+                _deckPushCloseLockout = 0.0f;
                 _deckOpenedByEject = false;
                 spdlog::debug("[PIPBOY] Tape deck closed (0.5s eject cooldown)");
 
@@ -5495,6 +5507,15 @@ namespace heisenberg
         if (_tapeDeckState != TapeDeckState::Open &&
             _tapeDeckState != TapeDeckState::Pushing &&
             !openingPushWindow) {
+            return;
+        }
+
+        // Deck just opened: refuse push-close until the lockout expires. The animation
+        // threshold above is not enough on its own — the pressing finger is still parked on
+        // the eject button when the tray reaches 75%, so the deck opened and immediately shut
+        // in a single press. Time is the right unit here because the blocking condition is
+        // "the hand has not withdrawn yet", which has nothing to do with tray travel.
+        if (_deckPushCloseLockout > 0.0f) {
             return;
         }
 
@@ -6618,6 +6639,7 @@ namespace heisenberg
         _tapeDeckAnimProgress   = 0.0f;
         _ejectCooldown          = 0.0f;
         _insertionOpenHandActive = false;
+        _deckPushCloseLockout      = 0.0f;
         _deckOpenedByEject      = false;
         _holotapeLoaded         = false;
         _loadedHolotapeFormID   = 0;

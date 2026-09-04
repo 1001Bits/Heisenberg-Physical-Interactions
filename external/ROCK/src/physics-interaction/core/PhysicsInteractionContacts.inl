@@ -801,6 +801,7 @@
         using generated_body_contact_registry::GeneratedBodyKind;
         using generated_body_contact_registry::hasFiniteSampledVelocity;
         using generated_body_contact_registry::hasFlag;
+        using generated_body_contact_registry::kFlagDynamicHandProxy;
         using generated_body_contact_registry::kFlagPowerArmor;
         using generated_body_contact_registry::kFlagPrimaryAnchor;
 
@@ -809,6 +810,7 @@
             bool valid = false;
             bool isLeft = false;
             bool primaryAnchor = false;
+            bool dynamicCollisionProxy = false;
             HandColliderBodyMetadata metadata{};
         };
 
@@ -837,6 +839,8 @@
             source.valid = true;
             source.isLeft = classification.kind == GeneratedBodyKind::LeftHand;
             source.primaryAnchor = hasFlag(classification.flags, kFlagPrimaryAnchor);
+            source.dynamicCollisionProxy =
+                hasFlag(classification.flags, kFlagDynamicHandProxy);
             source.metadata.valid = true;
             source.metadata.isLeft = source.isLeft;
             source.metadata.primaryPalmAnchor = source.primaryAnchor;
@@ -1281,26 +1285,70 @@
             }
         };
 
-        auto fillNativeSourceVelocity = [world](std::uint32_t sourceBodyId, contact_evidence::NativeContactEvidenceRecord& evidence) {
-            if (!world || !contact_evidence::isValidBodyId(sourceBodyId)) {
-                return;
-            }
+        auto tryReadNativeEndpointVelocityGame =
+            [&](std::uint32_t bodyId,
+                bool allowLiveMotionFallback,
+                RE::NiPoint3& outVelocityGame) {
+                outVelocityGame = {};
+                if (!world ||
+                    !contact_evidence::isValidBodyId(bodyId)) {
+                    return false;
+                }
 
-            auto* motion = havok_runtime::getBodyMotion(world, RE::hknpBodyId{ sourceBodyId });
-            if (!motion) {
-                return;
-            }
+                const float scale = havokToGameScale();
+                if (const auto* handSource = handSourceFor(bodyId);
+                    handSource && handSource->valid &&
+                    handSource->metadata.hasSampledLinearVelocityHavok) {
+                    outVelocityGame = RE::NiPoint3{
+                        handSource->metadata.sampledLinearVelocityHavok[0] * scale,
+                        handSource->metadata.sampledLinearVelocityHavok[1] * scale,
+                        handSource->metadata.sampledLinearVelocityHavok[2] * scale,
+                    };
+                    return std::isfinite(outVelocityGame.x) &&
+                           std::isfinite(outVelocityGame.y) &&
+                           std::isfinite(outVelocityGame.z);
+                }
+                if (const auto* weaponSource = weaponSourceFor(bodyId);
+                    weaponSource && weaponSource->valid &&
+                    weaponSource->hasSampledVelocity) {
+                    outVelocityGame = RE::NiPoint3{
+                        weaponSource->sampledVelocityHavok[0] * scale,
+                        weaponSource->sampledVelocityHavok[1] * scale,
+                        weaponSource->sampledVelocityHavok[2] * scale,
+                    };
+                    return std::isfinite(outVelocityGame.x) &&
+                           std::isfinite(outVelocityGame.y) &&
+                           std::isfinite(outVelocityGame.z);
+                }
 
-            const float scale = havokToGameScale();
-            evidence.sourceVelocityGame = RE::NiPoint3{
-                motion->linearVelocity.x * scale,
-                motion->linearVelocity.y * scale,
-                motion->linearVelocity.z * scale,
+                // Hand/weapon arbitration must compare the two queued target
+                // velocities from this contact step.  A dynamic proxy's live
+                // velocity is already solver-clipped, while keyframed weapon
+                // readback may be zero; treating either as target motion can
+                // invert which side actually entered the contact.
+                if (!allowLiveMotionFallback) {
+                    return false;
+                }
+
+                auto* motion = havok_runtime::getBodyMotion(
+                    world,
+                    RE::hknpBodyId{ bodyId });
+                if (!motion) {
+                    return false;
+                }
+                outVelocityGame = RE::NiPoint3{
+                    motion->linearVelocity.x * scale,
+                    motion->linearVelocity.y * scale,
+                    motion->linearVelocity.z * scale,
+                };
+                return std::isfinite(outVelocityGame.x) &&
+                       std::isfinite(outVelocityGame.y) &&
+                       std::isfinite(outVelocityGame.z);
             };
-        };
 
         auto publishNativeContactEvidence = [&](const HandColliderBodyMetadata* handMetadata = nullptr) {
-            if (!contactRoute.recordWorldSurfaceEvidence ||
+            if ((!contactRoute.recordWorldSurfaceEvidence &&
+                    !contactRoute.recordHandWeaponEvidence) ||
                 (!contact_pipeline_policy::isHand(
                      contactRoute.source.kind) &&
                  contactRoute.source.kind !=
@@ -1328,7 +1376,16 @@
             evidence.targetKind = endpointKindForEvidence(contactRoute.target.kind);
             evidence.sourceIsLeft = contact_pipeline_policy::isLeftOwned(contactRoute.source.kind);
             evidence.targetIsLeft = contact_pipeline_policy::isLeftOwned(contactRoute.target.kind);
-            fillNativeSourceVelocity(contactRoute.sourceBodyId, evidence);
+            evidence.sourceVelocityValid =
+                tryReadNativeEndpointVelocityGame(
+                    contactRoute.sourceBodyId,
+                    !contactRoute.recordHandWeaponEvidence,
+                    evidence.sourceVelocityGame);
+            evidence.targetVelocityValid =
+                tryReadNativeEndpointVelocityGame(
+                    contactRoute.targetBodyId,
+                    !contactRoute.recordHandWeaponEvidence,
+                    evidence.targetVelocityGame);
 
             const float scale = havokToGameScale();
             evidence.quality = contact_evidence::NativeContactQuality::RawPoint;
@@ -1357,6 +1414,7 @@
             }
 
             _nativeContactEvidence.record(evidence);
+
         };
 
         auto recordBodyContactEvidence = [&]() {
@@ -1518,14 +1576,32 @@
         bool isRight = bodyAIsRight || bodyBIsRight;
         bool isLeft = bodyAIsLeft || bodyBIsLeft;
         const HandColliderBodyMetadata* routeHandMetadata = nullptr;
+        bool routeHandIsDynamicCollisionProxy = false;
         if (contact_pipeline_policy::isHand(contactRoute.source.kind)) {
             const auto* handSource = handSourceFor(contactRoute.sourceBodyId);
             routeHandMetadata = handSource && handSource->valid ? &handSource->metadata : nullptr;
+            routeHandIsDynamicCollisionProxy =
+                handSource && handSource->valid &&
+                handSource->dynamicCollisionProxy;
         }
 
         // Heisenberg-preserved: feed the soft-contact native evidence cache from
         // the same routed contact that upstream publishes externally.
-        publishNativeContactEvidence(routeHandMetadata);
+        if (!routeHandIsDynamicCollisionProxy ||
+            contactRoute.recordHandWeaponEvidence) {
+            publishNativeContactEvidence(routeHandMetadata);
+        }
+
+        if (routeHandIsDynamicCollisionProxy) {
+            /*
+             * Layer-48 twins exist only to solve visual hand/world and
+             * hand/weapon blocking.  Their weapon manifold is useful to the
+             * reciprocal full-pose weapon stop, but publishing it as semantic
+             * touch/support-grip/provider evidence would make one physical
+             * contact appear twice (legacy hand bank + dynamic twin bank).
+             */
+            return;
+        }
 
         if (contactRoute.publishExternalContact) {
             publishExternalContact(contactRoute.sourceBodyId, contactRoute.targetBodyId, contactRoute.providerSourceKind, contactRoute.providerSourceHand, routeHandMetadata);

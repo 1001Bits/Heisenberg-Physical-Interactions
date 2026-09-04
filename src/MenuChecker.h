@@ -36,8 +36,9 @@ namespace heisenberg
         bool Initialize();
 
         /**
-         * Check if any game-stopping menu is open.
-         * This is the main check used to skip processing during menus.
+         * Check if a genuinely game-stopping menu is open. Favorites and the
+         * Pip-Boy are gameplay-transparent overlays and are intentionally
+         * excluded from this aggregate.
          */
         bool IsGameStopped() const;
 

@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 4.0)
 # >>> Project
 set(NAME "Heisenberg_F4VR")
 set(FRIENDLY_NAME "Heisenberg F4VR")
-set(VERSION 0.8.4)
+set(VERSION 0.8.14)
 
 message(">>> Start build for '${NAME}' v${VERSION}")
 
@@ -346,6 +346,14 @@ if(BUILD_HEISENBERG_TESTS)
   target_include_directories(HeisenbergFrikCompatibilityPolicyTests PRIVATE "${ROCK_DIR}/src")
   add_test(NAME HeisenbergFrikCompatibilityPolicyTests COMMAND HeisenbergFrikCompatibilityPolicyTests)
 
+  add_executable(HeisenbergRockConfigFileWatchPolicyTests
+    tests/RockConfigFileWatchPolicyTests.cpp
+    external/ROCK/src/RockConfigFileWatchPolicy.h
+  )
+  target_compile_features(HeisenbergRockConfigFileWatchPolicyTests PRIVATE cxx_std_23)
+  target_include_directories(HeisenbergRockConfigFileWatchPolicyTests PRIVATE "${ROCK_DIR}/src")
+  add_test(NAME HeisenbergRockConfigFileWatchPolicyTests COMMAND HeisenbergRockConfigFileWatchPolicyTests)
+
   add_executable(HeisenbergFrikFingerPoseBridgeTests
     tests/FrikFingerPoseBridgeTests.cpp
     external/ROCK/src/api/FRIKApi.h
@@ -359,12 +367,29 @@ if(BUILD_HEISENBERG_TESTS)
   add_executable(HeisenbergTwoHandedWeaponPolicyTests
     tests/TwoHandedWeaponPolicyTests.cpp
     external/ROCK/src/physics-interaction/weapon/TwoHandedWeaponPolicy.h
+    external/ROCK/src/physics-interaction/weapon/EquippedWeaponDropPolicy.h
     external/ROCK/src/physics-interaction/weapon/WeaponInteractionProbeFramePolicy.h
     external/ROCK/src/physics-interaction/TransformMath.h
   )
   target_compile_features(HeisenbergTwoHandedWeaponPolicyTests PRIVATE cxx_std_23)
   target_include_directories(HeisenbergTwoHandedWeaponPolicyTests PRIVATE "${ROCK_DIR}/src")
   add_test(NAME HeisenbergTwoHandedWeaponPolicyTests COMMAND HeisenbergTwoHandedWeaponPolicyTests)
+
+  add_executable(HeisenbergWeaponWallSweepPolicyTests
+    tests/WeaponWallSweepPolicyTests.cpp
+    external/ROCK/src/physics-interaction/weapon/WeaponWallSweepPolicy.h
+  )
+  target_compile_features(HeisenbergWeaponWallSweepPolicyTests PRIVATE cxx_std_23)
+  target_include_directories(HeisenbergWeaponWallSweepPolicyTests PRIVATE "${ROCK_DIR}/src")
+  add_test(NAME HeisenbergWeaponWallSweepPolicyTests COMMAND HeisenbergWeaponWallSweepPolicyTests)
+
+  add_executable(HeisenbergMenuPhysicsPolicyTests
+    tests/MenuPhysicsPolicyTests.cpp
+    external/ROCK/src/physics-interaction/core/MenuPhysicsPolicy.h
+  )
+  target_compile_features(HeisenbergMenuPhysicsPolicyTests PRIVATE cxx_std_23)
+  target_include_directories(HeisenbergMenuPhysicsPolicyTests PRIVATE "${ROCK_DIR}/src")
+  add_test(NAME HeisenbergMenuPhysicsPolicyTests COMMAND HeisenbergMenuPhysicsPolicyTests)
 
   add_executable(HeisenbergPipboyMeshContactPolicyTests
     tests/PipboyMeshContactPolicyTests.cpp
@@ -381,6 +406,17 @@ if(BUILD_HEISENBERG_TESTS)
   target_compile_features(HeisenbergGrabPosePolicyTests PRIVATE cxx_std_23)
   target_include_directories(HeisenbergGrabPosePolicyTests PRIVATE "${SOURCE_DIR}")
   add_test(NAME HeisenbergGrabPosePolicyTests COMMAND HeisenbergGrabPosePolicyTests)
+
+  add_executable(HeisenbergGrabOwnershipPolicyTests
+    tests/GrabOwnershipPolicyTests.cpp
+    src/GrabOwnershipPolicy.h
+    src/StorageZoneWeaponPolicy.h
+    external/ROCK/src/physics-interaction/input/HostGrabInputEdgePolicy.h
+    external/ROCK/src/physics-interaction/input/InputRemapPolicy.h
+  )
+  target_compile_features(HeisenbergGrabOwnershipPolicyTests PRIVATE cxx_std_23)
+  target_include_directories(HeisenbergGrabOwnershipPolicyTests PRIVATE "${SOURCE_DIR}" "${ROCK_DIR}/src")
+  add_test(NAME HeisenbergGrabOwnershipPolicyTests COMMAND HeisenbergGrabOwnershipPolicyTests)
 
   add_executable(HeisenbergEmbeddedOffsetsTests
     tests/EmbeddedOffsetsTests.cpp
@@ -423,11 +459,36 @@ if(BUILD_HEISENBERG_TESTS)
   add_executable(HeisenbergCollisionLayerPolicyTests
     tests/CollisionLayerPolicyTests.cpp
     external/ROCK/src/physics-interaction/collision/CollisionLayerPolicy.h
+    external/ROCK/src/physics-interaction/collision/ContactPipelinePolicy.h
     external/ROCK/src/physics-interaction/NativeMeleeSuppressionPolicy.h
   )
   target_compile_features(HeisenbergCollisionLayerPolicyTests PRIVATE cxx_std_23)
   target_include_directories(HeisenbergCollisionLayerPolicyTests PRIVATE "${ROCK_DIR}/src")
   add_test(NAME HeisenbergCollisionLayerPolicyTests COMMAND HeisenbergCollisionLayerPolicyTests)
+
+  add_executable(HeisenbergHandCollisionSuppressionTopologyTests
+    tests/HandCollisionSuppressionTopologyTests.cpp
+    external/ROCK/src/physics-interaction/collision/CollisionSuppressionRegistry.h
+    external/ROCK/src/physics-interaction/hand/HandLifecycle.h
+  )
+  target_compile_features(HeisenbergHandCollisionSuppressionTopologyTests PRIVATE cxx_std_23)
+  target_include_directories(HeisenbergHandCollisionSuppressionTopologyTests PRIVATE "${ROCK_DIR}/src")
+  add_test(NAME HeisenbergHandCollisionSuppressionTopologyTests COMMAND HeisenbergHandCollisionSuppressionTopologyTests)
+
+  add_executable(HeisenbergDynamicHandCollisionTopologyTests
+    tests/DynamicHandCollisionTopologyTests.cpp
+    external/ROCK/src/physics-interaction/hand/DynamicHandCollisionAuthorityPolicy.h
+    external/ROCK/src/physics-interaction/hand/DynamicHandCollisionFeedbackPolicy.h
+    external/ROCK/src/physics-interaction/hand/DynamicHandCollisionStabilityPolicy.h
+    external/ROCK/src/physics-interaction/hand/DynamicHandCollisionTelemetry.h
+    external/ROCK/src/physics-interaction/hand/DynamicHandTwinTargets.h
+    external/ROCK/src/physics-interaction/hand/HandColliderTypes.h
+    external/ROCK/src/physics-interaction/visual/PreAuthorityHandFramePolicy.h
+  )
+  target_compile_features(HeisenbergDynamicHandCollisionTopologyTests PRIVATE cxx_std_23)
+  target_include_directories(HeisenbergDynamicHandCollisionTopologyTests PRIVATE "${ROCK_DIR}/src")
+  target_link_libraries(HeisenbergDynamicHandCollisionTopologyTests PRIVATE F4VRCommon::framework)
+  add_test(NAME HeisenbergDynamicHandCollisionTopologyTests COMMAND HeisenbergDynamicHandCollisionTopologyTests)
 
   add_executable(HeisenbergGeneratedContactBufferPolicyTests
     tests/GeneratedContactBufferPolicyTests.cpp
@@ -436,6 +497,77 @@ if(BUILD_HEISENBERG_TESTS)
   target_compile_features(HeisenbergGeneratedContactBufferPolicyTests PRIVATE cxx_std_23)
   target_include_directories(HeisenbergGeneratedContactBufferPolicyTests PRIVATE "${ROCK_DIR}/src")
   add_test(NAME HeisenbergGeneratedContactBufferPolicyTests COMMAND HeisenbergGeneratedContactBufferPolicyTests)
+
+  add_executable(HeisenbergHeldLocomotionTransportPolicyTests
+    tests/HeldLocomotionTransportPolicyTests.cpp
+    external/ROCK/src/physics-interaction/grab/HeldLocomotionTransportPolicy.h
+  )
+  target_compile_features(HeisenbergHeldLocomotionTransportPolicyTests PRIVATE cxx_std_23)
+  target_include_directories(HeisenbergHeldLocomotionTransportPolicyTests PRIVATE "${ROCK_DIR}/src")
+  add_test(NAME HeisenbergHeldLocomotionTransportPolicyTests COMMAND HeisenbergHeldLocomotionTransportPolicyTests)
+
+  add_executable(HeisenbergHeldPlayerSpacePolicyTests
+    tests/HeldPlayerSpacePolicyTests.cpp
+    external/ROCK/src/physics-interaction/grab/GrabHeldObject.h
+    external/ROCK/src/physics-interaction/grab/HeldLocomotionTransportPolicy.h
+    external/ROCK/src/physics-interaction/grab/HeldPlayerSpaceRegistry.h
+    external/ROCK/src/physics-interaction/grab/HeldPlayerSpaceWarpPolicy.h
+  )
+  target_compile_features(HeisenbergHeldPlayerSpacePolicyTests PRIVATE cxx_std_23)
+  target_include_directories(HeisenbergHeldPlayerSpacePolicyTests PRIVATE "${ROCK_DIR}/src")
+  add_test(NAME HeisenbergHeldPlayerSpacePolicyTests COMMAND HeisenbergHeldPlayerSpacePolicyTests)
+
+  add_executable(HeisenbergDynamicGrabPolicyTests
+    tests/DynamicGrabPolicyTests.cpp
+    external/ROCK/src/physics-interaction/grab/DynamicGrabPolicy.h
+    external/ROCK/src/physics-interaction/grab/GrabHeldObject.h
+    external/ROCK/src/physics-interaction/hand/HandVisual.h
+  )
+  target_compile_features(HeisenbergDynamicGrabPolicyTests PRIVATE cxx_std_23)
+  target_include_directories(HeisenbergDynamicGrabPolicyTests PRIVATE "${ROCK_DIR}/src")
+  add_test(NAME HeisenbergDynamicGrabPolicyTests COMMAND HeisenbergDynamicGrabPolicyTests)
+
+  add_executable(HeisenbergNpcInjectionPolicyTests
+    tests/NpcInjectionPolicyTests.cpp
+    src/ConsumableUsePolicy.h
+    src/NpcInjectionPolicy.h
+    src/PostConsumeActivationPolicy.h
+  )
+  target_compile_features(HeisenbergNpcInjectionPolicyTests PRIVATE cxx_std_23)
+  target_include_directories(HeisenbergNpcInjectionPolicyTests PRIVATE "${SOURCE_DIR}")
+  add_test(NAME HeisenbergNpcInjectionPolicyTests COMMAND HeisenbergNpcInjectionPolicyTests)
+
+  add_executable(HeisenbergConsumeCommitPolicyTests
+    tests/ConsumeCommitPolicyTests.cpp
+    external/ROCK/src/physics-interaction/consume/ConsumeCommitPolicy.h
+  )
+  target_compile_features(HeisenbergConsumeCommitPolicyTests PRIVATE cxx_std_23)
+  target_include_directories(HeisenbergConsumeCommitPolicyTests PRIVATE "${ROCK_DIR}/src")
+  add_test(NAME HeisenbergConsumeCommitPolicyTests COMMAND HeisenbergConsumeCommitPolicyTests)
+
+  add_executable(HeisenbergViewCasterSelectionPolicyTests
+    tests/ViewCasterSelectionPolicyTests.cpp
+    external/ROCK/src/physics-interaction/object/ViewCasterSelectionPolicy.h
+  )
+  target_compile_features(HeisenbergViewCasterSelectionPolicyTests PRIVATE cxx_std_23)
+  target_include_directories(HeisenbergViewCasterSelectionPolicyTests PRIVATE "${ROCK_DIR}/src")
+  add_test(NAME HeisenbergViewCasterSelectionPolicyTests COMMAND HeisenbergViewCasterSelectionPolicyTests)
+
+  add_executable(HeisenbergPullCatchRetryPolicyTests
+    tests/PullCatchRetryPolicyTests.cpp
+    external/ROCK/src/physics-interaction/grab/PullCatchRetryPolicy.h
+  )
+  target_compile_features(HeisenbergPullCatchRetryPolicyTests PRIVATE cxx_std_23)
+  target_include_directories(HeisenbergPullCatchRetryPolicyTests PRIVATE "${ROCK_DIR}/src")
+  add_test(NAME HeisenbergPullCatchRetryPolicyTests COMMAND HeisenbergPullCatchRetryPolicyTests)
+
+  add_executable(HeisenbergPullMotionPolicyTests
+    tests/PullMotionPolicyTests.cpp
+    external/ROCK/src/physics-interaction/grab/PullMotionPolicy.h
+  )
+  target_compile_features(HeisenbergPullMotionPolicyTests PRIVATE cxx_std_23)
+  target_include_directories(HeisenbergPullMotionPolicyTests PRIVATE "${ROCK_DIR}/src")
+  add_test(NAME HeisenbergPullMotionPolicyTests COMMAND HeisenbergPullMotionPolicyTests)
 endif()
 
 # >>> Install/package manifest

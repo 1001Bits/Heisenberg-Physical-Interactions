@@ -1,5 +1,7 @@
 #include "physics-interaction/core/RockRuntimeState.h"
 
+#include "physics-interaction/core/MenuPhysicsPolicy.h"
+
 #include "RockConfig.h"
 #include "physics-interaction/core/RockRuntimeStatePolicy.h"
 #include "physics-interaction/debug/SkeletonBoneDebugMath.h"
@@ -284,11 +286,28 @@ namespace rock::runtime_state
         next.deltaSeconds = sampleFrameDeltaSeconds();
         next.playerAvailable = hasPlayer();
         next.weaponDrawn = sampleWeaponDrawn();
-        next.inputMenuBlocking = input.menuInputBlocking;
+        next.localFavoritesMenuOpen =
+            s_menuHandlerInitialized &&
+            s_gameMenus.isFavoritesMenuOpen();
+        next.localPipboyMenuOpen =
+            s_menuHandlerInitialized &&
+            s_gameMenus.isPipboyMenuOpen();
         next.localScopeMenuOpen = s_menuHandlerInitialized && s_gameMenus.isInScopeMenu();
         next.localLoadingMenuOpen = s_menuHandlerInitialized && s_gameMenus.isLoadingMenuOpen();
         next.localGameStopped = s_menuHandlerInitialized && s_gameMenus.isGameStopped();
-        next.localMenuBlocking = next.localGameStopped || next.inputMenuBlocking;
+        const auto menuDecision = menu_physics_policy::evaluate({
+            .inputMenuBlocking = input.menuInputBlocking,
+            .favoritesMenuOpen = next.localFavoritesMenuOpen,
+            .pipboyMenuOpen = next.localPipboyMenuOpen,
+            .nonOverlayGameStoppingMenuOpen =
+                s_menuHandlerInitialized &&
+                s_gameMenus.isPhysicsStopped(),
+        });
+        next.localMenuBlocking = menuDecision.physicsMenuBlocking;
+        // Store the policy-filtered gameplay gate. Favorites and Pip-Boy can
+        // still report a menu input context, but neither is allowed to disable
+        // locomotion, grabs, or ROCK's controller handling.
+        next.inputMenuBlocking = menuDecision.gameplayInputBlocking;
         next.compatibilityConfigBlocking = input.compatibilityConfigBlocking;
         next.visualAuthorityAvailable = input.visualAuthorityAvailable;
         next.visualSkeletonReadyHint = input.visualSkeletonReadyHint;

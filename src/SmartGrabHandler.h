@@ -103,14 +103,18 @@ namespace heisenberg
         // Clear smart grab state (called when grab ends normally)
         void ClearSmartGrab(bool isLeft);
 
+        // Categorize a single AlchemyItem by MAGIC EFFECT ARCHETYPE (kStimpak, kCureDisease,
+        // kCureAddiction, ...) with keyword and name fallbacks. Public because it is the only
+        // language-independent way to ask "what kind of medicine is this?" - the grab code uses
+        // it for injection eligibility, where a display-name test silently failed in every
+        // localised game and for every mod-added item.
+        CategorizedItem CategorizeItem(RE::TESBoundObject* obj) const;
+
     private:
         SmartGrabHandler() = default;
 
         // Assess current player needs
         PlayerNeeds AssessPlayerNeeds() const;
-
-        // Categorize a single AlchemyItem
-        CategorizedItem CategorizeItem(RE::TESBoundObject* obj) const;
 
         // Select the best item from inventory based on player needs
         // Returns nullptr if no suitable item found

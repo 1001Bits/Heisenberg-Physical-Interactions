@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <fstream>
+#include <list>
 #include <limits>
 #include <mutex>
 #include <string_view>
@@ -200,6 +201,10 @@ bEnableStickyGrab = false
 iWeaponEquipMode = 1
 bEnableVHHolstering = true
 
+; Full Dynamic: the embedded ROCK engine owns selection and constraint grabbing.
+; Falls back safely to Heisenberg keyframed grab if the embedded engine cannot load.
+iGrabMode = 9
+
 ; Max telekinesis distance (in centimeters)
 ; Objects beyond this distance cannot be grabbed via telekinesis (500cm = 5m default)
 fMaxGrabDistance = 500.0
@@ -292,10 +297,11 @@ fMouthOffsetX = 0.0
 fMouthOffsetY = 10.0
 fMouthOffsetZ = -9.0
 
-; Max hand speed to consume items (m/s) - must be moving slower than this
-; Prevents accidental consumes when quickly moving hand through zone
-; Default: 2.0
+; Legacy compatibility value; release-based consumption has no speed requirement
 fMouthVelocityThreshold = 2.0
+
+; Consume while held in the mouth area without releasing grip (default: off)
+bAutoConsumeInMouthArea = false
 
 ; Block manual consumption/chem use while wearing Power Armor
 ; (helmet prevents bringing items to mouth/hand)
@@ -308,6 +314,12 @@ bConsumableToHand = true
 ; Holotape To Hand: Off = holotape plays immediately when selected from
 ; Pipboy inventory. On = it appears in your right hand instead of playing.
 bHolotapeToHand = true
+
+; Inject while held in the opposite wrist area without releasing grip (default: off)
+bAutoConsumeInWristArea = false
+
+; Allow physical Stimpak revival of the player's current companion (default: on)
+bEnableCompanionStimpakInjection = true
 
 [DropToHand]
 ; Drop to Hand: Items dropped from inventory spawn in your hand instead of falling
@@ -385,8 +397,8 @@ bHideAllWandHUD = false
 bVerboseLaunch = false
 
 ; Log level: 0=trace, 1=debug, 2=info, 3=warn, 4=error
-; Default: 4 (error) - release default. Use 2 (info) or 1 (debug) to diagnose.
-iLogLevel = 4
+; Default: 3 (warn) - release default. Use 2 (info) or 1 (debug) to diagnose; 4 (error) for minimum volume.
+iLogLevel = 3
 )";
 
     void Config::Load()
@@ -721,6 +733,7 @@ iLogLevel = 4
         mouthOffsetZ = static_cast<float>(ini.GetDoubleValue("Consumables", "fMouthOffsetZ", kDefaults.mouthOffsetZ));
         mouthRadius = static_cast<float>(ini.GetDoubleValue("Consumables", "fMouthRadius", kDefaults.mouthRadius));
         mouthVelocityThreshold = static_cast<float>(ini.GetDoubleValue("Consumables", "fMouthVelocityThreshold", mouthVelocityThreshold));
+        autoConsumeInMouthArea = ini.GetBoolValue("Consumables", "bAutoConsumeInMouthArea", autoConsumeInMouthArea);
         mouthDropHapticStrength = static_cast<float>(ini.GetDoubleValue("Consumables", "fMouthHapticStrength", mouthDropHapticStrength));
         blockConsumptionInPA = ini.GetBoolValue("Consumables", "bBlockConsumptionInPA", blockConsumptionInPA);
         allowWeaponGrabInPowerArmor = ini.GetBoolValue("Grab", "bAllowWeaponGrabInPowerArmor", allowWeaponGrabInPowerArmor);
@@ -730,6 +743,14 @@ iLogLevel = 4
 
         // Hand injection zone
         enableHandInjection = ini.GetBoolValue("Consumables", "bEnableHandInjection", enableHandInjection);
+        autoConsumeInWristArea = ini.GetBoolValue("Consumables", "bAutoConsumeInWristArea", autoConsumeInWristArea);
+        enableNpcInjection = ini.GetBoolValue("Consumables", "bEnableNpcInjection", enableNpcInjection);
+        enableCompanionStimpakInjection = ini.GetBoolValue(
+            "Consumables",
+            "bEnableCompanionStimpakInjection",
+            enableCompanionStimpakInjection);
+        npcInjectionRadius = static_cast<float>(ini.GetDoubleValue("Consumables", "fNpcInjectionRadius", npcInjectionRadius));
+        showInjectionMessages = ini.GetBoolValue("Consumables", "bShowInjectionMessages", showInjectionMessages);
         handInjectionOffsetX = static_cast<float>(ini.GetDoubleValue("Consumables", "fHandInjectionOffsetX", kDefaults.handInjectionOffsetX));
         handInjectionOffsetY = static_cast<float>(ini.GetDoubleValue("Consumables", "fHandInjectionOffsetY", kDefaults.handInjectionOffsetY));
         handInjectionOffsetZ = static_cast<float>(ini.GetDoubleValue("Consumables", "fHandInjectionOffsetZ", kDefaults.handInjectionOffsetZ));
@@ -822,6 +843,9 @@ iLogLevel = 4
 
         // Pickpocket / Stealing
         enablePickpocket = ini.GetBoolValue("Pickpocket", "bEnablePickpocket", enablePickpocket);
+        // PARKED 2026-09-04: pickpocketing is disabled regardless of the INI/MCM value
+        // until the browse/steal flow works correctly. Remove this override to re-enable.
+        enablePickpocket = false;
 
         // Debug
         debugDrawControllers = ini.GetBoolValue("Debug", "bDebugDrawControllers", debugDrawControllers);
@@ -887,6 +911,19 @@ iLogLevel = 4
         clampFloat(snapDistance, 0.0f, 500.0f, "fSnapDistance");
         clampFloat(handCollisionRadius, 0.0f, 100.0f, "fHandCollisionRadius");
         clampFloat(handContactSlop, 0.0f, 20.0f, "fHandContactSlop");
+        // [Throwables] — these four are exposed in the MCM menu and are consumed by
+        // Heisenberg.cpp / Hooks.cpp, but the section was never READ from the INI, so every
+        // value the player picked in the menu was silently discarded and the compiled default
+        // used instead. Wiring the reads here is what makes the menu actually do something.
+        throwableActivationZone = static_cast<int>(
+            ini.GetLongValue("Throwables", "iThrowableActivationZone", throwableActivationZone));
+        throwableZoneRadius = static_cast<float>(
+            ini.GetDoubleValue("Throwables", "fThrowableZoneRadius", throwableZoneRadius));
+        throwableHoldDuration = static_cast<float>(
+            ini.GetDoubleValue("Throwables", "fThrowableHoldDuration", throwableHoldDuration));
+        remapGrenadeButtonToA =
+            ini.GetBoolValue("Throwables", "bRemapGrenadeButtonToA", remapGrenadeButtonToA);
+
         clampFloat(throwableZoneRadius, 0.0f, 100.0f, "fThrowableZoneRadius");
         clampFloat(throwableHoldDuration, 0.05f, 2.0f, "fThrowableHoldDuration");
         clampFloat(impactDamageMult, 0.0f, 10.0f, "fImpactDamageMult");
@@ -989,6 +1026,78 @@ iLogLevel = 4
         }
 
         BuildIni(&ini);
+
+        // THE INI MIRRORS THE MCM MENU 1:1. Everything else is internal.
+        //
+        // BuildIni still emits every Heisenberg-owned key, because GetNumericSetting() and the
+        // default-comparison path both build an "effective" INI from it and need the complete
+        // picture. The filtering happens here, at the only point where a file is written.
+        //
+        // Only keys BuildIni itself produces are eligible for removal. That is deliberate: a
+        // reference INI built from this same Config tells us precisely which keys are ours, so
+        // the embedded engine's [PhysicsInteraction] / [RealisticWeapons] block, and any
+        // third-party or hand-added section, is never touched. The legacy Heisenberg [ROCK]
+        // bridge section is host-owned and remains eligible for the explicit exceptions below.
+        //
+        // Reading stays permissive — Load() still honours any internal key a user adds by hand,
+        // so hidden diagnostics remain usable. They are simply no longer advertised or written.
+        {
+            // Documented exceptions: keys that stay in the INI even though the MCM does not
+            // expose them. iLogLevel is a support tool — "raise your log level and send me the
+            // log" is the first step of almost every bug report, and a key the user cannot see
+            // is a key they cannot raise. It drives both this logger and ROCK's.
+            static const std::set<std::string> kAlwaysWritten = {
+                "Debug|iLogLevel",
+                // Boot-critical architecture keys are read before the MCM-backed Config load.
+                // Removing them during Save() made the next process launch silently fall back
+                // to the old keyframed/no-engine architecture.
+                "ObjectPickup|iGrabMode",
+                "RockEngine|bUseRockEngineArchitecture",
+                // Preserve old installations long enough for the ownership policy to treat
+                // this external-ROCK switch as an embedded mode-9 compatibility alias.
+                "ROCK|bDelegateWorldGrabToRock",
+                // The SS2 cure gesture is intentionally supported without an MCM
+                // dependency. Keep its safety/feedback envelope explicit across
+                // intro, storage-zone, and item-positioning saves instead of
+                // silently falling back to hidden defaults after Save().
+                "Consumables|bEnableNpcInjection",
+                "Consumables|fNpcInjectionRadius",
+                "Consumables|bShowInjectionMessages",
+                // This hidden compatibility switch governs whether the narrow
+                // loose-offhand-weapon swap gesture may claim StorageZone. It
+                // must survive Config::Save even though it is not MCM-exposed.
+                "ItemStorage|bEnableStorageZoneWeaponEquip",
+            };
+
+            const std::set<std::string>& exposed = McmExposedKeys();
+            if (exposed.empty()) {
+                spdlog::warn("[Config] No MCM key list available — writing the full key set");
+            } else {
+                CSimpleIniA ours;
+                ours.SetUnicode();
+                BuildIni(&ours);
+
+                int stripped = 0;
+                std::list<CSimpleIniA::Entry> sections;
+                ours.GetAllSections(sections);
+                for (const auto& section : sections) {
+                    std::list<CSimpleIniA::Entry> sectionKeys;
+                    if (!ours.GetAllKeys(section.pItem, sectionKeys)) continue;
+                    for (const auto& key : sectionKeys) {
+                        const std::string id = std::string(section.pItem) + "|" + key.pItem;
+                        if (exposed.find(id) == exposed.end() &&
+                            kAlwaysWritten.find(id) == kAlwaysWritten.end()) {
+                            if (ini.Delete(section.pItem, key.pItem, true)) {
+                                ++stripped;
+                            }
+                        }
+                    }
+                }
+                spdlog::info("[Config] INI mirrors the MCM menu: {} exposed settings + {} "
+                             "documented exception(s) written, {} internal keys withheld",
+                             exposed.size(), kAlwaysWritten.size(), stripped);
+            }
+        }
 
         SI_Error rc = ini.SaveFile(kConfigPath);
         if (rc < 0) {
@@ -1110,10 +1219,10 @@ iLogLevel = 4
         ini.SetBoolValue("ObjectPickup", "bShowUnequipMessages", showUnequipMessages, "; Show HUD message when unequipping weapons");
         ini.SetBoolValue("ObjectPickup", "bEnableTwoHandedGrab", enableTwoHandedGrab, "; Two-handed single-object grab: second hand aims/stabilizes the held object");
         ini.SetBoolValue("ObjectPickup", "bEnableLimbGrab", enableLimbGrab, "; Limb grab: grab the nearest ragdoll limb of an actor (needs bEnableGrabActors); CTD-prone, opt-in");
-        ini.SetLongValue("ObjectPickup", "iGrabMode", grabMode, "; 0=Keyframed (Heisenberg keyframed backend), 9=Full Dynamic (embedded ROCK engine owns grab+selection; needs bUseRockEngineArchitecture=1). Other values degrade to 0.");
+        ini.SetLongValue("ObjectPickup", "iGrabMode", grabMode, "; 0=Keyframed fallback, 9=Full Dynamic (embedded ROCK exclusively owns grab+selection; needs bUseRockEngineArchitecture=1). Other values degrade to 0.");
         ini.SetBoolValue("ObjectPickup", "bHeldObjectCollidable", heldObjectCollidable, "; Keyframed hold keeps object collidable so it can hit other objects (iGrabMode=0 only)");
         ini.SetBoolValue("ObjectPickup", "bHeldObjectWallClamp", heldObjectWallClamp, "; Keyframed hold: sweep-cast the held object so it STOPS at walls and NPCs instead of clipping through (iGrabMode=0)");
-        ini.SetBoolValue("ObjectPickup", "bBlockActivateOnGrabSelection", blockActivateOnGrabSelection, "; Block A/activate looting an item just because you're aiming at it. OFF by default (ON broke A-looting + mod secondary actions). Only enable for a Grip>A SteamVR binding.");
+        ini.SetBoolValue("ObjectPickup", "bBlockActivateOnGrabSelection", blockActivateOnGrabSelection, "; Legacy compatibility key (ignored). Pointing at a pickup never blocks Grip/A input.");
         ini.SetBoolValue("ObjectPickup", "bUseXForLeftGrab",  useXForLeftGrab,  "; Use X instead of Grip for left-hand grabbing; enabling automatically enables Sticky Grab");
         ini.SetBoolValue("ObjectPickup", "bUseAForRightGrab", useAForRightGrab, "; Use A button instead of Grip for right hand grabbing");
         ini.SetDoubleValue("ObjectPickup", "fGrabStartSpeed", grabStartSpeed);
@@ -1194,6 +1303,12 @@ iLogLevel = 4
         ini.SetDoubleValue("ItemStorage", "fStorageZoneHoldTime", storageZoneHoldTime, "; seconds - how long to hold in zone before auto-storing");
         ini.SetBoolValue("ItemStorage", "bEnableDropToCompanion", enableDropToCompanion, "; Drop item near companion to give it to them");
         ini.SetBoolValue("ItemStorage", "bEnableDropToContainer", enableDropToContainer, "; Release while pointing at a chest/desk deposits the item into it");
+
+        // [Throwables] — MCM-exposed, so the INI must carry them.
+        ini.SetLongValue("Throwables", "iThrowableActivationZone", throwableActivationZone, "; 0=disabled (A works everywhere), 1=zone-gated");
+        ini.SetDoubleValue("Throwables", "fThrowableZoneRadius", throwableZoneRadius, "; Game units - radius of the throwable activation zone");
+        ini.SetDoubleValue("Throwables", "fThrowableHoldDuration", throwableHoldDuration, "; Seconds to hold before a throwable arms");
+        ini.SetBoolValue("Throwables", "bRemapGrenadeButtonToA", remapGrenadeButtonToA, "; Remap the grenade button to A");
         ini.SetDoubleValue("ItemStorage", "fCompanionTransferRadius", companionTransferRadius, "; Game units - proximity to detect companion");
         ini.SetDoubleValue("ItemStorage", "fHandTransferRadius", handTransferRadius, "; CM - skip companion/storage when hands this close");
         ini.SetBoolValue("ItemStorage", "bEnableAutoStorage", enableAutoStorage, "; Auto-store after holding in zone for duration");
@@ -1205,7 +1320,8 @@ iLogLevel = 4
         ini.SetDoubleValue("Consumables", "fMouthOffsetY", mouthOffsetY * GAME_UNITS_TO_CM, "; cm - forward from HMD (toward face)");
         ini.SetDoubleValue("Consumables", "fMouthOffsetZ", mouthOffsetZ * GAME_UNITS_TO_CM, "; cm - down from eye level (mouth area)");
         ini.SetDoubleValue("Consumables", "fMouthRadius", mouthRadius * GAME_UNITS_TO_CM, "; cm - sphere radius for consume detection");
-        ini.SetDoubleValue("Consumables", "fMouthVelocityThreshold", mouthVelocityThreshold, "; m/s - must be moving slower than this to consume");
+        ini.SetDoubleValue("Consumables", "fMouthVelocityThreshold", mouthVelocityThreshold, "; Legacy compatibility value; release-based consumption has no speed requirement");
+        ini.SetBoolValue("Consumables", "bAutoConsumeInMouthArea", autoConsumeInMouthArea, "; Consume in the mouth area without releasing grip (default off)");
         ini.SetDoubleValue("Consumables", "fMouthHapticStrength", mouthDropHapticStrength, "; Haptic strength when consuming at mouth (0.0-1.0)");
         ini.SetBoolValue("Consumables", "bBlockConsumptionInPA", blockConsumptionInPA, "; Block manual consumption/chem use while in Power Armor");
         ini.SetBoolValue("Grab", "bAllowWeaponGrabInPowerArmor", allowWeaponGrabInPowerArmor, "; Allow grabbing weapons while in Power Armor (false restores the legacy block)");
@@ -1215,6 +1331,11 @@ iLogLevel = 4
 
         // Hand injection zone - convert back to cm for INI
         ini.SetBoolValue("Consumables", "bEnableHandInjection", enableHandInjection, "; Enable injection consumption on opposite hand");
+        ini.SetBoolValue("Consumables", "bAutoConsumeInWristArea", autoConsumeInWristArea, "; Inject in the wrist area without releasing grip (default off)");
+        ini.SetBoolValue("Consumables", "bEnableNpcInjection", enableNpcInjection, "; Press SS2's held Disease Cure against a settler to invoke SS2's menuless treatment path");
+        ini.SetBoolValue("Consumables", "bEnableCompanionStimpakInjection", enableCompanionStimpakInjection, "; Allow a held Stimpak to revive the player's current companion");
+        ini.SetDoubleValue("Consumables", "fNpcInjectionRadius", npcInjectionRadius, "; Game units from the wand to the NPC's torso bone for an injection to register");
+        ini.SetBoolValue("Consumables", "bShowInjectionMessages", showInjectionMessages, "; Show a HUD confirmation when an item is given to an NPC by injection");
         ini.SetDoubleValue("Consumables", "fHandInjectionOffsetX", handInjectionOffsetX * GAME_UNITS_TO_CM, "; cm - left/right offset from wand");
         ini.SetDoubleValue("Consumables", "fHandInjectionOffsetY", handInjectionOffsetY * GAME_UNITS_TO_CM, "; cm - forward from wand");
         ini.SetDoubleValue("Consumables", "fHandInjectionOffsetZ", handInjectionOffsetZ * GAME_UNITS_TO_CM, "; cm - up/down from wand");
@@ -1242,7 +1363,7 @@ iLogLevel = 4
         
         // ROCK integration
         ini.SetLongValue("ROCK", "iUseRockPhysics", useRockPhysics, "; -1=auto (on if ROCK.dll present), 0=force off (built-in fallback), 1=force on");
-        ini.SetBoolValue("ROCK", "bDelegateWorldGrabToRock", delegateWorldGrabToRock, "; true = ROCK owns world-object grab (fully dynamic held object); Heisenberg keeps loot/drop/holotape in-hand placement");
+        ini.SetBoolValue("ROCK", "bDelegateWorldGrabToRock", delegateWorldGrabToRock, "; Legacy alias for iGrabMode=9 while embedded ROCK is hosted. New setups should use iGrabMode.");
 
         // Hand collision
         ini.SetBoolValue("ObjectPickup", "bEnableHandCollision", enableHandCollision, "; Enable hand collision with world");
@@ -1349,7 +1470,7 @@ iLogLevel = 4
         // load). Adding them keeps every loaded setting round-tripping. (Skipped intentionally:
         // bEnableDropToHand is a legacy bool alias shadowed by iDropToHandMode;
         // fLegZoneRadius needs the game->cm conversion and is handled elsewhere.)
-        ini.SetBoolValue  ("ItemStorage",  "bEnableStorageZoneWeaponEquip",    enableStorageZoneWeaponEquip,    "; Equip weapon dropped on a storage zone");
+        ini.SetBoolValue  ("ItemStorage",  "bEnableStorageZoneWeaponEquip",    enableStorageZoneWeaponEquip,    "; StorageZone may unequip the primary weapon only while a loose weapon is held in the offhand");
         ini.SetBoolValue  ("ObjectPickup", "bEnableAutomaticFingerCurls",      enableAutomaticFingerCurls,      "; Geometry-based finger curl solving");
         ini.SetBoolValue  ("ObjectPickup", "bEnableAutomaticHandPlacement",    enableAutomaticHandPlacement,    "; Geometry-based hand placement on grab");
         ini.SetBoolValue  ("ObjectPickup", "bEnableGrabActors",                enableGrabActors,                "; Allow grabbing actors/ragdolls");
@@ -1369,6 +1490,41 @@ iLogLevel = 4
     // menu and engine agree. Machine-seeded values are tracked separately from user choices:
     // when a later build changes a compiled default, an untouched seed migrates with it, while a
     // value changed by the player loses its seed marker and remains authoritative.
+    // Parse MCM config.json for every control id ("key:section") exactly once.
+    // This is the single authority for "is this setting user-facing?" — the same file the
+    // in-game menu is built from, so the INI cannot drift from the menu by construction.
+    const std::set<std::string>& Config::McmExposedKeys()
+    {
+        static const std::set<std::string> keys = [] {
+            std::set<std::string> out;
+            std::ifstream f(kMCMConfigPath);
+            if (!f) {
+                spdlog::warn("[Config] MCM config.json not found at {} — the INI filter cannot "
+                             "run, so Save() will fall back to writing every Heisenberg key",
+                             kMCMConfigPath);
+                return out;
+            }
+            const std::string json((std::istreambuf_iterator<char>(f)),
+                                   std::istreambuf_iterator<char>());
+            size_t pos = 0;
+            while ((pos = json.find("\"id\"", pos)) != std::string::npos) {
+                const size_t q1 = json.find('"', json.find(':', pos + 4));
+                if (q1 == std::string::npos) break;
+                const size_t q2 = json.find('"', q1 + 1);
+                if (q2 == std::string::npos) break;
+                const std::string id = json.substr(q1 + 1, q2 - q1 - 1);  // "key:section"
+                pos = q2 + 1;
+                const size_t sep = id.find(':');
+                if (sep == std::string::npos) continue;
+                out.insert(id.substr(sep + 1) + "|" + id.substr(0, sep));  // "Section|Key"
+            }
+            spdlog::info("[Config] MCM exposes {} settings — the INI mirrors exactly these; "
+                         "all other settings are internal", out.size());
+            return out;
+        }();
+        return keys;
+    }
+
     void Config::SeedMCMDefaultsIfMissing()
     {
         static bool s_seeded = false;

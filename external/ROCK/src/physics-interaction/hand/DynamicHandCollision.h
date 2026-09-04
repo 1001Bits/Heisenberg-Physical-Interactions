@@ -1,6 +1,7 @@
 #pragma once
 
 #include "physics-interaction/hand/DynamicHandCollisionFeedbackPolicy.h"
+#include "physics-interaction/hand/DynamicHandCollisionStabilityPolicy.h"
 #include "physics-interaction/hand/DynamicHandCollisionTransitionPolicy.h"
 #include "physics-interaction/hand/DynamicHandCollisionTelemetry.h"
 #include "physics-interaction/hand/DynamicHandTwinTargets.h"
@@ -16,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <string>
 
 namespace rock
 {
@@ -24,21 +26,49 @@ namespace rock
     struct PhysicsFrameContext;
     struct HandFrameInput;
 
+    struct DynamicHandCollisionFrameReadiness
+    {
+        bool rightWorldStopOperational = false;
+        bool leftWorldStopOperational = false;
+    };
+
+    struct DynamicHandCollisionContactBodySnapshot
+    {
+        bool valid = false;
+        bool isLeft = false;
+        bool primaryPalmAnchor = false;
+        bool sampledVelocityValid = false;
+        std::uint32_t bodyId = 0x7FFF'FFFFu;
+        hand_collider_semantics::HandColliderRole role =
+            hand_collider_semantics::HandColliderRole::PalmAnchor;
+        RE::NiPoint3 sampledVelocityHavok{};
+    };
+
     /*
-     * Dynamic world collision uses DYNAMIC twins of the palm anchor, five
-     * fingertip colliders, and one merged ForeArm1->Hand proxy per side. They
+     * Dynamic world collision uses DYNAMIC twins of all twenty production hand
+     * roles plus one optional merged ForeArm1->Hand proxy per side. The
+     * forearm is admitted only when its source frame is independently clean;
+     * the current embedded host seam publishes clean hand truth only, so its
+     * IK-ancestor forearm stays retired rather than receiving an invalid full
+     * hand translation rebase. The admitted twins
      * chase their published role frames with engine hard-keyframe velocities
-     * every physics substep, on the world-only
-     * extended layer. Static world clips their velocity inside the solver
-     * (true multi-plane contact); the rendered FRIK hand follows the COMBINED
-     * position deviation (sequential projection over per-body deviations, then
-     * exponential smoothing against solver contact noise). Authority is
-     * strictly one-directional (wand/skeleton targets -> twins -> render): the
-     * twin targets come from the same HandBoneColliderSet/BodyBoneColliderSet
-     * role-frame publications the keyframed colliders are driven with, never
-     * from dynamic-body readback, so rendering cannot feed back into physics.
-     * The twins are not gameplay contact
-     * evidence and collide only with static world-surface layers.
+     * every physics substep, on a dedicated extended layer that collides with
+     * static world surfaces and generated equipped-weapon hulls. Those
+     * surfaces clip proxy velocity inside the solver (true multi-plane
+     * contact); the rendered FRIK hand follows the COMBINED position deviation
+     * (sequential projection over per-body deviations). Sustained contact is
+     * stabilized as a world-space stop target, so additional controller
+     * pressure cannot creep the rendered hand through a wall. Authority is
+     * strictly one-directional (clean pre-authority hand -> twins -> render):
+     * the live HandBoneColliderSet/BodyBoneColliderSet role publications are
+     * translated back into FRIK's clean same-frame hand basis before they are
+     * queued. Dynamic-body readback never becomes a later physics target, and
+     * the previous render correction cannot feed back into the next frame.
+     * The twins are not gameplay contact evidence and remain excluded from
+     * clutter, actors, projectiles, other hands, and generated body colliders.
+     * When a firing/support grip owns a hand, its stronger visual authority
+     * still gates this one-way proxy correction, preventing a hand/weapon
+     * feedback loop while retaining free-hand world and weapon stopping.
      *
      * Threading: updateFrame runs on the main game thread; the drive flush runs
      * on the physics step thread and publishes fixed per-body telemetry through
@@ -50,10 +80,15 @@ namespace rock
         static constexpr std::size_t kPalmSlot = dynamic_hand_collision_telemetry::kPalmSlot;
         static constexpr std::size_t kFirstForearmSlot = dynamic_hand_collision_telemetry::kFirstForearmSlot;
         static constexpr std::size_t kBodiesPerHand = dynamic_hand_collision_telemetry::kBodiesPerHand;
+        static_assert(
+            kFirstForearmSlot ==
+                hand_collider_semantics::kHandColliderBodyCountPerHand,
+            "dynamic hand twins must cover every production hand role");
+        static_assert(kBodiesPerHand <= 32u, "contact telemetry uses a fixed 32-bit body mask");
 
         void setPhysicsCallbackGate(PhysicsCallbackQuiescenceGate* gate) { _physicsCallbackGate = gate; }
 
-        void updateFrame(const PhysicsFrameContext& frame,
+        [[nodiscard]] DynamicHandCollisionFrameReadiness updateFrame(const PhysicsFrameContext& frame,
             bool physicsWritesAllowed,
             const Hand& rightHand,
             const Hand& leftHand,
@@ -94,6 +129,25 @@ namespace rock
                 std::memory_order_acquire);
         }
         [[nodiscard]] dynamic_hand_collision_telemetry::HapticEvents consumeHapticEvents();
+        /*
+         * Relinquish only rendered-hand authority to a later, stronger
+         * same-frame owner.  The dynamic proxy bank remains alive and keeps
+         * producing contact evidence, so a reciprocal weapon/hand stop can
+         * retain and release cleanly without the two visual writers fighting.
+         * Main thread only.
+         */
+        void clearVisualForStrongerOwner(bool isLeft);
+        // Main-thread publication seam for the callback's immutable generated
+        // body registry.  Forearm twins are intentionally excluded: reciprocal
+        // gun stopping is a hand-surface behavior.
+        [[nodiscard]] bool tryGetContactBodySnapshot(
+            bool isLeft,
+            std::size_t bodyIndex,
+            DynamicHandCollisionContactBodySnapshot& outSnapshot) const;
+
+        [[nodiscard]] bool tryGetContactBodySnapshot(
+            std::uint32_t bodyId,
+            DynamicHandCollisionContactBodySnapshot& outSnapshot) const;
 
         /*
          * Debug-overlay accessor; main thread only (creation/retire happen on
@@ -154,6 +208,10 @@ namespace rock
         struct ProxySlot
         {
             BethesdaPhysicsBody body{};
+            // BethesdaPhysicsBody::create stores the supplied body-name
+            // pointer in persistent physics-system data. Keep its backing
+            // storage in this fixed slot for the body's complete lifetime.
+            std::string bodyName{};
             RE::hknpShape* shape = nullptr;
             GeneratedKeyframedBodyDriveState driveState{};
             RE::hknpWorld* createdWorld = nullptr;
@@ -206,6 +264,10 @@ namespace rock
         {
             std::array<ProxySlot, kBodiesPerHand> bodies{};
             RE::NiPoint3 appliedDeviation{};
+            dynamic_hand_collision_stability::
+                ContactHoldState<RE::NiPoint3> contactHold{};
+            RE::NiPoint3 lastCleanHandTranslation{};
+            bool lastCleanHandTranslationValid = false;
             bool visualActive = false;
             /*
              * Post-teleport visual recovery: while this window is open the

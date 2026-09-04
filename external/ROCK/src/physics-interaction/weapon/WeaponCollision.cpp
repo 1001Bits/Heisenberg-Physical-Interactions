@@ -3,11 +3,19 @@
 #include "physics-interaction/actor/ActorEquipmentGrab.h"
 #include "physics-interaction/native/BodyCollisionControl.h"
 #include "physics-interaction/collision/CollisionSuppressionRegistry.h"
+#include "physics-interaction/collision/CollisionLayerPolicy.h"
+#include "physics-interaction/contact/SoftContactWorldPolicy.h"
+#include "physics-interaction/core/RockRuntimeState.h"
+#include "physics-interaction/hand/DynamicHandCollision.h"
+#include "physics-interaction/hand/Hand.h"
+#include "physics-interaction/hand/HandVisual.h"
 #include "physics-interaction/native/HavokCompoundShapeBuilder.h"
 #include "physics-interaction/native/HavokConvexShapeBuilder.h"
 #include "physics-interaction/native/HavokOffsets.h"
+#include "physics-interaction/native/HavokWorldLock.h"
 #include "physics-interaction/native/NativeNiNodeFactory.h"
 #include "physics-interaction/native/NativeMemory.h"
+#include "physics-interaction/native/PhysicsShapeCast.h"
 #include "physics-interaction/grab/MeshGrab.h"
 #include "RockConfig.h"
 #include "physics-interaction/performance/PerformanceProfiler.h"
@@ -20,7 +28,9 @@
 #include "physics-interaction/weapon/WeaponPartRecordIdentityPolicy.h"
 #include "physics-interaction/weapon/WeaponSemantics.h"
 #include "physics-interaction/weapon/WeaponAuthority.h"
+#include "physics-interaction/weapon/WeaponWallSweepPolicy.h"
 #include "physics-interaction/TransformMath.h"
+#include "physics-interaction/contact/SoftContactPolicy.h"
 
 #include <intrin.h>
 
@@ -32,6 +42,8 @@
 #include "RE/Bethesda/TESForms.h"
 #include "RE/Havok/hkReferencedObject.h"
 #include "RE/Havok/hknpCapsuleShape.h"
+#include "RE/Havok/hknpAllHitsCollector.h"
+#include "RE/Havok/hknpCollisionResult.h"
 #include "RE/Havok/hknpMotion.h"
 
 #include "rock_support/Fo4VrRuntime.h"
@@ -59,7 +71,12 @@ namespace rock
         constexpr std::size_t MAX_CONVEX_HULL_POINTS = 0xFC;
         constexpr float MIN_HULL_DIAGONAL_GAME_UNITS = 0.5f;
         constexpr std::size_t MAX_GENERATED_CHILD_CONVEXES_PER_SOURCE = 16;
-        constexpr std::size_t GENERATED_WEAPON_BODY_CREATION_BATCH = 8;
+        // Initial draw must not publish generationKey=0 for several frames
+        // while visible hulls are created eight-at-a-time. The source inventory
+        // is already hard-capped, and replacement builds still target the
+        // inactive bank until their atomic publication below.
+        constexpr std::size_t GENERATED_WEAPON_BODY_CREATION_BATCH =
+            MAX_WEAPON_COLLISION_BODIES;
 
         struct QuantizedPointKey
         {
@@ -2503,6 +2520,11 @@ namespace rock
                std::abs(_generatedSourceCache.pointDedupGrid - g_rockConfig.rockWeaponCollisionPointDedupGrid) <= 0.00001f &&
                _generatedSourceCache.supportFitTargetPoints == g_rockConfig.rockWeaponCollisionSupportFitTargetPoints &&
                std::abs(_generatedSourceCache.supportFitMaxErrorGameUnits - g_rockConfig.rockWeaponCollisionSupportFitMaxErrorGameUnits) <= 0.00001f &&
+               _generatedSourceCache.maxSourceDistanceEnabled == g_rockConfig.rockWeaponCollisionMaxSourceDistanceEnabled &&
+               std::abs(_generatedSourceCache.maxSourceDistanceMelee - g_rockConfig.rockWeaponCollisionMaxSourceDistanceMelee) <= 0.00001f &&
+               std::abs(_generatedSourceCache.maxSourceDistancePistol - g_rockConfig.rockWeaponCollisionMaxSourceDistancePistol) <= 0.00001f &&
+               std::abs(_generatedSourceCache.maxSourceDistanceRifle - g_rockConfig.rockWeaponCollisionMaxSourceDistanceRifle) <= 0.00001f &&
+               std::abs(_generatedSourceCache.maxSourceDistanceHeavy - g_rockConfig.rockWeaponCollisionMaxSourceDistanceHeavy) <= 0.00001f &&
                !_generatedSourceCache.sources.empty() &&
                _generatedSourceCache.summary.signature != 0;
     }
@@ -2524,6 +2546,11 @@ namespace rock
         _generatedSourceCache.pointDedupGrid = g_rockConfig.rockWeaponCollisionPointDedupGrid;
         _generatedSourceCache.supportFitTargetPoints = g_rockConfig.rockWeaponCollisionSupportFitTargetPoints;
         _generatedSourceCache.supportFitMaxErrorGameUnits = g_rockConfig.rockWeaponCollisionSupportFitMaxErrorGameUnits;
+        _generatedSourceCache.maxSourceDistanceEnabled = g_rockConfig.rockWeaponCollisionMaxSourceDistanceEnabled;
+        _generatedSourceCache.maxSourceDistanceMelee = g_rockConfig.rockWeaponCollisionMaxSourceDistanceMelee;
+        _generatedSourceCache.maxSourceDistancePistol = g_rockConfig.rockWeaponCollisionMaxSourceDistancePistol;
+        _generatedSourceCache.maxSourceDistanceRifle = g_rockConfig.rockWeaponCollisionMaxSourceDistanceRifle;
+        _generatedSourceCache.maxSourceDistanceHeavy = g_rockConfig.rockWeaponCollisionMaxSourceDistanceHeavy;
         _generatedSourceCache.sources = std::move(sources);
         _generatedSourceCache.summary = summary;
     }
@@ -2572,6 +2599,11 @@ namespace rock
         _pendingGeneratedWeaponBuild.pointDedupGrid = g_rockConfig.rockWeaponCollisionPointDedupGrid;
         _pendingGeneratedWeaponBuild.supportFitTargetPoints = g_rockConfig.rockWeaponCollisionSupportFitTargetPoints;
         _pendingGeneratedWeaponBuild.supportFitMaxErrorGameUnits = g_rockConfig.rockWeaponCollisionSupportFitMaxErrorGameUnits;
+        _pendingGeneratedWeaponBuild.maxSourceDistanceEnabled = g_rockConfig.rockWeaponCollisionMaxSourceDistanceEnabled;
+        _pendingGeneratedWeaponBuild.maxSourceDistanceMelee = g_rockConfig.rockWeaponCollisionMaxSourceDistanceMelee;
+        _pendingGeneratedWeaponBuild.maxSourceDistancePistol = g_rockConfig.rockWeaponCollisionMaxSourceDistancePistol;
+        _pendingGeneratedWeaponBuild.maxSourceDistanceRifle = g_rockConfig.rockWeaponCollisionMaxSourceDistanceRifle;
+        _pendingGeneratedWeaponBuild.maxSourceDistanceHeavy = g_rockConfig.rockWeaponCollisionMaxSourceDistanceHeavy;
         _pendingGeneratedWeaponBuild.sources = std::move(sources);
         _pendingGeneratedWeaponBuild.summary = summary;
         return true;
@@ -2589,7 +2621,12 @@ namespace rock
                std::abs(_pendingGeneratedWeaponBuild.convexRadius - g_rockConfig.rockWeaponCollisionConvexRadius) <= 0.00001f &&
                std::abs(_pendingGeneratedWeaponBuild.pointDedupGrid - g_rockConfig.rockWeaponCollisionPointDedupGrid) <= 0.00001f &&
                _pendingGeneratedWeaponBuild.supportFitTargetPoints == g_rockConfig.rockWeaponCollisionSupportFitTargetPoints &&
-               std::abs(_pendingGeneratedWeaponBuild.supportFitMaxErrorGameUnits - g_rockConfig.rockWeaponCollisionSupportFitMaxErrorGameUnits) <= 0.00001f;
+               std::abs(_pendingGeneratedWeaponBuild.supportFitMaxErrorGameUnits - g_rockConfig.rockWeaponCollisionSupportFitMaxErrorGameUnits) <= 0.00001f &&
+               _pendingGeneratedWeaponBuild.maxSourceDistanceEnabled == g_rockConfig.rockWeaponCollisionMaxSourceDistanceEnabled &&
+               std::abs(_pendingGeneratedWeaponBuild.maxSourceDistanceMelee - g_rockConfig.rockWeaponCollisionMaxSourceDistanceMelee) <= 0.00001f &&
+               std::abs(_pendingGeneratedWeaponBuild.maxSourceDistancePistol - g_rockConfig.rockWeaponCollisionMaxSourceDistancePistol) <= 0.00001f &&
+               std::abs(_pendingGeneratedWeaponBuild.maxSourceDistanceRifle - g_rockConfig.rockWeaponCollisionMaxSourceDistanceRifle) <= 0.00001f &&
+               std::abs(_pendingGeneratedWeaponBuild.maxSourceDistanceHeavy - g_rockConfig.rockWeaponCollisionMaxSourceDistanceHeavy) <= 0.00001f;
     }
 
     bool WeaponCollision::advancePendingGeneratedWeaponBuild(RE::hknpWorld* world)
@@ -2637,6 +2674,7 @@ namespace rock
             if (!replacingExisting) {
                 _cachedWeaponKey = 0;
                 _cachedWeaponVisualKey = 0;
+                _cachedWeaponVisibleTriShapeCount = 0;
                 _cachedWeaponIdentityKey = 0;
                 _cachedWeaponOwnershipKey = 0;
                 _cachedWeaponFormID = 0;
@@ -2690,6 +2728,8 @@ namespace rock
 
         _cachedWeaponKey = equippedKey;
         _cachedWeaponVisualKey = pending.visualKey;
+        _cachedWeaponVisibleTriShapeCount =
+            pending.visibleTriShapeCount;
         _cachedWeaponIdentityKey = pending.identityKey;
         _cachedWeaponOwnershipKey = ownershipKey;
         _cachedWeaponFormID = weaponFormID;
@@ -2702,6 +2742,11 @@ namespace rock
         _cachedPointDedupGrid = g_rockConfig.rockWeaponCollisionPointDedupGrid;
         _cachedSupportFitTargetPoints = g_rockConfig.rockWeaponCollisionSupportFitTargetPoints;
         _cachedSupportFitMaxErrorGameUnits = g_rockConfig.rockWeaponCollisionSupportFitMaxErrorGameUnits;
+        _cachedMaxSourceDistanceEnabled = g_rockConfig.rockWeaponCollisionMaxSourceDistanceEnabled;
+        _cachedMaxSourceDistanceMelee = g_rockConfig.rockWeaponCollisionMaxSourceDistanceMelee;
+        _cachedMaxSourceDistancePistol = g_rockConfig.rockWeaponCollisionMaxSourceDistancePistol;
+        _cachedMaxSourceDistanceRifle = g_rockConfig.rockWeaponCollisionMaxSourceDistanceRifle;
+        _cachedMaxSourceDistanceHeavy = g_rockConfig.rockWeaponCollisionMaxSourceDistanceHeavy;
         _driveRebuildRequested.store(false, std::memory_order_release);
         _driveFailureCount.store(0, std::memory_order_release);
         performance_profiler::addCounter(performance_profiler::Counter::WeaponRebuildCompleted);
@@ -2720,12 +2765,27 @@ namespace rock
         _cachedPointDedupGrid = -1.0f;
         _cachedSupportFitTargetPoints = -1;
         _cachedSupportFitMaxErrorGameUnits = -1.0f;
+        _cachedMaxSourceDistanceEnabled = false;
+        _cachedMaxSourceDistanceMelee = -1.0f;
+        _cachedMaxSourceDistancePistol = -1.0f;
+        _cachedMaxSourceDistanceRifle = -1.0f;
+        _cachedMaxSourceDistanceHeavy = -1.0f;
     }
 
     void WeaponCollision::resetWeaponBodySetGeneration()
     {
         _cachedWeaponBodySetKey = 0;
         _weaponBodySetKeyAtomic.store(0, std::memory_order_release);
+        resetWeaponRootDriveSegmentHistory();
+    }
+
+    void WeaponCollision::resetWeaponRootDriveSegmentHistory()
+    {
+        _weaponRootDriveSegment = {};
+        _weaponRootDriveHistoryRoot = nullptr;
+        _weaponRootDrivePreviousWorld = {};
+        _weaponRootDriveHistoryGenerationKey = 0;
+        _weaponRootDriveHistoryValid = false;
     }
 
     void WeaponCollision::publishWeaponBodySetGeneration(const weapon_generated_source_completeness_policy::GeneratedSourceCompleteness& sourceCompleteness)
@@ -2879,6 +2939,18 @@ namespace rock
         }
 
         return snapshot;
+    }
+
+    WeaponCollision::WeaponRootDriveSegmentSnapshot
+        WeaponCollision::getWeaponRootDriveSegmentSnapshot() const
+    {
+        if (!_weaponRootDriveSegment.valid ||
+            _weaponRootDriveSegment.generationKey == 0 ||
+            _weaponRootDriveSegment.generationKey !=
+                getCurrentWeaponGenerationKey()) {
+            return {};
+        }
+        return _weaponRootDriveSegment;
     }
 
     bool WeaponCollision::isWeaponBodyIdAtomic(std::uint32_t bodyId) const
@@ -3411,7 +3483,12 @@ namespace rock
         const RE::NiAVObject* weaponNode,
         RE::NiPoint3* outWorldPoints,
         float* outRadiiGame,
-        std::uint32_t maxSamples) const
+        std::uint32_t maxSamples,
+        std::uint64_t* outSampleIdentities,
+        std::uint8_t* outCriticalSweepFlags,
+        std::uint32_t* outSourceBodyIds,
+        RE::NiPoint3* outAnchorLocals,
+        std::uint8_t* outAnchorUsesSourceLocal) const
     {
         if (!weaponNode || !outWorldPoints || !outRadiiGame || maxSamples == 0 ||
             getCurrentWeaponGenerationKey() == 0) {
@@ -3428,8 +3505,7 @@ namespace rock
         std::uint32_t bodyCount = 0;
         for (const auto& instance : bodies) {
             if (instance.body.isValid() &&
-                (!instance.generatedSourceLocalPointsGame.empty() ||
-                 !instance.generatedLocalPointsGame.empty())) {
+                !instance.generatedLocalPointsGame.empty()) {
                 ++bodyCount;
             }
         }
@@ -3441,9 +3517,169 @@ namespace rock
             (std::max)(0.0f, g_rockConfig.rockWeaponCollisionConvexRadius) *
             havokToGameScale();
         std::uint32_t count = 0;
+
+        struct SampleReference
+        {
+            std::size_t bodyOrdinal = 0;
+            std::size_t pointIndex = 0;
+        };
+
+        /*
+         * Emit the weapon-root AABB extrema before the ordinary fair-share
+         * point bank. These six stable physical points include the longitudinal
+         * muzzle/breech pair without assuming that a particular NIF uses X, Y,
+         * or Z as its barrel axis. SoftContact marks them critical and sweeps
+         * them every frame, closing the rotational cross-and-return hole left by
+         * a four-of-twenty-two rotating window.
+         */
+        soft_contact_policy::
+            CriticalWeaponExtremaSelection<SampleReference>
+            criticalSelection{};
+        for (std::size_t bodyOrdinal = 0;
+             bodyOrdinal < bodies.size();
+             ++bodyOrdinal) {
+            const auto& instance = bodies[bodyOrdinal];
+            if (!instance.body.isValid()) {
+                continue;
+            }
+            // Ranking always uses the one common weapon-root frame. The
+            // source-local vector is paired index-for-index at generation and
+            // is only an emission basis when that invariant still holds.
+            const auto& rankingPoints =
+                instance.generatedLocalPointsGame;
+            for (std::size_t pointIndex = 0;
+                 pointIndex < rankingPoints.size();
+                 ++pointIndex) {
+                soft_contact_policy::observeCriticalWeaponExtrema(
+                    criticalSelection,
+                    rankingPoints[pointIndex],
+                    SampleReference{
+                        .bodyOrdinal = bodyOrdinal,
+                        .pointIndex = pointIndex,
+                    });
+            }
+        }
+
+        const auto isAlreadyCriticalReference =
+            [&criticalSelection](
+                const std::size_t bodyOrdinal,
+                const std::size_t pointIndex,
+                const std::size_t beforeExtremum =
+                    soft_contact_policy::
+                        kCriticalWeaponWorldProbeCapacity) {
+                const std::size_t limit =
+                    (std::min)(
+                        beforeExtremum,
+                        criticalSelection.references.size());
+                for (std::size_t index = 0; index < limit; ++index) {
+                    const auto& reference =
+                        criticalSelection.references[index];
+                    if (criticalSelection.valid[index] &&
+                        reference.bodyOrdinal == bodyOrdinal &&
+                        reference.pointIndex == pointIndex) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+        const auto emitSample =
+            [&](const std::size_t bodyOrdinal,
+                const std::size_t pointIndex,
+                const bool critical) {
+                if (count >= maxSamples || bodyOrdinal >= bodies.size()) {
+                    return false;
+                }
+                const auto& instance = bodies[bodyOrdinal];
+                if (!instance.body.isValid()) {
+                    return false;
+                }
+                const bool sourceNodeCurrent =
+                    instance.sourceNode &&
+                    actor_equipment_grab::nodeContainsNode(
+                        const_cast<RE::NiAVObject*>(packageDriveRoot),
+                        instance.sourceNode,
+                        64);
+                const bool useSourceLocal =
+                    sourceNodeCurrent &&
+                    !instance.generatedSourceLocalPointsGame.empty() &&
+                    instance.generatedSourceLocalPointsGame.size() ==
+                        instance.generatedLocalPointsGame.size();
+                const RE::NiAVObject* sampleRoot =
+                    useSourceLocal ? instance.sourceNode : packageDriveRoot;
+                const auto& localPoints =
+                    useSourceLocal
+                        ? instance.generatedSourceLocalPointsGame
+                        : instance.generatedLocalPointsGame;
+                if (!sampleRoot || pointIndex >= localPoints.size()) {
+                    return false;
+                }
+
+                const auto& localPoint = localPoints[pointIndex];
+                outWorldPoints[count] =
+                    weapon_collision_geometry_math::localPointToWorld(
+                        sampleRoot->world.rotate,
+                        sampleRoot->world.translate,
+                        sampleRoot->world.scale,
+                        localPoint);
+                outRadiiGame[count] = convexRadiusGame;
+                const std::uint32_t stableBodyIndex =
+                    instance.publicationIndex != INVALID_BODY_ID
+                        ? instance.publicationIndex
+                        : static_cast<std::uint32_t>(bodyOrdinal);
+                const std::uint64_t identity =
+                    soft_contact_policy::makeWeaponSampleIdentity(
+                        stableBodyIndex,
+                        pointIndex,
+                        static_cast<std::uint64_t>(
+                            reinterpret_cast<std::uintptr_t>(sampleRoot)),
+                        useSourceLocal);
+                if (outSampleIdentities) {
+                    outSampleIdentities[count] = identity;
+                }
+                if (outCriticalSweepFlags) {
+                    outCriticalSweepFlags[count] = critical ? 1u : 0u;
+                }
+                if (outSourceBodyIds) {
+                    outSourceBodyIds[count] =
+                        instance.body.getBodyId().value;
+                }
+                if (outAnchorLocals) {
+                    outAnchorLocals[count] = localPoint;
+                }
+                if (outAnchorUsesSourceLocal) {
+                    outAnchorUsesSourceLocal[count] =
+                        useSourceLocal ? 1u : 0u;
+                }
+                ++count;
+                return true;
+            };
+
+        for (std::size_t extremum = 0;
+             extremum < criticalSelection.references.size() &&
+             count < maxSamples;
+             ++extremum) {
+            const auto& reference =
+                criticalSelection.references[extremum];
+            if (!criticalSelection.valid[extremum] ||
+                isAlreadyCriticalReference(
+                    reference.bodyOrdinal,
+                    reference.pointIndex,
+                    extremum)) {
+                continue;
+            }
+            (void)emitSample(
+                reference.bodyOrdinal,
+                reference.pointIndex,
+                true);
+        }
+
         std::uint32_t remainingBodies = bodyCount;
 
-        for (const auto& instance : bodies) {
+        for (std::size_t bodyOrdinal = 0;
+             bodyOrdinal < bodies.size();
+             ++bodyOrdinal) {
+            const auto& instance = bodies[bodyOrdinal];
             if (!instance.body.isValid() || count >= maxSamples) {
                 continue;
             }
@@ -3455,7 +3691,10 @@ namespace rock
                     instance.sourceNode,
                     64);
             const bool useSourceLocal =
-                sourceNodeCurrent && !instance.generatedSourceLocalPointsGame.empty();
+                sourceNodeCurrent &&
+                !instance.generatedSourceLocalPointsGame.empty() &&
+                instance.generatedSourceLocalPointsGame.size() ==
+                    instance.generatedLocalPointsGame.size();
             const RE::NiAVObject* sampleRoot =
                 useSourceLocal ? instance.sourceNode : packageDriveRoot;
             const auto& localPoints =
@@ -3479,18 +3718,1103 @@ namespace rock
             for (std::size_t sampleIndex = 0; sampleIndex < sampleCount && count < maxSamples; ++sampleIndex) {
                 const std::size_t pointIndex =
                     (sampleIndex * localPoints.size()) / sampleCount;
-                outWorldPoints[count] = weapon_collision_geometry_math::localPointToWorld(
-                    sampleRoot->world.rotate,
-                    sampleRoot->world.translate,
-                    sampleRoot->world.scale,
-                    localPoints[pointIndex]);
-                outRadiiGame[count] = convexRadiusGame;
-                ++count;
+                if (isAlreadyCriticalReference(
+                        bodyOrdinal,
+                        pointIndex)) {
+                    continue;
+                }
+                (void)emitSample(bodyOrdinal, pointIndex, false);
             }
             --remainingBodies;
         }
 
         return count;
+    }
+
+    void WeaponCollision::resetInteractionCollisionWorldSweepHistory() const
+    {
+        _interactionWorldSweepBodyHistory = {};
+        _interactionWorldSweepGenerationKey = 0;
+        _interactionWorldSweepRoot = nullptr;
+        _interactionWorldSweepPreviousRootWorld = {};
+        _interactionWorldSweepRootHistoryValid = false;
+        _interactionWorldSweepPreviousPlayerSpaceWorld = {};
+        _interactionWorldSweepPlayerSpaceHistoryValid = false;
+    }
+
+    WeaponCollision::InteractionWorldSweepResult
+        WeaponCollision::sweepInteractionCollisionAgainstWorld(
+            RE::hknpWorld* world,
+            const RE::NiAVObject* weaponNode,
+            float deltaSeconds,
+            float contactEnvelopeGameUnits,
+            bool contactEpisodeActive,
+            bool rightHandFreeForWeaponStop,
+            bool leftHandFreeForWeaponStop,
+            const Hand& rightHand,
+            const Hand& leftHand,
+            const DynamicHandCollisionRuntime*
+                dynamicHandCollision) const
+    {
+        InteractionWorldSweepResult result{};
+        static_assert(
+            MAX_WEAPON_BODIES <=
+                static_cast<std::size_t>(
+                    weapon_wall_sweep_policy::kMaximumBodies));
+
+        const auto lengthSquared = [](const RE::NiPoint3& value) {
+            return value.x * value.x + value.y * value.y +
+                   value.z * value.z;
+        };
+        const auto length = [&](const RE::NiPoint3& value) {
+            return std::sqrt((std::max)(0.0f, lengthSquared(value)));
+        };
+        const auto dot = [](const RE::NiPoint3& lhs,
+                             const RE::NiPoint3& rhs) {
+            return lhs.x * rhs.x + lhs.y * rhs.y +
+                   lhs.z * rhs.z;
+        };
+        const auto normalize = [&](const RE::NiPoint3& value) {
+            const float magnitude = length(value);
+            return std::isfinite(magnitude) && magnitude > 0.0001f
+                       ? value * (1.0f / magnitude)
+                       : RE::NiPoint3{};
+        };
+        const auto finiteTransform = [](const RE::NiTransform& value) {
+            bool finite = std::isfinite(value.translate.x) &&
+                          std::isfinite(value.translate.y) &&
+                          std::isfinite(value.translate.z);
+            for (int row = 0; finite && row < 3; ++row) {
+                for (int column = 0; finite && column < 3; ++column) {
+                    finite = std::isfinite(
+                        value.rotate.entry[row][column]);
+                }
+            }
+            return finite;
+        };
+
+        const std::uint64_t generationKey =
+            getCurrentWeaponGenerationKey();
+        if (!world || !weaponNode || generationKey == 0 ||
+            generationKey != _cachedWeaponBodySetKey) {
+            resetInteractionCollisionWorldSweepHistory();
+            result.staleAuthorityRejected = true;
+            return result;
+        }
+
+        /*
+         * A replacement build deliberately leaves the old physical bank live,
+         * but its source transforms belong to the prior equipped instance. It
+         * may continue providing native collision; exact visual correction must
+         * not combine those shapes with the new weapon root.
+         */
+        const bool observedAuthorityMismatch =
+            (_observedEquippedWeaponOwnershipKey != 0 &&
+             _cachedWeaponOwnershipKey !=
+                 _observedEquippedWeaponOwnershipKey) ||
+            (_observedEquippedWeaponFormID != 0 &&
+             _cachedWeaponFormID != _observedEquippedWeaponFormID);
+        if (observedAuthorityMismatch) {
+            resetInteractionCollisionWorldSweepHistory();
+            result.staleAuthorityRejected = true;
+            return result;
+        }
+
+        const auto& bodies = activeWeaponBodies();
+        const auto* packageDriveRoot = resolvePackageDriveNode(
+            bodies,
+            const_cast<RE::NiAVObject*>(weaponNode));
+        if (!packageDriveRoot ||
+            !finiteTransform(packageDriveRoot->world)) {
+            resetInteractionCollisionWorldSweepHistory();
+            result.staleAuthorityRejected = true;
+            return result;
+        }
+
+        if (_interactionWorldSweepGenerationKey != generationKey) {
+            resetInteractionCollisionWorldSweepHistory();
+            _interactionWorldSweepGenerationKey = generationKey;
+        }
+
+        bool playerSpaceDiscontinuity = false;
+        const auto& playerSpace = runtime_state::currentFrame().playerSpace;
+        if (playerSpace.valid && finiteTransform(playerSpace.world)) {
+            if (_interactionWorldSweepPlayerSpaceHistoryValid) {
+                const float playerTranslation = length(
+                    playerSpace.world.translate -
+                    _interactionWorldSweepPreviousPlayerSpaceWorld.translate);
+                const float playerRotation =
+                    hand_visual_lerp_math::rotationDistanceDegrees(
+                        _interactionWorldSweepPreviousPlayerSpaceWorld,
+                        playerSpace.world);
+                playerSpaceDiscontinuity =
+                    weapon_wall_sweep_policy::poseIsDiscontinuous(
+                        playerTranslation,
+                        playerRotation,
+                        weapon_wall_sweep_policy::
+                            kPlayerSpaceDiscontinuityDistanceGameUnits,
+                        weapon_wall_sweep_policy::
+                            kPlayerSpaceDiscontinuityRotationDegrees);
+            }
+            _interactionWorldSweepPreviousPlayerSpaceWorld =
+                playerSpace.world;
+            _interactionWorldSweepPlayerSpaceHistoryValid = true;
+        } else {
+            _interactionWorldSweepPlayerSpaceHistoryValid = false;
+        }
+
+        const bool rootHistoryMatches =
+            _interactionWorldSweepRootHistoryValid &&
+            _interactionWorldSweepRoot == packageDriveRoot;
+        const RE::NiTransform previousWeaponRootWorld =
+            rootHistoryMatches ?
+                _interactionWorldSweepPreviousRootWorld :
+                packageDriveRoot->world;
+        bool rootDiscontinuity = playerSpaceDiscontinuity;
+        if (_interactionWorldSweepRootHistoryValid) {
+            if (!rootHistoryMatches) {
+                rootDiscontinuity = true;
+            } else {
+                const float rootTranslation = length(
+                    packageDriveRoot->world.translate -
+                    _interactionWorldSweepPreviousRootWorld.translate);
+                const float rootRotation =
+                    hand_visual_lerp_math::rotationDistanceDegrees(
+                        _interactionWorldSweepPreviousRootWorld,
+                        packageDriveRoot->world);
+                rootDiscontinuity = rootDiscontinuity ||
+                    weapon_wall_sweep_policy::
+                        shouldRebaseSweepHistory(
+                            true,
+                            true,
+                            false,
+                            rootTranslation,
+                            rootRotation);
+            }
+        }
+        _interactionWorldSweepRoot = packageDriveRoot;
+        _interactionWorldSweepPreviousRootWorld =
+            packageDriveRoot->world;
+        _interactionWorldSweepRootHistoryValid = true;
+        if (rootDiscontinuity) {
+            _interactionWorldSweepBodyHistory = {};
+            result.rebasedForRootDiscontinuity = true;
+        }
+        const bool rootSweepHistoryCurrent =
+            rootHistoryMatches && !rootDiscontinuity;
+        result.hasPreviousClearWeaponWorld =
+            rootSweepHistoryCurrent &&
+            finiteTransform(previousWeaponRootWorld);
+        if (result.hasPreviousClearWeaponWorld) {
+            result.previousClearWeaponWorld =
+                previousWeaponRootWorld;
+        }
+        const float rootSweepTranslationDistance = length(
+            packageDriveRoot->world.translate -
+                previousWeaponRootWorld.translate);
+        const float rootSweepRotationDegrees =
+            hand_visual_lerp_math::rotationDistanceDegrees(
+                previousWeaponRootWorld,
+                packageDriveRoot->world);
+        const bool rootSweepHasMotion =
+            rootSweepTranslationDistance > 0.001f ||
+            rootSweepRotationDegrees > 0.01f;
+        result.rootHistoryCurrent = rootSweepHistoryCurrent;
+        result.rootHasMotion = rootSweepHasMotion;
+        result.rootTranslationGameUnits =
+            rootSweepTranslationDistance;
+        result.rootRotationDegrees =
+            rootSweepRotationDegrees;
+
+        std::array<std::size_t, MAX_WEAPON_BODIES> activeIndices{};
+        std::size_t activeCount = 0;
+        for (std::size_t index = 0; index < bodies.size(); ++index) {
+            if (bodies[index].body.isValid() &&
+                bodies[index].shape &&
+                activeCount < activeIndices.size()) {
+                activeIndices[activeCount++] = index;
+            }
+        }
+        if (activeCount == 0 ||
+            activeCount > static_cast<std::size_t>(
+                              weapon_wall_sweep_policy::
+                                  kMaximumBodies)) {
+            result.staleAuthorityRejected = true;
+            return result;
+        }
+
+        const auto bodySetContains = [&](const std::uint32_t bodyId) {
+            for (std::size_t ordinal = 0; ordinal < activeCount;
+                 ++ordinal) {
+                const auto& instance =
+                    bodies[activeIndices[ordinal]];
+                if (instance.body.isValid() &&
+                    instance.body.getBodyId().value == bodyId) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        const auto resolveWorldFilterInfo =
+            [&](const RE::hknpCollisionResult& hit) {
+                const std::uint32_t shapeFilterInfo =
+                    hit.hitBodyInfo.m_shapeCollisionFilterInfo.storage;
+                if (soft_contact_world_policy::
+                        acceptsWorldSurfaceFilterInfo(
+                            shapeFilterInfo)) {
+                    return shapeFilterInfo;
+                }
+                const auto bodyId = hit.hitBodyInfo.m_bodyId;
+                if (bodyId.value == INVALID_BODY_ID ||
+                    !bodySlotLooksReadable(world, bodyId)) {
+                    return shapeFilterInfo;
+                }
+                auto* body = havok_runtime::getBody(world, bodyId);
+                return body ? body->collisionFilterInfo :
+                              shapeFilterInfo;
+            };
+
+        const float safeEnvelope =
+            std::isfinite(contactEnvelopeGameUnits)
+                ? (std::max)(0.0f, contactEnvelopeGameUnits)
+                : 0.0f;
+        const float dt = std::clamp(
+            std::isfinite(deltaSeconds) ? deltaSeconds :
+                                          (1.0f / 90.0f),
+            1.0f / 240.0f,
+            0.1f);
+        const float convexRadiusGame =
+            (std::max)(0.0f,
+                g_rockConfig.rockWeaponCollisionConvexRadius) *
+            havokToGameScale();
+        const std::uint32_t weaponSweepFilterInfo =
+            collision_layer_policy::withCollisionLayer(
+                g_rockConfig.rockSoftContactWorldShapeCastFilterInfo,
+                collision_layer_policy::ROCK_LAYER_WEAPON);
+
+        const auto admitHit = [&](const InteractionWorldSweepHit& hit) {
+            constexpr float kParallelAlignment = 0.985f;
+            const auto isHandHit = [](const auto& candidate) {
+                return candidate.targetIsDynamicHandProxy ||
+                       candidate.targetIsGeneratedHandCollider;
+            };
+            const bool candidateIsHand = isHandHit(hit);
+            const auto candidateReplaces = [&](const auto& existing) {
+                if (hit.hasBlockedWeaponWorld !=
+                    existing.hasBlockedWeaponWorld) {
+                    return hit.hasBlockedWeaponWorld;
+                }
+                return weapon_wall_sweep_policy::
+                    shouldReplaceParallelSweepHit(
+                        existing.validatedContinuousEntry,
+                        existing.safeSweepFraction,
+                        existing.penetrationGame,
+                        hit.validatedContinuousEntry,
+                        hit.safeSweepFraction,
+                        hit.penetrationGame);
+            };
+
+            if (candidateIsHand) {
+                // One best eligible hand witness is sufficient. Keep it in a
+                // category of its own so palm/finger duplicates can neither
+                // consume both world planes nor be evicted by them. Different
+                // hand/world normals are not deduplicated: parallel normals
+                // can still describe planes at different positions/TOIs.
+                for (std::size_t index = 0;
+                     index < result.hitCount;
+                     ++index) {
+                    auto& existing = result.hits[index];
+                    if (!isHandHit(existing)) {
+                        continue;
+                    }
+                    if (candidateReplaces(existing)) {
+                        existing = hit;
+                    }
+                    return;
+                }
+                if (result.hitCount < result.hits.size()) {
+                    result.hits[result.hitCount++] = hit;
+                }
+                return;
+            }
+
+            std::array<std::size_t, 2> worldSlots{};
+            std::size_t worldCount = 0;
+            for (std::size_t index = 0;
+                 index < result.hitCount;
+                 ++index) {
+                auto& existing = result.hits[index];
+                if (isHandHit(existing)) {
+                    continue;
+                }
+                if (std::abs(dot(existing.surfaceNormalWorld,
+                                 hit.surfaceNormalWorld)) >=
+                    kParallelAlignment) {
+                    if (candidateReplaces(existing)) {
+                        existing = hit;
+                    }
+                    return;
+                }
+                if (worldCount < worldSlots.size()) {
+                    worldSlots[worldCount++] = index;
+                }
+            }
+
+            if (worldCount < worldSlots.size()) {
+                if (result.hitCount < result.hits.size()) {
+                    result.hits[result.hitCount++] = hit;
+                }
+                return;
+            }
+
+            // Preserve the existing bounded two-plane corner policy, but only
+            // compare world hits with world hits. The separate hand slot can
+            // never hide a wall or be mistaken for one.
+            const std::size_t first = worldSlots[0];
+            const std::size_t second = worldSlots[1];
+            const std::size_t weaker =
+                result.hits[first].penetrationGame <=
+                        result.hits[second].penetrationGame
+                    ? first
+                    : second;
+            const std::size_t peer = weaker == first ? second : first;
+            if (hit.penetrationGame >
+                    result.hits[weaker].penetrationGame &&
+                std::abs(dot(result.hits[peer].surfaceNormalWorld,
+                             hit.surfaceNormalWorld)) <
+                    kParallelAlignment) {
+                result.hits[weaker] = hit;
+            }
+        };
+
+        struct DiagnosticHandSamples
+        {
+            std::array<RE::NiPoint3, 32> points{};
+            std::array<float, 32> radii{};
+            std::uint32_t count{ 0 };
+        };
+        DiagnosticHandSamples rightHandSamples{};
+        DiagnosticHandSamples leftHandSamples{};
+        const auto copyFreeHandSamples = [](const Hand& hand,
+                                             const bool handFree,
+                                             DiagnosticHandSamples& samples) {
+            if (!handFree) {
+                return;
+            }
+            samples.count = (std::min)(
+                hand.copyHandCollisionSamples(
+                    samples.points.data(),
+                    samples.radii.data(),
+                    static_cast<std::uint32_t>(
+                        samples.points.size())),
+                static_cast<std::uint32_t>(
+                    samples.points.size()));
+        };
+        copyFreeHandSamples(
+            rightHand,
+            rightHandFreeForWeaponStop,
+            rightHandSamples);
+        copyFreeHandSamples(
+            leftHand,
+            leftHandFreeForWeaponStop,
+            leftHandSamples);
+
+        const auto sweptBodyNearHand =
+            [&](const RE::NiPoint3& sweepStartCenter,
+                const RE::NiPoint3& sweepEndCenter,
+                const float bodyRadius,
+                const DiagnosticHandSamples& samples) {
+                if (!std::isfinite(bodyRadius) ||
+                    bodyRadius < 0.0f) {
+                    return false;
+                }
+                const RE::NiPoint3 segmentDelta =
+                    sweepEndCenter - sweepStartCenter;
+                const float segmentLengthSquared =
+                    lengthSquared(segmentDelta);
+                for (std::uint32_t index = 0;
+                     index < samples.count &&
+                     index < samples.points.size();
+                     ++index) {
+                    const auto& point = samples.points[index];
+                    const float handRadius = samples.radii[index];
+                    if (!std::isfinite(point.x) ||
+                        !std::isfinite(point.y) ||
+                        !std::isfinite(point.z) ||
+                        !std::isfinite(handRadius) ||
+                        handRadius < 0.0f) {
+                        continue;
+                    }
+                    float fraction = 0.0f;
+                    if (std::isfinite(segmentLengthSquared) &&
+                        segmentLengthSquared > 0.000001f) {
+                        fraction = std::clamp(
+                            dot(point - sweepStartCenter,
+                                segmentDelta) /
+                                segmentLengthSquared,
+                            0.0f,
+                            1.0f);
+                    }
+                    const RE::NiPoint3 closest =
+                        sweepStartCenter +
+                        segmentDelta * fraction;
+                    const float combinedRadius =
+                        bodyRadius + handRadius + safeEnvelope;
+                    if (lengthSquared(point - closest) <=
+                        combinedRadius * combinedRadius) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+        for (std::size_t activeOrdinal = 0;
+             activeOrdinal < activeCount;
+             ++activeOrdinal) {
+            const std::size_t bodyIndex =
+                activeIndices[activeOrdinal];
+            const auto& instance = bodies[bodyIndex];
+            auto& history =
+                _interactionWorldSweepBodyHistory[bodyIndex];
+            const std::uint32_t sourceBodyId =
+                instance.body.getBodyId().value;
+
+            const bool sourceNodeCurrent =
+                instance.sourceNode &&
+                actor_equipment_grab::nodeContainsNode(
+                    const_cast<RE::NiAVObject*>(packageDriveRoot),
+                    instance.sourceNode,
+                    64);
+            const bool useSourceLocal =
+                sourceNodeCurrent &&
+                !instance.generatedSourceLocalPointsGame.empty() &&
+                instance.generatedSourceLocalPointsGame.size() ==
+                    instance.generatedLocalPointsGame.size();
+            const RE::NiAVObject* sourceBasis =
+                useSourceLocal ? instance.sourceNode :
+                                 packageDriveRoot;
+            const auto& localPoints =
+                useSourceLocal
+                    ? instance.generatedSourceLocalPointsGame
+                    : instance.generatedLocalPointsGame;
+            const RE::NiPoint3& localCenter =
+                useSourceLocal
+                    ? instance.generatedSourceLocalCenterGame
+                    : instance.generatedLocalCenterGame;
+            if (!sourceBasis || localPoints.empty() ||
+                !finiteTransform(sourceBasis->world)) {
+                history = {};
+                result.queryFailed = true;
+                continue;
+            }
+
+            RE::NiTransform currentTarget =
+                makeGeneratedBodyWorldTransform(
+                    sourceBasis->world,
+                    localCenter);
+            // Native generated-body placement and CastShape both consume only
+            // rotation+translation. The source scale is already baked into the
+            // generated shape's point cloud.
+            currentTarget.scale = 1.0f;
+            if (!finiteTransform(currentTarget)) {
+                history = {};
+                result.queryFailed = true;
+                continue;
+            }
+
+            const bool historyMatches =
+                history.valid &&
+                history.generationKey == generationKey &&
+                history.bodyId == sourceBodyId &&
+                history.shape == instance.shape &&
+                history.sourceBasis == sourceBasis;
+            if (!historyMatches) {
+                history = {};
+                history.generationKey = generationKey;
+                history.bodyId = sourceBodyId;
+                history.shape = instance.shape;
+                history.sourceBasis = sourceBasis;
+            }
+
+            if (!history.localBoundsValid) {
+                struct alignas(16) RawShapeAabb
+                {
+                    float minimum[4]{};
+                    float maximum[4]{};
+                };
+                RawShapeAabb raw{};
+                {
+                    havok_world_lock::ScopedWorldReadLock lock(world);
+                    RE::hkTransformf identity{};
+                    identity.SetIdentity();
+                    instance.shape->CalcAabb(
+                        identity,
+                        *reinterpret_cast<RE::hkAabb*>(&raw));
+                }
+                const float shapeScale = havokToGameScale();
+                const RE::NiPoint3 minimum{
+                    raw.minimum[0] * shapeScale,
+                    raw.minimum[1] * shapeScale,
+                    raw.minimum[2] * shapeScale,
+                };
+                const RE::NiPoint3 maximum{
+                    raw.maximum[0] * shapeScale,
+                    raw.maximum[1] * shapeScale,
+                    raw.maximum[2] * shapeScale,
+                };
+                bool boundsFinite =
+                    std::isfinite(minimum.x) &&
+                    std::isfinite(minimum.y) &&
+                    std::isfinite(minimum.z) &&
+                    std::isfinite(maximum.x) &&
+                    std::isfinite(maximum.y) &&
+                    std::isfinite(maximum.z) &&
+                    minimum.x <= maximum.x &&
+                    minimum.y <= maximum.y &&
+                    minimum.z <= maximum.z;
+                float radiusSquared = 0.0f;
+                if (boundsFinite) {
+                    for (const float x : { minimum.x, maximum.x }) {
+                        for (const float y : { minimum.y, maximum.y }) {
+                            for (const float z : { minimum.z, maximum.z }) {
+                                radiusSquared = (std::max)(
+                                    radiusSquared,
+                                    x * x + y * y + z * z);
+                            }
+                        }
+                    }
+                }
+                const float boundsRadius =
+                    std::sqrt((std::max)(0.0f, radiusSquared));
+                history.localBoundsValid = boundsFinite &&
+                    std::isfinite(boundsRadius) &&
+                    boundsRadius >= 0.05f &&
+                    boundsRadius <= 4000.0f;
+                if (history.localBoundsValid) {
+                    history.localBoundsMinGame = minimum;
+                    history.localBoundsMaxGame = maximum;
+                    history.boundsRadiusGame = boundsRadius;
+                }
+            }
+
+            const RE::NiTransform sweepStart = historyMatches
+                ? history.previousTargetWorld
+                : currentTarget;
+            if (history.localBoundsValid &&
+                !result.nearFreeHand) {
+                result.nearFreeHand =
+                    sweptBodyNearHand(
+                        sweepStart.translate,
+                        currentTarget.translate,
+                        history.boundsRadiusGame,
+                        rightHandSamples) ||
+                    sweptBodyNearHand(
+                        sweepStart.translate,
+                        currentTarget.translate,
+                        history.boundsRadiusGame,
+                        leftHandSamples);
+            }
+            const float rotationDegrees =
+                hand_visual_lerp_math::rotationDistanceDegrees(
+                    sweepStart,
+                    currentTarget);
+            const float translationDistance = length(
+                currentTarget.translate - sweepStart.translate);
+            const bool stationary =
+                translationDistance <= 0.001f &&
+                rotationDegrees <= 0.01f;
+            if (stationary &&
+                !weapon_wall_sweep_policy::
+                    shouldRunStationaryWitness(
+                        historyMatches,
+                        contactEpisodeActive)) {
+                history.previousTargetWorld = currentTarget;
+                continue;
+            }
+            const bool convexShape = instance.shape->flags.all(
+                RE::hknpShape::FlagsEnum::kIsConvexShape);
+            const bool needsRotationalEnvelope =
+                !convexShape || rotationDegrees > 0.05f;
+            if (needsRotationalEnvelope &&
+                !history.localBoundsValid) {
+                result.queryFailed = true;
+                continue;
+            }
+
+            const int requestedSubsteps =
+                weapon_wall_sweep_policy::rotationalSweepSubsteps(
+                    rotationDegrees,
+                    history.boundsRadiusGame);
+            const int bodyCastBudget =
+                weapon_wall_sweep_policy::fairCastBudget(
+                    static_cast<int>(activeCount),
+                    static_cast<int>(activeOrdinal));
+            const int admittedSubsteps = (std::min)(
+                requestedSubsteps,
+                bodyCastBudget);
+            result.rotationSubstepsRequested = (std::max)(
+                result.rotationSubstepsRequested,
+                static_cast<std::uint32_t>(requestedSubsteps));
+            if (admittedSubsteps <= 0) {
+                result.budgetLimited = true;
+                continue;
+            }
+            if (admittedSubsteps < requestedSubsteps) {
+                result.budgetLimited = true;
+            }
+
+            ++result.bodiesAttempted;
+            bool bodyQueriesComplete = true;
+            constexpr float kDegreesToRadians =
+                0.017453292519943295769f;
+            const float bodySurfaceArcGameUnits =
+                history.boundsRadiusGame * rotationDegrees *
+                kDegreesToRadians;
+            for (int segment = 0; segment < admittedSubsteps;
+                 ++segment) {
+                const float startFraction =
+                    static_cast<float>(segment) /
+                    static_cast<float>(admittedSubsteps);
+                const float endFraction =
+                    static_cast<float>(segment + 1) /
+                    static_cast<float>(admittedSubsteps);
+                const RE::NiTransform segmentStart =
+                    hand_visual_lerp_math::interpolateTransform(
+                        sweepStart,
+                        currentTarget,
+                        startFraction);
+                const RE::NiTransform segmentEnd =
+                    hand_visual_lerp_math::interpolateTransform(
+                        sweepStart,
+                        currentTarget,
+                        endFraction);
+                const RE::NiTransform segmentMid =
+                    hand_visual_lerp_math::interpolateTransform(
+                        sweepStart,
+                        currentTarget,
+                        0.5f * (startFraction + endFraction));
+                const RE::NiPoint3 segmentDelta =
+                    segmentEnd.translate - segmentStart.translate;
+                const float segmentDistance = length(segmentDelta);
+                const bool poseWitness =
+                    segmentDistance <=
+                    weapon_wall_sweep_policy::
+                        kPoseWitnessDistanceGameUnits;
+                const RE::NiPoint3 castDirection = poseWitness
+                    ? RE::NiPoint3{ 1.0f, 0.0f, 0.0f }
+                    : segmentDelta;
+                const float castDistance = poseWitness
+                    ? weapon_wall_sweep_policy::
+                          kPoseWitnessDistanceGameUnits
+                    : segmentDistance;
+
+                RE::NiTransform castStart = segmentEnd;
+                castStart.translate = segmentStart.translate;
+                castStart.scale = 1.0f;
+                const RE::NiPoint3 chordMidpoint =
+                    (segmentStart.translate + segmentEnd.translate) *
+                    0.5f;
+                const float centerSagitta = length(
+                    segmentMid.translate - chordMidpoint);
+                const float segmentRotation =
+                    hand_visual_lerp_math::rotationDistanceDegrees(
+                        segmentStart,
+                        segmentEnd);
+                const float envelopePadding =
+                    weapon_wall_sweep_policy::
+                        rotationalEnvelopePadding(
+                            history.boundsRadiusGame,
+                            segmentRotation,
+                            centerSagitta);
+                RE::NiPoint3 castBoundsMin =
+                    history.localBoundsMinGame;
+                RE::NiPoint3 castBoundsMax =
+                    history.localBoundsMaxGame;
+                if (needsRotationalEnvelope &&
+                    envelopePadding > 0.0f) {
+                    const RE::NiPoint3 padding{
+                        envelopePadding,
+                        envelopePadding,
+                        envelopePadding,
+                    };
+                    castBoundsMin = castBoundsMin - padding;
+                    castBoundsMax = castBoundsMax + padding;
+                }
+
+                RE::hknpAllHitsCollector collector;
+                ++result.castsAttempted;
+                bool castRan = false;
+                if (!needsRotationalEnvelope) {
+                    castRan = physics_shape_cast::castShape(
+                        world,
+                        physics_shape_cast::ShapeCastInput{
+                            .shape = instance.shape,
+                            .startWorld = castStart,
+                            .directionGame = castDirection,
+                            .distanceGame = castDistance,
+                            .collisionFilterInfo =
+                                weaponSweepFilterInfo,
+                            .collectStartPointHits = true,
+                        },
+                        collector);
+                } else {
+                    castRan = physics_shape_cast::
+                        castConservativeOrientedBox(
+                            world,
+                            physics_shape_cast::OrientedBoxCastInput{
+                                .localBoundsMinGame = castBoundsMin,
+                                .localBoundsMaxGame = castBoundsMax,
+                                .startBodyWorld = castStart,
+                                .directionGame = castDirection,
+                                .distanceGame = castDistance,
+                                .collisionFilterInfo =
+                                    weaponSweepFilterInfo,
+                                .collectStartPointHits = true,
+                            },
+                            collector);
+                }
+                if (!castRan) {
+                    bodyQueriesComplete = false;
+                    result.queryFailed = true;
+                    continue;
+                }
+                ++result.castsRun;
+                if (segmentRotation > 0.05f) {
+                    ++result.rotationSubstepsRun;
+                }
+
+                for (int hitIndex = 0;
+                     hitIndex < collector.hits._size;
+                     ++hitIndex) {
+                    const auto& nativeHit =
+                        collector.hits._data[hitIndex];
+                    ++result.rawHits;
+                    const std::uint32_t targetBodyId =
+                        nativeHit.hitBodyInfo.m_bodyId.value;
+                    const std::uint32_t targetFilterInfo =
+                        resolveWorldFilterInfo(nativeHit);
+                    const std::uint32_t targetLayer =
+                        targetFilterInfo & 0x7Fu;
+                    const bool targetIsDynamicHandProxy =
+                        targetLayer == collision_layer_policy::
+                            ROCK_LAYER_DYNAMIC_HAND_PROXY;
+                    const bool targetIsGeneratedHandCollider =
+                        targetLayer == collision_layer_policy::
+                            ROCK_LAYER_HAND;
+                    const bool targetIsHandCollider =
+                        collision_layer_policy::
+                            isWeaponSweepHandTargetLayer(
+                                targetLayer);
+                    if (targetIsGeneratedHandCollider) {
+                        ++result.rawGeneratedHandHits;
+                    } else if (targetIsDynamicHandProxy) {
+                        ++result.rawDynamicHandProxyHits;
+                    }
+                    const auto sweepWitness =
+                        weapon_wall_sweep_policy::
+                            classifySweepWitness(
+                                historyMatches,
+                                stationary,
+                                poseWitness,
+                                segment,
+                                admittedSubsteps,
+                                nativeHit.fraction.storage);
+                    if (!sweepWitness.fractionValid) {
+                        continue;
+                    }
+                    const float safeSweepFraction =
+                        weapon_wall_sweep_policy::
+                            safeSweepFraction(
+                                sweepWitness.sweepFraction,
+                                safeEnvelope,
+                                translationDistance,
+                                bodySurfaceArcGameUnits);
+                    bool handOwnershipResolved = false;
+                    bool targetHandIsLeft = false;
+                    if (targetIsGeneratedHandCollider) {
+                        HandColliderBodyMetadata metadata{};
+                        handOwnershipResolved =
+                            (rightHand.tryGetHandColliderMetadata(
+                                 targetBodyId,
+                                 metadata) ||
+                             leftHand.tryGetHandColliderMetadata(
+                                 targetBodyId,
+                                 metadata)) &&
+                            metadata.valid;
+                        if (handOwnershipResolved) {
+                            targetHandIsLeft = metadata.isLeft;
+                        }
+                    } else if (targetIsDynamicHandProxy) {
+                        DynamicHandCollisionContactBodySnapshot
+                            snapshot{};
+                        handOwnershipResolved =
+                            dynamicHandCollision &&
+                            dynamicHandCollision->
+                                tryGetContactBodySnapshot(
+                                    targetBodyId,
+                                    snapshot) &&
+                            snapshot.valid;
+                        if (handOwnershipResolved) {
+                            targetHandIsLeft = snapshot.isLeft;
+                        }
+                    }
+                    if (targetIsHandCollider &&
+                        handOwnershipResolved) {
+                        ++result.handOwnershipResolvedHits;
+                    }
+                    const bool targetHandFree =
+                        handOwnershipResolved &&
+                        (targetHandIsLeft
+                             ? leftHandFreeForWeaponStop
+                             : rightHandFreeForWeaponStop);
+                    if (targetIsHandCollider && targetHandFree) {
+                        ++result.handFreeSideHits;
+                    }
+                    const bool handTargetEligible =
+                        !targetIsHandCollider ||
+                        weapon_wall_sweep_policy::
+                            shouldAdmitWeaponSweepHandTarget(
+                                handOwnershipResolved,
+                                targetHandIsLeft,
+                                rightHandFreeForWeaponStop,
+                                leftHandFreeForWeaponStop);
+                    if (targetBodyId == INVALID_BODY_ID ||
+                        bodySetContains(targetBodyId) ||
+                        !handTargetEligible ||
+                        (!targetIsHandCollider &&
+                         !soft_contact_world_policy::
+                             acceptsWorldSurfaceFilterInfo(
+                                 targetFilterInfo))) {
+                        continue;
+                    }
+
+                    const RE::NiPoint3 surfacePoint =
+                        hkVectorToNiPoint(nativeHit.position);
+                    RE::NiPoint3 surfaceNormal = normalize(
+                        RE::NiPoint3{
+                            nativeHit.normal.x,
+                            nativeHit.normal.y,
+                            nativeHit.normal.z,
+                        });
+                    if (lengthSquared(surfaceNormal) <=
+                            0.000001f ||
+                        !std::isfinite(surfacePoint.x) ||
+                        !std::isfinite(surfacePoint.y) ||
+                        !std::isfinite(surfacePoint.z)) {
+                        continue;
+                    }
+                    if (dot(surfaceNormal,
+                            segmentStart.translate -
+                                surfacePoint) < 0.0f) {
+                        surfaceNormal = surfaceNormal * -1.0f;
+                    }
+
+                    float minimumSignedDistance =
+                        (std::numeric_limits<float>::max)();
+                    float previousMinimumSignedDistance =
+                        (std::numeric_limits<float>::infinity)();
+                    RE::NiPoint3 deepestPoint{};
+                    /*
+                     * currentTarget stores the transpose required by the
+                     * Ni-to-Havok bridge. Convert it back to Ni row-space so
+                     * the same generated support points can be evaluated at
+                     * both frame endpoints. This captures a barrel rotating
+                     * into a hand even when the hull center barely moves.
+                     */
+                    RE::NiTransform currentSupportWorld =
+                        currentTarget;
+                    currentSupportWorld.rotate =
+                        weapon_collision_geometry_math::
+                            transposeRotation(currentTarget.rotate);
+                    RE::NiTransform previousSupportWorld =
+                        sweepStart;
+                    previousSupportWorld.rotate =
+                        weapon_collision_geometry_math::
+                            transposeRotation(sweepStart.rotate);
+                    for (const auto& localPoint : localPoints) {
+                        const RE::NiPoint3 pointWorld =
+                            weapon_collision_geometry_math::
+                                localPointToWorld(
+                                    sourceBasis->world.rotate,
+                                    sourceBasis->world.translate,
+                                    sourceBasis->world.scale,
+                                    localPoint);
+                        const float signedDistance = dot(
+                            pointWorld - surfacePoint,
+                            surfaceNormal);
+                        if (std::isfinite(signedDistance) &&
+                            signedDistance < minimumSignedDistance) {
+                            minimumSignedDistance = signedDistance;
+                            deepestPoint = pointWorld;
+                        }
+                        const RE::NiPoint3 pointBodyLocal =
+                            transform_math::worldPointToLocal(
+                                currentSupportWorld,
+                                pointWorld);
+                        const RE::NiPoint3 previousPointWorld =
+                            transform_math::localPointToWorld(
+                                previousSupportWorld,
+                                pointBodyLocal);
+                        const float previousSignedDistance = dot(
+                            previousPointWorld - surfacePoint,
+                            surfaceNormal);
+                        if (std::isfinite(previousSignedDistance) &&
+                            previousSignedDistance <
+                                previousMinimumSignedDistance) {
+                            previousMinimumSignedDistance =
+                                previousSignedDistance;
+                        }
+                    }
+                    const float requiredCorrection =
+                        convexRadiusGame + safeEnvelope -
+                        minimumSignedDistance;
+                    if (!std::isfinite(requiredCorrection) ||
+                        requiredCorrection <= 0.001f) {
+                        continue;
+                    }
+
+                    InteractionWorldSweepHit hit{};
+                    hit.valid = true;
+                    hit.targetIsDynamicHandProxy =
+                        targetIsDynamicHandProxy;
+                    hit.targetIsGeneratedHandCollider =
+                        targetIsGeneratedHandCollider;
+                    hit.targetCollisionLayer = targetLayer;
+                    hit.sourceBodyId = sourceBodyId;
+                    hit.targetBodyId = targetBodyId;
+                    hit.surfacePointWorld = surfacePoint;
+                    hit.surfaceNormalWorld = surfaceNormal;
+                    hit.weaponPointWorld = deepestPoint;
+                    hit.weaponProbeRadiusGame = convexRadiusGame;
+                    hit.penetrationGame = requiredCorrection;
+                    hit.approachSpeedGameUnits =
+                        weapon_wall_sweep_policy::
+                            supportPlaneApproachSpeed(
+                                previousMinimumSignedDistance,
+                                minimumSignedDistance,
+                                dt);
+                    hit.sweepFraction =
+                        sweepWitness.sweepFraction;
+                    hit.safeSweepFraction =
+                        safeSweepFraction;
+                    hit.validatedContinuousEntry =
+                        sweepWitness.validatedContinuousEntry ||
+                        weapon_wall_sweep_policy::
+                            shouldPromoteHandStartOverlapToContinuousEntry(
+                                targetIsHandCollider,
+                                rootSweepHistoryCurrent,
+                                rootSweepHasMotion,
+                                sweepWitness.sweepFraction,
+                                hit.approachSpeedGameUnits);
+                    hit.hasBlockedWeaponWorld =
+                        hit.validatedContinuousEntry &&
+                        rootSweepHistoryCurrent &&
+                        rootSweepHasMotion;
+                    if (hit.hasBlockedWeaponWorld) {
+                        // Stop at the conservative time of impact, not at the
+                        // prior frame endpoint.  The latter visibly snapped a
+                        // slow gun backward and discarded the exact fraction
+                        // already produced by the continuous cast.
+                        hit.blockedWeaponWorld =
+                            hand_visual_lerp_math::interpolateTransform(
+                                previousWeaponRootWorld,
+                                packageDriveRoot->world,
+                            hit.safeSweepFraction);
+                    }
+                    if (targetIsHandCollider) {
+                        ++result.handHitsAdmitted;
+                        if (hit.validatedContinuousEntry) {
+                            ++result.validatedHandHits;
+                        }
+                        if (hit.hasBlockedWeaponWorld) {
+                            ++result.blockedHandHits;
+                        }
+                    }
+                    admitHit(hit);
+                }
+            }
+
+            /*
+             * Never advance past an unqueried interval. A transient native
+             * query failure therefore retries the old->new path next frame;
+             * successful hits from this frame remain fresh and usable.
+             */
+            if (bodyQueriesComplete) {
+                history.valid = true;
+                history.generationKey = generationKey;
+                history.bodyId = sourceBodyId;
+                history.shape = instance.shape;
+                history.sourceBasis = sourceBasis;
+                history.previousTargetWorld = currentTarget;
+            }
+        }
+
+        std::sort(
+            result.hits.begin(),
+            result.hits.begin() + result.hitCount,
+            [](const InteractionWorldSweepHit& lhs,
+                const InteractionWorldSweepHit& rhs) {
+                if (lhs.hasBlockedWeaponWorld !=
+                    rhs.hasBlockedWeaponWorld) {
+                    return lhs.hasBlockedWeaponWorld;
+                }
+                if (lhs.validatedContinuousEntry !=
+                    rhs.validatedContinuousEntry) {
+                    return lhs.validatedContinuousEntry;
+                }
+                if (lhs.validatedContinuousEntry &&
+                    std::isfinite(lhs.safeSweepFraction) &&
+                    std::isfinite(rhs.safeSweepFraction) &&
+                    std::abs(lhs.safeSweepFraction -
+                        rhs.safeSweepFraction) >
+                        weapon_wall_sweep_policy::
+                            kSweepStartFractionEpsilon) {
+                    return lhs.safeSweepFraction <
+                           rhs.safeSweepFraction;
+                }
+                return lhs.penetrationGame >
+                       rhs.penetrationGame;
+            });
+
+        if (result.budgetLimited || result.queryFailed) {
+            ROCK_LOG_SAMPLE_WARN(
+                Weapon,
+                1000,
+                "Exact weapon/world hull sweep degraded generation={:016X} bodies={} casts={}/{} requestedSubsteps={} runSubsteps={} budgetLimited={} queryFailed={}",
+                generationKey,
+                result.bodiesAttempted,
+                result.castsRun,
+                result.castsAttempted,
+                result.rotationSubstepsRequested,
+                result.rotationSubstepsRun,
+                result.budgetLimited ? "yes" : "no",
+                result.queryFailed ? "yes" : "no");
+        }
+        if (rootSweepHasMotion && result.nearFreeHand &&
+            (rightHandFreeForWeaponStop ||
+             leftHandFreeForWeaponStop)) {
+            ROCK_LOG_SAMPLE_WARN(
+                Weapon,
+                2000,
+                "Exact weapon sweep near free hand generation={:016X} root={} motion={:.2f}gu/{:.1f}deg casts={}/{} raw={} hand=43:{}/48:{} resolved/free/admit/valid/block={}/{}/{}/{}/{} output={} queryFailed={}",
+                generationKey,
+                result.rootHistoryCurrent ? "current" : "seeded",
+                result.rootTranslationGameUnits,
+                result.rootRotationDegrees,
+                result.castsRun,
+                result.castsAttempted,
+                result.rawHits,
+                result.rawGeneratedHandHits,
+                result.rawDynamicHandProxyHits,
+                result.handOwnershipResolvedHits,
+                result.handFreeSideHits,
+                result.handHitsAdmitted,
+                result.validatedHandHits,
+                result.blockedHandHits,
+                result.hitCount,
+                result.queryFailed ? "yes" : "no");
+        }
+        return result;
     }
 
     bool WeaponCollision::tryCaptureInteractionCollisionProbeAnchor(
@@ -3882,6 +5206,7 @@ namespace rock
         _cachedBhkWorld = bhkWorld;
         _cachedWeaponKey = 0;
         _cachedWeaponVisualKey = 0;
+        _cachedWeaponVisibleTriShapeCount = 0;
         _cachedWeaponIdentityKey = 0;
         _cachedWeaponOwnershipKey = 0;
         _cachedWeaponFormID = 0;
@@ -3922,6 +5247,7 @@ namespace rock
 
         _cachedWeaponKey = 0;
         _cachedWeaponVisualKey = 0;
+        _cachedWeaponVisibleTriShapeCount = 0;
         _cachedWeaponIdentityKey = 0;
         _cachedWeaponOwnershipKey = 0;
         _cachedWeaponFormID = 0;
@@ -3991,6 +5317,7 @@ namespace rock
         auto clearCurrentWeaponState = [&]() {
             _cachedWeaponKey = 0;
             _cachedWeaponVisualKey = 0;
+            _cachedWeaponVisibleTriShapeCount = 0;
             _cachedWeaponIdentityKey = 0;
             _cachedWeaponOwnershipKey = 0;
             _cachedWeaponFormID = 0;
@@ -4164,11 +5491,69 @@ namespace rock
             return;
         }
 
+        /*
+         * Publish the first usable bank immediately, then continue observing
+         * READY visible geometry while that same bank remains active. Fallout
+         * can attach the barrel, muzzle, stock, or OMOD children after the
+         * receiver first becomes visible. A monotonic visible-shape increase
+         * enters the existing stable replacement path while the provisional
+         * bank stays live, closing both the first-frame gap and the permanent
+         * incomplete-bank failure. Visibility decreases are ordinary reload
+         * animation and deliberately do not schedule a rebuild.
+         */
+        WeaponVisualKeyStats completenessVisualStats{};
+        std::uint64_t completenessVisualKey = 0;
+        bool moreCompleteVisualReplacement = false;
+        if (!rebuildRequired && hasWeaponBody() &&
+            observedKey == _cachedWeaponKey &&
+            _cachedWeaponVisualKey != 0) {
+            completenessVisualKey = getWeaponVisualCompositionKey(
+                weaponNode,
+                completenessVisualStats);
+            moreCompleteVisualReplacement =
+                weapon_wall_sweep_policy::
+                    shouldScheduleMoreCompleteVisibleReplacement(
+                        true,
+                        _cachedWeaponVisualKey,
+                        completenessVisualKey,
+                        _cachedWeaponVisibleTriShapeCount,
+                        completenessVisualStats.
+                            visibleTriShapeCount);
+            if (moreCompleteVisualReplacement) {
+                rebuildRequired = true;
+                ROCK_LOG_SAMPLE_INFO(
+                    Weapon,
+                    g_rockConfig.rockLogSampleMilliseconds,
+                    "Generated weapon collision observed more complete visible geometry; retaining active bank while replacement stabilizes key={:016X} visualKey={:016X}->{:016X} visibleTriShapes={}->{} bodies={}",
+                    observedKey,
+                    _cachedWeaponVisualKey,
+                    completenessVisualKey,
+                    _cachedWeaponVisibleTriShapeCount,
+                    completenessVisualStats.visibleTriShapeCount,
+                    getWeaponBodyCount());
+            } else {
+                // Stable-frame evidence must be consecutive. A transient
+                // visibility increase cannot be resumed after the scene
+                // returns to the already-published composition.
+                clearPendingWeaponVisualRebuild();
+            }
+        }
+
         if (rebuildRequired) {
-            WeaponVisualKeyStats visualKeyStats{};
-            const std::uint64_t observedVisualKey = getWeaponVisualCompositionKey(weaponNode, visualKeyStats);
+            WeaponVisualKeyStats visualKeyStats =
+                moreCompleteVisualReplacement
+                    ? completenessVisualStats
+                    : WeaponVisualKeyStats{};
+            const std::uint64_t observedVisualKey =
+                moreCompleteVisualReplacement
+                    ? completenessVisualKey
+                    : getWeaponVisualCompositionKey(
+                          weaponNode,
+                          visualKeyStats);
             const bool visualKeyChanged = observedVisualKey != 0 && observedVisualKey != _cachedWeaponVisualKey;
-            const bool generationDrivenRebuild = keyChanged || missingBodies;
+            const bool generationDrivenRebuild =
+                keyChanged || missingBodies ||
+                moreCompleteVisualReplacement;
             const bool omodPrebuildAuditCurrent =
                 _omodPrebuildAuditEquippedKey == observedKey && _omodPrebuildAuditRoot == weaponNode;
             if (generationDrivenRebuild && !omodPrebuildAuditCurrent &&
@@ -4195,7 +5580,16 @@ namespace rock
                 }
             }
             const int requiredStableFrames = (std::max)(0, g_rockConfig.rockWeaponCollisionVisualStabilizationFrames);
-            const bool stabilizeVisualRebuild = generationDrivenRebuild && requiredStableFrames > 0;
+            // An empty initial bank has no collision authority to retain, so a
+            // visible current witness is enough. Later generation/visual-key
+            // replacements continue to stabilize while the old active bank
+            // remains published until the replacement is complete.
+            const bool stabilizeVisualRebuild =
+                weapon_wall_sweep_policy::
+                    shouldStabilizeVisibleBuild(
+                        generationDrivenRebuild,
+                        hasWeaponBody(),
+                        requiredStableFrames);
 
             if (stabilizeVisualRebuild && !weaponVisualNodeVisible(weaponNode)) {
                 const bool newInvisibleDeferred =
@@ -4367,6 +5761,7 @@ namespace rock
                     }
                     _cachedWeaponKey = 0;
                     _cachedWeaponVisualKey = 0;
+                    _cachedWeaponVisibleTriShapeCount = 0;
                     _cachedWeaponIdentityKey = 0;
                     _cachedWeaponOwnershipKey = 0;
                     _cachedWeaponFormID = 0;
@@ -4412,6 +5807,7 @@ namespace rock
                         resetWeaponBodySetGeneration();
                         _cachedWeaponKey = 0;
                         _cachedWeaponVisualKey = 0;
+                        _cachedWeaponVisibleTriShapeCount = 0;
                         _cachedWeaponIdentityKey = 0;
                         _cachedWeaponOwnershipKey = 0;
                         _cachedWeaponFormID = 0;
@@ -4434,6 +5830,11 @@ namespace rock
                     workbenchExitRequested ? "yes" : "no",
                     usedCachedSources ? "yes" : "no",
                     GENERATED_WEAPON_BODY_CREATION_BATCH);
+                // With the source inventory capped to the same size as the
+                // creation batch, a valid initial draw publishes in this first
+                // visible update. Replacement builds retain their old active
+                // bank until this call atomically swaps the complete new bank.
+                (void)advancePendingGeneratedWeaponBuild(world);
                 return;
             }
         }
@@ -5086,7 +6487,11 @@ namespace rock
                  * holosight attachments) before any hull/Havok work is spent on it.
                  */
                 const float centerDistanceGame = weapon_collision_geometry_math::pointCenter(localPoints).Length();
-                if (centerDistanceGame > maxSourceDistanceGame) {
+                if (weapon_wall_sweep_policy::
+                        sourceDistanceFilterRejects(
+                            true,
+                            centerDistanceGame,
+                            maxSourceDistanceGame)) {
                     ++culledForDistance;
                     ROCK_LOG_TRACE(Weapon,
                         "{}generated mesh source skipped '{}': centerDistance={:.2f} exceeds maxSourceDistance={:.2f} game units from weapon origin",
@@ -5244,13 +6649,20 @@ namespace rock
     bool WeaponCollision::weaponCollisionSettingsChanged() const
     {
         if (_cachedConvexRadius < 0.0f || _cachedPointDedupGrid < 0.0f || _cachedSupportFitTargetPoints < 0 ||
-            _cachedSupportFitMaxErrorGameUnits < 0.0f) {
+            _cachedSupportFitMaxErrorGameUnits < 0.0f || _cachedMaxSourceDistanceMelee < 0.0f ||
+            _cachedMaxSourceDistancePistol < 0.0f || _cachedMaxSourceDistanceRifle < 0.0f ||
+            _cachedMaxSourceDistanceHeavy < 0.0f) {
             return false;
         }
         return std::abs(g_rockConfig.rockWeaponCollisionConvexRadius - _cachedConvexRadius) > 0.00001f ||
                std::abs(g_rockConfig.rockWeaponCollisionPointDedupGrid - _cachedPointDedupGrid) > 0.00001f ||
                g_rockConfig.rockWeaponCollisionSupportFitTargetPoints != _cachedSupportFitTargetPoints ||
-               std::abs(g_rockConfig.rockWeaponCollisionSupportFitMaxErrorGameUnits - _cachedSupportFitMaxErrorGameUnits) > 0.00001f;
+               std::abs(g_rockConfig.rockWeaponCollisionSupportFitMaxErrorGameUnits - _cachedSupportFitMaxErrorGameUnits) > 0.00001f ||
+               g_rockConfig.rockWeaponCollisionMaxSourceDistanceEnabled != _cachedMaxSourceDistanceEnabled ||
+               std::abs(g_rockConfig.rockWeaponCollisionMaxSourceDistanceMelee - _cachedMaxSourceDistanceMelee) > 0.00001f ||
+               std::abs(g_rockConfig.rockWeaponCollisionMaxSourceDistancePistol - _cachedMaxSourceDistancePistol) > 0.00001f ||
+               std::abs(g_rockConfig.rockWeaponCollisionMaxSourceDistanceRifle - _cachedMaxSourceDistanceRifle) > 0.00001f ||
+               std::abs(g_rockConfig.rockWeaponCollisionMaxSourceDistanceHeavy - _cachedMaxSourceDistanceHeavy) > 0.00001f;
     }
 
     std::size_t WeaponCollision::createGeneratedWeaponBodiesInBank(RE::hknpWorld* world,
@@ -5480,6 +6892,7 @@ namespace rock
 
         _cachedWeaponKey = 0;
         _cachedWeaponVisualKey = 0;
+        _cachedWeaponVisibleTriShapeCount = 0;
         _cachedWeaponIdentityKey = 0;
         _cachedWeaponOwnershipKey = 0;
         _cachedWeaponFormID = 0;
@@ -8034,6 +9447,7 @@ namespace rock
         std::size_t drivenSourceNodeCount)
     {
         if (!world || !hasWeaponBody() || getCurrentWeaponGenerationKey() == 0) {
+            resetWeaponRootDriveSegmentHistory();
             return;
         }
 
@@ -8041,9 +9455,70 @@ namespace rock
         RE::NiAVObject* cachedPackageDriveNode = resolvePackageDriveNode(bank, nullptr);
         RE::NiAVObject* packageDriveNode = fallbackWeaponNode ? fallbackWeaponNode : cachedPackageDriveNode;
         if (!packageDriveNode) {
+            resetWeaponRootDriveSegmentHistory();
             return;
         }
         const RE::NiTransform packageWorld = packageDriveNode->world;
+        const std::uint64_t generationKey =
+            getCurrentWeaponGenerationKey();
+        const auto finiteTransform = [](const RE::NiTransform& value) {
+            bool finite = std::isfinite(value.translate.x) &&
+                          std::isfinite(value.translate.y) &&
+                          std::isfinite(value.translate.z) &&
+                          std::isfinite(value.scale) &&
+                          std::abs(value.scale) > 0.0001f;
+            for (int row = 0; finite && row < 3; ++row) {
+                for (int column = 0; finite && column < 3;
+                     ++column) {
+                    finite = std::isfinite(
+                        value.rotate.entry[row][column]);
+                }
+            }
+            return finite;
+        };
+        const bool sameGeneration =
+            _weaponRootDriveHistoryGenerationKey == generationKey;
+        const bool sameRoot =
+            _weaponRootDriveHistoryRoot == packageDriveNode;
+        const float rootTranslation =
+            _weaponRootDriveHistoryValid
+                ? hand_visual_lerp_math::distanceGameUnits(
+                      _weaponRootDrivePreviousWorld.translate,
+                      packageWorld.translate)
+                : 0.0f;
+        const float rootRotation =
+            _weaponRootDriveHistoryValid
+                ? hand_visual_lerp_math::rotationDistanceDegrees(
+                      _weaponRootDrivePreviousWorld,
+                      packageWorld)
+                : 0.0f;
+        const bool segmentContinuous =
+            weapon_wall_sweep_policy::weaponDriveSegmentIsContinuous(
+                _weaponRootDriveHistoryValid,
+                sameGeneration,
+                sameRoot,
+                finiteTransform(_weaponRootDrivePreviousWorld) &&
+                    finiteTransform(packageWorld),
+                sourceDeltaSeconds,
+                rootTranslation,
+                rootRotation);
+        _weaponRootDriveSegment = {};
+        if (segmentContinuous) {
+            _weaponRootDriveSegment.valid = true;
+            _weaponRootDriveSegment.generationKey = generationKey;
+            _weaponRootDriveSegment.sequence =
+                ++_weaponRootDriveSequence;
+            _weaponRootDriveSegment.previousRootWorld =
+                _weaponRootDrivePreviousWorld;
+            _weaponRootDriveSegment.currentRootWorld = packageWorld;
+            _weaponRootDriveSegment.sourceDeltaSeconds =
+                sourceDeltaSeconds;
+        }
+        _weaponRootDriveHistoryRoot = packageDriveNode;
+        _weaponRootDrivePreviousWorld = packageWorld;
+        _weaponRootDriveHistoryGenerationKey = generationKey;
+        _weaponRootDriveHistoryValid =
+            generationKey != 0 && finiteTransform(packageWorld);
         const bool packageRootDiffersFromCached = cachedPackageDriveNode && cachedPackageDriveNode != packageDriveNode;
         bool updatedPublishedRoots = false;
 

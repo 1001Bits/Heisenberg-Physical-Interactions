@@ -16,6 +16,7 @@ namespace RE
 {
     class Actor;
     class BGSObjectInstance;
+    class NiAVObject;
     class NiPoint3;
     class NiTransform;
     class TESObjectREFR;
@@ -69,6 +70,10 @@ namespace rock
     // — exactly like ROCK's native grabs. Call with active=true when the host commits a grab on
     // that hand, active=false on release. Safe no-op while the engine is absent/uninitialized.
     void HostNotifyExternalGrab(bool a_isLeft, bool a_active);
+    // One-shot ownership handoff for a physical grip edge consumed by an
+    // already-active host grab. ROCK drains its own copy of that edge without
+    // acting on it, preventing same-frame release/re-grab under mode 9.
+    void HostConsumeExternalGrabInputEdge(bool a_isLeft);
     // Publishes the exact Havok bodies owned by a host-side grab. Body IDs are
     // scoped to their hknpWorld; the physics callback matches both values and
     // removes only those pairs from the player's character-controller solve.
@@ -193,11 +198,19 @@ namespace rock
     void HostEquipObjectPassThroughBegin();
     void HostEquipObjectPassThroughEnd();
 
-    // EMBED: host selects grab+selection ownership from iGrabMode. Passing true
+    // EMBED: host selects grab+selection ownership from its resolved policy. Passing true
     // (mode 9) cedes both to ROCK; false keeps both in Heisenberg. The decision
     // overrides standalone bGrabEnabled/bSelectionEnabled values now and after
     // every shared Heisenberg_F4VR.ini reload.
     void HostSetGrabOwnership(bool a_rockOwnsGrab);
+
+    // Current-frame, data-only hint from Fallout 4 VR's native ViewCaster.
+    // Publishing never starts a grab and never bypasses ROCK selection policy;
+    // ROCK must collision-query and validate the exact reference before use.
+    void HostPublishViewCasterGrabCandidate(
+        bool a_isLeft,
+        RE::TESObjectREFR* a_target);
+    RE::TESObjectREFR* HostGetViewCasterGrabCandidate(bool a_isLeft);
 
     // EMBED (Jul 18): true while the given hand is engaging the equipped weapon (two-handed
     // support touch/grip or part-grip). Host uses it to suppress its own grab on that hand.
@@ -278,6 +291,90 @@ namespace rock
         RE::NiPoint3* a_outContactPointWorld,
         bool* a_outHasContactPoint);
 
+    // Exact, same-main-thread view of a loose object currently owned by a ROCK
+    // grab. The node/ref are borrowed only for the duration of the host's
+    // post-update callback; grabTraceId must be supplied to the release call so
+    // a stale snapshot cannot detach a later grab from the same hand.
+    struct HostHeldObjectSnapshot
+    {
+        RE::TESObjectREFR* ref = nullptr;
+        RE::NiAVObject* heldNode = nullptr;
+        float heldSeconds = 0.0f;
+        float handSpeedMetersPerSecond = 0.0f;
+        std::uint64_t grabTraceId = 0;
+    };
+    bool HostGetHeldObjectSnapshot(
+        bool a_isLeft,
+        HostHeldObjectSnapshot& a_out);
+
+    // Exact Heisenberg item-profile bridge. This intentionally exposes only
+    // Priority 1/2 authored matches; ROCK must never turn a fuzzy or
+    // dimension-donor pose into rigid grab authority.
+    struct HostExactItemGrabProfile
+    {
+        RE::NiPoint3 localPosition{};
+        RE::NiMatrix3 localRotation{};
+        RE::NiTransform parentWorld{};
+        std::array<float, 5> fingerCurls{};
+        std::array<float, 15> jointCurls{};
+        bool hasFingerCurls{ false };
+        bool hasJointCurls{ false };
+        bool parentWorldValid{ false };
+    };
+    bool HostGetExactItemGrabProfile(
+        RE::TESObjectREFR* a_ref,
+        bool a_isLeft,
+        HostExactItemGrabProfile& a_out);
+    bool HostReleaseHeldObjectForInventory(
+        bool a_isLeft,
+        RE::TESObjectREFR* a_expectedRef,
+        std::uint64_t a_expectedGrabTraceId);
+
+    // Optional host reservation for quest items that may be physically held
+    // but must never enter ROCK's native player-mouth consume transfer. A true
+    // result blocks the candidate before ROCK detaches or activates the ref.
+    using HostPlayerConsumeBlockFn = bool (*)(RE::TESObjectREFR*);
+    void HostSetPlayerConsumeBlockCallback(
+        HostPlayerConsumeBlockFn a_fn);
+    // Engine-side query; default false in standalone ROCK. Callback faults are
+    // contained and fail closed for the current item.
+    bool HostShouldBlockPlayerConsume(RE::TESObjectREFR* a_ref);
+
+    // The embedded host owns game-specific delivery classification (including
+    // mod-added disease cures), Power Armor policy, and the user-facing
+    // Consumables settings.  ROCK owns only spatial detection and transfer.
+    // Standalone ROCK keeps its legacy mouth fallback when no callback is
+    // registered; a registered callback may fail closed by returning false.
+    enum class HostPlayerConsumeRoute : std::uint8_t
+    {
+        Blocked = 0,
+        Mouth,
+        OppositeWrist,
+    };
+
+    struct HostPlayerConsumeProfile
+    {
+        HostPlayerConsumeRoute route{ HostPlayerConsumeRoute::Blocked };
+        bool autoConsumeWhileHeld{ false };
+        float zoneOffsetXGameUnits{ 0.0f };
+        float zoneOffsetYGameUnits{ 0.0f };
+        float zoneOffsetZGameUnits{ 0.0f };
+        float zoneRadiusGameUnits{ 0.0f };
+    };
+
+    using HostPlayerConsumeProfileFn = bool (*)(
+        RE::TESObjectREFR*,
+        bool,
+        HostPlayerConsumeProfile&);
+    void HostSetPlayerConsumeProfileCallback(
+        HostPlayerConsumeProfileFn a_fn);
+    // a_inOut contains ROCK's standalone mouth fallback on entry.  Returns
+    // false only when a registered host callback rejects/faults the item.
+    bool HostResolvePlayerConsumeProfile(
+        RE::TESObjectREFR* a_ref,
+        bool a_holdingHandIsLeft,
+        HostPlayerConsumeProfile& a_inOut);
+
     // Live boundary samples from the exact generated hand/weapon collision
     // hulls. Used by host-owned animated meshes (Pip-Boy deck/button) that do
     // not expose a standalone Havok rigid body but still need to react to the
@@ -306,7 +403,21 @@ namespace rock
     // authority-written hands (loop-proof). Freshness is per-frame: ROCK clears the flag at
     // the end of its onFrameUpdate.
     void HostSetPreAuthorityHandWorlds(const RE::NiTransform& a_left, const RE::NiTransform& a_right);
+    // Compatibility fallback captured from the final skinned graph. Existing
+    // weapon consumers may read it through HostGetPreAuthorityHandWorld, but
+    // hand-collision feedback must use HostGetCleanPreAuthorityHandWorld and
+    // therefore rejects this potentially authority-written source.
+    void HostSetFallbackPreAuthorityHandWorlds(
+        const RE::NiTransform& a_left,
+        const RE::NiTransform& a_right);
+    // True only for the embedded HostLoad path, where flattened hand/arm
+    // frames can contain the preceding external-authority result and therefore
+    // must never be used as dynamic-collision intent without fresh clean truth.
+    bool HostRequiresPreAuthorityHandWorld();
     bool HostGetPreAuthorityHandWorld(bool a_isLeft, RE::NiTransform& a_out);
+    bool HostGetCleanPreAuthorityHandWorld(
+        bool a_isLeft,
+        RE::NiTransform& a_out);
 
     // Same-frame anatomical data captured beside the clean hand truth. The host clears
     // validity whenever it publishes a new hand pair, then fills each successfully resolved

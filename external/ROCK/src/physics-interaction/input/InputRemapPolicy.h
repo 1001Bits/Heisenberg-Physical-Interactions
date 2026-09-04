@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 
 namespace rock::input_remap_policy
@@ -141,6 +143,10 @@ namespace rock::input_remap_policy
      * left X raises the same bit on the left tracker only.
      */
     inline constexpr int kOpenVrAcceptButtonId = 7;
+    inline constexpr int kOpenVrGripButtonId = 2;
+    inline constexpr std::size_t kOpenVrGripAxisIndex = 2;
+    inline constexpr float kOpenVrGripAxisPressThreshold = 0.50f;
+    inline constexpr float kOpenVrGripAxisReleaseThreshold = 0.30f;
 
     [[nodiscard]] constexpr bool isAllowedGrabButtonId(int buttonId)
     {
@@ -166,6 +172,32 @@ namespace rock::input_remap_policy
     {
         const auto mask = buttonMask(buttonId);
         return mask != 0 && (pressedMask & mask) != 0;
+    }
+
+    /*
+     * Some OpenVR controller profiles expose Grip only through Axis2.x while
+     * others also set k_EButton_Grip.  Normalize those representations for
+     * ROCK's private tracker, with hysteresis so an analog sample hovering at
+     * the threshold cannot manufacture alternating press/release edges.
+     * The controller state returned to Fallout remains untouched.
+     */
+    [[nodiscard]] inline std::uint64_t normalizeGripPressedMask(
+        std::uint64_t digitalPressed,
+        std::uint64_t previousNormalizedPressed,
+        float gripAxisValue) noexcept
+    {
+        const auto gripMask = buttonMask(kOpenVrGripButtonId);
+        const bool digitalHeld = (digitalPressed & gripMask) != 0;
+        const bool previouslyHeld =
+            (previousNormalizedPressed & gripMask) != 0;
+        const bool analogHeld = std::isfinite(gripAxisValue) &&
+            (gripAxisValue >= kOpenVrGripAxisPressThreshold ||
+                (previouslyHeld &&
+                    gripAxisValue > kOpenVrGripAxisReleaseThreshold));
+        if (digitalHeld || analogHeld) {
+            return digitalPressed | gripMask;
+        }
+        return digitalPressed & ~gripMask;
     }
 
     [[nodiscard]] constexpr bool shouldSuppressNativeGripReadyAction(const NativeActionSuppressionInput& input)

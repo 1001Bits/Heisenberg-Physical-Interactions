@@ -24,6 +24,10 @@ namespace rock::generated_body_contact_registry
     inline constexpr std::uint32_t kFlagPrimaryAnchor = 1u << 0;
     inline constexpr std::uint32_t kFlagSampledVelocity = 1u << 1;
     inline constexpr std::uint32_t kFlagPowerArmor = 1u << 2;
+    // Solver-responsive layer-48 hand twins are visual collision probes, not
+    // gameplay/semantic hand bodies.  The contact callback admits them only as
+    // hand->weapon evidence for the reciprocal weapon stop.
+    inline constexpr std::uint32_t kFlagDynamicHandProxy = 1u << 3;
 
     struct Entry
     {

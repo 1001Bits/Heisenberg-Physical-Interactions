@@ -401,6 +401,7 @@ namespace heisenberg
                         loot.forcedIsLeft = isLeft;
                         loot.stickyGrab = false;
                         loot.markAsSmartGrab = false;
+                        loot.uniqueID = a_event.uniqueID;
                         _pendingLoots.push_back(loot);
                     }
                 }
@@ -504,6 +505,7 @@ namespace heisenberg
                     loot.timeQueued = 0.0f;
                     loot.oldContainerFormID = a_event.oldContainerFormID;  // for Take-All bulk detection
                     loot.burstId = _lootBurstId;                            // same id for all events this frame
+                    loot.uniqueID = a_event.uniqueID;                       // exact stack identity for the drop
 
                     // Deliver to the hand that looted this container: whichever wand's
                     // viewcaster is pointing at the container being looted. Falls back
@@ -600,6 +602,7 @@ namespace heisenberg
                             loot.baseFormID = a_event.baseObjectFormID;
                             loot.itemCount = a_event.itemCount;
                             loot.timeQueued = 0.0f;
+                            loot.uniqueID = a_event.uniqueID;
                             _pendingLoots.push_back(loot);
 
                             // Suppress "X added" HUD message — it displays next frame
@@ -957,13 +960,32 @@ namespace heisenberg
             const std::string itemName = ItemOffsetManager::GetItemName(refr);
             if (auto exact = offsetMgr.GetExactOffset(refr, isLeft); exact.has_value()) {
                 spdlog::debug("[DropToHand] Item '{}' has an exact authored offset - grabbing", itemName);
+            } else if (auto meshDonor = offsetMgr.GetSharedModelDonorOffset(refr, isLeft);
+                       meshDonor.has_value()) {
+                spdlog::debug("[DropToHand] Item '{}' will borrow shared-mesh donor '{}' - grabbing",
+                              itemName, meshDonor->matchedName);
             } else if (auto donor = offsetMgr.GetArmorDimensionalDonorOffset(refr, isLeft);
                        donor.has_value()) {
                 spdlog::debug("[DropToHand] Item '{}' will borrow armor donor '{}' - grabbing",
                               itemName, donor->matchedName);
             } else {
-                spdlog::debug("[DropToHand] Item '{}' has no authored offset; generated placement - grabbing",
-                              itemName);
+                // Log the MESH too. Whether an unauthored item can borrow a
+                // pose depends entirely on which NIF it renders: if it reuses
+                // an authored item's mesh the shared-mesh donor above catches
+                // it, and if it ships its own model nothing can. Without this
+                // the log says "no offset" and gives no way to tell which case
+                // it is, which is exactly where the 'Cura de enfermedades'
+                // report stalled.
+                const char* modelPath = nullptr;
+                if (auto* asModel = baseObj->As<RE::TESModel>()) {
+                    modelPath = asModel->GetModel();
+                }
+                spdlog::info("[DropToHand] Item '{}' has no authored offset; generated placement "
+                             "- grabbing (formID={:08X} edID='{}' model='{}')",
+                             itemName,
+                             baseObj->GetFormID(),
+                             baseObj->GetFormEditorID() ? baseObj->GetFormEditorID() : "",
+                             modelPath ? modelPath : "<none>");
             }
         }
         
@@ -1001,6 +1023,14 @@ namespace heisenberg
                 refr->formID, isLeft ? "left" : "right", drop.stickyGrab, drop.markAsSmartGrab);
 
             auto& state = grabMgr.GetGrab(isLeft);
+
+            // Exact delivery provenance: every successful DropToHand placement
+            // gets the seated-use guard, including non-sticky cooking/Pip-Boy
+            // handoffs. StartGrabOnRef is also used by unrelated public API and
+            // pickpocket paths, so marking inside that generic function would
+            // protect the wrong grabs and miss non-sticky deliveries.
+            state.isFromLootDrop = true;
+            state.consumeZoneExitRequired = true;
 
             // Scale HOLOTAPES for hand size (Pip-Boy deck proportions). Paper notes keep their
             // native scale. Both get the brief storage-zone grace — a note/holotape can start
@@ -1040,10 +1070,87 @@ namespace heisenberg
         // Clear the in-progress flag after successful grab - item is now in grabbed state
         // The actual grab state (leftGrab.active) will be true now
         _grabsInProgress.erase(drop.referenceFormID);
-        
+
+        // A successful placement proves this form CAN load, so forget its timeout history.
+        // Without this the cap is cumulative for the lifetime of the session and an item that
+        // merely had two slow loads early on would be permanently refused later.
+        if (grabStarted && drop.expectedBaseFormID != 0) {
+            _timeoutRetryCounts.erase(drop.expectedBaseFormID);
+        }
+
         return grabStarted;
     }
     
+    // =========================================================================
+    // Instance-exact inventory drop (CylonSurfer's DropObject API, 2026-09-04)
+    // =========================================================================
+    namespace
+    {
+        // Find the player's inventory stack for `baseFormID` whose ExtraUniqueID or
+        // ExtraInstanceData matches the loot identity. Returns the stack index and
+        // retains the stack's TBO_InstanceData so it survives releasing the lock.
+        bool ResolveExactInventoryStack(RE::Actor* player, std::uint32_t baseFormID,
+                                        std::uint16_t uniqueID, const void* instanceHint,
+                                        std::uint32_t& outStackIndex,
+                                        RE::BSTSmartPointer<RE::TBO_InstanceData>& outInstance)
+        {
+            if (!player || !player->inventoryList) return false;
+            if (uniqueID == 0 && !instanceHint) return false;
+
+            const RE::BSAutoReadLock inventoryLock{ player->inventoryList->rwLock };
+            for (auto& item : player->inventoryList->data) {
+                if (!item.object || item.object->GetFormID() != baseFormID) continue;
+
+                std::uint32_t index = 0;
+                for (auto* stack = item.stackData.get(); stack; stack = stack->nextStack.get(), ++index) {
+                    auto* extra = stack->extra.get();
+                    if (!extra) continue;
+
+                    auto* uid = extra->GetByType<RE::ExtraUniqueID>();
+                    auto* inst = extra->GetByType<RE::ExtraInstanceData>();
+                    const bool uidMatch = (uniqueID != 0 && uid && uid->uniqueID == uniqueID);
+                    const bool instMatch = (instanceHint && inst && inst->data.get() == instanceHint);
+                    if (!uidMatch && !instMatch) continue;
+
+                    outStackIndex = index;
+                    outInstance = inst ? inst->data : RE::BSTSmartPointer<RE::TBO_InstanceData>();
+                    return true;
+                }
+                return false;  // base form found, no stack carries the identity
+            }
+            return false;
+        }
+    }
+
+    RE::ObjectRefHandle DropToHand::DropLootFromInventory(RE::Actor* player, RE::TESBoundObject* boundObj,
+                                                          const PendingLoot& loot, std::int32_t count,
+                                                          const RE::NiPoint3& pos, const RE::NiPoint3& rot)
+    {
+        if (!player || !boundObj) return RE::ObjectRefHandle();
+
+        std::uint32_t stackIndex = 0;
+        RE::BSTSmartPointer<RE::TBO_InstanceData> instance;
+        const bool exact = ResolveExactInventoryStack(player, loot.baseFormID, loot.uniqueID,
+                                                      loot.instanceHint, stackIndex, instance);
+
+        RE::BSTSmallArray<std::uint32_t, 4> stackData;
+        if (exact) {
+            stackData.push_back(stackIndex);
+        }
+
+        spdlog::debug("[LootToHand] DropObject {:08X} x{} stack={} instance={} (uniqueID={} hint={})",
+            loot.baseFormID, count,
+            exact ? std::to_string(stackIndex) : std::string("default"),
+            instance ? "yes" : "none", loot.uniqueID, loot.instanceHint != nullptr);
+
+        // Suppress "X was removed" HUD notification during the drop
+        heisenberg::Hooks::SetSuppressHUDMessages(true);
+        RE::ObjectRefHandle handle = heisenberg::DropItemFromActor(
+            player, boundObj, instance.get(), count, &pos, &rot, exact ? &stackData : nullptr);
+        heisenberg::Hooks::SetSuppressHUDMessages(false);
+        return handle;
+    }
+
     bool DropToHand::TryDropPendingLoot(PendingLoot& loot)
     {
         spdlog::debug("[LootToHand] TryDropPendingLoot called for BaseID: {:08X}, waited {:.2f}s, forceHand={}", 
@@ -1147,13 +1254,7 @@ namespace heisenberg
                     if (wandNode) {
                         RE::NiPoint3 dropPos = wandNode->world.translate;
                         RE::NiPoint3 dropRot(0.0f, 0.0f, 0.0f);
-                        RE::TESObjectREFR::RemoveItemData removeData(boundObj, loot.itemCount);
-                        removeData.reason = RE::ITEM_REMOVE_REASON::KDropping;
-                        removeData.dropLoc = &dropPos;
-                        removeData.rotate = &dropRot;
-                        heisenberg::Hooks::SetSuppressHUDMessages(true);
-                        player->RemoveItem(removeData);
-                        heisenberg::Hooks::SetSuppressHUDMessages(false);
+                        DropLootFromInventory(player, boundObj, loot, loot.itemCount, dropPos, dropRot);
                         spdlog::debug("[LootToHand] Dropped {:08X} x{} on floor (hands full)", 
                             loot.baseFormID, loot.itemCount);
                     }
@@ -1193,15 +1294,10 @@ namespace heisenberg
         
         spdlog::debug("[LootToHand] Dropping {:08X} x{} (of {} total) to hand{}", 
             loot.baseFormID, dropCount, loot.itemCount, isAmmo ? " (ammo - full stack)" : "");
-        RE::TESObjectREFR::RemoveItemData removeData(boundObj, dropCount);
-        removeData.reason = RE::ITEM_REMOVE_REASON::KDropping;
-        removeData.dropLoc = &dropPos;
-        removeData.rotate = &dropRot;
-        
-        // Suppress "X was removed" HUD notification during our RemoveItem call
-        heisenberg::Hooks::SetSuppressHUDMessages(true);
-        RE::ObjectRefHandle droppedHandle = player->RemoveItem(removeData);
-        heisenberg::Hooks::SetSuppressHUDMessages(false);
+        // Instance-exact drop: targets the stack that was actually looted, not the
+        // first stack of this base form (see DropLootFromInventory).
+        RE::ObjectRefHandle droppedHandle =
+            DropLootFromInventory(player, boundObj, loot, dropCount, dropPos, dropRot);
         
         if (droppedHandle) {
             // Retain the resolved reference for every use below. Taking the raw
@@ -1478,9 +1574,22 @@ namespace heisenberg
 
                     // Timeout after 2 seconds (item should be loaded by then)
                     if (drop.timeQueued > 2.0f) {
-                        spdlog::warn("[DropToHand] Drop {:08X} timed out waiting for 3D (base {:08X}) — will retry via loot path",
-                            drop.referenceFormID, drop.expectedBaseFormID);
+                        // Hard retry cap. Independent of the model check below on purpose:
+                        // that one knows WHY a specific class of item can never succeed, this
+                        // one bounds the damage for any cause we have not thought of. Without
+                        // it, every recovery pass re-adds the item and re-applies its effect.
+                        constexpr int kMaxTimeoutRetries = 2;
+                        const int retries = _timeoutRetryCounts[drop.expectedBaseFormID];
+                        if (retries >= kMaxTimeoutRetries) {
+                            spdlog::warn("[DropToHand] Drop {:08X} (base {:08X}) abandoned after {} "
+                                         "timeout retries — refusing to re-add again",
+                                drop.referenceFormID, drop.expectedBaseFormID, retries);
+                            continue;
+                        }
+                        spdlog::warn("[DropToHand] Drop {:08X} timed out waiting for 3D (base {:08X}) — will retry via loot path (attempt {})",
+                            drop.referenceFormID, drop.expectedBaseFormID, retries + 1);
                         if (drop.expectedBaseFormID != 0) {
+                            _timeoutRetryCounts[drop.expectedBaseFormID] = retries + 1;
                             timedOutDrops.push_back(drop);
                         }
                         continue;  // discard from drop queue
@@ -1498,6 +1607,41 @@ namespace heisenberg
                 if (expectedBound) {
                     auto* player = RE::PlayerCharacter::GetSingleton();
                     if (player) {
+                        // ── DO NOT RETRY WHAT CAN NEVER SUCCEED ──────────────────────────
+                        // An item with no model will NEVER stream in 3D, so this recovery is
+                        // guaranteed to time out again, re-add again, and re-queue again -
+                        // forever. That loop is not merely wasteful: AddObjectToContainer
+                        // RE-APPLIES the item's effect on every pass, and Fallout 4 Survival
+                        // implements hunger/thirst/fatigue as hidden model-less ALCH tokens in
+                        // the player's inventory. A Starving token caught in this loop is
+                        // re-applied every couple of seconds, so the tier can never fall and
+                        // eating appears to do nothing. That is the "permanently starving"
+                        // report, and it has now recurred three times.
+                        //
+                        // The three entry-point guards in OnContainerChanged each enumerate
+                        // what a status token LOOKS like (non-playable, HC_ prefix, no model);
+                        // each was added after a recurrence, and each was defeated by a token
+                        // shaped slightly differently. This check is different in kind: it
+                        // does not care what the item IS, only whether retrying it can ever
+                        // work. Anything that cannot get 3D is dropped from the queue instead
+                        // of being fed back into it, which caps the blast radius for any
+                        // future token shape we have not seen.
+                        {
+                            const char* modelPath = nullptr;
+                            if (auto* asModel = expectedBound->As<RE::TESModel>()) {
+                                modelPath = asModel->GetModel();
+                            }
+                            if (!modelPath || modelPath[0] == char(0)) {
+                                spdlog::warn("[DropToHand] Abandoning timed-out drop {:08X} '{}': "
+                                             "no model, so it can never load 3D. NOT re-adding - "
+                                             "re-adding would re-apply its effect (survival status "
+                                             "token loop).",
+                                    drop.expectedBaseFormID,
+                                    RE::TESFullName::GetFullName(*expectedBound, false));
+                                continue;
+                            }
+                        }
+
                         // Unlike TryGrabPendingDrop's refID-recycling recovery, the original
                         // dropped world reference here is NOT known-gone — it just hasn't
                         // finished streaming its 3D in within the 2s window, and can finish
@@ -1563,6 +1707,20 @@ namespace heisenberg
         std::uint32_t baseFormID = baseObj->GetFormID();
         spdlog::debug("[StoreAndGrab] Storing world object {:08X} (base {:08X}) to inventory, then dropping to {} hand",
             refr->formID, baseFormID, isLeft ? "left" : "right");
+
+        // Capture the identity of THIS reference before it is absorbed into the
+        // inventory, so the later drop pulls the same instance back out (a modded
+        // or legendary weapon must not be swapped for the player's plain copy).
+        std::uint16_t uniqueID = 0;
+        const void* instanceHint = nullptr;
+        if (auto* extra = refr->extraList.get()) {
+            if (auto* uid = extra->GetByType<RE::ExtraUniqueID>()) {
+                uniqueID = uid->uniqueID;
+            }
+            if (auto* inst = extra->GetByType<RE::ExtraInstanceData>()) {
+                instanceHint = inst->data.get();
+            }
+        }
         
         // Suppress HUD message - we'll show our own when item goes to hand
         heisenberg::Hooks::SetSuppressHUDMessages(true);
@@ -1590,6 +1748,8 @@ namespace heisenberg
             loot.forceHand = true;
             loot.forcedIsLeft = isLeft;
             loot.stickyGrab = false;  // World weapon pickup - not sticky
+            loot.uniqueID = uniqueID;
+            loot.instanceHint = instanceHint;
             _pendingLoots.push_back(loot);
         }
         
@@ -1603,7 +1763,9 @@ namespace heisenberg
         int itemCount,
         bool stickyGrab,
         bool markAsSmartGrab,
-        bool bypassInitialDelay)
+        bool bypassInitialDelay,
+        std::uint16_t uniqueID,
+        const void* instanceHint)
     {
         std::lock_guard<std::mutex> lock(_mutex);
         PendingLoot loot;
@@ -1615,6 +1777,8 @@ namespace heisenberg
         loot.stickyGrab = stickyGrab;
         loot.markAsSmartGrab = markAsSmartGrab;
         loot.bypassInitialDelay = bypassInitialDelay;
+        loot.uniqueID = uniqueID;
+        loot.instanceHint = instanceHint;
         _pendingLoots.push_back(loot);
 
         spdlog::debug("[DropToHand] Queued {:08X} x{} for drop to {} hand (sticky={}, smartGrab={}, immediate={})",

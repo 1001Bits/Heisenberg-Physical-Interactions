@@ -5,6 +5,7 @@
 #include "HavokPhysicsKeyframe.h"
 #include "RE/Fallout.h"
 #include <array>
+#include <functional>
 #include <unordered_map>
 #include <chrono>
 
@@ -28,6 +29,72 @@ namespace heisenberg
     // to prevent hkbBehaviorGraph IO thread crash. Immediate for everything else.
     void SafeDisable(RE::TESObjectREFR* refr);
 
+    enum class NpcInjectionResult : std::uint8_t
+    {
+        NotAttempted,
+        FailedKeptInHand,
+        Accepted,
+        ReturnedToInventory,
+    };
+
+    enum class NpcInjectionGate : std::uint8_t
+    {
+        FeatureDisabled,
+        NotDiseaseCure,
+        NotCompanionStimpak,
+        NoTargetContact,
+        HoldAge,
+        HandSpeed,
+        Dispatch,
+    };
+
+    struct NpcInjectionAttempt
+    {
+        NpcInjectionResult result = NpcInjectionResult::NotAttempted;
+        NpcInjectionGate gate = NpcInjectionGate::FeatureDisabled;
+        std::uint32_t targetFormID = 0;
+        float targetDistanceGameUnits = -1.0f;
+    };
+
+    // Shared by keyframed Heisenberg grabs and hosted ROCK grabs. This is the
+    // single SS2 target/contact/settle/dispatch path. A dynamic backend may
+    // supply an exact pre-commit ownership handoff; returning false aborts
+    // before inventory mutation and Papyrus dispatch.
+    bool IsPlayerConsumableItem(RE::TESObjectREFR* refr);
+    bool IsPlayerInjectableItem(RE::TESObjectREFR* refr);
+    bool IsDiseaseCureItem(RE::TESObjectREFR* refr);
+    NpcInjectionAttempt TryInjectHeldDiseaseCure(
+        bool isLeft,
+        RE::TESObjectREFR* refr,
+        RE::NiAVObject* heldNode,
+        float heldSeconds,
+        float handSpeedMetersPerSecond,
+        const std::function<bool()>& prepareInventoryCommit = {});
+
+    // Companion Stimpaks deliberately use Fallout's native A/X activation
+    // path. The engine owns the final eligibility check, Stimpak consumption,
+    // revive state transition, animation, dialogue, and downstream mod hooks.
+    bool IsCompanionStimpakItem(RE::TESObjectREFR* refr);
+    bool HasHeldCompanionStimpakTarget(
+        bool isLeft,
+        RE::TESObjectREFR* refr,
+        RE::NiAVObject* heldNode = nullptr);
+    NpcInjectionAttempt TryInjectHeldCompanionStimpak(
+        bool isLeft,
+        RE::TESObjectREFR* refr,
+        RE::NiAVObject* heldNode,
+        float heldSeconds,
+        float handSpeedMetersPerSecond,
+        const std::function<bool()>& prepareInventoryCommit = {});
+
+    // Resolve a palm from the same clean tracked frame used by StartGrab. This
+    // keeps grip-edge handoff admission and final transfer validation in one
+    // coordinate frame even when FRIK finger calibration is unavailable.
+    bool GetCleanTrackedPalmPosition(
+        RE::NiAVObject* wandNode,
+        bool isLeft,
+        RE::NiPoint3& outPos);
+
     // Storage zone detection result
     struct StorageZoneResult
     {
@@ -41,6 +108,8 @@ namespace heisenberg
     // Check if a real weapon (gun, melee) is drawn - uses scene graph mesh detection
     // Returns true if should BLOCK grab, false if grab allowed
     bool HasRealWeaponEquipped();
+    RE::TESObjectWEAP* GetPlayerEquippedRealWeapon();
+    bool IsHandGrabbingRealWeapon(bool isLeft);
     
     // Check if an object reference is storable (can be picked up to inventory)
     // Used by selection priority system to prefer storable items
@@ -332,10 +401,13 @@ namespace heisenberg
         // Hand injection zone (opposite hand)
         bool isInHandInjectionZone = false;      // True if wand is in opposite hand's injection zone
         bool wasInHandInjectionZoneLocal = false; // Track zone entry/exit
+        // A DropToHand consumable that materializes inside the lap/opposite-
+        // hand zone must leave all self-use zones once before it can be used.
+        bool consumeZoneExitRequired = false;
         
         // Loot drop protection - prevent accidental equip immediately after looting
         float grabStartTime = 0.0f;   // Time (in seconds) when grab started
-        bool isFromLootDrop = false;  // True if this grab was initiated by DropToHand (looting)
+        bool isFromLootDrop = false;  // DropToHand delivery: extended equip/self-use protection
         bool isFromSmartGrab = false; // True if this grab was initiated by SmartGrab (behind head retrieval)
         bool skipStorageZone = false; // True to skip storage zone (e.g. holotape from deck near Pipboy)
         bool isNaturalGrab = false;   // True if this was a natural grab (close to object)
@@ -564,6 +636,7 @@ namespace heisenberg
             mouthZoneTimer = 0.0f;
             isInHandInjectionZone = false;
             wasInHandInjectionZoneLocal = false;
+            consumeZoneExitRequired = false;
             usedSnapMode = false;
             currentZoneName = "";
             grabStartTime = 0.0f;
@@ -644,6 +717,16 @@ namespace heisenberg
          */
         void EndGrab(bool isLeft, const RE::NiPoint3* throwVelocity = nullptr, bool forStorage = false,
                      const RE::NiPoint3* throwAngularVelocity = nullptr);  // rad/s world frame (ROCK release composition, audit rank 3)
+
+        /**
+         * Consume the physically held item when the player releases grip inside
+         * its valid self-use zone. This is deliberately called only from
+         * Hand::Release, never from generic EndGrab/storage/transfer teardown.
+         *
+         * @return true when the release was handled as a consume attempt. A
+         *         failed consume is also handled so the item remains in hand.
+         */
+        bool TryConsumeHeldConsumableOnRelease(bool isLeft);
 
         /**
          * Check if a hand is currently grabbing
@@ -757,6 +840,9 @@ namespace heisenberg
         void ApplyGrabVelocity(GrabState& state, const RE::NiPoint3& targetPos,
                                const RE::NiMatrix3& targetRot, float deltaTime);
         RE::bhkNPCollisionObject* GetCollisionObject(RE::TESObjectREFR* refr);
+        bool CommitHeldConsumableConsumption(bool isLeft,
+                                             RE::TESObjectREFR* refr,
+                                             const char* zoneLabel);
         
 
         // State for each hand

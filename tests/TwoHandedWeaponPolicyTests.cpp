@@ -1,8 +1,11 @@
 #include "physics-interaction/weapon/TwoHandedWeaponPolicy.h"
+#include "physics-interaction/weapon/EquippedWeaponDropPolicy.h"
 #include "physics-interaction/weapon/NativeScopeReentryPolicy.h"
 #include "physics-interaction/weapon/WeaponInteractionProbeFramePolicy.h"
 #include "physics-interaction/contact/SoftContactPolicy.h"
+#include "physics-interaction/core/PostHostGeneratedDriveFinalizePolicy.h"
 
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -55,6 +58,36 @@ namespace
 
 int main()
 {
+    using rock::equipped_weapon_drop_policy::SourceHand;
+    using rock::equipped_weapon_drop_policy::
+        resolveEquippedWeaponStashCarryHand;
+    Require(
+        resolveEquippedWeaponStashCarryHand(
+            false, true, true, false, false) == SourceHand::Left,
+        "a sole left offhand carry may stash a right-fired equipped weapon");
+    Require(
+        resolveEquippedWeaponStashCarryHand(
+            false, true, false, true, true) == SourceHand::Right,
+        "a sole right offhand carry may stash a left-fired equipped weapon");
+    Require(
+        resolveEquippedWeaponStashCarryHand(
+            true, false, false, false, false) == SourceHand::None &&
+            resolveEquippedWeaponStashCarryHand(
+                true, false, false, false, true) == SourceHand::None,
+        "primary-only carry must leave day-to-day shoulder holstering to Virtual Holsters");
+    Require(
+        resolveEquippedWeaponStashCarryHand(
+            false, true, false, true, false) == SourceHand::None &&
+            resolveEquippedWeaponStashCarryHand(
+                false, true, true, false, true) == SourceHand::None,
+        "a sole firing-hand part carry must not claim StorageZone");
+    Require(
+        resolveEquippedWeaponStashCarryHand(
+            false, true, true, true, false) == SourceHand::None &&
+            resolveEquippedWeaponStashCarryHand(
+                false, true, false, false, false) == SourceHand::None,
+        "two carry grips or no carry grip must not arm an equipped-weapon stash");
+
     using namespace rock::two_handed_weapon_policy;
 
     {
@@ -134,6 +167,10 @@ int main()
     }
 
     {
+        using rock::soft_contact_policy::
+            shouldRejectImplausibleFirstWorldWitness;
+        using rock::soft_contact_policy::
+            shouldDeferNativeWeaponFirstWitnessToSweep;
         using rock::soft_contact_policy::worldContactCorrectionLimit;
         Require(
             Near(
@@ -147,12 +184,30 @@ int main()
         Require(
             Near(
                 worldContactCorrectionLimit(
+                    false,
+                    false,
+                    37.0f,
+                    18.0f),
+                18.0f),
+            "fresh native weapon evidence must retain the acquisition safety cap");
+        Require(
+            Near(
+                worldContactCorrectionLimit(
+                    false,
+                    true,
+                    37.0f,
+                    18.0f),
+                37.0f),
+            "a validated weapon sweep must clear a deep thin-wall crossing in its acquisition frame");
+        Require(
+            Near(
+                worldContactCorrectionLimit(
                     true,
                     true,
                     37.0f,
                     18.0f),
-                18.0f),
-            "the independent weapon channel must retain its bounded correction");
+                37.0f),
+            "a validated weapon stop plane must provide the full required correction");
         Require(
             Near(
                 worldContactCorrectionLimit(
@@ -171,14 +226,747 @@ int main()
                     18.0f),
                 18.0f),
             "ordinary cached hand contact must preserve the configured acquisition envelope");
+
+        Require(
+            !shouldRejectImplausibleFirstWorldWitness(
+                false,
+                true,
+                37.0f,
+                18.0f),
+            "a validated fast weapon sweep must survive the 18-gu first-witness guard");
+        Require(
+            shouldRejectImplausibleFirstWorldWitness(
+                false,
+                false,
+                37.0f,
+                18.0f),
+            "an equally deep native-only first witness must still be rejected as implausible");
+        Require(
+            shouldRejectImplausibleFirstWorldWitness(
+                false,
+                true,
+                std::numeric_limits<float>::quiet_NaN(),
+                18.0f),
+            "validated sweep provenance must never admit a non-finite correction");
+        Require(
+            shouldDeferNativeWeaponFirstWitnessToSweep(
+                true,
+                true,
+                true,
+                false,
+                37.0f,
+                18.0f),
+            "a deep native weapon first witness must not suppress its validated hull sweep");
+        Require(
+            !shouldDeferNativeWeaponFirstWitnessToSweep(
+                true,
+                true,
+                true,
+                true,
+                37.0f,
+                18.0f) &&
+                !shouldDeferNativeWeaponFirstWitnessToSweep(
+                    true,
+                    true,
+                    true,
+                    false,
+                    9.0f,
+                    18.0f),
+            "an established episode or shallow native witness must retain native contact authority");
+        Require(
+            !shouldDeferNativeWeaponFirstWitnessToSweep(
+                false,
+                true,
+                true,
+                false,
+                37.0f,
+                18.0f),
+            "without a weapon sweep fallback, the native candidate must remain available to the caller's fail-closed guard");
     }
 
     {
+        using namespace
+            rock::post_host_generated_drive_finalize_policy;
+
+        const Identity queued{
+            .gameFrameIndex = 90,
+            .weaponGenerationKey = 0xABCDu,
+            .worldGeneration = 2,
+            .skeletonGeneration = 3,
+            .providerGeneration = 4,
+            .collisionGeneration = 5,
+            .bhkWorld = 0x1000u,
+            .hknpWorld = 0x2000u,
+            .weaponNode = 0x3000u,
+        };
+        Require(
+            isCurrent(true, true, queued, queued),
+            "the same post-host frame/world/weapon/lifecycle record must be admitted");
+        Require(
+            !isCurrent(false, true, queued, queued) &&
+                !isCurrent(true, false, queued, queued),
+            "a consumed token or shut-down runtime must reject finalization");
+
+        const auto RequireMismatchRejected =
+            [&](Identity current, const char* message) {
+                Require(!isCurrent(true, true, queued, current), message);
+            };
+        auto current = queued;
+        ++current.gameFrameIndex;
+        RequireMismatchRejected(current, "a stale game frame must reject the collider queue");
+        current = queued;
+        ++current.worldGeneration;
+        RequireMismatchRejected(current, "a changed world generation must reject the collider queue");
+        current = queued;
+        ++current.skeletonGeneration;
+        RequireMismatchRejected(current, "a changed skeleton generation must reject the collider queue");
+        current = queued;
+        ++current.providerGeneration;
+        RequireMismatchRejected(current, "a changed provider generation must reject the collider queue");
+        current = queued;
+        ++current.collisionGeneration;
+        RequireMismatchRejected(current, "a changed collision generation must reject the collider queue");
+        current = queued;
+        current.bhkWorld = 0x1001u;
+        RequireMismatchRejected(current, "a changed bhk world must reject the collider queue");
+        current = queued;
+        current.hknpWorld = 0x2001u;
+        RequireMismatchRejected(current, "a changed hknp world must reject the collider queue");
+        current = queued;
+        ++current.weaponGenerationKey;
+        RequireMismatchRejected(current, "a changed weapon generation must reject the collider queue");
+        current = queued;
+        current.weaponNode = 0x3001u;
+        RequireMismatchRejected(current, "a changed weapon node must reject the collider queue");
+        current = queued;
+        current.bhkWorld = 0;
+        RequireMismatchRejected(current, "a missing live world must reject the collider queue");
+    }
+
+    {
+        using namespace rock::soft_contact_policy;
+
+        Require(
+            kExactWeaponWorldProbeStateIndex ==
+                kSampledWeaponWorldProbeCapacity,
+            "the primary exact weapon anchor must use a state slot outside the sampled hull bank");
+        Require(
+            kSecondaryExactWeaponWorldProbeStateIndex ==
+                kSampledWeaponWorldProbeCapacity + 1,
+            "the secondary exact weapon anchor must have its own non-aliasing state slot");
+        Require(
+            kWeaponWorldProbeStateCapacity ==
+                kSampledWeaponWorldProbeCapacity + 2,
+            "weapon probe state must remain bounded to samples plus two exact corner anchors");
+        Require(
+            !isSampledWeaponWorldProbeId(
+                kExactWeaponWorldProbeId) &&
+                !isSampledWeaponWorldProbeId(
+                    kSecondaryExactWeaponWorldProbeId) &&
+                isExactWeaponWorldProbeId(
+                    kExactWeaponWorldProbeId) &&
+                isExactWeaponWorldProbeId(
+                    kSecondaryExactWeaponWorldProbeId),
+            "both exact native anchor IDs must remain distinct from sampled hull IDs");
+        Require(
+            kCriticalWeaponWorldProbeCapacity == 6,
+            "weapon CCD must reserve the six axis extrema, including the asset-axis-independent muzzle/breech pair");
+        CriticalWeaponExtremaSelection<std::size_t>
+            extremaSelection{};
+        observeCriticalWeaponExtrema(
+            extremaSelection,
+            Vec3{ 0.0f, 0.0f, 0.0f },
+            std::size_t{ 0 });
+        observeCriticalWeaponExtrema(
+            extremaSelection,
+            Vec3{ -5.0f, 1.0f, 2.0f },
+            std::size_t{ 1 });
+        observeCriticalWeaponExtrema(
+            extremaSelection,
+            Vec3{ 6.0f, -4.0f, 3.0f },
+            std::size_t{ 2 });
+        observeCriticalWeaponExtrema(
+            extremaSelection,
+            Vec3{ 2.0f, 7.0f, -8.0f },
+            std::size_t{ 3 });
+        observeCriticalWeaponExtrema(
+            extremaSelection,
+            Vec3{
+                std::numeric_limits<float>::quiet_NaN(),
+                -100.0f,
+                100.0f },
+            std::size_t{ 4 });
+        Require(
+            extremaSelection.valid[0] &&
+                extremaSelection.valid[1] &&
+                extremaSelection.valid[2] &&
+                extremaSelection.valid[3] &&
+                extremaSelection.valid[4] &&
+                extremaSelection.valid[5] &&
+                extremaSelection.references[0] == 1u &&
+                extremaSelection.references[1] == 2u &&
+                extremaSelection.references[2] == 2u &&
+                extremaSelection.references[3] == 3u &&
+                extremaSelection.references[4] == 3u &&
+                extremaSelection.references[5] == 2u,
+            "production extrema selection must mark the stable min/max point reference on all three weapon-root axes and ignore invalid samples");
+        Require(
+            shouldAdmitWeaponProbeSweep(
+                true,
+                true,
+                false),
+            "a critical weapon extremum must sweep even while cached/native evidence owns the frame");
+        Require(
+            !shouldAdmitWeaponProbeSweep(
+                false,
+                true,
+                true),
+            "cached/native authority must suppress only the rotating noncritical remainder");
+        Require(
+            shouldAdmitWeaponProbeSweep(
+                false,
+                false,
+                true) &&
+                !shouldAdmitWeaponProbeSweep(
+                    false,
+                    false,
+                    false),
+            "a noncritical weapon sample must follow bounded rotating admission during acquisition");
+
+        const auto crossReturn =
+            modelCrossReturnSweepCoverage(
+                4.0f,
+                -3.0f,
+                5.0f);
+        Require(
+            !crossReturn.sparseEndpointSweepDetects &&
+                crossReturn.perFrameCriticalSweepDetects,
+            "a per-frame critical sweep must detect a thin-plane cross-and-return that sparse endpoints erase");
+        const auto noCross =
+            modelCrossReturnSweepCoverage(
+                4.0f,
+                2.0f,
+                5.0f);
+        Require(
+            !noCross.sparseEndpointSweepDetects &&
+                !noCross.perFrameCriticalSweepDetects,
+            "critical coverage must not invent a crossing when every observation stays on one side");
+
+        WeaponCorrectionManifold<Vec3> cornerManifold{};
+        Require(
+            admitWeaponCorrectionPlane(
+                cornerManifold,
+                Vec3{ 1.0f, 0.0f, 0.0f },
+                3.0f) &&
+                admitWeaponCorrectionPlane(
+                    cornerManifold,
+                    Vec3{ 0.0f, 1.0f, 0.0f },
+                    4.0f) &&
+                cornerManifold.count == 2,
+            "two independent wall planes must enter the bounded weapon manifold");
+        const auto cornerCorrection =
+            solveWeaponCorrectionManifold(cornerManifold);
+        Require(
+            Near(cornerCorrection.x, 3.0f) &&
+                Near(cornerCorrection.y, 4.0f) &&
+                Near(cornerCorrection.z, 0.0f),
+            "an orthogonal corner must preserve both plane corrections instead of selecting one wall");
+
+        WeaponCorrectionManifold<Vec3> obliqueManifold{};
+        (void)admitWeaponCorrectionPlane(
+            obliqueManifold,
+            Vec3{ 1.0f, 0.0f, 0.0f },
+            2.0f);
+        (void)admitWeaponCorrectionPlane(
+            obliqueManifold,
+            Vec3{ 0.70710678f, 0.70710678f, 0.0f },
+            3.0f);
+        const auto obliqueCorrection =
+            solveWeaponCorrectionManifold(obliqueManifold);
+        Require(
+            obliqueCorrection.x >= 1.999f &&
+                (obliqueCorrection.x + obliqueCorrection.y) *
+                        0.70710678f >=
+                    2.999f,
+            "sequential projection must satisfy both constraints of an oblique two-plane corner");
+
+        WeaponCorrectionManifold<Vec3> parallelManifold{};
+        (void)admitWeaponCorrectionPlane(
+            parallelManifold,
+            Vec3{ 1.0f, 0.0f, 0.0f },
+            2.0f);
+        (void)admitWeaponCorrectionPlane(
+            parallelManifold,
+            Vec3{ 1.0f, 0.0f, 0.0f },
+            5.0f);
+        (void)admitWeaponCorrectionPlane(
+            parallelManifold,
+            Vec3{ -1.0f, 0.0f, 0.0f },
+            4.0f);
+        const auto parallelCorrection =
+            solveWeaponCorrectionManifold(parallelManifold);
+        Require(
+            parallelManifold.count == 1 &&
+                Near(parallelCorrection.x, 5.0f) &&
+                Near(parallelCorrection.y, 0.0f),
+            "parallel or opposed-collinear wall witnesses must dedupe to the stronger constraint instead of adding twice");
+
+        Require(
+            weaponCorrectionNormalsAreIndependent(
+                Vec3{ 1.0f, 0.0f, 0.0f },
+                Vec3{ 0.0f, 1.0f, 0.0f }) &&
+                !weaponCorrectionNormalsAreIndependent(
+                    Vec3{ 1.0f, 0.0f, 0.0f },
+                    Vec3{ -1.0f, 0.0f, 0.0f }),
+            "only genuinely independent wall normals may occupy both persistent corner slots");
+        Require(
+            secondaryWeaponPlaneMayUseProbe(
+                sampledWeaponWorldProbeId(3),
+                false) &&
+                secondaryWeaponPlaneMayUseProbe(
+                    kExactWeaponWorldProbeId,
+                    true) &&
+                secondaryWeaponPlaneMayUseProbe(
+                    kSecondaryExactWeaponWorldProbeId,
+                    true),
+            "either transient exact hit may enter the secondary cache because the destination slot normalizes its ID");
+        Require(
+            normalizeWeaponCachedPlaneProbeId(
+                WeaponCachedPlaneSlot::Primary,
+                kSecondaryExactWeaponWorldProbeId,
+                true) == kExactWeaponWorldProbeId &&
+                normalizeWeaponCachedPlaneProbeId(
+                    WeaponCachedPlaneSlot::Secondary,
+                    kExactWeaponWorldProbeId,
+                    true) == kSecondaryExactWeaponWorldProbeId,
+            "cache destination slots must own exact probe IDs even when hit #1 is the stronger primary plane");
+        Require(
+            normalizeWeaponCachedPlaneProbeId(
+                WeaponCachedPlaneSlot::Secondary,
+                sampledWeaponWorldProbeId(3),
+                false) == sampledWeaponWorldProbeId(3),
+            "sampled probe IDs must remain stable when admitted to the secondary cache");
+        Require(
+            selectWeaponCachedPlaneSlot(
+                false,
+                false,
+                false,
+                false) == WeaponCachedPlaneSlot::Primary,
+            "the first valid weapon plane must populate the primary cache even when it is an exact native anchor");
+        Require(
+            selectWeaponCachedPlaneSlot(
+                true,
+                false,
+                true,
+                true) == WeaponCachedPlaneSlot::Secondary,
+            "an independent sampled plane must persist in the bounded secondary corner cache");
+        Require(
+            selectWeaponCachedPlaneSlot(
+                true,
+                false,
+                false,
+                true) == WeaponCachedPlaneSlot::None &&
+                selectWeaponCachedPlaneSlot(
+                    true,
+                    false,
+                    true,
+                    false) == WeaponCachedPlaneSlot::None &&
+                selectWeaponCachedPlaneSlot(
+                    true,
+                    true,
+                    true,
+                    true) == WeaponCachedPlaneSlot::None,
+            "parallel evidence, exact secondary anchors, and a full two-plane cache must not allocate another slot");
+        Require(
+            shouldRetainCachedWeaponPlane(
+                true,
+                true,
+                true,
+                true) &&
+                !shouldRetainCachedWeaponPlane(
+                    false,
+                    true,
+                    true,
+                    true) &&
+                !shouldRetainCachedWeaponPlane(
+                    true,
+                    false,
+                    true,
+                    true) &&
+                !shouldRetainCachedWeaponPlane(
+                    true,
+                    true,
+                    false,
+                    true) &&
+                !shouldRetainCachedWeaponPlane(
+                    true,
+                    true,
+                    true,
+                    false),
+            "either cached corner plane must clear on generation/layout/probe invalidation or geometric separation");
+        for (std::size_t ordinal = 0;
+             ordinal < kSampledWeaponWorldProbeCapacity;
+             ++ordinal) {
+            const auto probeId =
+                sampledWeaponWorldProbeId(ordinal);
+            Require(
+                isSampledWeaponWorldProbeId(probeId),
+                "every sampled hull ordinal must map to the sampled ID range");
+            Require(
+                probeId != kExactWeaponWorldProbeId,
+                "no sampled hull ordinal may reuse the exact native anchor ID");
+            Require(
+                probeId == sampledWeaponWorldProbeId(ordinal),
+                "a sampled hull ordinal must retain a stable ID");
+        }
+
+        std::array<bool, kSampledWeaponWorldProbeCapacity>
+            visited{};
+        std::size_t cursor = 0;
+        constexpr std::size_t kCastBudget = 4;
+        const std::size_t windowsNeeded =
+            (kSampledWeaponWorldProbeCapacity +
+             kCastBudget - 1) /
+            kCastBudget;
+        for (std::size_t frame = 0;
+             frame < windowsNeeded;
+             ++frame) {
+            const auto window =
+                resolveBoundedRotatingProbeWindow(
+                    cursor,
+                    kSampledWeaponWorldProbeCapacity,
+                    kCastBudget);
+            Require(
+                window.count <= kCastBudget,
+                "weapon probe admission must not exceed the per-frame cast budget");
+            for (std::size_t offset = 0;
+                 offset < window.count;
+                 ++offset) {
+                const std::size_t index =
+                    boundedRotatingProbeIndex(
+                        window,
+                        offset,
+                        kSampledWeaponWorldProbeCapacity);
+                Require(
+                    index < visited.size(),
+                    "rotating weapon probe admission must stay inside bounded state");
+                visited[index] = true;
+            }
+            cursor = window.nextCursor;
+        }
+        for (const bool wasVisited : visited) {
+            Require(
+                wasVisited,
+                "bounded rotation must admit every sampled weapon hull probe without starvation");
+        }
+
+        SparseProbeQueryHistory<Vec3> sparseHistory{};
+        constexpr std::uint64_t sampleIdentity = 0x1234u;
+        (void)observeSparseProbe(
+            sparseHistory,
+            Vec3{ 0.0f, 0.0f, 0.0f },
+            sampleIdentity);
+        (void)observeSparseProbe(
+            sparseHistory,
+            Vec3{ 4.0f, 0.0f, 0.0f },
+            sampleIdentity);
+        (void)observeSparseProbe(
+            sparseHistory,
+            Vec3{ 9.0f, 0.0f, 0.0f },
+            sampleIdentity);
+        Require(
+            Near(sparseHistory.lastQueryPosition.x, 0.0f),
+            "an unadmitted sparse probe must retain the last position covered by a cast");
+        Require(
+            Near(sparseHistory.previousObserved.x, 9.0f),
+            "per-frame observation must remain independent of sparse query history");
+        commitSparseProbeQuery(
+            sparseHistory,
+            Vec3{ 9.0f, 0.0f, 0.0f },
+            sampleIdentity);
+        Require(
+            Near(sparseHistory.lastQueryPosition.x, 9.0f),
+            "an admitted cast must advance sparse query history");
+        Require(
+            observeSparseProbe(
+                sparseHistory,
+                Vec3{ 30.0f, 0.0f, 0.0f },
+                0x5678u) &&
+                Near(sparseHistory.lastQueryPosition.x, 30.0f),
+            "a changed physical sample identity must rebase instead of bridging unrelated points");
+
+        SparseProbeQueryHistory<Vec3> discontinuityHistory{};
+        (void)observeSparseProbe(
+            discontinuityHistory,
+            Vec3{},
+            sampleIdentity);
+        Require(
+            !sparseProbeObservationIsDiscontinuous(
+                discontinuityHistory,
+                Vec3{ 20.0f, 0.0f, 0.0f },
+                sampleIdentity,
+                1.0f / 90.0f),
+            "a plausible fast weapon sample must retain continuous sweep history");
+        Require(
+            sparseProbeObservationIsDiscontinuous(
+                discontinuityHistory,
+                Vec3{ 40.0f, 0.0f, 0.0f },
+                sampleIdentity,
+                1.0f / 90.0f),
+            "a one-frame pose teleport must rebase before it can become a deferred sparse sweep");
+        Require(
+            !sparseProbeObservationIsDiscontinuous(
+                discontinuityHistory,
+                Vec3{ 1000.0f, 0.0f, 0.0f },
+                0x9999u,
+                1.0f / 90.0f),
+            "a changed sample identity is handled by identity rebasing rather than discontinuity bridging");
+
+        const auto sampleA = makeWeaponSampleIdentity(0, 2, 0x1000u, true);
+        const auto sampleB = makeWeaponSampleIdentity(1, 5, 0x2000u, false);
+        auto layoutAB = appendWeaponSampleLayoutIdentity(0, sampleA);
+        layoutAB = appendWeaponSampleLayoutIdentity(layoutAB, sampleB);
+        auto layoutBA = appendWeaponSampleLayoutIdentity(0, sampleB);
+        layoutBA = appendWeaponSampleLayoutIdentity(layoutBA, sampleA);
+        Require(
+            sampleA == makeWeaponSampleIdentity(0, 2, 0x1000u, true),
+            "a physical weapon sample identity must be stable for one body/point/basis");
+        Require(
+            sampleA != makeWeaponSampleIdentity(0, 3, 0x1000u, true) &&
+                sampleA != makeWeaponSampleIdentity(0, 2, 0x3000u, true),
+            "point or transform-basis changes must invalidate sample history");
+        Require(
+            makeExactWeaponWorldProbeIdentity(0x1234u) !=
+                makeExactWeaponWorldProbeIdentity(0x5678u),
+            "native exact-probe history must be generation-local to its source weapon body");
+        Require(
+            makeExactWeaponWorldProbeIdentity(
+                0x1234u,
+                kExactWeaponWorldProbeId) !=
+                makeExactWeaponWorldProbeIdentity(
+                    0x1234u,
+                    kSecondaryExactWeaponWorldProbeId),
+            "the two exact corner anchors must never alias history for the same source body");
+        Require(
+            layoutAB != layoutBA,
+            "reordering the bounded sample layout must invalidate ordinal probe state");
+    }
+
+    {
+        using rock::soft_contact_policy::
+            shouldAdmitNativeVisualStopTarget;
+        using rock::soft_contact_policy::
+            shouldCacheNativeVisualStopPlane;
+        using rock::soft_contact_policy::
+            shouldAcquireWeaponHandStop;
+        using rock::soft_contact_policy::
+            isHandPhysicallyFreeForWeaponStop;
+        using rock::soft_contact_policy::
+            hasHeldObjectAuthorityForWeaponStop;
+        using rock::soft_contact_policy::
+            resolveWeaponHandEntryFraction;
+        using rock::soft_contact_policy::
+            resolveWeaponHandDirectionalMotion;
+        const auto cleanWeaponHandEntry =
+            resolveWeaponHandEntryFraction(10.0f, 2.0f, 4.0f);
+        Require(
+            cleanWeaponHandEntry.valid &&
+                Near(cleanWeaponHandEntry.fraction, 0.75f),
+            "a clear-to-contact weapon-hand crossing must resolve an interior entry fraction");
+        const auto lateWeaponHandEntry =
+            resolveWeaponHandEntryFraction(3.0f, 1.0f, 4.0f);
+        Require(
+            lateWeaponHandEntry.valid &&
+                Near(lateWeaponHandEntry.fraction, 0.0f),
+            "a one-solve-late first manifold must conservatively retain the preceding weapon pose");
+        const auto delayedAcquisitionEntry =
+            resolveWeaponHandEntryFraction(3.8f, 3.4f, 4.0f);
+        Require(
+            delayedAcquisitionEntry.valid &&
+                Near(delayedAcquisitionEntry.fraction, 0.0f),
+            "a persistent already-overlapping manifold must never capture the penetrated segment endpoint");
+        Require(
+            !resolveWeaponHandEntryFraction(10.0f, 5.0f, 4.0f).valid,
+            "a weapon segment that remains clear of the hand must not report an entry fraction");
+        Require(
+            !resolveWeaponHandEntryFraction(5.0f, 5.0f, 4.0f).valid &&
+                !resolveWeaponHandEntryFraction(
+                    std::numeric_limits<float>::quiet_NaN(),
+                    2.0f,
+                    4.0f)
+                    .valid,
+            "stationary or non-finite weapon-hand samples must reject entry reconstruction");
+        const auto thresholdWeaponHandEntry =
+            resolveWeaponHandEntryFraction(6.0f, 4.0f, 4.0f);
+        Require(
+            thresholdWeaponHandEntry.valid &&
+                Near(thresholdWeaponHandEntry.fraction, 1.0f) &&
+                resolveWeaponHandEntryFraction(4.0f, 3.0f, 4.0f).valid,
+            "touching the clearance at the segment end is valid and an already-contacting prior sample retains fraction zero");
+        Require(
+            shouldAdmitNativeVisualStopTarget(
+                false, true, false, true, false),
+            "a generated weapon manifold must stop a free legacy hand when its dynamic proxy bank is unavailable");
+        Require(
+            !shouldAdmitNativeVisualStopTarget(
+                false, true, false, false, true),
+            "the weapon/world probe channel must not consume a hand/weapon manifold as wall evidence");
+        Require(
+            !shouldAdmitNativeVisualStopTarget(
+                false, false, true, false, true),
+            "generic native world admission must not reinterpret generated hands as static walls");
+        Require(
+            shouldAcquireWeaponHandStop(
+                true, true, true, true, true, true,
+                6.0f, 0.25f, 6.25f),
+            "a continuously sampled weapon that closes on a free hand must stop at its previous clear pose");
+        Require(
+            !shouldAcquireWeaponHandStop(
+                true, true, true, true, true, true,
+                0.0f, 6.0f, 6.0f) &&
+                !shouldAcquireWeaponHandStop(
+                    true, true, true, true, true, true,
+                    2.0f, 3.0f, 5.0f),
+            "a stationary/slower weapon must not move when the hand is the side entering contact");
+        Require(
+            !shouldAcquireWeaponHandStop(
+                false, true, true, true, true, true,
+                6.0f, 0.0f, 6.0f) &&
+                !shouldAcquireWeaponHandStop(
+                    true, false, true, true, true, true,
+                    6.0f, 0.0f, 6.0f) &&
+                !shouldAcquireWeaponHandStop(
+                    true, true, false, true, true, true,
+                    6.0f, 0.0f, 6.0f),
+            "missing continuous history, stale weapon identity, or an occupied hand must reject reciprocal weapon stops");
+        Require(
+            !shouldAcquireWeaponHandStop(
+                true, true, true, true, false, true,
+                6.0f, 0.0f, 6.0f) &&
+                !shouldAcquireWeaponHandStop(
+                    true, true, true, true, true, false,
+                    6.0f, 0.0f, 6.0f),
+            "stale contact frames and unknown endpoint velocities must not acquire a weapon stop");
+        Require(
+            !shouldAcquireWeaponHandStop(
+                true, true, true, true, true, true,
+                8.0f, 0.0f, 0.0f) &&
+                shouldAcquireWeaponHandStop(
+                    true, true, true, true, true, true,
+                    8.0f, 0.0f, 4.0f),
+            "common-mode motion must reject while a gun catching a co-moving hand may stop");
+        Require(
+            !shouldAcquireWeaponHandStop(
+                true, true, true, true, true, true,
+                0.5f, 0.0f, 0.5f) &&
+                shouldAcquireWeaponHandStop(
+                    true, true, true, true, true, true,
+                    0.6f, 0.0f, 0.6f),
+            "weapon-hand acquisition must reject tracking noise at and below the half-unit-per-second floor");
+        Require(
+            shouldAcquireWeaponHandStop(
+                true, true, true, false, true, true,
+                6.0f, 0.0f, 6.0f),
+            "a persistent weapon-dominant manifold may acquire conservatively when first-frame metadata was unavailable");
+        Require(
+            isHandPhysicallyFreeForWeaponStop(
+                false, true, false, false),
+            "a presentation-only visual return must not disable reciprocal gun-to-hand collision");
+        Require(
+            !isHandPhysicallyFreeForWeaponStop(
+                true, false, false, false) &&
+                !isHandPhysicallyFreeForWeaponStop(
+                    false, false, true, false) &&
+                !isHandPhysicallyFreeForWeaponStop(
+                    false, false, false, true),
+            "real weapon ownership, a disabled hand, and held-object ownership must still block reciprocal gun-to-hand collision");
+        Require(
+            !hasHeldObjectAuthorityForWeaponStop(false, false, false) &&
+                hasHeldObjectAuthorityForWeaponStop(true, false, false) &&
+                hasHeldObjectAuthorityForWeaponStop(false, true, false) &&
+                hasHeldObjectAuthorityForWeaponStop(false, false, true),
+            "ROCK-held, host-held, and host-suppressed hands must each preserve their stronger object/collision authority");
+
+        const auto towardNoise =
+            resolveWeaponHandDirectionalMotion(-0.6f, 0.49f);
+        const auto awayNoise =
+            resolveWeaponHandDirectionalMotion(-0.6f, -0.49f);
+        Require(
+            towardNoise.valid && awayNoise.valid &&
+                Near(towardNoise.handApproachSpeedGameUnits, 0.0f) &&
+                Near(awayNoise.handApproachSpeedGameUnits, 0.0f) &&
+                Near(towardNoise.relativeClosingSpeedGameUnits, 0.6f) &&
+                Near(awayNoise.relativeClosingSpeedGameUnits, 0.6f),
+            "stationary offhand proxy noise must not reverse slow gun-to-hand arbitration");
+        Require(
+            rock::soft_contact_policy::
+                    isAuthoritativeWeaponHandEvidenceLayer(48u, 48u) &&
+                !rock::soft_contact_policy::
+                    isAuthoritativeWeaponHandEvidenceLayer(43u, 48u),
+            "a legacy callback must not consume the dynamic proxy bank's first-contact episode");
+
+        using rock::soft_contact_policy::
+            observeWeaponHandContactEpisode;
+        rock::soft_contact_policy::WeaponHandContactEpisodeState
+            episode{};
+        auto episodeStep = observeWeaponHandContactEpisode(
+            episode, true, 0x1234u, 10u);
+        Require(episodeStep.freshEntry && episodeStep.next.active,
+            "the first canonical hand/weapon witness must open one stop episode");
+        episode = episodeStep.next;
+        episode = observeWeaponHandContactEpisode(
+                      episode, false, 0x1234u, 11u)
+                      .next;
+        episode = observeWeaponHandContactEpisode(
+                      episode, false, 0x1234u, 12u)
+                      .next;
+        episodeStep = observeWeaponHandContactEpisode(
+            episode, true, 0x1234u, 12u);
+        Require(!episodeStep.freshEntry,
+            "body-pair churn and a bounded callback miss must not rearm a persistent overlap");
+        episode = episodeStep.next;
+        episode = observeWeaponHandContactEpisode(
+                      episode, false, 0x1234u, 13u)
+                      .next;
+        episode = observeWeaponHandContactEpisode(
+                      episode, false, 0x1234u, 14u)
+                      .next;
+        episode = observeWeaponHandContactEpisode(
+                      episode, false, 0x1234u, 15u)
+                      .next;
+        Require(!episode.active,
+            "three clear frames must close the prior hand/weapon episode");
+        episodeStep = observeWeaponHandContactEpisode(
+            episode, true, 0x1234u, 16u);
+        Require(episodeStep.freshEntry,
+            "a genuinely separated pair may acquire a new snap-free stop");
+        const auto generationStep =
+            observeWeaponHandContactEpisode(
+                episodeStep.next, true, 0x5678u, 17u);
+        Require(generationStep.freshEntry,
+            "a weapon generation change must start an independent episode");
+        const auto wrapStep =
+            observeWeaponHandContactEpisode(
+                { true, 0x5678u, 0xFFFF'FFFFu },
+                true,
+                0x5678u,
+                0u);
+        Require(!wrapStep.freshEntry,
+            "unsigned frame wrap must preserve a continuous contact episode");
+        Require(
+            !shouldCacheNativeVisualStopPlane(true) &&
+                shouldCacheNativeVisualStopPlane(false),
+            "moving generated-weapon planes must remain fresh while stable world planes retain normal caching");
+
         using rock::soft_contact_policy::
             resolveWorldContactChannels;
         const auto releaseChannels =
             resolveWorldContactChannels(
                 true,
+                false,
+                false,
+                false,
+                false,
                 false,
                 true,
                 true,
@@ -195,6 +983,10 @@ int main()
             resolveWorldContactChannels(
                 true,
                 false,
+                false,
+                false,
+                false,
+                false,
                 true,
                 false,
                 true,
@@ -207,6 +999,10 @@ int main()
             resolveWorldContactChannels(
                 true,
                 true,
+                false,
+                false,
+                false,
+                false,
                 true,
                 true,
                 true,
@@ -214,6 +1010,184 @@ int main()
         Require(
             !menuBlocked.anyEnabled(),
             "a blocking menu must suppress both world-contact channels");
+
+        const auto dynamicHandOwner =
+            resolveWorldContactChannels(
+                true,
+                true,
+                true,
+                true,
+                false,
+                false,
+                true,
+                true,
+                true,
+                false);
+        Require(
+            !dynamicHandOwner.handPushback,
+            "the dynamic hand solver must supersede legacy hand soft contact");
+        Require(
+            dynamicHandOwner.weaponWallCollision,
+            "selecting dynamic hand collision must preserve the independent weapon wall channel");
+
+        const auto oneHandFallback =
+            resolveWorldContactChannels(
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+                true,
+                true,
+                true,
+                false);
+        Require(
+            !oneHandFallback.rightHandPushback &&
+                oneHandFallback.leftHandPushback,
+            "a current-frame proxy failure must restore legacy wall stop only for the affected hand");
+
+        const auto oneAttachedHandFallback =
+            resolveWorldContactChannels(
+                true,
+                true,
+                false,
+                false,
+                true,
+                false,
+                true,
+                true,
+                true,
+                false);
+        Require(
+            !oneAttachedHandFallback.rightHandPushback &&
+                oneAttachedHandFallback.leftHandPushback,
+            "an attached hand must not start a legacy fallback authority while the unrelated free hand retains it");
+        Require(
+            oneAttachedHandFallback.weaponWallCollision,
+            "attached-hand fallback suppression must retain the rigid weapon wall channel");
+    }
+
+    {
+        Require(
+            !isHandAttachedForWeaponWallTransport(
+                true, true, false, false),
+            "PartCarry must not drag its detached former firing hand during visual return");
+        Require(
+            isHandAttachedForWeaponWallTransport(
+                true, false, true, false),
+            "a PartCarry pivot or attached part grip must travel with the weapon");
+        Require(
+            isHandAttachedForWeaponWallTransport(
+                true, true, false, true),
+            "an occupied two-hand primary grip must travel with the weapon");
+        Require(
+            isHandAttachedForWeaponWallTransport(
+                false, true, false, false),
+            "an unowned native weapon may be transported by its firing hand");
+        Require(
+            !isHandAttachedForWeaponWallTransport(
+                false, false, false, false),
+            "an unrelated free hand must never receive weapon wall transport");
+
+        Require(
+            hasCompleteAttachedHandWorldSet(false, false),
+            "a genuinely hand-free weapon pose may use the finite wall-correction fallback");
+        Require(
+            hasCompleteAttachedHandWorldSet(true, true),
+            "a complete attached-hand target set may transport rigidly with the weapon");
+        Require(
+            !hasCompleteAttachedHandWorldSet(true, false),
+            "a missing attached-hand target must fail closed instead of splitting the weapon from that hand");
+
+        Require(
+            hasCompleteAttachedHandPublicationSet(
+                true, true, true, true),
+            "a two-hand wall transport may commit only after both attached hand writers accept it");
+        Require(
+            !hasCompleteAttachedHandPublicationSet(
+                true, true, false, true) &&
+                !hasCompleteAttachedHandPublicationSet(
+                    true, true, true, false),
+            "either attached-hand publication failure must abort the complete rigid wall transaction");
+        Require(
+            hasCompleteAttachedHandPublicationSet(
+                true, false, true, false),
+            "an unattached free hand must not be required to publish a weapon wall correction");
+
+        Require(
+            shouldReuseWeaponWorldContactRigidPin(
+                true, true, true, true, true, false),
+            "an immutable wall episode must preserve its captured grip relation while the bounded release target advances");
+        Require(
+            shouldReuseWeaponWorldContactRigidPin(
+                true, true, true, false, false, true) &&
+                !shouldReuseWeaponWorldContactRigidPin(
+                    true, true, true, false, false, false),
+            "reciprocal hand stops must retain their prior exact blocked-pose identity rule");
+        Require(
+            !shouldReuseWeaponWorldContactRigidPin(
+                true, false, true, true, true, true) &&
+                !shouldReuseWeaponWorldContactRigidPin(
+                    true, true, false, true, true, true) &&
+                !shouldReuseWeaponWorldContactRigidPin(
+                    true, true, true, true, false, true),
+            "generation, ownership, or stop-kind changes must retire an immutable grip pin");
+
+        Require(
+            Near(safeWeaponWallCorrectionFallback(18.0f), 18.0f) &&
+                Near(
+                    safeWeaponWallCorrectionFallback(
+                        std::numeric_limits<float>::quiet_NaN()),
+                    kWeaponWallCorrectionFallbackGameUnits),
+            "missing reach data must retain a finite configured/default correction envelope");
+        Require(
+            Near(
+                safeWeaponWallCorrectionFallback(1000000.0f),
+                kWeaponWallCorrectionHardSafetyGameUnits),
+            "corrupt correction configuration must remain below the hard safety ceiling");
+        Require(
+            weaponWallPoseDoesNotWorsenReach(55.0f, 54.0f, 40.0f),
+            "a wall stop that improves an already overextended raw pose must remain admissible");
+        Require(
+            weaponWallPoseDoesNotWorsenReach(55.0f, 55.2f, 40.0f),
+            "a sub-tolerance stop step must remain admissible outside nominal reach");
+        Require(
+            !weaponWallPoseDoesNotWorsenReach(55.0f, 57.0f, 40.0f),
+            "a wall response must not worsen an already overextended hand pose");
+
+        const auto roomyReach = directionalArmReachCorrectionLimit(
+            Vec3{},
+            Vec3{ 37.0f, 0.0f, 0.0f },
+            Vec3{},
+            50.0f);
+        Require(
+            roomyReach.valid &&
+                !roomyReach.constrained &&
+                Near(roomyReach.maxCorrection, 37.0f),
+            "a validated roomy reach sphere must preserve full cached wall depth");
+
+        const auto obliqueReach = directionalArmReachCorrectionLimit(
+            Vec3{ 0.0f, 4.0f, 0.0f },
+            Vec3{ 4.0f, 0.0f, 0.0f },
+            Vec3{},
+            5.15f);
+        Require(
+            obliqueReach.valid &&
+                obliqueReach.constrained &&
+                Near(obliqueReach.maxCorrection, 3.0f),
+            "reach limiting must shorten only the wall-direction scalar without adding tangent motion");
+
+        const auto tighterPeerReach = directionalArmReachCorrectionLimit(
+            Vec3{ 0.0f, 4.8f, 0.0f },
+            Vec3{ 4.0f, 0.0f, 0.0f },
+            Vec3{},
+            5.15f);
+        Require(
+            tighterPeerReach.valid &&
+                tighterPeerReach.maxCorrection <
+                    obliqueReach.maxCorrection,
+            "a shared two-hand correction must use the tighter attached arm's scalar limit");
     }
 
     {

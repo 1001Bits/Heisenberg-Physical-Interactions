@@ -1,6 +1,7 @@
 #pragma once
 
 #include "physics-interaction/contact/SoftContactMath.h"
+#include "physics-interaction/contact/SoftContactPolicy.h"
 #include "physics-interaction/contact/NativeContactEvidence.h"
 #include "physics-interaction/contact/ContactTargetIdentity.h"
 
@@ -17,6 +18,7 @@ namespace RE
 namespace rock
 {
     class Hand;
+    class DynamicHandCollisionRuntime;
     class WeaponCollision;
     struct PhysicsFrameContext;
 
@@ -64,7 +66,8 @@ namespace rock
     class SoftContactRuntime
     {
     public:
-        static constexpr std::size_t kMaxWorldContactProbesPerHand = 23;
+        static constexpr std::size_t kMaxWorldContactProbesPerHand =
+            soft_contact_policy::kWeaponWorldProbeStateCapacity;
 
         void reset();
 
@@ -73,9 +76,14 @@ namespace rock
         void update(const PhysicsFrameContext& frame,
             const Hand& rightHand,
             const Hand& leftHand,
-            bool rightHandWeaponEquipped,
-            bool leftSupportGripActive,
+            bool rightDynamicHandWorldStopOperational,
+            bool leftDynamicHandWorldStopOperational,
+            bool rightHandWeaponOwned,
+            bool leftHandWeaponOwned,
+            bool rightHandVisualReturnActive,
+            bool leftHandVisualReturnActive,
             bool weaponFiringHandIsLeft,
+            const DynamicHandCollisionRuntime* dynamicHandCollision,
             const WeaponCollision* weaponCollision,
             RE::NiNode* weaponNode,
             const contact_evidence::NativeContactEvidenceSnapshot& nativeContactEvidence);
@@ -86,13 +94,35 @@ namespace rock
             RE::NiPoint3& outCorrection,
             bool& outFiringHandIsLeft) const;
 
+        bool getWeaponWorldStopPose(
+            RE::NiTransform& outWeaponWorld,
+            bool& outFiringHandIsLeft) const;
+
+        // Read-only wall-plane view of the already-retained weapon stop. Hand
+        // targets deliberately return false: this accessor does not create a
+        // second contact authority or let reciprocal hand stops move the
+        // player controller.
+        bool getWeaponWorldStopSurface(
+            RE::NiPoint3& outSurfacePointWorld,
+            RE::NiPoint3& outSurfaceNormalWorld,
+            bool& outTargetIsDynamicHand) const;
+
+        /*
+         * Reports the free dynamic hand targeted by the retained reciprocal
+         * weapon stop.  This is presentation ownership only; callers must not
+         * use it to mark the hand physically occupied or contact evidence
+         * would invalidate its own stop.
+         */
+        bool getWeaponHandStopTarget(bool& outTargetHandIsLeft) const;
+
     private:
         struct HandRuntime
         {
             struct WorldProbeState
             {
-                bool valid = false;
-                RE::NiPoint3 previous{};
+                soft_contact_policy::SparseProbeQueryHistory<
+                    RE::NiPoint3>
+                    history{};
                 float restQueryCooldownSeconds = 0.0f;
             };
 
@@ -130,8 +160,44 @@ namespace rock
             ReleaseBlend releaseBlend{};
             std::array<WorldProbeState, kMaxWorldContactProbesPerHand> worldProbes{};
             std::uint32_t worldProbeCastCursor = 0;
+            bool weaponSampleLayoutInitialized = false;
+            std::uint64_t weaponSampleLayoutSignature = 0;
+            std::uint32_t weaponSampleLayoutCount = 0;
+            bool weaponAuthorityDiscontinuityThisFrame = false;
             CachedWorldPlane cachedWorldPlane{};
+            // A bounded sampled-probe-only companion keeps a perpendicular
+            // corner plane alive after its acquisition sweep. Exact native
+            // anchors remain primary-only so state IDs never alias.
+            CachedWorldPlane secondaryCachedWorldPlane{};
             soft_contact_math::HapticEdgeState worldHaptic{};
+        };
+
+        struct WeaponWorldStopState
+        {
+            bool active = false;
+            std::uint64_t generationKey = 0;
+            RE::NiTransform blockedWeaponWorld{};
+            RE::NiPoint3 surfacePointWorld{};
+            RE::NiPoint3 surfaceNormalWorld{};
+            std::uint32_t sourceBodyId = 0x7FFF'FFFFu;
+            bool targetIsDynamicHand = false;
+            bool targetHandIsLeft = false;
+            std::uint32_t targetDynamicHandBodyId =
+                0x7FFF'FFFFu;
+            std::uint32_t targetHandCollisionLayer = 0;
+            bool anchorUsesSourceLocal = false;
+            RE::NiPoint3 anchorLocal{};
+            float probeRadiusGame = 0.0f;
+            float missElapsedSeconds = 0.0f;
+            // Once a resolved raw probe proves outward plane exit, continue
+            // the bounded full-pose return until completion. Without this
+            // latch, the next stationary outside sample could re-retain the
+            // partially released pose because it contains no new retreat.
+            bool releaseActive = false;
+            bool previousRawProbeValid = false;
+            float previousRawProbeSignedDistance = 0.0f;
+            bool previousRawWeaponWorldValid = false;
+            RE::NiTransform previousRawWeaponWorld{};
         };
 
         void clearHand(bool isLeft);
@@ -142,12 +208,17 @@ namespace rock
         // channels. Sharing a cached plane made a palm and muzzle overwrite
         // one another and alternate visual authority from frame to frame.
         HandRuntime _weapon{};
+        WeaponWorldStopState _weaponWorldStop{};
+        std::array<
+            soft_contact_policy::WeaponHandContactEpisodeState,
+            2>
+            _weaponHandContactEpisodes{};
         std::uint64_t _weaponGenerationKey = 0;
         SoftContactDebugSnapshot _debugSnapshot{};
         RE::NiPoint3 _weaponWorldCorrection{};
         bool _weaponWorldCorrectionActive = false;
         bool _weaponWorldCorrectionHandIsLeft = false;
-        bool _wasHandWorldEnabled = false;
+        std::array<bool, 2> _wasHandWorldEnabled{};
         std::uint32_t _logCounter = 0;
     };
 }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <mutex>
@@ -34,6 +35,7 @@ namespace heisenberg
         HeldObjectActivation = 1u << 3,
         ItemPositionConfig = 1u << 4,
         StorageZoneConfig = 1u << 5,
+        PostConsumeActivation = 1u << 6,
     };
 
     /**
@@ -91,10 +93,23 @@ namespace heisenberg
 
         // Input suppression - prevents native F4VR from also responding to grip
         void UpdateInputSuppression();
+        void RecoverSkeletonCollapsedByScopeExit(float deltaTime);
+        void AuditSurvivalStatusTokens();
         // Update only Heisenberg's named BSInputEnableManager layer. Multiple in-mod
         // owners compose through a reason mask, so one feature cannot globally
         // re-enable controls that another feature still owns.
         void SetInputSuppression(InputSuppressionReason reason, bool suppressed);
+
+        // Keep the grab/activate binding from falling through to Talk/Open in
+        // the frame where a held consumable disappears.
+        void BeginPostConsumeActivationSuppression(bool isLeft);
+        bool IsPostConsumeActivationSuppressed() const
+        {
+            return _postConsumeActivationSuppressed[0].load(
+                       std::memory_order_acquire) ||
+                   _postConsumeActivationSuppressed[1].load(
+                       std::memory_order_acquire);
+        }
 
         // Chest pocket zone - enables native grenades when hand is near chest
         void UpdateChestPocketZone();
@@ -166,6 +181,12 @@ namespace heisenberg
             _postGrabFightingSuppressed = false;
             _holdFightingSuppressed = false;
             _zKeySuppressed = false;
+            for (auto& active :
+                 _postConsumeActivationSuppressed) {
+                active.store(false, std::memory_order_release);
+            }
+            _postConsumeActivationMinimumUntil = {};
+            ClearLastUnequippedWeapon();
             RefreshOwnedInputLayer();
             spdlog::info("Cleared hand states on load");
         }
@@ -195,6 +216,12 @@ namespace heisenberg
         bool _inputSuppressed = false;
         bool _fightingSuppressed = false;  // Suppressing kFighting to prevent native throwable ready
         bool _zKeySuppressed = false;      // Permanently suppress native Z-key spring mode
+        std::array<std::atomic<bool>, 2>
+            _postConsumeActivationSuppressed{};
+        std::array<std::chrono::steady_clock::time_point, 2>
+            _postConsumeActivationMinimumUntil{};
+        static constexpr auto POST_CONSUME_ACTIVATION_MINIMUM_TAIL =
+            std::chrono::milliseconds(500);
 
         // Chest zone + grip detection for native throwables
         // When right hand is in chest zone AND grip pressed = native throwable ready
@@ -403,6 +430,7 @@ namespace heisenberg
         // UnEquipItem crashes when called during HookPostPhysics, so defer by one frame
         RE::TESForm* _pendingUnequipForm = nullptr;
         std::string _pendingUnequipName;
+        bool _pendingUnequipOffhandIsLeft = true;
 
         // Deferred weapon re-equip - set by Hand::OnGrabPressed, processed next frame
         RE::TESForm* _pendingReequipForm = nullptr;
@@ -432,10 +460,14 @@ namespace heisenberg
         void UpdateCachedWeaponState();
 
         // Queue a weapon unequip (processed in HookEndUpdate, safe context)
-        void QueueWeaponUnequip(RE::TESForm* form, const char* name)
+        void QueueWeaponUnequip(
+            RE::TESForm* form,
+            const char* name,
+            bool offhandIsLeft)
         {
             _pendingUnequipForm = form;
             _pendingUnequipName = name ? name : "Weapon";
+            _pendingUnequipOffhandIsLeft = offhandIsLeft;
         }
 
         // Queue a weapon re-equip (processed in HookEndUpdate, safe context)
@@ -448,7 +480,15 @@ namespace heisenberg
         // Get/clear last weapon unequipped via storage zone (for re-equip)
         RE::TESForm* GetLastUnequippedWeapon() const { return _lastUnequippedWeapon; }
         const std::string& GetLastUnequippedWeaponName() const { return _lastUnequippedWeaponName; }
-        void ClearLastUnequippedWeapon() { _lastUnequippedWeapon = nullptr; _lastUnequippedWeaponName.clear(); }
+        void ClearLastUnequippedWeapon()
+        {
+            _pendingUnequipForm = nullptr;
+            _pendingUnequipName.clear();
+            _pendingReequipForm = nullptr;
+            _pendingReequipName.clear();
+            _lastUnequippedWeapon = nullptr;
+            _lastUnequippedWeaponName.clear();
+        }
 
         // Process pending weapon unequip - called from HookEndUpdate (after physics)
         void ProcessPendingWeaponUnequip();

@@ -63,7 +63,8 @@ namespace rock::mouth_consume
             return mul(value, 1.0f / len);
         }
 
-        [[nodiscard]] const Probe* selectedProbe(const DetectorInput& input) noexcept
+        template <class Input>
+        [[nodiscard]] const Probe* selectedProbe(const Input& input) noexcept
         {
             if (input.hasObjectProbe && finitePoint(input.objectProbe.pointGame)) {
                 return &input.objectProbe;
@@ -74,7 +75,8 @@ namespace rock::mouth_consume
             return nullptr;
         }
 
-        [[nodiscard]] float resolvedProbeSpeed(const DetectorInput& input, const RuntimeState& runtime) noexcept
+        template <class Input>
+        [[nodiscard]] float resolvedProbeSpeed(const Input& input, const RuntimeState& runtime) noexcept
         {
             const Probe* probe = selectedProbe(input);
             if (!probe) {
@@ -130,7 +132,7 @@ namespace rock::mouth_consume
         return std::clamp(normalized + coreBonus, 0.0f, 1.0f);
     }
 
-    Decision evaluate(const DetectorInput& input, RuntimeState& runtime) noexcept
+    Decision evaluateCenteredZone(const CenteredDetectorInput& input, RuntimeState& runtime) noexcept
     {
         Decision decision{};
         const Probe* probe = selectedProbe(input);
@@ -147,11 +149,9 @@ namespace rock::mouth_consume
         decision.speedGameUnitsPerSecond = speed;
 
         if (!input.config.enabled ||
-            !input.hasHmdFrame ||
+            !input.hasCenter ||
             !probe ||
-            !finitePoint(input.hmdPositionWorld) ||
-            !finitePoint(input.hmdForwardWorld) ||
-            !finitePoint(input.config.hmdMouthOffsetGameUnits) ||
+            !finitePoint(input.centerGame) ||
             !std::isfinite(input.config.mouthRadiusGameUnits) ||
             !std::isfinite(input.config.enterPaddingGameUnits) ||
             !std::isfinite(input.config.exitPaddingGameUnits) ||
@@ -162,6 +162,16 @@ namespace rock::mouth_consume
             return decision;
         }
 
+        const float radius = (std::max)(0.1f, input.config.mouthRadiusGameUnits);
+        const float distanceGameUnits = length(sub(probe->pointGame, input.centerGame));
+        decision.mouthCenterGame = input.centerGame;
+        decision.distanceGameUnits = distanceGameUnits;
+        decision.spatiallyEligibleForRelease =
+            std::isfinite(distanceGameUnits) && distanceGameUnits <= radius;
+
+        // Speed is an auto-consume safety input only.  The geometry result
+        // above remains available to a release edge even when this branch
+        // rejects the dwell candidate.
         if (std::isfinite(input.config.maxSpeedGameUnitsPerSecond) &&
             input.config.maxSpeedGameUnitsPerSecond > 0.0f &&
             speed > input.config.maxSpeedGameUnitsPerSecond) {
@@ -172,19 +182,9 @@ namespace rock::mouth_consume
             return decision;
         }
 
-        const RE::NiPoint3 mouthCenter = computeMouthCenter(input.hmdPositionWorld, input.hmdForwardWorld, input.config.hmdMouthOffsetGameUnits);
-        if (!finitePoint(mouthCenter)) {
-            runtime.candidate = false;
-            runtime.confirmed = false;
-            runtime.dwellSeconds = 0.0f;
-            updateProbeHistory();
-            return decision;
-        }
-        const float radius = (std::max)(0.1f, input.config.mouthRadiusGameUnits);
         const bool wasCandidate = runtime.candidate;
         const float padding = wasCandidate ? input.config.exitPaddingGameUnits : input.config.enterPaddingGameUnits;
         const float threshold = radius + (std::max)(0.0f, padding);
-        const float distanceGameUnits = length(sub(probe->pointGame, mouthCenter));
         if (!std::isfinite(distanceGameUnits) || distanceGameUnits > threshold) {
             runtime.candidate = false;
             runtime.confirmed = false;
@@ -201,12 +201,37 @@ namespace rock::mouth_consume
         decision.confirmedForCommit = runtime.confirmed;
         decision.enteredCandidate = !wasCandidate;
         decision.changedCandidate = !wasCandidate;
-        decision.mouthCenterGame = mouthCenter;
-        decision.distanceGameUnits = distanceGameUnits;
         decision.confidence = candidateConfidence(distanceGameUnits, threshold, radius);
         decision.speedGameUnitsPerSecond = speed;
 
         updateProbeHistory();
         return decision;
+    }
+
+    Decision evaluate(const DetectorInput& input, RuntimeState& runtime) noexcept
+    {
+        if (!input.hasHmdFrame ||
+            !finitePoint(input.hmdPositionWorld) ||
+            !finitePoint(input.hmdForwardWorld) ||
+            !finitePoint(input.config.hmdMouthOffsetGameUnits)) {
+            resetRuntime(runtime);
+            return {};
+        }
+
+        const RE::NiPoint3 mouthCenter = computeMouthCenter(
+            input.hmdPositionWorld,
+            input.hmdForwardWorld,
+            input.config.hmdMouthOffsetGameUnits);
+        return evaluateCenteredZone(CenteredDetectorInput{
+                .hasCenter = finitePoint(mouthCenter),
+                .centerGame = mouthCenter,
+                .objectProbe = input.objectProbe,
+                .hasObjectProbe = input.hasObjectProbe,
+                .handProbe = input.handProbe,
+                .hasHandProbe = input.hasHandProbe,
+                .deltaSeconds = input.deltaSeconds,
+                .config = input.config,
+            },
+            runtime);
     }
 }

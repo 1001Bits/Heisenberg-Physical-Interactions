@@ -71,6 +71,10 @@ namespace rock::contact_pipeline_policy
         bool recordHandSemanticContact = false;
         // Restored with the soft-contact runtime: gates NativeContactEvidence publication.
         bool recordWorldSurfaceEvidence = false;
+        // Keyframed layer-43 and layer-44 bodies provide a fresh moving plane
+        // for the legacy free-hand visual stop; they cannot solver-separate
+        // one another by themselves.
+        bool recordHandWeaponEvidence = false;
         bool recordBodyContact = false;
         bool drivesWeaponSupportContact = false;
         bool driveHandDynamicPush = false;
@@ -270,12 +274,14 @@ namespace rock::contact_pipeline_policy
             if (isHand(a.kind) && b.kind == ContactEndpointKind::Weapon) {
                 auto result = makeClassification(ContactRoute::HandWeapon, a, b);
                 result.recordHandSemanticContact = true;
+                result.recordHandWeaponEvidence = true;
                 result.drivesWeaponSupportContact = true;
                 return result;
             }
             if (a.kind == ContactEndpointKind::Weapon && isHand(b.kind)) {
                 auto result = makeClassification(ContactRoute::HandWeapon, b, a);
                 result.recordHandSemanticContact = true;
+                result.recordHandWeaponEvidence = true;
                 result.drivesWeaponSupportContact = true;
                 return result;
             }

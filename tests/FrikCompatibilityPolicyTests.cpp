@@ -22,12 +22,12 @@ int main()
 
     static_assert(
         rock::logging_policy::DefaultLogLevel ==
-        static_cast<int>(rock::logging_policy::LogLevel::Error));
+        static_cast<int>(rock::logging_policy::LogLevel::Warn));
     Require(
-        !rock::logging_policy::shouldEmit(
+        rock::logging_policy::shouldEmit(
             rock::logging_policy::DefaultLogLevel,
             rock::logging_policy::LogLevel::Warn),
-        "release logging must suppress warnings below the configured error level");
+        "release logging must retain warnings at the configured warning level");
     Require(
         rock::logging_policy::shouldEmit(
             rock::logging_policy::DefaultLogLevel,

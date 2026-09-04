@@ -1441,7 +1441,11 @@ namespace rock
         // solve reads weaponNode->world. SoftContactRuntime will publish a
         // fresh absolute correction after this update; retaining the old one
         // here would feed it back into the two-hand base and accumulate drift.
-        clearWeaponWorldContactTranslation(weaponNode);
+        clearWeaponWorldContactTranslation(
+            weaponNode,
+            currentWeaponGenerationKey,
+            currentEquippedWeaponOwnershipKey,
+            /*preserveRigidStopPin=*/true);
 
         _handlingSettings = handlingSettings;
         setGrabbedObjectHandPoseOwnership(
@@ -2145,21 +2149,59 @@ namespace rock
     }
 
     void TwoHandedGrip::clearWeaponWorldContactTranslation(
-        RE::NiNode* currentWeaponNode)
+        RE::NiNode* currentWeaponNode,
+        const std::uint64_t currentWeaponGenerationKey,
+        const std::uint64_t currentWeaponOwnershipKey,
+        const bool preserveRigidStopPin)
     {
-        (void)frik_visual_authority::
-            clearExternalHandWorldTransform(
-                WEAPON_WORLD_CONTACT_RIGHT_TAG,
-                handFromBool(false));
-        (void)frik_visual_authority::
-            clearExternalHandWorldTransform(
-                WEAPON_WORLD_CONTACT_LEFT_TAG,
-                handFromBool(true));
+        /*
+         * A retained rigid stop is level-triggered authority.  Dropping its
+         * hand writers at update start exposes the raw firing/support hand for
+         * part of the frame before the identical stop is republished, which is
+         * visible as wall-contact flicker.  The final non-preserving clear on
+         * contact release still removes both writers immediately.
+         */
+        if (!preserveRigidStopPin) {
+            (void)frik_visual_authority::
+                clearExternalHandWorldTransform(
+                    WEAPON_WORLD_CONTACT_RIGHT_TAG,
+                    handFromBool(false));
+            (void)frik_visual_authority::
+                clearExternalHandWorldTransform(
+                    WEAPON_WORLD_CONTACT_LEFT_TAG,
+                    handFromBool(true));
+        }
 
         RE::NiNode* appliedWeaponNode =
             _weaponWorldContactVisual.weaponNode.get();
+        const bool currentNodeMatches =
+            currentWeaponNode &&
+            appliedWeaponNode == currentWeaponNode;
+        const bool parentTopologyMatches =
+            appliedWeaponNode &&
+            appliedWeaponNode->parent ==
+                _weaponWorldContactVisual.parentNode.get();
+        const bool generationMatches =
+            _weaponWorldContactVisual.weaponGenerationKey != 0 &&
+            ((currentWeaponGenerationKey != 0 &&
+              currentWeaponGenerationKey ==
+                  _weaponWorldContactVisual.weaponGenerationKey) ||
+             (_activeWeaponGenerationKey != 0 &&
+              _activeWeaponGenerationKey ==
+                  _weaponWorldContactVisual.weaponGenerationKey));
+        const bool ownershipMatches =
+            (currentWeaponOwnershipKey != 0 &&
+             currentWeaponOwnershipKey ==
+                 _weaponWorldContactVisual.weaponOwnershipKey) ||
+            (_activeEquippedWeaponOwnershipKey != 0 &&
+             _activeEquippedWeaponOwnershipKey ==
+                 _weaponWorldContactVisual.weaponOwnershipKey);
         if (_weaponWorldContactVisual.active &&
-            appliedWeaponNode) {
+            appliedWeaponNode &&
+            currentNodeMatches &&
+            parentTopologyMatches &&
+            generationMatches &&
+            ownershipMatches) {
             const RE::NiPoint3 localTranslationDelta =
                 appliedWeaponNode->local.translate -
                 _weaponWorldContactVisual.
@@ -2169,7 +2211,25 @@ namespace rock
                 std::isfinite(localTranslationDelta.y) &&
                 std::isfinite(localTranslationDelta.z) &&
                 localTranslationDelta.Length() <= 0.01f;
-            if (retainedAppliedTranslation) {
+            const bool retainedAppliedFullPose =
+                retainedAppliedTranslation &&
+                isFiniteTransform(appliedWeaponNode->local) &&
+                hand_visual_lerp_math::rotationDistanceDegrees(
+                    appliedWeaponNode->local,
+                    _weaponWorldContactVisual.appliedLocal) <=
+                    0.05f &&
+                std::abs(appliedWeaponNode->local.scale -
+                    _weaponWorldContactVisual.appliedLocal.scale) <=
+                    0.001f;
+            const bool retainedOwnedFrame =
+                _weaponWorldContactVisual.ownsFullPose ?
+                    retainedAppliedFullPose :
+                    retainedAppliedTranslation;
+            if (retainedOwnedFrame &&
+                _weaponWorldContactVisual.ownsFullPose) {
+                appliedWeaponNode->local =
+                    _weaponWorldContactVisual.baseLocal;
+            } else if (retainedOwnedFrame) {
                 // Preserve a newer animation rotation/scale if one arrived
                 // after our translation. Only the translation component was
                 // ever owned by this overlay.
@@ -2177,12 +2237,12 @@ namespace rock
                     _weaponWorldContactVisual.
                         baseLocal.translate;
             }
-            if (retainedAppliedTranslation &&
+            if (retainedOwnedFrame &&
                 appliedWeaponNode->parent) {
                 f4vr::updateTransformsDown(
                     appliedWeaponNode,
                     true);
-            } else if (retainedAppliedTranslation) {
+            } else if (retainedOwnedFrame) {
                 appliedWeaponNode->world =
                     appliedWeaponNode->local;
                 f4vr::updateTransformsDown(
@@ -2191,7 +2251,9 @@ namespace rock
             }
         }
         _weaponWorldContactVisual = {};
-        (void)currentWeaponNode;
+        if (!preserveRigidStopPin) {
+            _weaponWorldContactRigidStopPin = {};
+        }
     }
 
     bool TwoHandedGrip::applyWeaponWorldContactTranslation(
@@ -2207,7 +2269,9 @@ namespace rock
             !std::isfinite(correctionWorld.y) ||
             !std::isfinite(correctionWorld.z)) {
             clearWeaponWorldContactTranslation(
-                weaponNode);
+                weaponNode,
+                weaponGenerationKey,
+                weaponOwnershipKey);
             return false;
         }
 
@@ -2216,22 +2280,12 @@ namespace rock
                 correctionWorld.x * correctionWorld.x +
                 correctionWorld.y * correctionWorld.y +
                 correctionWorld.z * correctionWorld.z);
-        const float configuredMaxCorrection =
-            std::isfinite(
-                g_rockConfig.
-                    rockSoftContactWorldMaxCorrectionGameUnits) &&
-                    g_rockConfig.
-                            rockSoftContactWorldMaxCorrectionGameUnits >
-                        0.0f
-                ? g_rockConfig.
-                      rockSoftContactWorldMaxCorrectionGameUnits
-                : 18.0f;
         if (!std::isfinite(correctionLength) ||
-            correctionLength <= 0.001f ||
-            correctionLength >
-                configuredMaxCorrection + 0.01f) {
+            correctionLength <= 0.001f) {
             clearWeaponWorldContactTranslation(
-                weaponNode);
+                weaponNode,
+                weaponGenerationKey,
+                weaponOwnershipKey);
             return false;
         }
 
@@ -2239,23 +2293,53 @@ namespace rock
         // restore its exact raw local frame first. If FRIK/two-hand authority
         // did refresh it, the local mismatch makes that new frame the base.
         clearWeaponWorldContactTranslation(
-            weaponNode);
+            weaponNode,
+            weaponGenerationKey,
+            weaponOwnershipKey);
 
         std::array<RE::NiTransform, 2>
             gripHandWorld{};
         std::array<bool, 2>
             haveGripHandWorld{};
+        std::array<bool, 2>
+            attachedHandExpected{};
+        const bool weaponTransformOwned =
+            ownsWeaponTransform();
         for (const bool isLeft :
              { false, true }) {
             const std::size_t index =
                 isLeft ? 1u : 0u;
-            haveGripHandWorld[index] =
-                hasVisualAuthorityForHand(isLeft) &&
-                computeLiveGripHandWorld(
-                    isLeft,
-                    gripHandWorld[index]);
-            if (!haveGripHandWorld[index] &&
-                isLeft == firingHandIsLeft) {
+            const bool isFiringHand =
+                isLeft == firingHandIsLeft;
+            const bool activePartGrip =
+                partGrip(isLeft).active;
+            const bool occupiedPrimaryGrip =
+                isFiringHand &&
+                _state == TwoHandedState::Gripping &&
+                weapon_support_authority_policy::
+                    supportGripAppliesPrimaryHandAuthority(
+                        _authorityMode);
+            attachedHandExpected[index] =
+                two_handed_weapon_policy::
+                    isHandAttachedForWeaponWallTransport(
+                        weaponTransformOwned,
+                        isFiringHand,
+                        activePartGrip,
+                        occupiedPrimaryGrip);
+            if (!attachedHandExpected[index]) {
+                continue;
+            }
+
+            if (activePartGrip || occupiedPrimaryGrip) {
+                haveGripHandWorld[index] =
+                    computeLiveGripHandWorld(
+                        isLeft,
+                        gripHandWorld[index]);
+            } else {
+                // Only the native, unowned weapon path may infer attachment
+                // from the firing hand. PartCarry's detached firing hand can
+                // still have visual-return authority but must never be dragged
+                // with the weapon wall correction.
                 haveGripHandWorld[index] =
                     HostGetPreAuthorityHandWorld(
                         isLeft,
@@ -2266,68 +2350,128 @@ namespace rock
         /*
          * The weapon-only contact channel is evaluated after the generic hand
          * channel, so its correction can supersede the hand channel's reach-
-         * projected transport. Clamp against the ACTUAL firing-grip target
-         * used below, then transport this one effective correction to the
-         * weapon and every owned grip hand. This prevents a gun stopped by a
-         * wall from pulling its welded firing hand beyond anatomical reach
-         * while locomotion continues through the surface.
+         * projected transport. Limit one shared correction scalar along the
+         * original wall response direction against EVERY attached grip hand.
+         * Radially projecting each target would introduce tangent motion and
+         * split the rendered hands, weapon, and collision hull. Missing reach
+         * evidence falls back to the finite acquisition envelope.
          */
-        RE::NiPoint3 effectiveCorrectionWorld =
-            correctionWorld;
-        const std::size_t firingHandIndex =
-            firingHandIsLeft ? 1u : 0u;
-        soft_contact_math::ArmReachProjection
-            firingHandReachProjection{};
-        if (haveGripHandWorld[firingHandIndex]) {
+        const float fallbackCorrectionLimit =
+            two_handed_weapon_policy::
+                safeWeaponWallCorrectionFallback(
+                    g_rockConfig.
+                        rockSoftContactWorldMaxCorrectionGameUnits);
+        float allowedCorrectionLength =
+            (std::min)(
+                correctionLength,
+                two_handed_weapon_policy::
+                    kWeaponWallCorrectionHardSafetyGameUnits);
+        bool anyAttachedHandExpected = false;
+        bool everyAttachedHandWorldAvailable = true;
+        bool usedFallbackReachLimit = false;
+        bool reachConstrained =
+            allowedCorrectionLength + 0.001f <
+            correctionLength;
+        for (const bool isLeft : { false, true }) {
+            const std::size_t index = isLeft ? 1u : 0u;
+            if (!attachedHandExpected[index]) {
+                continue;
+            }
+            anyAttachedHandExpected = true;
+            if (!haveGripHandWorld[index]) {
+                everyAttachedHandWorldAvailable = false;
+                continue;
+            }
+
             RE::NiPoint3 shoulderWorld{};
             float maxReach = 0.0f;
-            if (HostGetPreAuthorityArmReach(
-                    firingHandIsLeft,
+            if (!HostGetPreAuthorityArmReach(
+                    isLeft,
                     shoulderWorld,
                     maxReach)) {
-                const RE::NiPoint3 requestedTarget =
-                    soft_contact_math::add(
-                        gripHandWorld[firingHandIndex].
-                            translate,
-                        effectiveCorrectionWorld);
-                firingHandReachProjection =
-                    soft_contact_math::
-                        projectHandTargetToArmReach(
-                            requestedTarget,
-                            shoulderWorld,
-                            maxReach);
-                if (firingHandReachProjection.valid) {
-                    effectiveCorrectionWorld =
-                        soft_contact_math::clampLength(
-                            soft_contact_math::sub(
-                                firingHandReachProjection.target,
-                                gripHandWorld[firingHandIndex].
-                                    translate),
-                            configuredMaxCorrection);
-                }
+                allowedCorrectionLength =
+                    (std::min)(
+                        allowedCorrectionLength,
+                        fallbackCorrectionLimit);
+                usedFallbackReachLimit = true;
+                continue;
             }
+
+            const auto reachLimit =
+                two_handed_weapon_policy::
+                    directionalArmReachCorrectionLimit(
+                        gripHandWorld[index].translate,
+                        correctionWorld,
+                        shoulderWorld,
+                        maxReach);
+            if (!reachLimit.valid) {
+                allowedCorrectionLength =
+                    (std::min)(
+                        allowedCorrectionLength,
+                        fallbackCorrectionLimit);
+                usedFallbackReachLimit = true;
+                continue;
+            }
+            allowedCorrectionLength =
+                (std::min)(
+                    allowedCorrectionLength,
+                    reachLimit.maxCorrection);
+            reachConstrained =
+                reachConstrained ||
+                reachLimit.constrained;
         }
+        if (!two_handed_weapon_policy::
+                hasCompleteAttachedHandWorldSet(
+                    anyAttachedHandExpected,
+                    everyAttachedHandWorldAvailable)) {
+            ROCK_LOG_SAMPLE_WARN(
+                Weapon,
+                1000,
+                "Weapon wall correction withheld: an attached grip hand has no current world target attachedMask={}{} availableMask={}{}",
+                attachedHandExpected[0] ? "R" : "-",
+                attachedHandExpected[1] ? "L" : "-",
+                haveGripHandWorld[0] ? "R" : "-",
+                haveGripHandWorld[1] ? "L" : "-");
+            return false;
+        }
+        if (!anyAttachedHandExpected) {
+            allowedCorrectionLength =
+                (std::min)(
+                    allowedCorrectionLength,
+                    fallbackCorrectionLimit);
+            usedFallbackReachLimit = true;
+        }
+        const RE::NiPoint3 effectiveCorrectionWorld =
+            correctionWorld *
+            (allowedCorrectionLength /
+             correctionLength);
         const float effectiveCorrectionLength =
             soft_contact_math::length(
                 effectiveCorrectionWorld);
         if (!std::isfinite(effectiveCorrectionLength) ||
             effectiveCorrectionLength <= 0.001f) {
             clearWeaponWorldContactTranslation(
-                weaponNode);
+                weaponNode,
+                weaponGenerationKey,
+                weaponOwnershipKey);
             return false;
         }
-        if (firingHandReachProjection.projected) {
+        if (reachConstrained || usedFallbackReachLimit) {
             ROCK_LOG_SAMPLE_DEBUG(
                 Weapon,
                 1000,
-                "Weapon wall correction projected to firing-arm reach "
-                "hand={} requested={:.2f}gu applied={:.2f}gu "
-                "transport={:.2f}gu",
-                firingHandIsLeft ? "left" : "right",
-                firingHandReachProjection.requestedDistance,
-                firingHandReachProjection.appliedDistance,
-                effectiveCorrectionLength);
+                "Weapon wall correction directionally bounded "
+                "requested={:.2f}gu applied={:.2f}gu "
+                "fallbackReach={} attachedMask={}{}",
+                correctionLength,
+                effectiveCorrectionLength,
+                usedFallbackReachLimit ? "yes" : "no",
+                attachedHandExpected[0] ? "R" : "-",
+                attachedHandExpected[1] ? "L" : "-");
         }
+
+        const std::size_t firingHandIndex =
+            firingHandIsLeft ? 1u : 0u;
 
         /*
          * A normal FRIK-owned weapon is a child of the firing hand. Moving
@@ -2340,40 +2484,10 @@ namespace rock
         const bool handDrivesNativeWeapon =
             two_handed_weapon_policy::
                 canUseHandOnlyWeaponWorldContactTransport(
-                    ownsWeaponTransform(),
+                    weaponTransformOwned,
                     haveGripHandWorld[firingHandIndex],
                     frikHasVisualAuthority());
-        bool weaponTranslationApplied = false;
-        if (!handDrivesNativeWeapon) {
-            const RE::NiTransform baseLocal =
-                weaponNode->local;
-            RE::NiTransform correctedWeaponWorld =
-                weaponNode->world;
-            correctedWeaponWorld.translate +=
-                effectiveCorrectionWorld;
-            if (!applyWeaponVisualAuthority(
-                    weaponNode,
-                    correctedWeaponWorld)) {
-                return false;
-            }
-
-            _weaponWorldContactVisual.active = true;
-            _weaponWorldContactVisual.weaponNode.reset(
-                weaponNode);
-            _weaponWorldContactVisual.weaponGenerationKey =
-                weaponGenerationKey;
-            _weaponWorldContactVisual.weaponOwnershipKey =
-                weaponOwnershipKey;
-            _weaponWorldContactVisual.baseLocal =
-                baseLocal;
-            _weaponWorldContactVisual.appliedLocal =
-                weaponNode->local;
-            _weaponWorldContactVisual.correctionWorld =
-                effectiveCorrectionWorld;
-            weaponTranslationApplied = true;
-        }
-
-        bool handTranslationApplied = false;
+        std::array<bool, 2> handPublished{};
         for (const bool isLeft :
              { false, true }) {
             const std::size_t index =
@@ -2397,18 +2511,530 @@ namespace rock
                     handFromBool(isLeft),
                     gripHandWorld[index],
                     WEAPON_WORLD_CONTACT_HAND_PRIORITY)) {
-                // Hosted 0.77.12 re-derives every ROCK_Weapon* winner
-                // through computeLiveGripHandWorld after FRIK. Record the
-                // corrected final target or the host would replace it with
-                // the uncorrected grip and stretch the hands off the gun.
-                recordPublishedHandWorld(
-                    isLeft,
-                    gripHandWorld[index]);
-                handTranslationApplied = true;
+                handPublished[index] = true;
             }
+        }
+
+        if (!two_handed_weapon_policy::
+                hasCompleteAttachedHandPublicationSet(
+                    attachedHandExpected[0],
+                    attachedHandExpected[1],
+                    handPublished[0],
+                    handPublished[1])) {
+            // Hand writers were staged before the weapon mutation. Roll every
+            // staged writer back and leave the weapon at its untouched base so
+            // a host-side publication failure cannot split the rigid grip.
+            (void)frik_visual_authority::
+                clearExternalHandWorldTransform(
+                    WEAPON_WORLD_CONTACT_RIGHT_TAG,
+                    handFromBool(false));
+            (void)frik_visual_authority::
+                clearExternalHandWorldTransform(
+                    WEAPON_WORLD_CONTACT_LEFT_TAG,
+                    handFromBool(true));
+            ROCK_LOG_SAMPLE_WARN(
+                Weapon,
+                1000,
+                "Weapon wall correction withheld: attached hand authority publication failed attachedMask={}{} publishedMask={}{}",
+                attachedHandExpected[0] ? "R" : "-",
+                attachedHandExpected[1] ? "L" : "-",
+                handPublished[0] ? "R" : "-",
+                handPublished[1] ? "L" : "-");
+            return false;
+        }
+
+        bool weaponTranslationApplied = false;
+        if (!handDrivesNativeWeapon) {
+            const RE::NiTransform baseLocal =
+                weaponNode->local;
+            RE::NiTransform correctedWeaponWorld =
+                weaponNode->world;
+            correctedWeaponWorld.translate +=
+                effectiveCorrectionWorld;
+            if (!applyWeaponVisualAuthority(
+                    weaponNode,
+                    correctedWeaponWorld)) {
+                (void)frik_visual_authority::
+                    clearExternalHandWorldTransform(
+                        WEAPON_WORLD_CONTACT_RIGHT_TAG,
+                        handFromBool(false));
+                (void)frik_visual_authority::
+                    clearExternalHandWorldTransform(
+                        WEAPON_WORLD_CONTACT_LEFT_TAG,
+                        handFromBool(true));
+                return false;
+            }
+
+            _weaponWorldContactVisual.active = true;
+            _weaponWorldContactVisual.weaponNode.reset(
+                weaponNode);
+            _weaponWorldContactVisual.parentNode.reset(
+                weaponNode->parent);
+            _weaponWorldContactVisual.weaponGenerationKey =
+                weaponGenerationKey;
+            _weaponWorldContactVisual.weaponOwnershipKey =
+                weaponOwnershipKey;
+            _weaponWorldContactVisual.baseLocal =
+                baseLocal;
+            _weaponWorldContactVisual.appliedLocal =
+                weaponNode->local;
+            _weaponWorldContactVisual.correctionWorld =
+                effectiveCorrectionWorld;
+            weaponTranslationApplied = true;
+        }
+
+        bool handTranslationApplied = false;
+        for (const bool isLeft : { false, true }) {
+            const std::size_t index = isLeft ? 1u : 0u;
+            if (!handPublished[index]) {
+                continue;
+            }
+            // Hosted 0.77.12 re-derives every ROCK_Weapon* winner through
+            // computeLiveGripHandWorld after FRIK. Commit the corrected final
+            // targets only after the complete rigid transaction succeeded.
+            recordPublishedHandWorld(
+                isLeft,
+                gripHandWorld[index]);
+            handTranslationApplied = true;
         }
         return weaponTranslationApplied ||
                handTranslationApplied;
+    }
+
+    bool TwoHandedGrip::applyWeaponWorldContactPose(
+        RE::NiNode* weaponNode,
+        const RE::NiTransform& blockedWeaponWorld,
+        const bool firingHandIsLeft,
+        const std::uint64_t weaponGenerationKey,
+        const std::uint64_t weaponOwnershipKey,
+        const bool immutableWallStop)
+    {
+        if (!weaponNode || weaponGenerationKey == 0 ||
+            !isFiniteTransform(blockedWeaponWorld) ||
+            !isFiniteTransform(weaponNode->world)) {
+            clearWeaponWorldContactTranslation(
+                weaponNode,
+                weaponGenerationKey,
+                weaponOwnershipKey);
+            return false;
+        }
+
+        // Remove the previous overlay before capturing the raw weapon/hand
+        // relationship for this frame. The blocked pose is absolute and must
+        // never be composed on top of its own prior publication.
+        clearWeaponWorldContactTranslation(
+            weaponNode,
+            weaponGenerationKey,
+            weaponOwnershipKey,
+            true);
+        const RE::NiTransform rawWeaponWorld = weaponNode->world;
+        if (!isFiniteTransform(rawWeaponWorld)) {
+            return false;
+        }
+        const float requestedTranslation =
+            hand_visual_lerp_math::distanceGameUnits(
+                rawWeaponWorld.translate,
+                blockedWeaponWorld.translate);
+        const float requestedRotation =
+            hand_visual_lerp_math::rotationDistanceDegrees(
+                rawWeaponWorld,
+                blockedWeaponWorld);
+        if (!std::isfinite(requestedTranslation) ||
+            !std::isfinite(requestedRotation)) {
+            return false;
+        }
+
+        const bool requestedBlockedPoseMatches =
+            isFiniteTransform(
+                _weaponWorldContactRigidStopPin.blockedWeaponWorld) &&
+            hand_visual_lerp_math::distanceGameUnits(
+                _weaponWorldContactRigidStopPin.blockedWeaponWorld.translate,
+                blockedWeaponWorld.translate) <= 0.01f &&
+            hand_visual_lerp_math::rotationDistanceDegrees(
+                _weaponWorldContactRigidStopPin.blockedWeaponWorld,
+                blockedWeaponWorld) <= 0.05f;
+        const bool retainedRigidStopPin =
+            two_handed_weapon_policy::
+                shouldReuseWeaponWorldContactRigidPin(
+                    _weaponWorldContactRigidStopPin.active,
+                    _weaponWorldContactRigidStopPin.
+                            weaponGenerationKey ==
+                        weaponGenerationKey,
+                    _weaponWorldContactRigidStopPin.
+                            weaponOwnershipKey ==
+                        weaponOwnershipKey,
+                    _weaponWorldContactRigidStopPin.
+                        immutableWallStop,
+                    immutableWallStop,
+                    requestedBlockedPoseMatches);
+
+        std::array<RE::NiTransform, 2> gripHandWorld{};
+        std::array<RE::NiTransform, 2> handWeaponLocal{};
+        std::array<RE::NiTransform, 2> targetGripHandWorld{};
+        std::array<bool, 2> haveGripHandWorld{};
+        std::array<bool, 2> attachedHandExpected{};
+        std::array<RE::NiPoint3, 2> shoulderWorld{};
+        std::array<float, 2> maximumReach{};
+        std::array<bool, 2> haveReach{};
+        const bool weaponTransformOwned = ownsWeaponTransform();
+        bool anyAttachedHandExpected = false;
+        bool everyAttachedHandWorldAvailable = true;
+        bool missingReachEvidence = false;
+
+        for (const bool isLeft : { false, true }) {
+            const std::size_t index = isLeft ? 1u : 0u;
+            const bool isFiringHand =
+                isLeft == firingHandIsLeft;
+            const bool activePartGrip =
+                partGrip(isLeft).active;
+            const bool occupiedPrimaryGrip =
+                isFiringHand &&
+                _state == TwoHandedState::Gripping &&
+                weapon_support_authority_policy::
+                    supportGripAppliesPrimaryHandAuthority(
+                        _authorityMode);
+            attachedHandExpected[index] =
+                two_handed_weapon_policy::
+                    isHandAttachedForWeaponWallTransport(
+                        weaponTransformOwned,
+                        isFiringHand,
+                        activePartGrip,
+                        occupiedPrimaryGrip);
+            if (!attachedHandExpected[index]) {
+                continue;
+            }
+            anyAttachedHandExpected = true;
+
+            if (retainedRigidStopPin && immutableWallStop &&
+                _weaponWorldContactRigidStopPin.
+                    attachedHandExpected[index] &&
+                isFiniteTransform(
+                    _weaponWorldContactRigidStopPin.
+                        attachedHandWeaponLocal[index])) {
+                // The immutable wall owner keeps the grip frame captured on
+                // the acquisition frame. Raw hand presentation is evidence
+                // only while blocked and must never rewrite this relation.
+                handWeaponLocal[index] =
+                    _weaponWorldContactRigidStopPin.
+                        attachedHandWeaponLocal[index];
+                gripHandWorld[index] =
+                    transform_math::composeTransforms(
+                        rawWeaponWorld,
+                        handWeaponLocal[index]);
+                haveGripHandWorld[index] = true;
+                continue;
+            }
+
+            if (activePartGrip || occupiedPrimaryGrip) {
+                haveGripHandWorld[index] =
+                    computeLiveGripHandWorld(
+                        isLeft,
+                        gripHandWorld[index]);
+            } else {
+                haveGripHandWorld[index] =
+                    HostGetPreAuthorityHandWorld(
+                        isLeft,
+                        gripHandWorld[index]);
+            }
+            if (!haveGripHandWorld[index] ||
+                !isUsableHandAuthorityTransform(
+                    gripHandWorld[index])) {
+                everyAttachedHandWorldAvailable = false;
+                continue;
+            }
+            handWeaponLocal[index] =
+                transform_math::composeTransforms(
+                    transform_math::invertTransform(
+                        rawWeaponWorld),
+                    gripHandWorld[index]);
+            haveReach[index] =
+                HostGetPreAuthorityArmReach(
+                    isLeft,
+                    shoulderWorld[index],
+                    maximumReach[index]);
+            missingReachEvidence =
+                missingReachEvidence || !haveReach[index];
+        }
+
+        if (!two_handed_weapon_policy::
+                hasCompleteAttachedHandWorldSet(
+                    anyAttachedHandExpected,
+                    everyAttachedHandWorldAvailable)) {
+            ROCK_LOG_SAMPLE_WARN(
+                Weapon,
+                1000,
+                "Weapon wall pose withheld: attached hand world unavailable attachedMask={}{} availableMask={}{}",
+                attachedHandExpected[0] ? "R" : "-",
+                attachedHandExpected[1] ? "L" : "-",
+                haveGripHandWorld[0] ? "R" : "-",
+                haveGripHandWorld[1] ? "L" : "-");
+            return false;
+        }
+
+        float allowedPoseFraction = 1.0f;
+        if (!immutableWallStop && requestedTranslation >
+            two_handed_weapon_policy::
+                kWeaponWallCorrectionHardSafetyGameUnits) {
+            allowedPoseFraction = (std::min)(
+                allowedPoseFraction,
+                two_handed_weapon_policy::
+                    kWeaponWallCorrectionHardSafetyGameUnits /
+                    requestedTranslation);
+        }
+        if (!immutableWallStop &&
+            (!anyAttachedHandExpected || missingReachEvidence)) {
+            const float fallback =
+                two_handed_weapon_policy::
+                    safeWeaponWallCorrectionFallback(
+                        g_rockConfig.
+                            rockSoftContactWorldMaxCorrectionGameUnits);
+            if (requestedTranslation > fallback) {
+                allowedPoseFraction = (std::min)(
+                    allowedPoseFraction,
+                    fallback / requestedTranslation);
+            }
+        }
+
+        const auto poseAt = [&](const float fraction) {
+            return hand_visual_lerp_math::interpolateTransform(
+                rawWeaponWorld,
+                blockedWeaponWorld,
+                std::clamp(fraction, 0.0f, 1.0f));
+        };
+        const auto resolveHandsAt = [&](const RE::NiTransform& pose) {
+            for (std::size_t index = 0;
+                 index < targetGripHandWorld.size();
+                 ++index) {
+                if (!attachedHandExpected[index] ||
+                    !haveGripHandWorld[index]) {
+                    continue;
+                }
+                targetGripHandWorld[index] =
+                    transform_math::composeTransforms(
+                        pose,
+                        handWeaponLocal[index]);
+            }
+        };
+        const auto attachedHandsReachable =
+            [&](const RE::NiTransform& pose) {
+                resolveHandsAt(pose);
+                for (std::size_t index = 0;
+                     index < targetGripHandWorld.size();
+                     ++index) {
+                    if (!attachedHandExpected[index] ||
+                        !haveReach[index]) {
+                        continue;
+                    }
+                    const float reachDistance =
+                        hand_visual_lerp_math::distanceGameUnits(
+                            shoulderWorld[index],
+                            targetGripHandWorld[index].translate);
+                    const float rawReachDistance =
+                        hand_visual_lerp_math::distanceGameUnits(
+                            shoulderWorld[index],
+                            gripHandWorld[index].translate);
+                    // FRIK's reported natural reach can already be shorter
+                    // than the authored firing-hand pose.  A wall stop that
+                    // returns the weapon toward its previous clear pose must
+                    // not be discarded merely because the raw pose began
+                    // outside that nominal sphere. Only reject a correction
+                    // that makes the existing extension materially worse.
+                    if (!two_handed_weapon_policy::
+                            weaponWallPoseDoesNotWorsenReach(
+                                rawReachDistance,
+                                reachDistance,
+                                maximumReach[index])) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+
+        RE::NiTransform effectiveWeaponWorld =
+            immutableWallStop ? blockedWeaponWorld :
+                                poseAt(allowedPoseFraction);
+        if (!immutableWallStop &&
+            !attachedHandsReachable(effectiveWeaponWorld)) {
+            // The raw pose is always the continuity baseline, even when it is
+            // already outside FRIK's nominal reach sphere.
+            float low = 0.0f;
+            float high = allowedPoseFraction;
+            for (int iteration = 0; iteration < 10;
+                 ++iteration) {
+                const float middle = 0.5f * (low + high);
+                if (attachedHandsReachable(poseAt(middle))) {
+                    low = middle;
+                } else {
+                    high = middle;
+                }
+            }
+            allowedPoseFraction = low;
+            effectiveWeaponWorld = poseAt(allowedPoseFraction);
+            resolveHandsAt(effectiveWeaponWorld);
+        }
+        if (immutableWallStop) {
+            // The stop pose was admitted by the generation-current exact
+            // sweep/overlap guard. Once admitted it is the complete pose, not
+            // a per-frame correction request that reach/raw-hand writers may
+            // re-limit or rotate. During confirmed retreat SoftContactRuntime
+            // advances this same pose in bounded steps; the stored local grip
+            // frames carry every attached hand with it as one rigid pair.
+            resolveHandsAt(effectiveWeaponWorld);
+        }
+        if (allowedPoseFraction <= 0.0001f ||
+            !isFiniteTransform(effectiveWeaponWorld)) {
+            return false;
+        }
+
+        if (retainedRigidStopPin && !immutableWallStop) {
+            for (std::size_t index = 0;
+                 index < targetGripHandWorld.size(); ++index) {
+                if (attachedHandExpected[index] &&
+                    _weaponWorldContactRigidStopPin.
+                        attachedHandExpected[index]) {
+                    targetGripHandWorld[index] =
+                        _weaponWorldContactRigidStopPin.
+                            attachedHandWorld[index];
+                }
+            }
+        }
+
+        const std::size_t firingHandIndex =
+            firingHandIsLeft ? 1u : 0u;
+        const bool handDrivesNativeWeapon =
+            two_handed_weapon_policy::
+                canUseHandOnlyWeaponWorldContactTransport(
+                    weaponTransformOwned,
+                    haveGripHandWorld[firingHandIndex],
+                    frikHasVisualAuthority());
+        std::array<bool, 2> handPublished{};
+        for (const bool isLeft : { false, true }) {
+            const std::size_t index = isLeft ? 1u : 0u;
+            const char* tag = isLeft ?
+                WEAPON_WORLD_CONTACT_LEFT_TAG :
+                WEAPON_WORLD_CONTACT_RIGHT_TAG;
+            if (!attachedHandExpected[index]) {
+                (void)frik_visual_authority::
+                    clearExternalHandWorldTransform(
+                        tag,
+                        handFromBool(isLeft));
+                continue;
+            }
+            if (frik_visual_authority::
+                    applyExternalHandWorldTransform(
+                        tag,
+                        handFromBool(isLeft),
+                        targetGripHandWorld[index],
+                        WEAPON_WORLD_CONTACT_HAND_PRIORITY)) {
+                handPublished[index] = true;
+            }
+        }
+        if (!two_handed_weapon_policy::
+                hasCompleteAttachedHandPublicationSet(
+                    attachedHandExpected[0],
+                    attachedHandExpected[1],
+                    handPublished[0],
+                    handPublished[1])) {
+            (void)frik_visual_authority::
+                clearExternalHandWorldTransform(
+                    WEAPON_WORLD_CONTACT_RIGHT_TAG,
+                    handFromBool(false));
+            (void)frik_visual_authority::
+                clearExternalHandWorldTransform(
+                    WEAPON_WORLD_CONTACT_LEFT_TAG,
+                    handFromBool(true));
+            return false;
+        }
+
+
+        if (!retainedRigidStopPin) {
+            _weaponWorldContactRigidStopPin.active = true;
+            _weaponWorldContactRigidStopPin.weaponGenerationKey =
+                weaponGenerationKey;
+            _weaponWorldContactRigidStopPin.weaponOwnershipKey =
+                weaponOwnershipKey;
+            _weaponWorldContactRigidStopPin.immutableWallStop =
+                immutableWallStop;
+            _weaponWorldContactRigidStopPin.blockedWeaponWorld =
+                blockedWeaponWorld;
+            _weaponWorldContactRigidStopPin.attachedHandWorld =
+                targetGripHandWorld;
+            for (std::size_t index = 0;
+                 index < targetGripHandWorld.size(); ++index) {
+                if (!attachedHandExpected[index]) {
+                    continue;
+                }
+                _weaponWorldContactRigidStopPin.
+                    attachedHandWeaponLocal[index] =
+                        transform_math::composeTransforms(
+                            transform_math::invertTransform(
+                                effectiveWeaponWorld),
+                            targetGripHandWorld[index]);
+            }
+            _weaponWorldContactRigidStopPin.attachedHandExpected =
+                attachedHandExpected;
+        }
+
+        bool weaponPoseApplied = false;
+        if (!handDrivesNativeWeapon) {
+            const RE::NiTransform baseLocal = weaponNode->local;
+            if (!applyWeaponVisualAuthority(
+                    weaponNode,
+                    effectiveWeaponWorld)) {
+                (void)frik_visual_authority::
+                    clearExternalHandWorldTransform(
+                        WEAPON_WORLD_CONTACT_RIGHT_TAG,
+                        handFromBool(false));
+                (void)frik_visual_authority::
+                    clearExternalHandWorldTransform(
+                        WEAPON_WORLD_CONTACT_LEFT_TAG,
+                        handFromBool(true));
+                return false;
+            }
+            _weaponWorldContactVisual.active = true;
+            _weaponWorldContactVisual.weaponNode.reset(weaponNode);
+            _weaponWorldContactVisual.parentNode.reset(
+                weaponNode->parent);
+            _weaponWorldContactVisual.weaponGenerationKey =
+                weaponGenerationKey;
+            _weaponWorldContactVisual.weaponOwnershipKey =
+                weaponOwnershipKey;
+            _weaponWorldContactVisual.baseLocal = baseLocal;
+            _weaponWorldContactVisual.appliedLocal =
+                weaponNode->local;
+            _weaponWorldContactVisual.correctionWorld =
+                effectiveWeaponWorld.translate -
+                rawWeaponWorld.translate;
+            _weaponWorldContactVisual.ownsFullPose = true;
+            weaponPoseApplied = true;
+        }
+
+        bool handPoseApplied = false;
+        for (const bool isLeft : { false, true }) {
+            const std::size_t index = isLeft ? 1u : 0u;
+            if (!handPublished[index]) {
+                continue;
+            }
+            recordPublishedHandWorld(
+                isLeft,
+                targetGripHandWorld[index]);
+            handPoseApplied = true;
+        }
+        ROCK_LOG_SAMPLE_DEBUG(
+            Weapon,
+            1000,
+            "Weapon wall pose applied fraction={:.3f} translation={:.2f}gu rotation={:.2f}deg attachedMask={}{} handDriven={}",
+            allowedPoseFraction,
+            hand_visual_lerp_math::distanceGameUnits(
+                rawWeaponWorld.translate,
+                effectiveWeaponWorld.translate),
+            hand_visual_lerp_math::rotationDistanceDegrees(
+                rawWeaponWorld,
+                effectiveWeaponWorld),
+            attachedHandExpected[0] ? "R" : "-",
+            attachedHandExpected[1] ? "L" : "-",
+            handDrivesNativeWeapon ? "yes" : "no");
+        return weaponPoseApplied || handPoseApplied;
     }
 
     void TwoHandedGrip::recordPublishedHandWorld(const bool isLeft, const RE::NiTransform& appliedWorld)

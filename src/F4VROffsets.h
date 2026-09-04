@@ -124,6 +124,26 @@ namespace heisenberg
                                                 bool defaultProcessingOnly, bool fromScript, bool looping);
     inline REL::Relocation<_TESObjectREFR_ActivateRef> TESObjectREFR_ActivateRef{ REL::Offset(0x3f4a60) };
 
+    /**
+     * Return whether an alchemy form is one of Fallout 4's native Stimpaks.
+     * VR offset: 0x6548B0 - Address Library ID 364328 (verified)
+     */
+    using _MenuGameSettings_IsStimpak = bool(*)(RE::TESForm& form);
+    inline REL::Relocation<_MenuGameSettings_IsStimpak> MenuGameSettings_IsStimpak{
+        REL::Offset(0x6548B0)
+    };
+
+    /**
+     * Native companion-revive preflight used by the normal Activate action.
+     * The target is the wounded companion reference; PlayerRef and inventory
+     * checks remain engine-owned.
+     * VR offset: 0xCEC750 - Address Library ID 1037816 (verified)
+     */
+    using _ActorUtils_PlayerCanStimpak = bool(*)(RE::TESObjectREFR& target);
+    inline REL::Relocation<_ActorUtils_PlayerCanStimpak> ActorUtils_PlayerCanStimpak{
+        REL::Offset(0xCEC750)
+    };
+
     // =========================================================================
     // WEAPON EQUIPPING
     // =========================================================================
@@ -137,6 +157,93 @@ namespace heisenberg
                                                                RE::TESForm* object, 
                                                                RE::TBO_InstanceData* instanceData);
     inline REL::Relocation<_BGSObjectInstance_ctor> BGSObjectInstance_ctor{ REL::Offset(0x2dd930) };
+
+    // =========================================================================
+    // DROP FROM INVENTORY - instance-exact Actor::DropObject
+    // =========================================================================
+    // Proposed by CylonSurfer (2026-09-04). TESObjectREFR::RemoveItem with only a
+    // TESBoundObject* drops the FIRST stack of that base form in the inventory
+    // list, so a looted legendary/modded weapon can be swapped for the player's
+    // own plain copy of the same base form. Actor::DropObject takes a
+    // BGSObjectInstance (base form + TBO_InstanceData) plus an explicit stack-id
+    // array, so the exact stack that was looted is the one that leaves.
+    // VR offset: 0xDDFA60 (Actor vtable slot 0xEB in CommonLibF4).
+    //
+    // Signature (VR):
+    //   ObjectRefHandle* DropObject(Actor* self, ObjectRefHandle* outHandle,
+    //       BGSObjectInstance* item, BSTSmallArray<uint32_t,4>* stackData,
+    //       int32_t count, NiPoint3* pos, NiPoint3* rot)
+    using _Actor_DropObject = RE::ObjectRefHandle*(*)(RE::Actor* actor,
+                                                     RE::ObjectRefHandle* outHandle,
+                                                     RE::BGSObjectInstance* itemInstance,
+                                                     RE::BSTSmallArray<std::uint32_t, 4>* stackData,
+                                                     std::int32_t count,
+                                                     const RE::NiPoint3* pos,
+                                                     const RE::NiPoint3* rot);
+    inline REL::Relocation<_Actor_DropObject> Actor_DropObject{ REL::Offset(0xDDFA60) };
+
+    /**
+     * Drop a specific inventory item from an actor into the world.
+     *
+     * @param actor        Owner of the inventory (usually the player).
+     * @param baseForm     Base form of the item to drop.
+     * @param instanceData TBO_InstanceData of the exact instance (mods, legendary,
+     *                     renamed). nullptr = engine picks the default stack.
+     * @param count        Number of items to drop from that stack.
+     * @param pos / rot    World placement of the spawned reference (nullptr = actor feet).
+     * @param stackData    Optional explicit stack-id list; nullptr = default stack.
+     * @return Handle of the dropped reference (empty handle on failure).
+     */
+    inline RE::ObjectRefHandle DropItemFromActor(RE::Actor* actor,
+                                                 RE::TESForm* baseForm,
+                                                 RE::TBO_InstanceData* instanceData = nullptr,
+                                                 std::int32_t count = 1,
+                                                 const RE::NiPoint3* pos = nullptr,
+                                                 const RE::NiPoint3* rot = nullptr,
+                                                 RE::BSTSmallArray<std::uint32_t, 4>* stackData = nullptr)
+    {
+        RE::ObjectRefHandle outHandle;
+        if (!actor || !baseForm) {
+            return outHandle;
+        }
+
+        // One-time sanity check: the direct offset should be the same code the
+        // engine reaches through the Actor vtable (slot 0xEB). A mismatch is
+        // logged, not fatal - the offset was verified against FO4VR 1.2.72.
+        static bool s_vtableChecked = false;
+        if (!s_vtableChecked) {
+            s_vtableChecked = true;
+            auto** vtable = *reinterpret_cast<std::uintptr_t***>(actor);
+            const std::uintptr_t viaVtable = vtable ? reinterpret_cast<std::uintptr_t>(vtable[0xEB]) : 0;
+            const std::uintptr_t viaOffset = Actor_DropObject.address();
+            if (viaVtable != viaOffset) {
+                spdlog::warn("[DropObject] vtable slot 0xEB ({:X}) != REL::Offset(0xDDFA60) ({:X}) - using the offset",
+                    viaVtable, viaOffset);
+            } else {
+                spdlog::info("[DropObject] Actor::DropObject offset verified against vtable ({:X})", viaOffset);
+            }
+        }
+
+        // Same 0x10 layout as RE::BGSObjectInstance (TESForm* + BSTSmartPointer<TBO_InstanceData>),
+        // built by hand so no REL::ID constructor is needed on VR.
+        struct LocalObjectInstance {
+            RE::TESForm* object{ nullptr };
+            RE::BSTSmartPointer<RE::TBO_InstanceData> instanceData;
+        };
+        static_assert(sizeof(LocalObjectInstance) == 0x10);
+
+        LocalObjectInstance instance;
+        instance.object = baseForm;
+        instance.instanceData = RE::BSTSmartPointer<RE::TBO_InstanceData>(instanceData);
+
+        RE::BSTSmallArray<std::uint32_t, 4> localStackData;
+        RE::BSTSmallArray<std::uint32_t, 4>* stacks = stackData ? stackData : &localStackData;
+
+        Actor_DropObject(actor, &outHandle,
+                         reinterpret_cast<RE::BGSObjectInstance*>(&instance),
+                         stacks, count, pos, rot);
+        return outHandle;
+    }
 
     /**
      * GetEquippedWeapon - Get the currently equipped weapon for an actor

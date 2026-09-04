@@ -55,8 +55,13 @@ namespace heisenberg
             return nullptr;
         }
 
-        // Check if this node matches
-        if (root->name.c_str() && nodeName == root->name.c_str()) {
+        // Check if this node matches. CASE-INSENSITIVE on purpose: runtime node names are
+        // BSFixedStrings, which intern case-insensitively with first-interning-wins semantics
+        // process-wide. A mesh authored 'Button' and another authored 'button' can therefore
+        // both present EITHER casing at runtime depending on which loaded first - an
+        // exact-match here made target-node config silently load-order-dependent. CI compare
+        // cannot create a match the engine itself distinguishes, because the engine doesn't.
+        if (root->name.c_str() && _stricmp(nodeName.c_str(), root->name.c_str()) == 0) {
             return root;
         }
 

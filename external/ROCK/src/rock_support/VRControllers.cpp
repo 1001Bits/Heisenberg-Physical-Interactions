@@ -1,5 +1,7 @@
 #include "rock_support/VRControllers.h"
 
+#include "physics-interaction/input/InputRemapPolicy.h"
+
 #include <algorithm>
 #include <chrono>
 
@@ -103,6 +105,19 @@ namespace rock::vr_input
             current = {};
             return;
         }
+
+        // The embedded host deliberately keeps ROCK's input-remap hooks off,
+        // so this manager is the authoritative fallback for grab input. Some
+        // OpenVR profiles publish Grip through Axis2.x without a dependable
+        // k_EButton_Grip bit. Normalize that representation before deriving
+        // held/pressed/released state; previous already contains last frame's
+        // normalized mask and therefore supplies the hysteresis state.
+        current.ulButtonPressed =
+            input_remap_policy::normalizeGripPressedMask(
+                current.ulButtonPressed,
+                previous.ulButtonPressed,
+                current.rAxis[
+                    input_remap_policy::kOpenVrGripAxisIndex].x);
 
         for (std::size_t buttonIndex = 0; buttonIndex < kButtonCount; ++buttonIndex) {
             const std::uint64_t mask = std::uint64_t{ 1 } << buttonIndex;

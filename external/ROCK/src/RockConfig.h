@@ -122,11 +122,11 @@ namespace rock
 
         bool rockDeveloperModeEnabled = false;
 
-        // Release default is error-only. NOTE the NSDMI is NOT the effective default -
+        // Release default is WARN (0.8.6). NOTE the NSDMI is NOT the effective default -
         // load()/reload() both call resetToDefaults() first, so RockConfig.cpp's
-        // resetToDefaults() value is authoritative. Both are error (4); keep them
+        // resetToDefaults() value is authoritative. Both are warn (3); keep them
         // in sync or the header value is inert.
-        int rockLogLevel = 4;
+        int rockLogLevel = 3;  // Warn — release default; matches logging_policy::DefaultLogLevel
         // EMBED: default-empty on purpose. A >15-char std::string literal NSDMI on a namespace-scope
         // global (g_rockConfig) miscompiles in the static-lib embed: MSVC constexpr-materializes the
         // heap ("large-mode") representation but the buffer pointer comes out NULL, so the first
@@ -160,7 +160,10 @@ namespace rock
         float rockWeaponCollisionSupportFitMaxErrorGameUnits = 0.5f;
         float rockWeaponCollisionMaxLinearVelocity = 50.0f;
         float rockWeaponCollisionMaxAngularVelocity = 100.0f;
-        bool rockWeaponCollisionMaxSourceDistanceEnabled = true;
+        // Diagnostic opt-in only. Authored attachment pivots are not a reliable
+        // geometry-coverage bound; center-distance culling can remove a valid
+        // muzzle, stock, or scope hull and leave a wall-collision hole.
+        bool rockWeaponCollisionMaxSourceDistanceEnabled = false;
         float rockWeaponCollisionMaxSourceDistanceMelee = 90.0f;
         float rockWeaponCollisionMaxSourceDistancePistol = 20.0f;
         float rockWeaponCollisionMaxSourceDistanceRifle = 45.0f;
@@ -218,10 +221,9 @@ namespace rock
         float rockWeaponVisualReturnMaxAngleDegrees = 90.0f;
 
         bool rockSoftContactWorldEnabled = true;
-        // EMBED: free-hand visual wall pushback is temporarily disabled for
-        // release while its FRIK 0.77.12 presentation is revisited. This is a
-        // separate channel from equipped-weapon/world collision.
-        bool rockHandWorldPushbackEnabled = false;
+        // Master gate for solver-backed free-hand world/weapon stopping.
+        // Equipped-weapon/world collision remains an independent channel.
+        bool rockHandWorldPushbackEnabled = true;
         int rockSoftContactVisualPriority = 80;
         float rockSoftContactWorldRadiusPaddingGameUnits = 1.5f;
         float rockSoftContactWorldContactPaddingGameUnits = 0.35f;
@@ -251,11 +253,9 @@ namespace rock
         float rockNativeScopeOverlayPitchDegrees = 0.0f;
         float rockNativeScopeOverlayYawDegrees = 0.0f;
         float rockNativeScopeOverlayRollDegrees = 0.0f;
-        // EMBED: upstream's dynamic hand-collision drive is the alternative to the Heisenberg-preserved
-        // soft-contact runtime; the two are mutually exclusive (see PhysicsInteraction::updateFrame).
-        // The embed-wide rockHandWorldPushbackEnabled gate controls both paths
-        // and currently defaults OFF; this alternative also remains OFF.
-        bool rockHandCollisionDynamicDrive = false;
+        // The dynamic proxy solver owns free-hand presentation when enabled;
+        // SoftContactPolicy keeps the legacy hand channel mutually exclusive.
+        bool rockHandCollisionDynamicDrive = true;
         float rockHandCollisionDynamicMaxLinearVelocityHavok = 15.0f;
         float rockHandCollisionDynamicContactPressMaxVelocityHavok = 1.0f;
         float rockHandCollisionDynamicDivergenceTeleportGameUnits = 40.0f;
@@ -377,7 +377,7 @@ namespace rock
         bool rockLargeObjectBlockRestrictToClutterLargeLayer = true;
 
         // ── Embedded-host ownership masters (added for the Heisenberg single-DLL embed) ──
-        // When ROCK runs embedded inside Heisenberg, the host's iGrabMode chooses whether
+        // When ROCK runs embedded inside Heisenberg, the host's resolved policy chooses whether
         // ROCK owns grab+selection while ROCK keeps hand/weapon/world collision running.
         // Standalone ROCK leaves both true (no behaviour change).
         bool rockGrabEnabled = true;       // master: ROCK initiates / holds / throws grabs
@@ -386,7 +386,7 @@ namespace rock
         // dominant-hand collider suite while a weapon is drawn — the open hand can't push objects
         // when armed. false = HIGGS behavior (hand collision stays live while armed); true = stock ROCK.
         bool rockSuppressDominantHandCollision = false;
-        // EMBED: set via rock::HostSetGrabOwnership from Heisenberg's iGrabMode.
+        // EMBED: set via rock::HostSetGrabOwnership from Heisenberg's resolved ownership policy.
         // Once configured, both ON and OFF are forced after every shared-INI
         // load/reload so missing standalone ROCK keys cannot start a second grab system.
         bool rockHostGrabOwnershipConfigured = false;
@@ -580,18 +580,18 @@ namespace rock
         // since their computed deltaV rarely reaches this ceiling anyway.
         float rockDynamicPushMaxVelocityDelta = 2.5f;
 
-        float rockGrabLinearTau = 0.03f;
+        float rockGrabLinearTau = 0.01f;
         float rockGrabLinearDamping = 0.8f;
         float rockGrabLinearProportionalRecovery = 2.0f;
         float rockGrabLinearConstantRecovery = 1.0f;
 
-        float rockGrabAngularTau = 0.03f;
+        float rockGrabAngularTau = 0.01f;
         float rockGrabAngularDamping = 0.8f;
         float rockGrabAngularProportionalRecovery = 2.0f;
         float rockGrabAngularConstantRecovery = 1.0f;
 
-        float rockGrabConstraintMaxForce = 2000.0f;
-        float rockGrabMaxForceToMassRatio = 500.0f;
+        float rockGrabConstraintMaxForce = 8000.0f;
+        float rockGrabMaxForceToMassRatio = 1500.0f;
         float rockForceGrabAttachSettleSeconds = 0.10f;
         bool rockGrabEffectiveMotorMassFloorEnabled = true;
         float rockGrabEffectiveMotorMassFloor = 2.0f;
@@ -600,12 +600,20 @@ namespace rock
         float rockGrabPhysicsRateForceScaleExponent = 0.5f;
         float rockGrabPhysicsRateMinForceScale = 0.75f;
         float rockGrabPhysicsRateMaxForceScale = 1.35f;
-        bool rockGrabRoomVelocityFeedForward = false;
-        bool rockGrabLocomotionTransport = false;
-        bool rockGrabSmoothVelocityDrive = false;
+        bool rockGrabRoomVelocityFeedForward = true;
+        bool rockGrabLocomotionTransport = true;
+        bool rockGrabSmoothVelocityDrive = true;
         float rockGrabSmoothVelocityCorrectorGain = 0.2f;
+        bool rockGrabHeldObjectSweepEnabled = true;
+        float rockGrabHeldObjectSweepSkinGameUnits = 0.75f;
+        float rockGrabHeldObjectSweepMinDistanceGameUnits = 0.5f;
+        int rockGrabHeldObjectSweepMaxBodies = 16;
+        bool rockGrabHeldObjectSweepRotationEnabled = true;
+        float rockGrabHeldObjectSweepMaxAngularStepDegrees = 5.0f;
+        float rockGrabHeldObjectSweepMaxSurfaceArcStepGameUnits = 2.0f;
+        int rockGrabHeldObjectSweepMaxCasts = 48;
 
-        float rockGrabForceFadeInTime = 0.1f;
+        float rockGrabForceFadeInTime = 0.02f;
         int rockGrabRagdollDecompositionMode = -1;
         // (0, -2, 0), NOT the zero vector: resetToDefaults() assigns (0,-2,0) and overrides
         // these NSDMIs on every load()/reload(). Kept in sync so the header states the value
@@ -677,10 +685,14 @@ namespace rock
         float rockGrabVelocityDamping = 0.25f;
         bool rockGrabPlayerSpaceCompensation = true;
         float rockGrabPlayerSpaceWarpDistance = 35.0f;
-        float rockGrabPlayerSpaceWarpMinRotationDegrees = 0.6f;
+        float rockGrabPlayerSpaceWarpMinRotationDegrees = 12.0f;
         bool rockGrabPlayerSpaceTransformWarpEnabled = true;
-        bool rockGrabPlayerSpaceContinuousWarp = true;
+        bool rockGrabPlayerSpaceContinuousWarp = false;
         float rockGrabVisualHandMaxOffsetGameUnits = 10.0f;
+        // Visual seating is sourced from the commanded/clamped grab pose, not
+        // from live rigid-body readback, so it cannot feed solver jitter back
+        // into FRIK.
+        bool rockGrabHeldObjectVisualHandAuthorityEnabled = true;
         bool rockGrabLocomotionAuthorityBridgeEnabled = true;
         float rockGrabLocomotionAuthorityMaxLeadSeconds = grab_locomotion_authority_bridge::kDefaultMaxLeadSeconds;
         float rockGrabLocomotionAuthoritySmoothingHz = grab_locomotion_authority_bridge::kDefaultSmoothingHz;
@@ -917,7 +929,9 @@ namespace rock
         float rockPulledAngularDamping = 8.0f;
         float rockPulledGrabHandAdjustDistanceGameUnits = 10.5f;
         bool rockPullToObjectCenterEnabled = true;
-        bool rockPullLongAxisPresentationEnabled = true;
+        // Axis-only PCA leaves roll unconstrained and can make pulled props
+        // orbit/twirl before the final saved or palm-seat relation takes over.
+        bool rockPullLongAxisPresentationEnabled = false;
         bool rockForceGrabSeatAlignmentEnabled = true;
         float rockPullPresentationMinElongationRatio = 2.0f;
         float rockPullPresentationAngularGainPerSecond = 6.0f;

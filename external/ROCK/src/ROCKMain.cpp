@@ -28,9 +28,12 @@
 #include "physics-interaction/performance/PerformanceProfiler.h"
 #include "physics-interaction/visual/FrikCompatibilityPolicy.h"
 #include "physics-interaction/visual/FrikVisualAuthorityBridge.h"
+#include "physics-interaction/visual/PreAuthorityHandFramePolicy.h"
 #include "physics-interaction/weapon/SeeThroughScopesCompatibility.h"
 #include "physics-interaction/weapon/NativeScopeReentryPolicy.h"
 #include "physics-interaction/RockLoggingPolicy.h"
+#include "../../../src/ItemOffsets.h"
+#include "../../../src/WandNodeHelper.h"
 
 #include "RE/Bethesda/PlayerCharacter.h"
 #include "RE/Bethesda/TESForms.h"
@@ -58,6 +61,10 @@ namespace
     std::atomic<bool> s_nativeScopeGeometryHookInstalled{ false };
     rock::external_held_body_registry::Registry<64>
         s_externalHeldBodyRegistry;
+    // Retained only across the chained host update immediately preceding
+    // ROCK's update. Cleared at the start of every hook invocation so a host
+    // early-return can never leave a stale ViewCaster target behind.
+    RE::NiPointer<RE::TESObjectREFR> s_hostViewCasterGrabCandidates[2]{};
 
     bool s_pluginLoaded = false;
     // NOTE (Jul 20 audit): a per-frame SEH fault-containment flag (s_rockFrameFaulted) and
@@ -72,11 +79,15 @@ namespace
     // blanket wrap of the whole per-frame pipeline.
     // EMBED (Jul 19, frame-order audit): host pre-authority hand snapshot + post-update seam.
     RE::NiTransform s_preAuthHandWorld[2]{};   // [0]=Right, [1]=Left
-    bool s_preAuthHandFresh = false;           // set by host, cleared at onFrameUpdate tail
+    rock::pre_authority_hand_frame_policy::Provenance
+        s_preAuthHandProvenance =
+            rock::pre_authority_hand_frame_policy::Provenance::Unavailable;
     RE::NiPoint3 s_preAuthShoulderWorld[2]{};
     float s_preAuthMaxReach[2] = { 0.0f, 0.0f };
     bool s_preAuthArmReachValid[2] = { false, false };
     rock::HostPostUpdateFn s_hostPostUpdateFn = nullptr;
+    rock::HostPlayerConsumeBlockFn s_hostPlayerConsumeBlockFn = nullptr;
+    rock::HostPlayerConsumeProfileFn s_hostPlayerConsumeProfileFn = nullptr;
     std::atomic<std::uint32_t> s_providerGeneration{ 1 };
     std::atomic<std::uint32_t> s_skeletonGeneration{ 1 };
     std::atomic<bool> s_physicsCreationRequested{ false };
@@ -449,10 +460,19 @@ namespace
             !performanceBenchmarkBaseline &&
             runtime.localSkeletonReady &&
             !runtime.localMenuBlocking &&
+            !runtime.inputMenuBlocking &&
             !runtime.compatibilityConfigBlocking;
         input_remap_runtime::setWeaponDrawn(runtime.weaponDrawn);
         input_remap_runtime::setGameplayInputAllowed(gameplayInputAllowed);
-        debug_controller_runtime::update(gameplayInputAllowed, runtime.deltaSeconds);
+        // DEVELOPER MODE ONLY. This polls XInput and maps BARE A/B/X/Y to debug-collider
+        // draw and live grab-pivot authoring - and persists those flags into the user's INI
+        // (persistPhysicsBool). Ungated, a player with an Xbox pad connected for desktop use
+        // could put permanent debug wireframes and edited grab pivots into their config from
+        // one stray press, with no in-game way to undo it. bDeveloperModeEnabled already
+        // existed and defaulted false; it simply was not consulted here.
+        if (g_rockConfig.rockDeveloperModeEnabled) {
+            debug_controller_runtime::update(gameplayInputAllowed, runtime.deltaSeconds);
+        }
 
         if (!g_rockConfig.rockEnabled ||
             performanceBenchmarkBaseline) {
@@ -494,7 +514,8 @@ namespace
         // renderer and muzzle use. This stays an immediate per-frame sample: no motion
         // smoothing is introduced into the already-stable walking/aim path.
         see_through_scopes::updateFrame();
-        s_preAuthHandFresh = false;
+        s_preAuthHandProvenance =
+            rock::pre_authority_hand_frame_policy::Provenance::Unavailable;
         s_preAuthArmReachValid[0] = false;
         s_preAuthArmReachValid[1] = false;
     }
@@ -664,6 +685,10 @@ namespace
     // so FRIK finishes its skeleton and weapon pass before ROCK writes final state.
     void onGameFrameUpdateHook(const std::uint64_t rcx)
     {
+        for (auto& candidate : s_hostViewCasterGrabCandidates) {
+            candidate.reset();
+        }
+
         if (s_originalGameLoopFunc) {
             s_originalGameLoopFunc(rcx);
         }
@@ -679,6 +704,7 @@ namespace
             runtime.localSkeletonReady &&
             runtime.visualSkeletonReadyHint &&
             !runtime.localMenuBlocking &&
+            !runtime.inputMenuBlocking &&
             !runtime.compatibilityConfigBlocking;
         const bool benchmarkEligible =
             commonBenchmarkEligibility &&
@@ -983,6 +1009,13 @@ namespace rock
     {
         if (s_physicsInteraction && s_physicsInteraction->isInitialized()) {
             s_physicsInteraction->hostNotifyExternalGrab(a_isLeft, a_active);
+        }
+    }
+
+    void HostConsumeExternalGrabInputEdge(bool a_isLeft)
+    {
+        if (s_physicsInteraction && s_physicsInteraction->isInitialized()) {
+            s_physicsInteraction->hostConsumeExternalGrabInputEdge(a_isLeft);
         }
     }
 
@@ -1298,8 +1331,32 @@ namespace rock
         g_rockConfig.rockHostGrabOwnershipForced = a_rockOwnsGrab;
         g_rockConfig.rockGrabEnabled = a_rockOwnsGrab;
         g_rockConfig.rockSelectionEnabled = a_rockOwnsGrab;
-        logger::info("ROCK(host): grab+selection ownership {} (Heisenberg iGrabMode host seam)",
+        // Embedded ROCK consumes the host ViewCaster candidate.  Its own VATS
+        // glow and curved beam are deliberately visual-only and must not
+        // compete with Fallout VR's native selection feedback.
+        if (a_rockOwnsGrab) {
+            g_rockConfig.rockHighlightEnabled = false;
+            g_rockConfig.rockSelectionBeamEnabled = false;
+        }
+        if (!a_rockOwnsGrab) {
+            for (auto& candidate : s_hostViewCasterGrabCandidates) {
+                candidate.reset();
+            }
+        }
+        logger::info("ROCK(host): grab+selection ownership {} (Heisenberg resolved ownership seam)",
             a_rockOwnsGrab ? "ceded to embedded ROCK" : "retained by host");
+    }
+
+    void HostPublishViewCasterGrabCandidate(
+        bool a_isLeft,
+        RE::TESObjectREFR* a_target)
+    {
+        s_hostViewCasterGrabCandidates[a_isLeft ? 1u : 0u].reset(a_target);
+    }
+
+    RE::TESObjectREFR* HostGetViewCasterGrabCandidate(bool a_isLeft)
+    {
+        return s_hostViewCasterGrabCandidates[a_isLeft ? 1u : 0u].get();
     }
 
     namespace
@@ -1417,6 +1474,164 @@ namespace rock
             *a_outAgeFrames,
             *a_outContactPointWorld,
             *a_outHasContactPoint);
+    }
+
+    bool HostGetHeldObjectSnapshot(
+        bool a_isLeft,
+        HostHeldObjectSnapshot& a_out)
+    {
+        a_out = {};
+        if (!s_physicsInteraction) {
+            return false;
+        }
+        return s_physicsInteraction->hostGetHeldObjectSnapshot(
+            a_isLeft,
+            a_out.ref,
+            a_out.heldNode,
+            a_out.heldSeconds,
+            a_out.handSpeedMetersPerSecond,
+            a_out.grabTraceId);
+    }
+
+    bool HostGetExactItemGrabProfile(
+        RE::TESObjectREFR* a_ref,
+        bool a_isLeft,
+        HostExactItemGrabProfile& a_out)
+    {
+        a_out = {};
+        if (!a_ref) {
+            return false;
+        }
+        auto& offsetManager =
+            heisenberg::ItemOffsetManager::GetSingleton();
+        auto resolved = offsetManager.GetExactOffset(a_ref, a_isLeft);
+        if (!resolved.has_value()) {
+            /*
+             * Bounds in TESBoundObject are integral model-space extents. An
+             * exact L/W/H triple is therefore a useful donor key for objects
+             * that reuse the same geometry but have a different form/name.
+             * GetExactDimensionsOffset remains strict (no tolerance), prefers
+             * the same form type, and resolves ties deterministically; fuzzy
+             * shape matching is deliberately excluded from this bridge.
+             */
+            resolved = offsetManager.GetExactDimensionsOffset(
+                a_ref, a_isLeft);
+        }
+        if (!resolved.has_value()) {
+            return false;
+        }
+
+        auto profile = *resolved;
+        const bool namedLeft =
+            profile.matchedName.size() >= 2 &&
+            profile.matchedName.compare(profile.matchedName.size() - 2, 2, "_L") == 0;
+        const bool namedRight =
+            profile.matchedName.size() >= 2 &&
+            profile.matchedName.compare(profile.matchedName.size() - 2, 2, "_R") == 0;
+        if (profile.isRightHandSpace) {
+            if (a_isLeft && !profile.isLeftHanded && !namedLeft) {
+                profile.position.z = -profile.position.z;
+                profile.rotation.entry[0][1] = -profile.rotation.entry[0][1];
+                profile.rotation.entry[1][0] = -profile.rotation.entry[1][0];
+                profile.rotation.entry[1][2] = -profile.rotation.entry[1][2];
+                profile.rotation.entry[2][1] = -profile.rotation.entry[2][1];
+            }
+        } else if (!a_isLeft && !namedRight) {
+            profile.position.x = -profile.position.x;
+            profile.rotation.entry[0][1] = -profile.rotation.entry[0][1];
+            profile.rotation.entry[0][2] = -profile.rotation.entry[0][2];
+            profile.rotation.entry[1][0] = -profile.rotation.entry[1][0];
+            profile.rotation.entry[2][0] = -profile.rotation.entry[2][0];
+        }
+
+        a_out.localPosition = profile.position;
+        a_out.localRotation = profile.rotation;
+        a_out.fingerCurls = { profile.thumbCurl, profile.indexCurl,
+            profile.middleCurl, profile.ringCurl, profile.pinkyCurl };
+        std::copy(std::begin(profile.jointCurls), std::end(profile.jointCurls),
+            a_out.jointCurls.begin());
+        a_out.hasFingerCurls = profile.hasFingerCurls;
+        a_out.hasJointCurls = profile.hasJointCurls;
+        if (profile.isFRIKOffset) {
+            a_out.parentWorldValid =
+                HostGetPreAuthorityHandWorld(a_isLeft, a_out.parentWorld);
+        } else if (auto* nodes = f4cf::f4vr::getPlayerNodes()) {
+            if (auto* wand = heisenberg::GetWandNode(nodes, a_isLeft)) {
+                a_out.parentWorld = wand->world;
+                a_out.parentWorldValid = true;
+            }
+        }
+        if (!a_out.parentWorldValid) {
+            a_out.parentWorld = {};
+        }
+        return true;
+    }
+
+    bool HostReleaseHeldObjectForInventory(
+        bool a_isLeft,
+        RE::TESObjectREFR* a_expectedRef,
+        std::uint64_t a_expectedGrabTraceId)
+    {
+        return s_physicsInteraction &&
+               s_physicsInteraction->hostReleaseHeldObjectForInventory(
+                   a_isLeft,
+                   a_expectedRef,
+                   a_expectedGrabTraceId);
+    }
+
+    void HostSetPlayerConsumeBlockCallback(
+        HostPlayerConsumeBlockFn a_fn)
+    {
+        s_hostPlayerConsumeBlockFn = a_fn;
+        logger::info(
+            "ROCK(host): player-consume reservation callback {}",
+            a_fn ? "registered" : "cleared");
+    }
+
+    bool HostShouldBlockPlayerConsume(RE::TESObjectREFR* a_ref)
+    {
+        if (!a_ref || !s_hostPlayerConsumeBlockFn) {
+            return false;
+        }
+        try {
+            return s_hostPlayerConsumeBlockFn(a_ref);
+        } catch (...) {
+            logger::error(
+                "ROCK(host): player-consume reservation callback faulted; blocking the current held item");
+            return true;
+        }
+    }
+
+    void HostSetPlayerConsumeProfileCallback(
+        HostPlayerConsumeProfileFn a_fn)
+    {
+        s_hostPlayerConsumeProfileFn = a_fn;
+        logger::info(
+            "ROCK(host): player-consume route/profile callback {}",
+            a_fn ? "registered" : "cleared");
+    }
+
+    bool HostResolvePlayerConsumeProfile(
+        RE::TESObjectREFR* a_ref,
+        bool a_holdingHandIsLeft,
+        HostPlayerConsumeProfile& a_inOut)
+    {
+        if (!a_ref) {
+            return false;
+        }
+        if (!s_hostPlayerConsumeProfileFn) {
+            return true;
+        }
+        try {
+            return s_hostPlayerConsumeProfileFn(
+                a_ref,
+                a_holdingHandIsLeft,
+                a_inOut);
+        } catch (...) {
+            logger::error(
+                "ROCK(host): player-consume route/profile callback faulted; blocking the current held item");
+            return false;
+        }
     }
 
     std::uint32_t HostCopyHandCollisionSamples(
@@ -1560,16 +1775,49 @@ namespace rock
     {
         s_preAuthHandWorld[1] = a_left;
         s_preAuthHandWorld[0] = a_right;
-        s_preAuthHandFresh = true;
+        s_preAuthHandProvenance =
+            pre_authority_hand_frame_policy::Provenance::CleanPass1;
         // Reach is paired with this exact clean-hand publication. Invalidate the old
         // pair first; FrikArmGoalHook fills whichever current arms resolve safely.
         s_preAuthArmReachValid[0] = false;
         s_preAuthArmReachValid[1] = false;
     }
 
+    void HostSetFallbackPreAuthorityHandWorlds(
+        const RE::NiTransform& a_left,
+        const RE::NiTransform& a_right)
+    {
+        s_preAuthHandWorld[1] = a_left;
+        s_preAuthHandWorld[0] = a_right;
+        s_preAuthHandProvenance =
+            pre_authority_hand_frame_policy::Provenance::SkinnedFallback;
+        // The fallback pair can still serve legacy weapon consumers, but any
+        // old reach sample belonged to a different hand publication.
+        s_preAuthArmReachValid[0] = false;
+        s_preAuthArmReachValid[1] = false;
+    }
+
+    bool HostRequiresPreAuthorityHandWorld()
+    {
+        return s_pluginLoaded;
+    }
+
     bool HostGetPreAuthorityHandWorld(bool a_isLeft, RE::NiTransform& a_out)
     {
-        if (!s_preAuthHandFresh) {
+        if (!pre_authority_hand_frame_policy::isAvailable(
+                s_preAuthHandProvenance)) {
+            return false;
+        }
+        a_out = s_preAuthHandWorld[a_isLeft ? 1 : 0];
+        return true;
+    }
+
+    bool HostGetCleanPreAuthorityHandWorld(
+        bool a_isLeft,
+        RE::NiTransform& a_out)
+    {
+        if (!pre_authority_hand_frame_policy::isTrueCleanPass1(
+                s_preAuthHandProvenance)) {
             return false;
         }
         a_out = s_preAuthHandWorld[a_isLeft ? 1 : 0];
@@ -1583,7 +1831,9 @@ namespace rock
         const bool finite = std::isfinite(a_shoulderWorld.x) &&
             std::isfinite(a_shoulderWorld.y) && std::isfinite(a_shoulderWorld.z) &&
             std::isfinite(a_maxReach);
-        if (!s_preAuthHandFresh || !finite || a_maxReach <= 1.0f || a_maxReach >= 200.0f) {
+        if (!pre_authority_hand_frame_policy::isAvailable(
+                s_preAuthHandProvenance) ||
+            !finite || a_maxReach <= 1.0f || a_maxReach >= 200.0f) {
             s_preAuthArmReachValid[i] = false;
             return;
         }
@@ -1596,7 +1846,9 @@ namespace rock
         float& a_maxReach)
     {
         const int i = a_isLeft ? 1 : 0;
-        if (!s_preAuthHandFresh || !s_preAuthArmReachValid[i]) {
+        if (!pre_authority_hand_frame_policy::isAvailable(
+                s_preAuthHandProvenance) ||
+            !s_preAuthArmReachValid[i]) {
             return false;
         }
         a_shoulderWorld = s_preAuthShoulderWorld[i];

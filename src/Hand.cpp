@@ -6,8 +6,10 @@
 #include "FingerCurves.h"
 #include "FRIKInterface.h"
 #include "Grab.h"
+#include "GrabOwnershipPolicy.h"
 #include "GrabPosePolicy.h"
 #include "Heisenberg.h"
+#include "StorageZoneWeaponPolicy.h"
 #include "../external/ROCK/src/ROCKMain.h"
 #include "HeisenbergInterface001.h"
 #include "Highlight.h"
@@ -35,7 +37,8 @@
 
 namespace
 {
-    // Returns true if any blocking menu is open (pause, pipboy, inventory, etc.)
+    // Returns true if a genuinely blocking menu is open. Favorites and Pip-Boy
+    // remain live for tracking, selection, grabbing, and release input.
     // Uses event-based MenuChecker for thread safety instead of direct UI calls
     bool IsBlockingMenuOpen()
     {
@@ -71,6 +74,7 @@ namespace
         auto nameView = RE::TESFullName::GetFullName(*weaponForm, false);
         return nameView.empty() ? "Weapon" : std::string(nameView);
     }
+
 }
 
 namespace heisenberg
@@ -87,12 +91,67 @@ namespace heisenberg
 
     bool Hand::IsPrimaryHand() const
     {
-        return VRInput::GetSingleton().IsLeftHandedMode() ? _isLeft : !_isLeft;
+        return storage_zone_weapon_policy::isPrimaryHand(
+            _isLeft,
+            VRInput::GetSingleton().IsLeftHandedMode());
     }
 
     bool Hand::IsOffHand() const
     {
         return !IsPrimaryHand();
+    }
+
+    bool Hand::TryUnequipWeaponForStorageZoneSwap()
+    {
+        if (IsBlockingMenuOpen() ||
+            MenuChecker::GetSingleton().IsInMenuCloseCooldown()) {
+            return false;
+        }
+
+        if (!g_config.enableStorageZoneWeaponEquip ||
+            !IsPrimaryHand()) {
+            return false;
+        }
+
+        const auto storageCheck = CheckItemStorageZone(_position);
+        if (!storageCheck.isInZone) {
+            return false;
+        }
+
+        const bool offhandIsLeft =
+            storage_zone_weapon_policy::offhandIsLeft(
+                VRInput::GetSingleton().IsLeftHandedMode());
+        const bool offhandGrabbingWeapon =
+            IsHandGrabbingRealWeapon(offhandIsLeft);
+        auto* equippedWeapon = GetPlayerEquippedRealWeapon();
+        const bool playerHasWeaponEquipped = equippedWeapon != nullptr;
+        if (!storage_zone_weapon_policy::shouldUnequipPrimaryWeapon(
+                storage_zone_weapon_policy::Input{
+                    .featureEnabled =
+                        g_config.enableStorageZoneWeaponEquip,
+                    .primaryHand = IsPrimaryHand(),
+                    .insideStorageZone = storageCheck.isInZone,
+                    .offhandGrabbingWeapon = offhandGrabbingWeapon,
+                    .playerHasWeaponEquipped =
+                        playerHasWeaponEquipped,
+                })) {
+            return false;
+        }
+
+        const std::string displayName =
+            GetWeaponDisplayName(equippedWeapon);
+        g_heisenberg.QueueWeaponUnequip(
+            equippedWeapon,
+            displayName.c_str(),
+            offhandIsLeft);
+        spdlog::info(
+            "[GRAB] StorageZone weapon-swap gesture queued unequip of '{}' "
+            "(primary={} offhandWeapon={} equipped={})",
+            displayName,
+            _isLeft ? "left" : "right",
+            offhandGrabbingWeapon,
+            playerHasWeaponEquipped);
+        return true;
     }
 
     void Hand::Update()
@@ -104,6 +163,8 @@ namespace heisenberg
         // workshop functions. We must completely disable Heisenberg to allow the
         // native grip functionality to work.
         if (IsBlockingMenuOpen()) {
+            rock::HostPublishViewCasterGrabCandidate(_isLeft, nullptr);
+
             // Only update tracking (needed for other mods like FRIK)
             UpdateTracking();
 
@@ -530,11 +591,13 @@ namespace heisenberg
     {
         if (_state == State::Held || _state == State::Pulling) {
             // Don't update selection while holding or pulling
+            rock::HostPublishViewCasterGrabCandidate(_isLeft, nullptr);
             return;
         }
 
         // Don't select objects when hand is disabled via API
         if (HeisenbergPluginAPI::IsHandDisabledByAPI(_isLeft)) {
+            rock::HostPublishViewCasterGrabCandidate(_isLeft, nullptr);
             if (_selection.IsValid()) {
                 std::scoped_lock lock(_stateMutex);
                 _selection.Clear();
@@ -552,6 +615,16 @@ namespace heisenberg
         // =====================================================================
         
         RE::ObjectRefHandle targetHandle = GetVRWandTargetHandle(_isLeft);
+        RE::NiPointer<RE::TESObjectREFR> targetPtr;
+        if (targetHandle) {
+            targetPtr = targetHandle.get();
+        }
+
+        // ROCK owns grabbing in embedded mode, but Fallout's native
+        // ViewCaster remains the authoritative selector.  The bridge retains
+        // the reference for this frame and ROCK still validates its physics
+        // body before it can become a grab target.
+        rock::HostPublishViewCasterGrabCandidate(_isLeft, targetPtr.get());
         
         // Check if target changed from last frame
         bool targetChanged = (targetHandle != _lastViewCasterHandle);
@@ -560,7 +633,7 @@ namespace heisenberg
 
         // Fire ViewCaster target-changed callback for external plugins
         if (targetChanged) {
-            RE::TESObjectREFR* newTarget = targetHandle ? targetHandle.get().get() : nullptr;
+            RE::TESObjectREFR* newTarget = targetPtr.get();
             RE::TESObjectREFR* oldTarget = oldHandle ? oldHandle.get().get() : nullptr;
             HeisenbergPluginAPI::InvokeViewCasterTargetChangedCallbacks(_isLeft, newTarget, oldTarget);
         }
@@ -596,8 +669,7 @@ namespace heisenberg
         }
         
         // Get reference from handle
-        RE::NiPointer<RE::TESObjectREFR> refrPtr = targetHandle.get();
-        RE::TESObjectREFR* refr = refrPtr.get();
+        RE::TESObjectREFR* refr = targetPtr.get();
         
         if (!refr) {
             _selection.Clear();
@@ -855,11 +927,78 @@ namespace heisenberg
     {
         _grabPressed = true;
 
+        // Programmatic in-hand placement (DropToHand, SmartGrab, cooking, and
+        // the public API) intentionally remains a GrabManager operation even
+        // when iGrabMode=9 gives ordinary world selection to embedded ROCK.
+        // Service an already-active host grab before any ROCK/support-grip
+        // cede.  The v0.8.10 ordering returned above this branch and stranded
+        // sticky items: the runtime log showed Acid held by GrabManager while
+        // repeated valid left-grip press/release edges did nothing.
+        auto& grabMgr = GrabManager::GetSingleton();
+        const auto& grabState = grabMgr.GetGrabState(_isLeft);
+        const bool rockHosted = heisenberg::IsRockEngineHosted();
+        const bool weaponSupportEngaged =
+            rockHosted && rock::HostIsWeaponSupportEngaged(_isLeft);
+        const auto gripInput =
+            grab_ownership_policy::resolveGripInput(
+                g_config.grabMode,
+                g_config.delegateWorldGrabToRock,
+                rockHosted,
+                grabState.active,
+                weaponSupportEngaged);
+        if (gripInput.owner ==
+            grab_ownership_policy::GripInputOwner::HostActiveGrab) {
+            // Menus normally bypass UpdateInput entirely, but retain this gate
+            // as a fail-safe for a menu transition occurring mid-frame.
+            if (IsBlockingMenuOpen()) {
+                return;
+            }
+
+            const bool stickyGrab = grabState.stickyGrab;
+            auto* heldRef = grabState.GetRefr();
+            if (gripInput.consumeEmbeddedRockEdge) {
+                rock::HostConsumeExternalGrabInputEdge(_isLeft);
+            }
+            if (!grab_ownership_policy::shouldReleaseActiveHostGrab(
+                    stickyGrab,
+                    grab_ownership_policy::GripEdge::Pressed)) {
+                spdlog::debug(
+                    "[GRAB-OWNER] {} grip press retained active non-sticky "
+                    "host grab until release (formID={:08X})",
+                    _isLeft ? "Left" : "Right",
+                    heldRef ? heldRef->GetFormID() : 0u);
+                return;
+            }
+            spdlog::info(
+                "[GRAB-OWNER] {} grip press releasing active host sticky "
+                "grab before ROCK cede (formID={:08X})",
+                _isLeft ? "Left" : "Right",
+                heldRef ? heldRef->GetFormID() : 0u);
+            Release(true);
+            if (stickyGrab) {
+                g_heisenberg.StartStickyGrabCooldown(_isLeft);
+            }
+            TransitionToIdle();
+            return;
+        }
+
+        // StorageZone only owns a primary-hand grip for the explicit weapon
+        // swap gesture. Run this before the embedded-world-grab cede so mode 9
+        // and mode 0 use the same compatibility rule. Consuming ROCK's copy of
+        // the edge prevents it from also acquiring a firing/world grip.
+        if (TryUnequipWeaponForStorageZoneSwap()) {
+            if (rockHosted) {
+                rock::HostConsumeExternalGrabInputEdge(_isLeft);
+            }
+            return;
+        }
+
         // OFFHAND-VS-GRAB GATE (Jul 18, user request): while this hand is engaging the equipped
         // weapon (ROCK two-handed support touch/grip), a grip press means "grab the weapon" —
         // NOT "grab a world object". Starting a Heisenberg grab here made two systems pose the
         // same hand (ROCK support grip + our grab/pull) = the chewing-gum stretch.
-        if (heisenberg::IsRockEngineHosted() && rock::HostIsWeaponSupportEngaged(_isLeft)) {
+        if (gripInput.owner ==
+            grab_ownership_policy::GripInputOwner::EmbeddedRockWeaponSupport) {
             spdlog::debug("[GRAB] {} hand: grip press ceded to ROCK two-handed support grip (no object grab)",
                           _isLeft ? "Left" : "Right");
             return;
@@ -868,43 +1007,9 @@ namespace heisenberg
         // iGrabMode=9 (Full Dynamic): the embedded ROCK engine reads grip input itself and owns
         // grab+selection end-to-end. Heisenberg must not contend for the grip or start its own
         // grabs (double-grab / input-flap — see the two-handed offhand grip conflict).
-        if (g_config.grabMode == static_cast<int>(GrabMode::FullDynamic) && heisenberg::IsRockEngineHosted()) {
+        if (gripInput.owner ==
+            grab_ownership_policy::GripInputOwner::EmbeddedRockWorldGrab) {
             return;
-        }
-
-        // Check if we have an active grab — both sticky and non-sticky desync cases.
-        // Must be checked BEFORE menu cooldown: player should be able to release
-        // a grab immediately after closing Pipboy (not blocked by 1s cooldown).
-        auto& grabMgr = GrabManager::GetSingleton();
-        const auto& grabState = grabMgr.GetGrabState(_isLeft);
-        if (grabState.active && !IsBlockingMenuOpen()) {
-            if (grabState.stickyGrab) {
-                // Sticky grab: grip PRESS releases it
-                spdlog::debug("[GRAB] {} hand: Grip pressed on sticky grab - releasing",
-                            _isLeft ? "Left" : "Right");
-                Release(true);
-                g_heisenberg.StartStickyGrabCooldown(_isLeft);
-                TransitionToIdle();
-                return;
-            }
-            if (_state == State::Idle || _state == State::Held || _state == State::Pulling) {
-                // Non-sticky grab active. _state==Idle is the desync-from-DropToHand-timing
-                // case (release missed because DropToHand hadn't processed yet); _state==
-                // Held/Pulling is the NORMAL case for a non-sticky grab (DropToHand.cpp
-                // passes stickyGrab=false for world weapon pickups) with the grip
-                // physically still up - state-sync in Update() forces _state=Held for any
-                // GrabManager-started grab, so without this branch a press here fell
-                // through the switch below into `default:` ("no valid target"), which
-                // spawns SmartGrab / queues a weapon unequip while THIS hand is still
-                // holding something. Release it now on press instead (same recovery as
-                // the Idle case) so the no-target default branch is unreachable while
-                // GrabManager holds an object for this hand.
-                spdlog::debug("[GRAB] {} hand: Grip pressed on {} non-sticky grab - releasing",
-                            _isLeft ? "Left" : "Right", _state == State::Idle ? "desynced" : "active");
-                Release(true);
-                TransitionToIdle();
-                return;
-            }
         }
 
         // Don't allow grabbing when blocking menus are open
@@ -912,8 +1017,7 @@ namespace heisenberg
             return;
         }
 
-        // Don't allow grabbing for 1 second after closing a menu
-        // This prevents accidental grabs when exiting inventory/pipboy
+        // Don't allow grabbing briefly after closing a genuinely blocking menu.
         if (MenuChecker::GetSingleton().IsInMenuCloseCooldown()) {
             spdlog::debug("[GRAB] {} hand: Grip pressed during menu close cooldown - ignoring",
                          _isLeft ? "Left" : "Right");
@@ -1152,51 +1256,6 @@ namespace heisenberg
 
                 auto storageCheck = CheckItemStorageZone(_position);
 
-                // WEAPON UNEQUIP: If weapon hand is in storage zone and weapon is drawn, unequip it.
-                // Must check IsWeaponDrawn() because equipData->item persists even after unequip,
-                // which would cause repeated unequip triggers on subsequent grip presses.
-                if (g_config.enableStorageZoneWeaponEquip && IsPrimaryHand() && storageCheck.isInZone) {
-                    auto* player = f4vr::getPlayer();
-                    if (player && player->GetWeaponMagicDrawn() &&
-                        player->currentProcess && player->currentProcess->middleHigh &&
-                        !player->currentProcess->middleHigh->equippedItems.empty() &&
-                        player->currentProcess->middleHigh->equippedItems.front().item.object) {
-                        auto* item = player->currentProcess->middleHigh->equippedItems.front().item.object;
-                        auto* reForm = reinterpret_cast<RE::TESForm*>(item);
-                        // Only unequip real weapons (guns, melee) - skip throwables and non-weapons
-                        bool isRealWeapon = false;
-                        if (reForm->IsWeapon()) {
-                            auto* weapon = static_cast<RE::TESObjectWEAP*>(reForm);
-                            auto weaponType = weapon->weaponData.type.get();
-                            if (weaponType != RE::WEAPON_TYPE::kGrenade && weaponType != RE::WEAPON_TYPE::kMine) {
-                                isRealWeapon = true;
-                            }
-                        }
-                        if (isRealWeapon) {
-                            // Get full display name with mods (e.g., "Laser Pistol" not just "Laser")
-                            std::string displayName = GetWeaponDisplayName(reForm);
-                            // Defer unequip to next frame - calling UnEquipItem during
-                            // HookPostPhysics causes an access violation exception
-                            g_heisenberg.QueueWeaponUnequip(reForm, displayName.c_str());
-                            spdlog::debug("[GRAB] Queued weapon '{}' for unequip via storage zone",
-                                        displayName);
-                            break;
-                        }
-                    }
-                    // RE-EQUIP: Weapon not drawn, but we have a previously unequipped weapon
-                    // Grip in storage zone with weapon hand → re-equip the last unequipped weapon
-                    else if (player && !player->GetWeaponMagicDrawn()) {
-                        auto* lastWeapon = g_heisenberg.GetLastUnequippedWeapon();
-                        if (lastWeapon) {
-                            auto weaponName = g_heisenberg.GetLastUnequippedWeaponName();
-                            g_heisenberg.QueueWeaponReequip(lastWeapon, weaponName.c_str());
-                            spdlog::debug("[GRAB] Queued weapon '{}' for re-equip via storage zone",
-                                        weaponName);
-                            break;
-                        }
-                    }
-                }
-
                 // SmartGrab: grip in storage zone with no weapon - pull item from inventory
                 if (storageCheck.isInZone && g_config.enableSmartGrab) {
                     spdlog::debug("[SMARTGRAB] {} hand: Grip pressed in storage zone - trying smart grab",
@@ -1219,37 +1278,53 @@ namespace heisenberg
     {
         _grabPressed = false;
 
-        // iGrabMode=9 (Full Dynamic): release is ROCK's to handle too.
-        if (g_config.grabMode == static_cast<int>(GrabMode::FullDynamic) && heisenberg::IsRockEngineHosted()) {
-            return;
-        }
-        
-        // Get the grab state from GrabManager - this is the authoritative source
-        // because grabs can be started by DropToHand without going through Hand state machine
+        // GrabManager is authoritative for programmatic in-hand placements.
+        // It keeps both sticky and hold-to-grab release semantics even while
+        // embedded ROCK owns idle/world grab input.
         auto& grabMgr = GrabManager::GetSingleton();
         const auto& grabState = grabMgr.GetGrabState(_isLeft);
+        const auto gripInput =
+            grab_ownership_policy::resolveGripInput(
+                g_config.grabMode,
+                g_config.delegateWorldGrabToRock,
+                heisenberg::IsRockEngineHosted(),
+                grabState.active,
+                false);
 
-        // If GrabManager has an active grab for this hand (regardless of Hand's state)
-        if (grabState.active) {
-            // Check for sticky grab mode - if active, don't release the object
-            if (grabState.stickyGrab) {
-                spdlog::debug("{} hand: Grip released but sticky grab active - keeping hold",
-                              _isLeft ? "Left" : "Right");
-                return;  // Don't release
+        if (gripInput.owner ==
+            grab_ownership_policy::GripInputOwner::HostActiveGrab) {
+            if (gripInput.consumeEmbeddedRockEdge) {
+                rock::HostConsumeExternalGrabInputEdge(_isLeft);
             }
-            
-            // Don't release while blocking menus are open - this protects
-            // objects grabbed by DropToHand while in Pipboy/inventory/etc.
-            if (IsBlockingMenuOpen()) {
-                spdlog::debug("{} hand: Grip released but blocking menu open - keeping hold",
-                              _isLeft ? "Left" : "Right");
+            if (!grab_ownership_policy::shouldReleaseActiveHostGrab(
+                    grabState.stickyGrab,
+                    grab_ownership_policy::GripEdge::Released)) {
+                spdlog::debug(
+                    "{} hand: Grip released but sticky host grab active - keeping hold",
+                    _isLeft ? "Left" : "Right");
                 return;
             }
-            
-            // Release with throwing
+            if (IsBlockingMenuOpen()) {
+                spdlog::debug(
+                    "{} hand: Grip released but blocking menu open - keeping host hold",
+                    _isLeft ? "Left" : "Right");
+                return;
+            }
+
+            auto* heldRef = grabState.GetRefr();
+            spdlog::info(
+                "[GRAB-OWNER] {} grip release dropping active non-sticky host "
+                "grab before ROCK cede (formID={:08X})",
+                _isLeft ? "Left" : "Right",
+                heldRef ? heldRef->GetFormID() : 0u);
             Release(true);
-            
             TransitionToIdle();
+            return;
+        }
+
+        // iGrabMode=9 (Full Dynamic): release is ROCK's to handle too.
+        if (gripInput.owner ==
+            grab_ownership_policy::GripInputOwner::EmbeddedRockWorldGrab) {
             return;
         }
 
@@ -1367,20 +1442,36 @@ namespace heisenberg
                         // visible mesh instead of the object origin so gripping
                         // a second spot along the shaft reaches StartGrab's
                         // two-anchor path.
-                        constexpr float kCoHoldMeshDistance = 5.0f;
+                        RE::NiPoint3 candidatePalm = _position;
+                        if (auto* playerNodes =
+                                f4cf::f4vr::getPlayerNodes()) {
+                            if (auto* wand =
+                                    heisenberg::GetWandNode(
+                                        playerNodes,
+                                        _isLeft)) {
+                                (void)GetCleanTrackedPalmPosition(
+                                    wand,
+                                    _isLeft,
+                                    candidatePalm);
+                            }
+                        }
+
+                        constexpr float kCandidateMeshDistance =
+                            grab_pose_policy::
+                                kSameObjectTransferCandidateDistance;
                         const float handToBoundCenter =
                             (held3D->worldBound.center -
-                             _position).Length();
+                             candidatePalm).Length();
                         const bool clearlyOutsideHeldMesh =
                             grab_pose_policy::
                                 CanRejectCoHoldMeshQuery(
                                     handToBoundCenter,
                                     held3D->worldBound.fRadius,
-                                    kCoHoldMeshDistance);
+                                    kCandidateMeshDistance);
 
                         // worldBound is already a world-space sphere enclosing
                         // every visible child. If the hand is outside that
-                        // sphere plus the five-unit acceptance distance and
+                        // sphere plus the transfer-candidate distance and
                         // the policy's five-unit update guard, no triangle can
                         // qualify. Invalid/degenerate bounds deliberately
                         // return false and retain the exact compatibility path.
@@ -1390,11 +1481,12 @@ namespace heisenberg
                             GetTriangles(held3D, triangles, 4096);
                             if (GetClosestMeshPointToPoint(
                                     triangles,
-                                    _position,
+                                    candidatePalm,
                                     grabPoint,
                                     grabDistance) &&
-                                grabDistance <=
-                                    kCoHoldMeshDistance) {
+                                grab_pose_policy::
+                                    ShouldOfferSameObjectTransferCandidate(
+                                        grabDistance)) {
                                 useHeldObject = true;
                             }
                         }
@@ -1443,11 +1535,18 @@ namespace heisenberg
                             physicalTouch && hasTouchPoint;
                         // This selection is tied to the exact same reference
                         // the other hand owns and was admitted only by a fresh
-                        // ROCK contact or the exact <=5u visible-mesh query
-                        // above. Carry that provenance across StartGrab so it
-                        // cannot be rejected by a second, differently framed
-                        // palm-distance test.
-                        _selection.isHeldObjectTransferContact = true;
+                        // ROCK contact or a visible-mesh candidate admitted in
+                        // the same palm frame StartGrab uses. Only the narrower
+                        // five-unit result is tagged as exact contact; wider
+                        // candidates still receive StartGrab's canonical
+                        // twelve-unit validation.
+                        _selection.isHeldObjectTransferContact =
+                            physicalTouch ||
+                            (std::isfinite(grabDistance) &&
+                             grabDistance >= 0.0f &&
+                             grabDistance <=
+                                 grab_pose_policy::
+                                     kHeldObjectExactContactDistance);
                         spdlog::info(
                             "[GRAB] {} hand: held-object {} selection "
                             "{:08X} (mesh/contact dist={:.1f}u)",
@@ -1496,6 +1595,13 @@ namespace heisenberg
     void Hand::Release(bool throw_object)
     {
         auto& grabMgr = GrabManager::GetSingleton();
+
+        // This is the physical grip-release boundary. Keep consumption out of
+        // GrabManager::EndGrab because storage, hand transfer, API teardown,
+        // and abort paths also end grabs and must never consume an item.
+        if (grabMgr.TryConsumeHeldConsumableOnRelease(_isLeft)) {
+            return;
+        }
         
         if (throw_object) {
             // FAITHFULNESS (2026-07-05 audit rank 3): ROCK's release/throw composition —

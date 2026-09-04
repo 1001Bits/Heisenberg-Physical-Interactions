@@ -8,12 +8,17 @@
 #include "../external/ROCK/src/physics-interaction/weapon/LooseWeaponGripZone.h"
 #include "../external/ROCK/src/physics-interaction/weapon/NativeScopeReentryPolicy.h"
 #include "DropToHand.h"
+#include "ConsumableUsePolicy.h"
 #include "DualWieldAPI.h"
 #include "F4VROffsets.h"
 #include "FingerCurves.h"
 #include "FRIKInterface.h"
 #include "GrabConstraint.h"
+#include "GrabOwnershipPolicy.h"
 #include "GrabPosePolicy.h"
+#include "SmartGrabHandler.h"
+#include "SS2Integration.h"
+#include "NpcInjectionPolicy.h"
 #include "HeldCollisionBodySetPolicy.h"
 #include "HandCollision.h"
 #include "Hand.h"
@@ -36,6 +41,7 @@
 #include "f4vr/F4VRUtils.h"
 #include "RE/Bethesda/UI.h"
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -518,11 +524,12 @@ namespace
     }
 
     // Palm input for any solver that also publishes rendered-hand authority.
-    // HostGetPreAuthorityHandWorld is captured after FRIK but before authority
+    // HostGetCleanPreAuthorityHandWorld is captured after FRIK pass 1 but
+    // before authority
     // writers, so it cannot contain this solver's previous output.  If that
     // same-frame seam or finger calibration is unavailable, deliberately use
     // the controller/wand frame rather than reading the skinned hand.
-    bool GetCleanTrackedPalmPosition(
+    bool GetCleanTrackedPalmPositionImpl(
         RE::NiAVObject* wandNode,
         bool isLeft,
         RE::NiPoint3& outPos)
@@ -530,7 +537,7 @@ namespace
         RE::NiPoint3 palmLocal{};
         RE::NiPoint3 directionLocal{};
         RE::NiTransform cleanHandWorld{};
-        if (rock::HostGetPreAuthorityHandWorld(
+        if (rock::HostGetCleanPreAuthorityHandWorld(
                 isLeft,
                 cleanHandWorld) &&
             heisenberg::GetCalibratedPalmLocal(
@@ -574,7 +581,7 @@ namespace
         }
         const auto& wandWorld = wandNode->world;
         outPos =
-            wandWorld.rotate *
+            wandWorld.rotate.Transpose() *
                 (wandPalmLocal * wandWorld.scale) +
             wandWorld.translate;
         return std::isfinite(outPos.x) &&
@@ -1353,7 +1360,35 @@ namespace
         return MakeAxisAngleRotation(axis, angle);
     }
 
-    bool TryCalculateRuntimeHandPlacementFromGeometry(heisenberg::GrabState& state, RE::NiAVObject* wandNode, bool isLeft)
+    // Port of HIGGS Hand::TransitionHeld placement (hand.cpp:1301-1547),
+    // translation only: the object keeps its world rotation and is moved so
+    // that the closest mesh point to the palm line lands on the palm.
+    //
+    //   objectWorld  - pose to seat FROM. For a close grab this is the live
+    //                  node transform. For a remote pull it is the object's
+    //                  virtual ARRIVAL pose (bound centre at the palm), which
+    //                  is where HIGGS's pulled object physically is when its
+    //                  TransitionHeld runs. Only the translation may differ
+    //                  from state.node->world; rotation must match.
+    //   pulledArrival- HIGGS `shouldMoveHandBack` (hand.cpp:1330-1337 and
+    //                  1407-1409): the object arrived by pull, so before the
+    //                  closest-point search it is moved back out of the hand
+    //                  by palmDir * pulledGrabHandAdjustDistance. A close
+    //                  grab does NOT get this shift in HIGGS.
+    //
+    // Palm anchor and palm normal come from GetPalmSurfaceSeatFrame: the
+    // skinned-hand palm (knuckle centroid + palmar depth) with its PALMAR
+    // direction, or the wand-frame palmPosition/palmVector constants. The
+    // palmar direction is the equivalent of HIGGS's palmVector (out of the
+    // palm). The finger-forward calibrated direction that used to drive this
+    // ray points along the fingers, not out of the palm, so the search ran
+    // parallel to the hand surface.
+    bool TryCalculateRuntimeHandPlacementFromGeometry(
+        heisenberg::GrabState& state,
+        RE::NiAVObject* wandNode,
+        bool isLeft,
+        const RE::NiTransform& objectWorld,
+        bool pulledArrival)
     {
         state.ClearRuntimeHandPlacement();
 
@@ -1362,18 +1397,22 @@ namespace
             return false;
         }
 
-        // HIGGS's handNode is Skyrim's weapon/controller node — a wand-equivalent
-        // with a deterministic OpenVR-derived orientation, not a skinned bone.
-        // The palmVector and g_finger* constants were calibrated against that
-        // frame, so on F4VR we anchor them to wandNode (not FRIK's LArm_Hand,
-        // whose rotation is pose-dependent because IK adjusts wrist bend per
-        // arm pose — measured corrRot(hand->wand) varied widely grab-to-grab).
-        RE::NiNode* handNode = wandNode->IsNode();
-        if (!handNode) {
-            spdlog::warn("[GEOM-PLACE] wandNode for {} hand is not an NiNode", isLeft ? "left" : "right");
+        RE::NiTransform parentWorld{};
+        RE::NiPoint3 palmPos{};
+        RE::NiPoint3 palmDir{};
+        bool usesSkinnedHand = false;
+        if (!GetPalmSurfaceSeatFrame(
+                wandNode,
+                isLeft,
+                parentWorld,
+                palmPos,
+                palmDir,
+                usesSkinnedHand)) {
+            spdlog::info("[GEOM-PLACE] FALLBACK: no palm frame for '{}'", state.node->name.c_str());
             return false;
         }
 
+        // HIGGS gathers every triangle of the object root (hand.cpp:1414-1415).
         std::vector<heisenberg::TriangleData> triangles;
         triangles.reserve(256);
         heisenberg::GetTriangles(state.node.get(), triangles);
@@ -1381,167 +1420,92 @@ namespace
             spdlog::info("[GEOM-PLACE] FALLBACK: no triangles for '{}' - will use stored item offset", state.node->name.c_str());
             return false;
         }
-        spdlog::info("[GEOM-PLACE] Extracted {} triangles for '{}'", triangles.size(), state.node->name.c_str());
 
-        // HIGGS-style palm: hardcoded offset in wand-local frame
-        // (Config palmPosition/palmVector, transformed via wandNode->world).
-        // This matches HIGGS's `palmPosHandspace = {0, -2.4, 6}` — a known
-        // point on the palm skin surface, NOT the knuckle centroid. Using
-        // the calibrated knuckle centroid placed objects INSIDE the hand
-        // flesh; the wand-frame hardcoded palm is on the skin, so surface-
-        // snap lands the closest mesh point on the skin as intended.
-        RE::NiPoint3 calibratedPalmPos;
-        RE::NiPoint3 calibratedPalmDir;
-        const bool usingCalibratedPalm = GetCalibratedPalmWorld(isLeft, calibratedPalmPos, calibratedPalmDir);
-        RE::NiPoint3 palmPos = usingCalibratedPalm ? calibratedPalmPos : GetPalmPosition(handNode, isLeft);
-        RE::NiPoint3 palmDir = usingCalibratedPalm ? calibratedPalmDir : GetPalmDirection(handNode, isLeft);
-        spdlog::info("[GEOM-PLACE] palm source: {}",
-                     usingCalibratedPalm ? "SKINNED-HAND (calibrated)" : "WAND (config fallback)");
-        // Palm-frame diagnostic. Dumps both anchor transforms (wand + skinned
-        // hand bone) and both palm-direction candidates (computed = what we
-        // use; wand-config = what the old code would have given). If the two
-        // don't align, placement differs visibly from finger-cast geometry.
-        {
-            const auto& wr = handNode->world.rotate;
-            spdlog::warn("[WAND-DIAG] wand name='{}' pos=({:.1f},{:.1f},{:.1f})",
-                         handNode->name.c_str(),
-                         handNode->world.translate.x, handNode->world.translate.y, handNode->world.translate.z);
-            spdlog::warn("[WAND-DIAG] wand rot row0=({:.3f},{:.3f},{:.3f}) row1=({:.3f},{:.3f},{:.3f}) row2=({:.3f},{:.3f},{:.3f})",
-                         wr.entry[0][0], wr.entry[0][1], wr.entry[0][2],
-                         wr.entry[1][0], wr.entry[1][1], wr.entry[1][2],
-                         wr.entry[2][0], wr.entry[2][1], wr.entry[2][2]);
-            // wr * (1,0,0) = col0; wr * (0,1,0) = col1; wr * (0,0,1) = col2.
-            // NiMatrix3 * NiPoint3 is row-dot (column-vector convention), so
-            // `wr * axisLocal` gives world-space direction the local axis points.
-            spdlog::warn("[WAND-DIAG] wand axes +X=({:.3f},{:.3f},{:.3f}) +Y=({:.3f},{:.3f},{:.3f}) +Z=({:.3f},{:.3f},{:.3f})",
-                         wr.entry[0][0], wr.entry[1][0], wr.entry[2][0],
-                         wr.entry[0][1], wr.entry[1][1], wr.entry[2][1],
-                         wr.entry[0][2], wr.entry[1][2], wr.entry[2][2]);
-
-            // Skinned hand bone (LArm_Hand / RArm_Hand under COM) — what
-            // HIGGS calls "NPC R Hand [RHnd]" in Skyrim. Its axes are what
-            // palmPosition / palmVector were originally tuned against.
-            if (RE::NiNode* skinned = GetSkinnedHandNode(isLeft)) {
-                const auto& sr = skinned->world.rotate;
-                spdlog::warn("[WAND-DIAG] skin name='{}' pos=({:.1f},{:.1f},{:.1f})",
-                             skinned->name.c_str(),
-                             skinned->world.translate.x, skinned->world.translate.y, skinned->world.translate.z);
-                spdlog::warn("[WAND-DIAG] skin axes +X=({:.3f},{:.3f},{:.3f}) +Y=({:.3f},{:.3f},{:.3f}) +Z=({:.3f},{:.3f},{:.3f})",
-                             sr.entry[0][0], sr.entry[1][0], sr.entry[2][0],
-                             sr.entry[0][1], sr.entry[1][1], sr.entry[2][1],
-                             sr.entry[0][2], sr.entry[1][2], sr.entry[2][2]);
-            } else {
-                spdlog::warn("[WAND-DIAG] skin: UNAVAILABLE (GetSkinnedHandNode returned null)");
+        // HIGGS (hand.cpp:1372-1382, 1417-1425):
+        //   originalTransform = collidableNode->m_worldTransform;
+        //   adjustedTransform = originalTransform;
+        //   if (shouldMoveHandBack) adjustedTransform.pos += palmDirection * pulledGrabHandAdjustDistance;
+        //   triangles.ApplyTransform(adjustedTransform * inverse(originalTransform));
+        // Rotation is identical on both sides, so the triangle adjustment is
+        // the pure translation (adjusted.translate - live.translate).
+        RE::NiTransform adjustedTransform = objectWorld;
+        adjustedTransform.rotate = state.node->world.rotate;
+        if (pulledArrival) {
+            const float moveBack = heisenberg::g_config.pulledGrabHandAdjustDistance;
+            if (std::abs(moveBack) > 1e-4f) {
+                adjustedTransform.translate += palmDir * moveBack;
             }
-
-            // What the wand-config path would produce (bug-(b) witness).
-            RE::NiPoint3 palmVecLocal(
-                heisenberg::g_config.palmVectorX,
-                heisenberg::g_config.palmVectorY,
-                heisenberg::g_config.palmVectorZ);
-            if (isLeft) palmVecLocal.x *= -1.0f;
-            const RE::NiPoint3 wandDir = heisenberg::VectorNormalized(wr * palmVecLocal);
-
-            // Direction from palm anchor to object center — ground truth of
-            // where palm *should* be pointed.
-            RE::NiPoint3 palmToObj = state.node->world.translate - palmPos;
-            float len = std::sqrt(palmToObj.x*palmToObj.x + palmToObj.y*palmToObj.y + palmToObj.z*palmToObj.z);
-            if (len > 1e-3f) palmToObj = RE::NiPoint3(palmToObj.x/len, palmToObj.y/len, palmToObj.z/len);
-            spdlog::warn("[WAND-DIAG] palmPos=({:.1f},{:.1f},{:.1f}) palmDir_used=({:.3f},{:.3f},{:.3f}) palmDir_wandCfg=({:.3f},{:.3f},{:.3f}) palm->objDir=({:.3f},{:.3f},{:.3f})",
-                         palmPos.x, palmPos.y, palmPos.z,
-                         palmDir.x, palmDir.y, palmDir.z,
-                         wandDir.x, wandDir.y, wandDir.z,
-                         palmToObj.x, palmToObj.y, palmToObj.z);
         }
-
-        // HIGGS "shouldMoveHandBack" pre-shift (hand.cpp:1373-1382 +
-        // 1407-1413). Shift the object's starting transform by
-        // palmDir * pulledGrabHandAdjustDistance and apply the same
-        // translation to every triangle BEFORE running closest-point. The
-        // surface-snap then operates against the shifted geometry. Skipped
-        // when the config value is ~0 so testing can toggle it without
-        // recompiling.
-        const float preShiftDist = heisenberg::g_config.pulledGrabHandAdjustDistance;
-        const RE::NiPoint3 preShiftVec = (std::abs(preShiftDist) > 1e-4f)
-            ? palmDir * preShiftDist
-            : RE::NiPoint3(0.0f, 0.0f, 0.0f);
-        if (std::abs(preShiftDist) > 1e-4f) {
+        const RE::NiPoint3 triangleShift =
+            adjustedTransform.translate - state.node->world.translate;
+        if (heisenberg::VectorLengthSquared(triangleShift) > 1e-8f) {
             for (auto& tri : triangles) {
-                tri.v0 += preShiftVec;
-                tri.v1 += preShiftVec;
-                tri.v2 += preShiftVec;
+                tri.v0 += triangleShift;
+                tri.v1 += triangleShift;
+                tri.v2 += triangleShift;
             }
-            spdlog::warn("[GEOM-PLACE] PRE-SHIFT '{}': dist={:.2f} vec=({:+.2f},{:+.2f},{:+.2f})",
-                         state.node->name.c_str(), preShiftDist,
-                         preShiftVec.x, preShiftVec.y, preShiftVec.z);
         }
 
-        // HIGGS closest-point-on-graphics-geometry-to-line (hand.cpp:1432).
-        // Single pass: for every triangle, find the closest point on that
-        // triangle to the palm RAY (position + direction). Degrades gracefully
-        // as aim error grows, and on-axis aim gives the same result as a
-        // ray hit. HIGGS's shouldMoveHandBack pre-shift is applied above.
+        // HIGGS GetClosestPointOnGraphicsGeometryToLine (hand.cpp:1432).
         RE::NiPoint3 closestPoint;
         RE::NiPoint3 closestNormal;
         int closestTriIndex = -1;
-        float distToRay = 0.0f;
-        bool found = heisenberg::GetClosestPointOnGeometryToLine(
+        float distToLine = 0.0f;
+        const bool found = heisenberg::GetClosestPointOnGeometryToLine(
             triangles, palmPos, palmDir,
-            closestPoint, closestNormal, closestTriIndex, distToRay);
-
+            closestPoint, closestNormal, closestTriIndex, distToLine);
         if (!found) {
             spdlog::info("[GEOM-PLACE] FALLBACK: no closest-point hit for '{}' - will use stored item offset", state.node->name.c_str());
             return false;
         }
-        const float closestDistSq = heisenberg::VectorLengthSquared(closestPoint - palmPos);
-        float closestDistance = std::sqrt(closestDistSq);
-        spdlog::info("[GEOM-PLACE] Nearest point: ({:.1f},{:.1f},{:.1f}), normal=({:.3f},{:.3f},{:.3f}), dist={:.1f}, tri={}",
-                     closestPoint.x, closestPoint.y, closestPoint.z,
-                     closestNormal.x, closestNormal.y, closestNormal.z,
-                     closestDistance, closestTriIndex);
 
-        // HIGGS surface-snap with pre-shifted transform (hand.cpp:1545-1546):
+        // HIGGS (hand.cpp:1545-1546):
         //   desiredNodeTransform = adjustedTransform;
         //   desiredNodeTransform.pos += palmPos - ptPos;
-        // adjustedTransform.pos = originalTransform.pos + preShiftVec. For
-        // same-triangle selection the shift cancels; it only changes the
-        // result if the shift moves a different triangle into the closest
-        // position, which can happen on elongated objects.
-        RE::NiTransform desiredWorldTransform = state.node->world;
-        desiredWorldTransform.translate =
-            state.node->world.translate + preShiftVec + (palmPos - closestPoint);
+        RE::NiTransform desiredWorldTransform = adjustedTransform;
+        desiredWorldTransform.translate += (palmPos - closestPoint);
         if (heisenberg::g_config.enableAxialPlacement &&
             std::abs(heisenberg::g_config.axialPlacementClearance) > 1.0e-4f) {
             desiredWorldTransform.translate += palmDir * heisenberg::g_config.axialPlacementClearance;
         }
-        spdlog::warn("[GEOM-PLACE] SURFACE-SNAP '{}': closestDist={:.2f}",
-                     state.node->name.c_str(), std::sqrt(closestDistSq));
-
-        RE::NiNode* storageParent = usingCalibratedPalm ? GetSkinnedHandNode(isLeft) : nullptr;
-        bool usingSkinnedStorage = storageParent != nullptr;
-        if (!storageParent) {
-            storageParent = handNode;  // wand fallback
-            usingSkinnedStorage = false;
+        if (!std::isfinite(desiredWorldTransform.translate.x) ||
+            !std::isfinite(desiredWorldTransform.translate.y) ||
+            !std::isfinite(desiredWorldTransform.translate.z)) {
+            spdlog::warn("[GEOM-PLACE] non-finite seat for '{}' - ignored", state.node->name.c_str());
+            return false;
         }
 
-        RE::NiPoint3 worldOffset = desiredWorldTransform.translate - storageParent->world.translate;
-        // F4VR row-vector convention (see FRIK updateTransforms / MEMORY.md project_f4vr_matrix_convention):
-        //   world.rotate   = local.rotate * parent.rotate
-        //   world.translate= parent.translate + parent.rotate.Transpose() * local.translate
-        // Inverse store: local.translate = parent.rotate * (world.translate - parent.translate)
-        //                local.rotate    = world.rotate * parent.rotate.Transpose()
-        RE::NiPoint3 localOffset = storageParent->world.rotate * worldOffset;
-        RE::NiMatrix3 localRotation = desiredWorldTransform.rotate * storageParent->world.rotate.Transpose();
+        // hand.cpp:1547 `desiredNodeTransformHandSpace = inverseHand * desiredNodeTransform`,
+        // stored against the same parent frame the palm was measured in.
+        StoreRuntimeWorldPlacement(
+            state,
+            parentWorld,
+            desiredWorldTransform.translate,
+            desiredWorldTransform.rotate,
+            usesSkinnedHand);
 
-        spdlog::warn("[GEOM-PLACE] RESULT '{}': parent={} worldOffset=({:.2f},{:.2f},{:.2f}) localOffset=({:.2f},{:.2f},{:.2f})",
-                    state.node->name.c_str(),
-                    usingSkinnedStorage ? "SKINNED" : "WAND",
-                    worldOffset.x, worldOffset.y, worldOffset.z,
-                    localOffset.x, localOffset.y, localOffset.z);
+        spdlog::info(
+            "[GEOM-PLACE] SURFACE-SNAP '{}': tris={} palm=({:.1f},{:.1f},{:.1f}) "
+            "palmDir=({:.2f},{:.2f},{:.2f}) surface=({:.1f},{:.1f},{:.1f}) "
+            "lineDist={:.2f} tri={} pulled={} moveBack={:.1f} frame={} "
+            "local=({:.2f},{:.2f},{:.2f})",
+            state.node->name.c_str(),
+            triangles.size(),
+            palmPos.x, palmPos.y, palmPos.z,
+            palmDir.x, palmDir.y, palmDir.z,
+            closestPoint.x, closestPoint.y, closestPoint.z,
+            distToLine,
+            closestTriIndex,
+            pulledArrival,
+            pulledArrival ? heisenberg::g_config.pulledGrabHandAdjustDistance : 0.0f,
+            usesSkinnedHand ? "SKINNED" : "WAND",
+            state.runtimeHandPlacementPosition.x,
+            state.runtimeHandPlacementPosition.y,
+            state.runtimeHandPlacementPosition.z);
 
-        // Also log what the integrated/saved item offset would have been for comparison.
-        // Lookup is independent of whether we actually apply the offset — geometry-calc
-        // testing leaves customOffset=nullopt, but we still want the baseline for diffing.
+        // Oracle comparison: what the offset database would have used for
+        // this item. Only meaningful when the offset was authored in the same
+        // (wand) frame; a skinned-frame seat is logged as such.
         {
             std::optional<heisenberg::ItemOffset> baseline;
             if (auto* refr = state.GetRefr()) {
@@ -1549,24 +1513,78 @@ namespace
             }
             if (baseline.has_value()) {
                 const auto& b = baseline.value();
-                spdlog::warn("[GEOM-PLACE] COMPARE baseline '{}': pos=({:.2f},{:.2f},{:.2f}) curls=({:.2f},{:.2f},{:.2f},{:.2f},{:.2f}) matched='{}'",
+                spdlog::info("[GEOM-PLACE] COMPARE baseline '{}': pos=({:.2f},{:.2f},{:.2f}) matched='{}' seatFrame={} d=({:+.2f},{:+.2f},{:+.2f})",
                             state.node->name.c_str(),
                             b.position.x, b.position.y, b.position.z,
-                            b.thumbCurl, b.indexCurl, b.middleCurl, b.ringCurl, b.pinkyCurl,
-                            b.matchedName);
-                spdlog::warn("[GEOM-PLACE] DIFF calc-baseline '{}': d=({:+.2f},{:+.2f},{:+.2f})",
-                            state.node->name.c_str(),
-                            localOffset.x - b.position.x,
-                            localOffset.y - b.position.y,
-                            localOffset.z - b.position.z);
-            } else {
-                spdlog::warn("[GEOM-PLACE] No baseline offset for '{}' (nothing to compare to)",
-                            state.node->name.c_str());
+                            b.matchedName,
+                            usesSkinnedHand ? "SKINNED" : "WAND",
+                            state.runtimeHandPlacementPosition.x - b.position.x,
+                            state.runtimeHandPlacementPosition.y - b.position.y,
+                            state.runtimeHandPlacementPosition.z - b.position.z);
             }
         }
-
-        state.SetRuntimeHandPlacement(localOffset, localRotation, usingSkinnedStorage);
         return true;
+    }
+
+    // Close-grab convenience: seat from the live node pose, no pull shift.
+    bool TryCalculateRuntimeHandPlacementFromGeometry(heisenberg::GrabState& state, RE::NiAVObject* wandNode, bool isLeft)
+    {
+        if (!state.node) {
+            state.ClearRuntimeHandPlacement();
+            return false;
+        }
+        return TryCalculateRuntimeHandPlacementFromGeometry(
+            state, wandNode, isLeft, state.node->world, /*pulledArrival=*/false);
+    }
+
+    // Remote pull: the object is still at arm's length when the grab starts,
+    // but HIGGS seats a pulled object when it ARRIVES at the hand. Build that
+    // arrival pose (bound centre at the palm, rotation unchanged) and seat
+    // from it, so the pull animation's target is the surface-snapped seat and
+    // not a multi-meter translate of the distant surface point.
+    bool TryCalculatePulledArrivalPlacementFromGeometry(
+        heisenberg::GrabState& state,
+        RE::NiAVObject* wandNode,
+        bool isLeft,
+        const RE::NiTransform& objectWorld)
+    {
+        if (!state.node || !wandNode) {
+            return false;
+        }
+
+        RE::NiTransform parentWorld{};
+        RE::NiPoint3 palmPos{};
+        RE::NiPoint3 palmDir{};
+        bool usesSkinnedHand = false;
+        if (!GetPalmSurfaceSeatFrame(
+                wandNode,
+                isLeft,
+                parentWorld,
+                palmPos,
+                palmDir,
+                usesSkinnedHand)) {
+            return false;
+        }
+
+        RE::NiPoint3 centreWorld = objectWorld.translate;
+        const float boundRadius = state.node->worldBound.fRadius;
+        const RE::NiPoint3 boundCentre = state.node->worldBound.center;
+        if (std::isfinite(boundRadius) &&
+            boundRadius > 0.01f &&
+            boundRadius < 10000.0f &&
+            std::isfinite(boundCentre.x) &&
+            std::isfinite(boundCentre.y) &&
+            std::isfinite(boundCentre.z)) {
+            // worldBound is measured on the live node; re-express its centre
+            // relative to the pose we were asked to seat from.
+            centreWorld = objectWorld.translate +
+                          (boundCentre - state.node->world.translate);
+        }
+
+        RE::NiTransform arrivalWorld = objectWorld;
+        arrivalWorld.translate = objectWorld.translate + (palmPos - centreWorld);
+        return TryCalculateRuntimeHandPlacementFromGeometry(
+            state, wandNode, isLeft, arrivalWorld, /*pulledArrival=*/true);
     }
 
     // Direct-children recursion — Utils::FindNode walks GetRuntimeData().children
@@ -1688,8 +1706,12 @@ namespace
             state.ClearRuntimeFingerCurls();
             if (ApplyStoredFingerCurls(state, isLeft)) {
                 state.pendingFingerCurls = false;
+                // DEFERRED path - the counterpart to the IMMEDIATE one in StartGrab. Same
+                // authored curls, applied post-physics once the object is seated at its final
+                // placement. Tagged identically so the two are directly comparable in a log.
                 spdlog::info(
-                    "[GRAB-POSE] {} applied paired authored offset curls",
+                    "[GRAB-POSE] {} applied paired authored offset curls "
+                    "(curls=DEFERRED, post-physics)",
                     context);
                 return true;
             }
@@ -1917,9 +1939,11 @@ namespace
             (desiredWorldPos -
              renderedHand->world.translate);
         renderedLocalPos -= paLocal;
+        RE::NiMatrix3 renderedHandRotOrtho = renderedHand->world.rotate;
+        heisenberg::OrthoNormalize(renderedHandRotOrtho);
         const RE::NiMatrix3 renderedLocalRot =
             desiredWorldRot *
-            renderedHand->world.rotate.Transpose();
+            renderedHandRotOrtho.Transpose();
 
         state.SetRigidRenderedHandPlacement(
             renderedLocalPos,
@@ -1942,20 +1966,11 @@ namespace
     // =====================================================================
     int GetEffectiveGrabMode()
     {
-        int configuredGrabMode = heisenberg::g_config.grabMode;
-
-        // Full Dynamic (iGrabMode=9): the embedded ROCK engine owns grab+selection.
-        // Only honored while the engine is actually hosted; else degrade to Keyframed so
-        // selecting 9 without bUseRockEngineArchitecture=1 never disables grabbing.
-        if (configuredGrabMode == static_cast<int>(heisenberg::GrabMode::FullDynamic)) {
-            return heisenberg::IsRockEngineHosted()
-                       ? configuredGrabMode
-                       : static_cast<int>(heisenberg::GrabMode::Keyframed);
-        }
-
-        // Two-scenario cleanup: every other historical mode (1-8) was removed.
-        // Anything that isn't Full Dynamic degrades to the keyframed backend.
-        return static_cast<int>(heisenberg::GrabMode::Keyframed);
+        return heisenberg::grab_ownership_policy::resolve(
+                   heisenberg::g_config.grabMode,
+                   heisenberg::g_config.delegateWorldGrabToRock,
+                   heisenberg::IsRockEngineHosted())
+            .effectiveGrabMode;
     }
     
     // =====================================================================
@@ -4001,6 +4016,17 @@ namespace
 // =========================================================================
 namespace heisenberg
 {
+    bool GetCleanTrackedPalmPosition(
+        RE::NiAVObject* wandNode,
+        bool isLeft,
+        RE::NiPoint3& outPos)
+    {
+        return GetCleanTrackedPalmPositionImpl(
+            wandNode,
+            isLeft,
+            outPos);
+    }
+
     // Allow grabbing with Unarmed equipped, but block grabbing with real weapons.
     // "Unarmed" is a special weapon type that represents bare fists.
     // We let the user grab items even while Unarmed is "drawn" because:
@@ -4084,6 +4110,68 @@ namespace heisenberg
             lastWeaponLog = now;
         }
         return true;
+    }
+
+    RE::TESObjectWEAP* GetPlayerEquippedRealWeapon()
+    {
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player || !player->inventoryList) {
+            return nullptr;
+        }
+
+        const RE::BSAutoReadLock inventoryLock{
+            player->inventoryList->rwLock };
+        for (auto& inventoryItem : player->inventoryList->data) {
+            auto* weapon = inventoryItem.object ?
+                inventoryItem.object->As<RE::TESObjectWEAP>() :
+                nullptr;
+            if (!weapon) {
+                continue;
+            }
+
+            const auto weaponType = weapon->weaponData.type.get();
+            if (weaponType == RE::WEAPON_TYPE::kGrenade ||
+                weaponType == RE::WEAPON_TYPE::kMine) {
+                continue;
+            }
+
+            for (auto* stack = inventoryItem.stackData.get(); stack;
+                 stack = stack->nextStack.get()) {
+                if (stack->IsEquipped()) {
+                    return weapon;
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    bool IsHandGrabbingRealWeapon(const bool isLeft)
+    {
+        auto isRealWeaponReference = [](RE::TESObjectREFR* refr) {
+            auto* baseForm = refr ? refr->GetObjectReference() : nullptr;
+            auto* weapon = baseForm ?
+                baseForm->As<RE::TESObjectWEAP>() :
+                nullptr;
+            if (!weapon) {
+                return false;
+            }
+            const auto weaponType = weapon->weaponData.type.get();
+            return weaponType != RE::WEAPON_TYPE::kGrenade &&
+                   weaponType != RE::WEAPON_TYPE::kMine;
+        };
+
+        auto& grabManager = GrabManager::GetSingleton();
+        if (grabManager.IsGrabbing(isLeft) &&
+            isRealWeaponReference(
+                grabManager.GetGrabState(isLeft).GetRefr())) {
+            return true;
+        }
+
+        // Full-dynamic mode owns loose world objects inside ROCK rather than
+        // GrabManager, so query its exact held-object snapshot as the fallback.
+        rock::HostHeldObjectSnapshot snapshot{};
+        return rock::HostGetHeldObjectSnapshot(isLeft, snapshot) &&
+               isRealWeaponReference(snapshot.ref);
     }
     
     // Check if an object reference is storable (can be picked up to inventory)
@@ -4673,9 +4761,14 @@ namespace
             return false;
         }
 
-        // 0.5s cooldown after grabbing — prevents accidental consume when retrieving items
+        // Programmatic loot appears at the controller without a deliberate
+        // hand motion. Give it a longer grace so seated hands resting together
+        // cannot immediately self-inject the new item.
         float elapsed = static_cast<float>(heisenberg::Utils::GetTime()) - state.grabStartTime;
-        if (elapsed < 0.5f) {
+        if (!heisenberg::consumable_use_policy::mayUseHeldConsumable(
+                elapsed,
+                state.isFromLootDrop,
+                state.consumeZoneExitRequired)) {
             state.mouthZoneTimer = 0.0f;
             state.isInMouthZone = false;
             return false;
@@ -4798,9 +4891,14 @@ namespace
         if (!heisenberg::g_config.enableHandInjection)
             return false;
 
-        // Same 0.5s post-grab cooldown as mouth zone
+        // Use the same delivery-aware grace as the mouth path. This is the
+        // seated-play case: loot materializes in one lap hand while the other
+        // hand is already inside the injection sphere.
         float elapsed = static_cast<float>(heisenberg::Utils::GetTime()) - state.grabStartTime;
-        if (elapsed < 0.5f)
+        if (!heisenberg::consumable_use_policy::mayUseHeldConsumable(
+                elapsed,
+                state.isFromLootDrop,
+                state.consumeZoneExitRequired))
             return false;
 
         if (!IsInHandInjectionZone(isLeft))
@@ -4822,13 +4920,54 @@ namespace
         return false;
     }
 
-    // Helper: Check if held item is an injectable (syringe-type chem)
-    // Whitelist: stimpak, med-x, psycho (and variants), antibiotics, calmex
+    // Helper: Check if held item is an injectable (syringe-type chem).
+    //
+    // The English display-name whitelist this used to be was silently broken in every
+    // localised game: a Spanish Stimpak reads "Estimulante" and matched nothing, so
+    // injection simply did not work. It also missed every mod-added medical item, which is
+    // how the Sim Settlements 2 disease cure ("Cura de enfermedades") fell through.
+    //
+    // SmartGrabHandler::CategorizeItem already solves this properly: it reads the item's
+    // MAGIC EFFECT ARCHETYPES (kStimpak, kCureDisease, kCureAddiction, ...) plus keywords,
+    // which are language-independent and mod-independent. The name test is kept only as a
+    // last-resort fallback for items whose effects do not classify.
     bool IsInjectable(RE::TESObjectREFR* refr)
     {
         if (!refr) return false;
         auto* baseForm = refr->GetObjectReference();
         if (!baseForm || !baseForm->IsAlchemyItem()) return false;
+
+        if (auto* bound = static_cast<RE::TESBoundObject*>(baseForm)) {
+            const auto cat = heisenberg::SmartGrabHandler::GetSingleton().CategorizeItem(bound);
+            using C = heisenberg::SmartGrabCategory;
+            // SYRINGE-DELIVERED ONLY. This set decides which items are wrist-injected, and
+            // it is exclusive: anything listed here is BLOCKED from mouth consumption while
+            // hand injection is on. Including the whole chem family was wrong — Rad-X is a
+            // swallowed pill and Jet is an inhaler, so tagging them CombatChem/RadResistance
+            // made them refuse the mouth zone while only accepting a wrist gesture the player
+            // has no reason to try. Keep this list to items that really are injectors.
+            const auto injectables = C::Stimpack | C::RadAway | C::Antibiotic | C::Addictol;
+            if (static_cast<std::uint32_t>(cat.categories & injectables) != 0) {
+                return true;
+            }
+        }
+
+        // Per-item injectors that no CATEGORY can pick out. Psycho is a syringe but shares the
+        // CombatChem category with Jet, an inhaler — so the category is the wrong granularity
+        // and only an item-level test works. Editor IDs are non-localised (unlike display
+        // names, which is the bug this whole classifier replaced) and stable across the base
+        // game plus most mod-added variants, which conventionally keep the vanilla stem.
+        if (const char* editorId = baseForm->GetFormEditorID()) {
+            static constexpr const char* kInjectorEditorIdStems[] = {
+                "Psycho",   // covers PsychoJet, PsychoBuff, PsychoTats, ...
+            };
+            for (const char* stem : kInjectorEditorIdStems) {
+                if (heisenberg::ContainsCI(editorId, stem)) {
+                    return true;
+                }
+            }
+        }
+
         auto nameView = RE::TESFullName::GetFullName(*baseForm, false);
         if (nameView.empty()) return false;
         const std::string name(nameView);
@@ -4839,6 +4978,861 @@ namespace
                heisenberg::ContainsCI(n, "psycho") ||
                heisenberg::ContainsCI(n, "antibiotic") ||
                heisenberg::ContainsCI(n, "calmex");
+    }
+
+    // =========================================================================
+    // NPC INJECTION - SS2 DISEASE CURES + NATIVE COMPANION STIMPAKS
+    // =========================================================================
+    // Scope is deliberately narrow (owner directive): this exists so a sick settler can be
+    // cured by physically pressing the cure against them instead of opening the trade menu.
+    // It is NOT a general "hand any item to any NPC" gesture. The only second
+    // route is an exact native Stimpak touching a wounded current companion;
+    // arbitrary chems and ordinary NPCs still do nothing.
+    //
+    // SS2 authors this particular cure with script-archetype effects. Resolve
+    // its identity from the live manager property, then call SS2's own
+    // menuless disease-cure function rather than trying to imitate only half
+    // of a ContainerMenu trade.
+    //
+    // Deliberately NOT a proximity-only test: the cure must be close to the actor's actual
+    // rendered body, so walking past a settler holding one cannot donate it.
+    // SS2's generic Disease Cure uses script-archetype effects, so the normal
+    // kCureDisease/Antibiotic classifier cannot identify it. Compare exact form
+    // identity with NPC_RPGManager's live DiseaseCureForm property. This also
+    // follows SS2 patches that redirect the property to a compatible item and
+    // rejects similarly named per-disease internal potions.
+    bool IsDiseaseCureItemImpl(RE::TESObjectREFR* refr)
+    {
+        if (!refr) return false;
+        auto* baseForm = refr->GetObjectReference();
+        if (!baseForm || !baseForm->IsAlchemyItem()) return false;
+
+        return heisenberg::ss2::IsDiseaseCureForm(baseForm);
+    }
+
+    bool IsCompanionStimpakItemImpl(RE::TESObjectREFR* refr)
+    {
+        if (!refr) return false;
+        auto* baseForm = refr->GetObjectReference();
+        if (!baseForm || !baseForm->IsAlchemyItem()) return false;
+
+        // Do not infer Stimpaks from localized names, keywords, models, or
+        // broad injectable categories. This is the same native classifier the
+        // companion activation path uses.
+        return heisenberg::MenuGameSettings_IsStimpak.get()(*baseForm);
+    }
+
+    heisenberg::npc_injection_policy::CompanionEvidence
+        GetPlayerCompanionEvidence(
+            RE::Actor* actor,
+            RE::PlayerCharacter* player)
+    {
+        heisenberg::npc_injection_policy::CompanionEvidence evidence{};
+        if (!actor || !player) return evidence;
+
+        evidence.commandedFlag =
+            actor->boolFlags.all(
+                RE::Actor::BOOL_FLAGS::kIsCommandedActor);
+
+        if (actor->currentProcess &&
+            actor->currentProcess->middleHigh) {
+            auto& commandingActor =
+                actor->currentProcess->middleHigh->commandingActor;
+            if (commandingActor) {
+                const auto commandingActorPtr = commandingActor.get();
+                evidence.commandedByPlayer =
+                    commandingActorPtr &&
+                    commandingActorPtr.get() ==
+                        reinterpret_cast<RE::Actor*>(player);
+            }
+        }
+
+        auto* playerActor = reinterpret_cast<RE::Actor*>(player);
+        if (playerActor->currentProcess &&
+            playerActor->currentProcess->middleHigh) {
+            for (std::uint32_t i = 0;
+                 i < playerActor->currentProcess->middleHigh->
+                         commandedActors.size();
+                 ++i) {
+                auto& commandData =
+                    playerActor->currentProcess->middleHigh->
+                        commandedActors[i];
+                const auto commandedActor =
+                    commandData.commandedActor.get();
+                if (commandedActor &&
+                    commandedActor.get() == actor) {
+                    evidence.inPlayerCommandList = true;
+                    break;
+                }
+            }
+        }
+
+        // Base-game CurrentCompanionFaction. This catches ordinary followers
+        // such as Codsworth, whose current-companion state is not necessarily
+        // represented by one of the commanded-actor process flags.
+        if (auto* factionForm =
+                RE::TESForm::GetFormByID(0x0001C21C)) {
+            if (auto* faction = factionForm->As<RE::TESFaction>()) {
+                evidence.inCurrentCompanionFaction =
+                    actor->IsInFaction(faction);
+            }
+        }
+        return evidence;
+    }
+
+    bool IsWoundedCurrentPlayerCompanion(
+        RE::Actor* actor,
+        RE::PlayerCharacter* player)
+    {
+        if (!actor || !player ||
+            actor == reinterpret_cast<RE::Actor*>(player) ||
+            actor->GetFormID() == player->GetFormID()) {
+            return false;
+        }
+
+        const auto evidence =
+            GetPlayerCompanionEvidence(actor, player);
+        const bool inBleedoutAnimation =
+            actor->boolFlags.all(
+                RE::Actor::BOOL_FLAGS::kInBleedoutAnimation);
+        return heisenberg::npc_injection_policy::
+            AllowsCompanionStimpakInjection(
+                true,
+                true,
+                evidence,
+                actor->lifeState,
+                inBleedoutAnimation);
+    }
+
+    enum class InjectionTargetKind : std::uint8_t
+    {
+        DiseaseCure,
+        WoundedCompanion,
+    };
+
+    RE::Actor* FindInjectionTargetActor(
+        bool isLeft,
+        RE::NiAVObject* heldNode,
+        InjectionTargetKind targetKind,
+        float& outDistance)
+    {
+        outDistance = -1.0f;
+
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        auto* playerNodes = f4cf::f4vr::getPlayerNodes();
+        auto* procLists = heisenberg::GetProcessListsSingleton();
+        if (!player || !playerNodes || !procLists) return nullptr;
+
+        RE::NiNode* holdingWand = heisenberg::GetWandNode(playerNodes, isLeft);
+        if (!holdingWand) return nullptr;
+        // The reverse-engineered ProcessLists ABI takes its point by mutable
+        // reference even though it is logically an input.
+        RE::NiPoint3 tip = holdingWand->world.translate;
+
+        const auto toPolicyPoint = [](const RE::NiPoint3& point) {
+            return heisenberg::npc_injection_policy::Point3{
+                point.x,
+                point.y,
+                point.z,
+            };
+        };
+
+        // The wand is permanent evidence. A valid nearby held-object bound is
+        // an optional SECOND probe, never a replacement: an unloaded/stale
+        // scene bound must not make contact at the controller disappear. The
+        // pure policy rejects non-finite, negative, oversized, and implausibly
+        // far bounds instead of clamping them into a remote cure sphere.
+        bool hasHeldBound = false;
+        RE::NiPoint3 heldBoundCenter{};
+        float heldBoundRadius = 0.0f;
+        if (heldNode) {
+            const auto& bound = heldNode->worldBound;
+            hasHeldBound = true;
+            heldBoundCenter = bound.center;
+            heldBoundRadius = bound.fRadius;
+        }
+        auto contactProbes =
+            heisenberg::npc_injection_policy::MakeContactProbeSet(
+                toPolicyPoint(tip),
+                hasHeldBound,
+                toPolicyPoint(heldBoundCenter),
+                heldBoundRadius);
+        if (targetKind == InjectionTargetKind::WoundedCompanion) {
+            // Companion revival is object-contact driven. The permanent wand
+            // probe is useful for the older Disease Cure gesture, but must not
+            // revive someone merely because the controller is nearby while
+            // the visible Stimpak itself is not touching them.
+            if (contactProbes.count < 2) {
+                return nullptr;
+            }
+            contactProbes.probes[0] = contactProbes.probes[1];
+            contactProbes.count = 1;
+        }
+
+        // Cast a generous net, then rank every candidate by rendered torso
+        // distance. The old closest-actor helper usually returned PlayerRef
+        // first (or a seated actor's foot marker), rejected that one result,
+        // and never considered the sick settler actually being touched.
+        RE::BSScrapArray<RE::NiPointer<RE::Actor>> actors;
+        const float searchRadius = heisenberg::g_config.npcInjectionRadius + 150.0f;
+        heisenberg::ProcessLists_GetActorsWithinRangeOfPoint(
+            procLists,
+            tip,
+            searchRadius,
+            actors);
+
+        RE::NiPointer<RE::Actor> nearest;
+        // SS2's older disease-cure gesture intentionally retains its generous
+        // configurable proximity radius.  Companion revival is different: the
+        // held Stimpak sphere must reach the rendered body surface.  Its probe
+        // radius is already subtracted by the distance helpers, so only a tiny
+        // numerical/one-frame tolerance belongs here.
+        constexpr float kCompanionSurfaceToleranceGameUnits = 1.5f;
+        float nearestDistance =
+            targetKind == InjectionTargetKind::WoundedCompanion ?
+                kCompanionSurfaceToleranceGameUnits :
+                heisenberg::g_config.npcInjectionRadius;
+        for (auto& candidate : actors) {
+            RE::Actor* actor = candidate.get();
+            if (!actor) {
+                continue;
+            }
+            const bool eligible =
+                targetKind == InjectionTargetKind::DiseaseCure ?
+                    heisenberg::npc_injection_policy::IsEligibleNpcTarget(
+                        reinterpret_cast<std::uintptr_t>(actor),
+                        reinterpret_cast<std::uintptr_t>(player),
+                        actor->formID,
+                        actor->IsDead(true)) :
+                    IsWoundedCurrentPlayerCompanion(actor, player);
+            if (!eligible) {
+                continue;
+            }
+
+            auto* root = actor->Get3D(false);
+            if (!root) {
+                continue;
+            }
+
+            // Measure against connected torso/arm capsules rather than isolated
+            // bone points. Touching the midpoint of a forearm or the space
+            // between spine joints is real body contact even when neither
+            // endpoint lies inside the configured radius.
+            float actorDistance = std::numeric_limits<float>::infinity();
+            struct BodyPoint
+            {
+                RE::NiPoint3 point{};
+                bool valid = false;
+            };
+            const auto resolveBodyPoint = [&](const char* boneName) {
+                BodyPoint result{};
+                if (auto* bone = root->GetObjectByName(boneName)) {
+                    result.point = bone->world.translate;
+                    result.valid = std::isfinite(result.point.x) &&
+                                   std::isfinite(result.point.y) &&
+                                   std::isfinite(result.point.z);
+                }
+                return result;
+            };
+
+            const std::array<BodyPoint, 6> torsoPoints{
+                resolveBodyPoint("Head"),
+                resolveBodyPoint("Neck"),
+                resolveBodyPoint("Chest"),
+                resolveBodyPoint("SPINE2"),
+                resolveBodyPoint("SPINE1"),
+                resolveBodyPoint("Pelvis"),
+            };
+            const std::array<BodyPoint, 6> leftArmPoints{
+                resolveBodyPoint("LArm_Collarbone"),
+                resolveBodyPoint("LArm_UpperArm"),
+                resolveBodyPoint("LArm_ForeArm1"),
+                resolveBodyPoint("LArm_ForeArm2"),
+                resolveBodyPoint("LArm_ForeArm3"),
+                resolveBodyPoint("LArm_Hand"),
+            };
+            const std::array<BodyPoint, 6> rightArmPoints{
+                resolveBodyPoint("RArm_Collarbone"),
+                resolveBodyPoint("RArm_UpperArm"),
+                resolveBodyPoint("RArm_ForeArm1"),
+                resolveBodyPoint("RArm_ForeArm2"),
+                resolveBodyPoint("RArm_ForeArm3"),
+                resolveBodyPoint("RArm_Hand"),
+            };
+            const std::array<BodyPoint, 5> leftLegPoints{
+                resolveBodyPoint("Pelvis"),
+                resolveBodyPoint("LLeg_Thigh"),
+                resolveBodyPoint("LLeg_Calf"),
+                resolveBodyPoint("LLeg_Foot"),
+                resolveBodyPoint("LLeg_Toe1"),
+            };
+            const std::array<BodyPoint, 5> rightLegPoints{
+                resolveBodyPoint("Pelvis"),
+                resolveBodyPoint("RLeg_Thigh"),
+                resolveBodyPoint("RLeg_Calf"),
+                resolveBodyPoint("RLeg_Foot"),
+                resolveBodyPoint("RLeg_Toe1"),
+            };
+
+            bool foundBodyCapsule = false;
+            const auto measureChain = [&](const auto& points, float radius) {
+                const BodyPoint* previous = nullptr;
+                std::size_t validCount = 0;
+                for (const auto& point : points) {
+                    if (!point.valid) {
+                        continue;
+                    }
+                    ++validCount;
+                    if (previous) {
+                        foundBodyCapsule = true;
+                        actorDistance = (std::min)(
+                            actorDistance,
+                            heisenberg::npc_injection_policy::
+                                MinimumProbeDistanceToCapsule(
+                                    contactProbes,
+                                    {
+                                        .start = toPolicyPoint(previous->point),
+                                        .end = toPolicyPoint(point.point),
+                                        .radius = radius,
+                                    }));
+                    }
+                    previous = &point;
+                }
+                if (validCount == 1 && previous) {
+                    foundBodyCapsule = true;
+                    const auto point = toPolicyPoint(previous->point);
+                    actorDistance = (std::min)(
+                        actorDistance,
+                        heisenberg::npc_injection_policy::
+                            MinimumProbeDistanceToCapsule(
+                                contactProbes,
+                                {
+                                    .start = point,
+                                    .end = point,
+                                    .radius = radius,
+                                }));
+                }
+            };
+            measureChain(torsoPoints, 7.0f);
+            measureChain(leftArmPoints, 4.0f);
+            measureChain(rightArmPoints, 4.0f);
+            if (targetKind ==
+                InjectionTargetKind::WoundedCompanion) {
+                measureChain(leftLegPoints, 4.0f);
+                measureChain(rightLegPoints, 4.0f);
+            }
+
+            // Companion revival accepts a Stimpak touching the rendered actor
+            // anywhere, not just the historical torso/arm injection capsules.
+            // Bone capsules above are cheap, animation-current coverage for
+            // ordinary humanoids. If they did not already prove contact, use
+            // the actor's actual scene geometry so clothing, feet, creatures,
+            // and nonstandard skeletons remain valid touch targets.
+            bool hasActorMeshCoverage = false;
+            bool probesNearActorBound = true;
+            const auto& actorBound = root->worldBound;
+            if (std::isfinite(actorBound.center.x) &&
+                std::isfinite(actorBound.center.y) &&
+                std::isfinite(actorBound.center.z) &&
+                std::isfinite(actorBound.fRadius) &&
+                actorBound.fRadius >= 0.0f &&
+                actorBound.fRadius <= 200.0f) {
+                const auto boundCenter =
+                    toPolicyPoint(actorBound.center);
+                const float boundDistance =
+                    heisenberg::npc_injection_policy::
+                        MinimumProbeDistanceToCapsule(
+                            contactProbes,
+                            {
+                                .start = boundCenter,
+                                .end = boundCenter,
+                                .radius = actorBound.fRadius,
+                            });
+                probesNearActorBound =
+                    std::isfinite(boundDistance) &&
+                    boundDistance <= nearestDistance + 10.0f;
+            }
+            if (targetKind == InjectionTargetKind::WoundedCompanion &&
+                probesNearActorBound &&
+                (!std::isfinite(actorDistance) ||
+                 actorDistance > nearestDistance)) {
+                std::vector<heisenberg::TriangleData> actorTriangles;
+                constexpr std::size_t kActorMeshTriangleBudget = 50000;
+                heisenberg::GetTriangles(
+                    root,
+                    actorTriangles,
+                    kActorMeshTriangleBudget);
+                hasActorMeshCoverage = !actorTriangles.empty();
+                if (hasActorMeshCoverage) {
+                    const std::size_t probeCount = (std::min)(
+                        contactProbes.count,
+                        contactProbes.probes.size());
+                    for (std::size_t probeIndex = 0;
+                         probeIndex < probeCount;
+                         ++probeIndex) {
+                        const auto& probe =
+                            contactProbes.probes[probeIndex];
+                        RE::NiPoint3 probePoint{
+                            probe.center.x,
+                            probe.center.y,
+                            probe.center.z,
+                        };
+                        RE::NiPoint3 meshPoint{};
+                        float meshDistance =
+                            std::numeric_limits<float>::infinity();
+                        if (heisenberg::GetClosestMeshPointToPoint(
+                                actorTriangles,
+                                probePoint,
+                                meshPoint,
+                                meshDistance) &&
+                            std::isfinite(meshDistance)) {
+                            actorDistance = (std::min)(
+                                actorDistance,
+                                (std::max)(
+                                    0.0f,
+                                    meshDistance - probe.radius));
+                        }
+                    }
+                }
+            }
+
+            const bool needsFallbackCoverage =
+                targetKind == InjectionTargetKind::WoundedCompanion ?
+                    (!foundBodyCapsule && !hasActorMeshCoverage) :
+                    !foundBodyCapsule;
+            if (needsFallbackCoverage) {
+                // If exact scene geometry is unavailable, use the complete
+                // actor 3D bound only for an unusual companion that exposes
+                // neither recognized skeleton capsules nor mesh triangles.
+                // Never let that broad bound replace real coverage. Disease
+                // cures retain their narrower historical fallback.
+                RE::NiPoint3 bodyPoint = root->worldBound.center;
+                if (!std::isfinite(bodyPoint.x) ||
+                    !std::isfinite(bodyPoint.y) ||
+                    !std::isfinite(bodyPoint.z)) {
+                    bodyPoint = root->world.translate;
+                }
+                const bool fullActorFallback =
+                    targetKind ==
+                    InjectionTargetKind::WoundedCompanion;
+                const float fallbackBodyRadius =
+                    fullActorFallback ? 35.0f : 8.0f;
+                const float maximumFallbackBodyRadius =
+                    fullActorFallback ? 100.0f : 15.0f;
+                const float rawRadius = root->worldBound.fRadius;
+                const float bodyRadius =
+                    std::isfinite(rawRadius) && rawRadius >= 0.0f &&
+                            rawRadius <= 200.0f ?
+                        (std::min)(rawRadius,
+                                   maximumFallbackBodyRadius) :
+                        fallbackBodyRadius;
+                const auto point = toPolicyPoint(bodyPoint);
+                actorDistance = (std::min)(
+                    actorDistance,
+                    heisenberg::npc_injection_policy::
+                        MinimumProbeDistanceToCapsule(
+                            contactProbes,
+                            {
+                                .start = point,
+                                .end = point,
+                                .radius = bodyRadius,
+                            }));
+            }
+
+            if (std::isfinite(actorDistance) &&
+                actorDistance <= nearestDistance) {
+                nearest = candidate;
+                nearestDistance = actorDistance;
+            }
+        }
+
+        if (!nearest) {
+            return nullptr;
+        }
+        outDistance = nearestDistance;
+        return nearest.get();
+    }
+
+    // SS2's OnItemRemoved handler only records the trade target; it actually
+    // treats that actor when ContainerMenu later closes. A physical gesture has
+    // no menu-close event, so invoke NPC_RPGManager's authoritative menuless
+    // path and let SS2 perform disease checks, consume one cure, or refund it.
+    heisenberg::NpcInjectionResult InjectHeldItemIntoActor(
+        RE::TESObjectREFR* refr,
+        RE::Actor* target,
+        const std::function<bool()>& prepareInventoryCommit)
+    {
+        if (!refr || !target) {
+            return heisenberg::NpcInjectionResult::FailedKeptInHand;
+        }
+
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        auto* baseForm = refr->GetObjectReference();
+        if (!player || !baseForm) {
+            return heisenberg::NpcInjectionResult::FailedKeptInHand;
+        }
+
+        if (!heisenberg::npc_injection_policy::IsEligibleNpcTarget(
+                reinterpret_cast<std::uintptr_t>(target),
+                reinterpret_cast<std::uintptr_t>(player),
+                target->formID,
+                target->IsDead(true))) {
+            spdlog::error(
+                "[INJECT-NPC] Refused invalid/player injection target {:08X}",
+                target->formID);
+            return heisenberg::NpcInjectionResult::FailedKeptInHand;
+        }
+
+        auto* bound = baseForm->As<RE::TESBoundObject>();
+        if (!bound) {
+            return heisenberg::NpcInjectionResult::FailedKeptInHand;
+        }
+
+        std::int32_t count = 1;
+        if (refr->extraList) {
+            if (auto* extraData = refr->extraList->GetByType(RE::EXTRA_DATA_TYPE::kCount)) {
+                count = *reinterpret_cast<std::int16_t*>(
+                    reinterpret_cast<std::uint8_t*>(extraData) + 0x18);
+            }
+        }
+        if (count < 1) count = 1;
+
+        std::string targetName = "settler";
+        if (auto* npcBase = target->GetObjectReference()) {
+            auto nameView = RE::TESFullName::GetFullName(*npcBase, false);
+            if (!nameView.empty()) targetName = std::string(nameView);
+        }
+        const std::string itemName = heisenberg::ItemOffsetManager::GetItemName(refr);
+
+        const auto result = heisenberg::ss2::DispatchDiseaseCure(
+            target,
+            baseForm,
+            [&]() {
+                // Dynamic ROCK must surrender the live body/constraint before
+                // this world ref is placed in inventory and disabled. A false
+                // return aborts the SS2 call without mutating either owner.
+                if (prepareInventoryCommit &&
+                    !prepareInventoryCommit()) {
+                    return false;
+                }
+                heisenberg::Hooks::SetSuppressHUDMessages(true);
+                try {
+                    RE::BSTSmartPointer<RE::ExtraDataList> nullExtra;
+                    heisenberg::AddObjectToContainer(
+                        player,
+                        bound,
+                        &nullExtra,
+                        count,
+                        nullptr,
+                        0);
+                    SafeDisableRef(refr);
+                    heisenberg::Hooks::SetSuppressHUDMessages(false);
+                    return true;
+                } catch (...) {
+                    heisenberg::Hooks::SetSuppressHUDMessages(false);
+                    throw;
+                }
+            });
+
+        if (result ==
+            heisenberg::ss2::DiseaseCureDispatchResult::PreflightFailed) {
+            spdlog::warn(
+                "[INJECT-NPC] SS2 preflight failed for {:08X}; keeping '{}' in hand",
+                target->formID,
+                itemName);
+            return heisenberg::NpcInjectionResult::FailedKeptInHand;
+        }
+
+        if (result == heisenberg::ss2::DiseaseCureDispatchResult::Accepted) {
+            // This is intentionally warning-level: the owner's active log
+            // level is warning, and a one-line target audit is essential for
+            // proving that medicine went to the settler rather than PlayerRef.
+            spdlog::warn(
+                "[INJECT-NPC] DISPATCH QUEUED: SS2 accepted one '{}' for target {:08X} '{}'; "
+                "held stack x{} was transferred to PlayerRef for TryToUseCureItemOnActor (Papyrus decides cure/refund asynchronously)",
+                itemName,
+                target->formID,
+                targetName,
+                count);
+            if (heisenberg::g_config.showInjectionMessages) {
+                const std::string msg =
+                    std::format("Treatment queued for {}", targetName);
+                heisenberg::Hooks::ShowHUDMessageDirect(msg.c_str());
+            }
+            return heisenberg::NpcInjectionResult::Accepted;
+        }
+
+        spdlog::error(
+            "[INJECT-NPC] SS2 rejected the cure call for {:08X}; '{}' remains in player inventory",
+            target->formID,
+            itemName);
+        if (heisenberg::g_config.showInjectionMessages) {
+            const std::string msg = std::format(
+                "Injection failed; {} returned to inventory",
+                itemName);
+            heisenberg::Hooks::ShowHUDMessageDirect(msg.c_str());
+        }
+        return heisenberg::NpcInjectionResult::ReturnedToInventory;
+    }
+
+    heisenberg::NpcInjectionResult InjectHeldStimpakIntoCompanion(
+        RE::TESObjectREFR* refr,
+        RE::Actor* target,
+        const std::function<bool()>& prepareInventoryCommit)
+    {
+        if (!refr || !target) {
+            return heisenberg::NpcInjectionResult::FailedKeptInHand;
+        }
+
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        auto* baseForm = refr->GetObjectReference();
+        if (!player || !baseForm ||
+            !heisenberg::g_config.enableCompanionStimpakInjection ||
+            !IsCompanionStimpakItemImpl(refr) ||
+            !IsWoundedCurrentPlayerCompanion(target, player)) {
+            spdlog::warn(
+                "[INJECT-COMPANION] Commit revalidation failed for target {:08X}; keeping held Stimpak in hand",
+                target->GetFormID());
+            return heisenberg::NpcInjectionResult::FailedKeptInHand;
+        }
+
+        auto* bound = baseForm->As<RE::TESBoundObject>();
+        if (!bound) {
+            return heisenberg::NpcInjectionResult::FailedKeptInHand;
+        }
+
+        std::int32_t count = 1;
+        if (refr->extraList) {
+            if (auto* extraData = refr->extraList->GetByType(
+                    RE::EXTRA_DATA_TYPE::kCount)) {
+                count = *reinterpret_cast<std::int16_t*>(
+                    reinterpret_cast<std::uint8_t*>(extraData) + 0x18);
+            }
+        }
+        if (count < 1) count = 1;
+
+        std::string targetName = "companion";
+        if (auto* npcBase = target->GetObjectReference()) {
+            const auto nameView =
+                RE::TESFullName::GetFullName(*npcBase, false);
+            if (!nameView.empty()) targetName = std::string(nameView);
+        }
+        const std::string itemName =
+            heisenberg::ItemOffsetManager::GetItemName(refr);
+
+        // Dynamic ROCK owns a live body/constraint until this exact boundary.
+        // If it cannot surrender that ownership, abort before either inventory
+        // or actor state can change.
+        if (prepareInventoryCommit && !prepareInventoryCommit()) {
+            spdlog::error(
+                "[INJECT-COMPANION] Exact held-object ownership handoff failed for target {:08X}; keeping item in hand",
+                target->GetFormID());
+            return heisenberg::NpcInjectionResult::FailedKeptInHand;
+        }
+
+        // The normal companion activation expects a Stimpak in PlayerRef's
+        // inventory. Return the held world stack first, without consuming it.
+        // From this point on a failure is intentionally inventory-safe: the
+        // item remains in PlayerRef and we never attempt a manual rollback or
+        // a second consumption path.
+        heisenberg::Hooks::SetSuppressHUDMessages(true);
+        try {
+            RE::BSTSmartPointer<RE::ExtraDataList> nullExtra;
+            heisenberg::AddObjectToContainer(
+                player,
+                bound,
+                &nullExtra,
+                count,
+                nullptr,
+                0);
+            SafeDisableRef(refr);
+            heisenberg::DropToHand::GetSingleton().
+                MarkAsRecentlyStored(baseForm->GetFormID());
+            heisenberg::Hooks::SetSuppressHUDMessages(false);
+        } catch (...) {
+            heisenberg::Hooks::SetSuppressHUDMessages(false);
+            throw;
+        }
+
+        if (!heisenberg::ActorUtils_PlayerCanStimpak.get()(*target)) {
+            spdlog::warn(
+                "[INJECT-COMPANION] Native PlayerCanStimpak rejected {:08X} '{}'; '{}' remains in player inventory",
+                target->GetFormID(),
+                targetName,
+                itemName);
+            if (heisenberg::g_config.showInjectionMessages) {
+                const std::string message = std::format(
+                    "Cannot revive {}; {} returned to inventory",
+                    targetName,
+                    itemName.empty() ? "Stimpak" : itemName);
+                heisenberg::Hooks::ShowHUDMessageDirect(message.c_str());
+            }
+            return heisenberg::NpcInjectionResult::ReturnedToInventory;
+        }
+
+        // This is the normal A/X companion activation. The internal-activation
+        // scope bypasses only Heisenberg's held-object input guard; Fallout
+        // still owns the revive, one-Stimpak consumption, animation, dialogue,
+        // and every native/Papyrus observer of that action.
+        bool activated = false;
+        heisenberg::Hooks::SetInternalActivation(true);
+        try {
+            activated = target->ActivateRef(
+                player,
+                nullptr,
+                1,
+                false,
+                false,
+                false);
+            heisenberg::Hooks::SetInternalActivation(false);
+        } catch (...) {
+            heisenberg::Hooks::SetInternalActivation(false);
+            throw;
+        }
+
+        if (!activated) {
+            spdlog::error(
+                "[INJECT-COMPANION] Native ActivateRef rejected {:08X} '{}'; '{}' remains in player inventory",
+                target->GetFormID(),
+                targetName,
+                itemName);
+            if (heisenberg::g_config.showInjectionMessages) {
+                const std::string message = std::format(
+                    "Revive failed; {} returned to inventory",
+                    itemName.empty() ? "Stimpak" : itemName);
+                heisenberg::Hooks::ShowHUDMessageDirect(message.c_str());
+            }
+            return heisenberg::NpcInjectionResult::ReturnedToInventory;
+        }
+
+        spdlog::warn(
+            "[INJECT-COMPANION] NATIVE REVIVE ACCEPTED: target {:08X} '{}', held '{}' stack x{} returned to PlayerRef before ActivateRef; engine owns one-Stimpak consumption",
+            target->GetFormID(),
+            targetName,
+            itemName,
+            count);
+        if (heisenberg::g_config.showInjectionMessages) {
+            const std::string message =
+                std::format("Revived {}", targetName);
+            heisenberg::Hooks::ShowHUDMessageDirect(message.c_str());
+        }
+        return heisenberg::NpcInjectionResult::Accepted;
+    }
+
+    heisenberg::NpcInjectionAttempt TryInjectHeldDiseaseCureImpl(
+        bool isLeft,
+        RE::TESObjectREFR* refr,
+        RE::NiAVObject* heldNode,
+        float heldSeconds,
+        float handSpeedMetersPerSecond,
+        const std::function<bool()>& prepareInventoryCommit)
+    {
+        heisenberg::NpcInjectionAttempt attempt{};
+        if (!heisenberg::g_config.enableNpcInjection) {
+            attempt.gate = heisenberg::NpcInjectionGate::FeatureDisabled;
+            return attempt;
+        }
+        if (!IsDiseaseCureItemImpl(refr)) {
+            attempt.gate = heisenberg::NpcInjectionGate::NotDiseaseCure;
+            return attempt;
+        }
+
+        float injectDistance = -1.0f;
+        RE::Actor* target = FindInjectionTargetActor(
+            isLeft,
+            heldNode,
+            InjectionTargetKind::DiseaseCure,
+            injectDistance);
+        if (!target) {
+            attempt.gate = heisenberg::NpcInjectionGate::NoTargetContact;
+            return attempt;
+        }
+
+        attempt.targetFormID = target->formID;
+        attempt.targetDistanceGameUnits = injectDistance;
+        if (!std::isfinite(heldSeconds) || heldSeconds < 0.5f) {
+            attempt.gate = heisenberg::NpcInjectionGate::HoldAge;
+            return attempt;
+        }
+        if (!std::isfinite(handSpeedMetersPerSecond) ||
+            handSpeedMetersPerSecond >=
+                heisenberg::g_config.mouthVelocityThreshold) {
+            attempt.gate = heisenberg::NpcInjectionGate::HandSpeed;
+            return attempt;
+        }
+
+        attempt.gate = heisenberg::NpcInjectionGate::Dispatch;
+        spdlog::warn(
+            "[INJECT-NPC] Disease Cure pressed against {:08X} at {:.1f}gu "
+            "(hand={}, held={:.2f}s speed={:.2f}m/s) — dispatching SS2 cure",
+            target->formID,
+            injectDistance,
+            isLeft ? "left" : "right",
+            heldSeconds,
+            handSpeedMetersPerSecond);
+        attempt.result = InjectHeldItemIntoActor(
+            refr,
+            target,
+            prepareInventoryCommit);
+        if (attempt.result ==
+            heisenberg::NpcInjectionResult::FailedKeptInHand) {
+            spdlog::warn(
+                "[INJECT-NPC] Injection dispatch failed for {:08X}; keeping item in hand",
+                target->formID);
+        }
+        return attempt;
+    }
+
+    heisenberg::NpcInjectionAttempt TryInjectHeldCompanionStimpakImpl(
+        bool isLeft,
+        RE::TESObjectREFR* refr,
+        RE::NiAVObject* heldNode,
+        float heldSeconds,
+        float handSpeedMetersPerSecond,
+        const std::function<bool()>& prepareInventoryCommit)
+    {
+        heisenberg::NpcInjectionAttempt attempt{};
+        if (!heisenberg::g_config.enableCompanionStimpakInjection) {
+            attempt.gate = heisenberg::NpcInjectionGate::FeatureDisabled;
+            return attempt;
+        }
+        if (!IsCompanionStimpakItemImpl(refr)) {
+            attempt.gate =
+                heisenberg::NpcInjectionGate::NotCompanionStimpak;
+            return attempt;
+        }
+        if (!heldNode && refr) {
+            heldNode = refr->Get3D();
+        }
+
+        float injectDistance = -1.0f;
+        RE::Actor* target = FindInjectionTargetActor(
+            isLeft,
+            heldNode,
+            InjectionTargetKind::WoundedCompanion,
+            injectDistance);
+        if (!target) {
+            attempt.gate =
+                heisenberg::NpcInjectionGate::NoTargetContact;
+            return attempt;
+        }
+
+        attempt.targetFormID = target->GetFormID();
+        attempt.targetDistanceGameUnits = injectDistance;
+
+        attempt.gate = heisenberg::NpcInjectionGate::Dispatch;
+        spdlog::warn(
+            "[INJECT-COMPANION] Stimpak pressed against wounded companion {:08X} at {:.1f}gu (hand={}, held={:.2f}s speed={:.2f}m/s) - invoking native revive activation",
+            target->GetFormID(),
+            injectDistance,
+            isLeft ? "left" : "right",
+            heldSeconds,
+            handSpeedMetersPerSecond);
+        attempt.result = InjectHeldStimpakIntoCompanion(
+            refr,
+            target,
+            prepareInventoryCommit);
+        return attempt;
     }
 
     // Armor zone types for zone-specific equipping
@@ -5769,6 +6763,20 @@ namespace
         auto* baseForm = refr->GetObjectReference();
         if (!baseForm || !baseForm->IsAlchemyItem())
             return false;
+
+        // Defense in depth: the SS2 cure is NPC-only. Even if a caller bypasses
+        // the zone router, never return the held unit to PlayerRef's inventory
+        // and never invoke EquipObject/DrinkPotion on the player for this form.
+        if (heisenberg::ss2::IsDiseaseCureForm(baseForm)) {
+            spdlog::warn(
+                "[CONSUME] Blocked player self-use of SS2 Disease Cure {:08X}; keeping it held",
+                baseForm->GetFormID());
+            if (heisenberg::g_config.showConsumeMessages) {
+                heisenberg::Hooks::ShowHUDMessageDirect(
+                    "Disease Cure can only be used on a settler");
+            }
+            return false;
+        }
         
         // Cast to AlchemyItem for DrinkPotion
         RE::AlchemyItem* alchemyItem = static_cast<RE::AlchemyItem*>(baseForm);
@@ -5791,24 +6799,43 @@ namespace
         //
         // Going with Option 2: Consume from inventory, delete world ref
         
-        // Check if player has at least 1 of this item in inventory
+        // Inventory count BEFORE anything happens, with the held unit still out in the world.
+        // Kept as a number, not a bool: the accounting check at the end needs the magnitude to
+        // prove exactly one unit was used rather than merely that some were.
+        int countBefore = 0;
         bool hasInInventory = false;
         auto* inventory = player->inventoryList;
         if (inventory) {
             for (auto& item : inventory->data) {
                 if (item.object && item.object->GetFormID() == baseForm->GetFormID()) {
-                    hasInInventory = true;
+                    countBefore = item.GetCount();
+                    hasInInventory = countBefore > 0;
                     break;
                 }
             }
         }
         
-        // DrinkPotion applies alchemy effects (health, rads, addiction, etc.)
-        // but does NOT remove the item from inventory. We must remove it explicitly.
-        if (!hasInInventory) {
-            // No backup in inventory - add the world item to inventory first
-            spdlog::debug("[CONSUME] No backup in inventory, using ActivateRef+DrinkPotion path");
-
+        // ── THE HELD UNIT ALWAYS GOES INTO INVENTORY FIRST ──────────────────────────
+        // Consuming what is in your hand must reduce your total possession by exactly ONE.
+        // The held world reference IS one unit, so there are only two self-consistent
+        // recipes: (a) put it in inventory, then have the game consume one from inventory,
+        // or (b) destroy the world ref and apply effects WITHOUT consuming from inventory.
+        //
+        // The old code branched on whether a spare existed and picked (b) when it did -
+        // Disable() the held ref, then DrinkPotion, which removes nothing. That was correct
+        // for DrinkPotion. It became a DOUBLE consume the moment consumption moved to
+        // EquipObject, because EquipObject genuinely consumes a unit from inventory: the
+        // held one was destroyed AND an inventory one was eaten. Two Jets for one use.
+        //
+        // Why it looked Pip-Boy-dependent: consume-to-hand takes the item FROM inventory, so
+        // with 2+ of something a spare always remains and the buggy branch is taken. Grab a
+        // loose one off the world with only that one to your name and there is no spare, so
+        // the correct branch ran. The Pip-Boy is just how items come from inventory - the
+        // real predictor was "do you own a spare", which is why the last one always worked.
+        //
+        // Recipe (a) for every case: uniform, and it is exactly what the game does when you
+        // pick an item up and use it.
+        {
             // Mark as recently stored so harvest-to-hand doesn't re-grab after ActivateRef
             heisenberg::DropToHand::GetSingleton().MarkAsRecentlyStored(baseForm->GetFormID());
 
@@ -5817,23 +6844,72 @@ namespace
             bool activateResult = refr->ActivateRef(player, nullptr, 1, false, false, false);
             heisenberg::Hooks::SetInternalActivation(false);
             heisenberg::Hooks::SetSuppressHUDMessages(false);
-            spdlog::debug("[CONSUME] ActivateRef returned {} for {:08X}", activateResult, refr->formID);
-        } else {
-            // Has backup in inventory - disable world ref, consume from inventory
-            spdlog::debug("[CONSUME] Has backup in inventory, consuming from inventory");
-            refr->Disable();
-            spdlog::debug("[CONSUME] Disabled world reference {:08X}", refr->formID);
+            spdlog::debug("[CONSUME] Held unit returned to inventory (ActivateRef={}) for {:08X}, hadSpare={}",
+                activateResult, refr->formID, hasInInventory);
         }
 
-        // Apply alchemy effects
-        bool drinkResult = heisenberg::Actor_DrinkPotion(player, alchemyItem, 1);
-        spdlog::debug("[CONSUME] DrinkPotion returned {} for '{}'", drinkResult, itemName);
+        // ── CONSUME VIA THE NATIVE "USE ITEM" PATH ──────────────────────────────────
+        // DrinkPotion applies the alchemy effects and nothing else. That is enough for
+        // health/rads/addiction, but NOT for Survival: hunger and thirst are driven by a
+        // script layer that watches the EQUIP pipeline, so a drink performed with
+        // DrinkPotion is invisible to it. Live evidence - a Parched player drank Purified
+        // Water, '[CONSUME] Successfully consumed' logged, and in the following 90 seconds
+        // the Survival system did not equip a single status token, while 11 seconds EARLIER
+        // it had equipped five of them in 100ms. It was alive; it simply never saw the drink.
+        //
+        // EquipObject is what the game itself calls when you use an item from the Pip-Boy,
+        // so it produces exactly the events Survival expects, and it consumes the item.
+        // g_internalEquip stops our own consumable-to-hand hook from bouncing it back to
+        // the hand. DrinkPotion stays as a fallback: if the equip path fails for any reason
+        // the item must still be eaten, or the player loses it for nothing.
+        bool drinkResult = false;
+        bool consumedViaEquip = false;
+        if (auto* equipMgr = RE::ActorEquipManager::GetSingleton()) {
+            // Same shape the armour/weapon equip paths use. Declared locally because the
+            // engine's BGSObjectInstance layout is what EquipObject expects and CommonLib's
+            // definition is not directly constructible here.
+            // Layout must match the armour/weapon equip paths exactly (see ~5527) - the
+            // static_assert is what guarantees we hand EquipObject the shape it expects.
+            struct LocalObjectInstance {
+                RE::TESForm* object{ nullptr };
+                RE::BSTSmartPointer<RE::TBO_InstanceData> instanceData;
+            };
+            static_assert(sizeof(LocalObjectInstance) == 0x10);
 
-        // Only remove from inventory in the ActivateRef path (Case 2).
-        // In Case 1 (hasInInventory), the world ref was Disabled — that ref IS the
-        // consumed item (already removed from inventory by DropToHand). No extra removal needed.
-        // DrinkPotion only applies effects, it does NOT remove from inventory.
-        if (!hasInInventory) {
+            LocalObjectInstance instance;
+            instance.object = alchemyItem;
+
+            heisenberg::Hooks::SetInternalEquip(true);
+            consumedViaEquip = heisenberg::ActorEquipManager_EquipObject(
+                equipMgr,
+                player,
+                reinterpret_cast<RE::BGSObjectInstance*>(&instance),
+                0,        // stackID
+                1,        // count
+                nullptr,  // slot - the game resolves it for a consumable
+                false,    // queueEquip: consume now, not next frame
+                false,    // forceEquip
+                true,     // playSounds
+                true,     // applyNow
+                false);   // locked
+            heisenberg::Hooks::SetInternalEquip(false);
+            spdlog::debug("[CONSUME] EquipObject returned {} for '{}'", consumedViaEquip, itemName);
+        }
+
+        if (!consumedViaEquip) {
+            drinkResult = heisenberg::Actor_DrinkPotion(player, alchemyItem, 1);
+            spdlog::warn("[CONSUME] EquipObject path unavailable/failed for '{}' - fell back to "
+                         "DrinkPotion. Effects apply, but Survival hunger/thirst will NOT update.",
+                         itemName);
+        } else {
+            drinkResult = true;
+        }
+
+        // ONLY on the DrinkPotion fallback. The held unit is now always in inventory (above),
+        // so exactly one unit must leave it. EquipObject already removes one itself - removing
+        // here too would eat TWO. DrinkPotion applies effects without removing anything, so on
+        // that path this removal is what balances the books.
+        if (!consumedViaEquip) {
             auto* boundObj = baseForm->As<RE::TESBoundObject>();
             if (boundObj) {
                 RE::TESObjectREFR::RemoveItemData removeData(boundObj, 1);
@@ -5841,7 +6917,7 @@ namespace
                 heisenberg::Hooks::SetSuppressHUDMessages(true);
                 player->RemoveItem(removeData);
                 heisenberg::Hooks::SetSuppressHUDMessages(false);
-                spdlog::debug("[CONSUME] Removed 1x '{}' from inventory (ActivateRef path)", itemName);
+                spdlog::debug("[CONSUME] Removed 1x '{}' from inventory (DrinkPotion fallback path)", itemName);
             }
         }
         
@@ -5859,7 +6935,30 @@ namespace
             heisenberg::Hooks::ShowHUDMessageDirect(msg.c_str());
         }
 
-        spdlog::info("[CONSUME] Successfully consumed '{}'", itemName);
+        // Count the item AFTER the whole sequence. Net possession must have fallen by exactly
+        // one: countBefore was taken with the held unit still OUT of inventory, so the correct
+        // end state is countBefore (the held unit came in, one was consumed). Anything lower
+        // means a second unit was eaten - the double-consume returning.
+        {
+            int countAfter = 0;
+            if (auto* inv = player->inventoryList) {
+                for (auto& item : inv->data) {
+                    if (item.object && item.object->GetFormID() == baseForm->GetFormID()) {
+                        countAfter = item.GetCount();
+                        break;
+                    }
+                }
+            }
+            const int expected = countBefore;   // held unit added, one consumed
+            if (countAfter != expected) {
+                spdlog::warn("[CONSUME] ACCOUNTING MISMATCH for '{}': inventory before={} after={} "
+                             "expected={} (viaEquip={}) — more than one unit was used",
+                             itemName, countBefore, countAfter, expected, consumedViaEquip);
+            } else {
+                spdlog::info("[CONSUME] Successfully consumed '{}' (inventory {} -> {}, viaEquip={})",
+                             itemName, countBefore, countAfter, consumedViaEquip);
+            }
+        }
         
         return true;
     }
@@ -6400,7 +7499,10 @@ namespace
         // world.translate = parent.translate + parent.rotate * local.translate.
         outTransform.rotate = localRotation * parentRot;
         outTransform.translate = parentPos + (parentRot.Transpose() * localOffset);
-        outTransform.scale = state.node->local.scale > 0.0f ? state.node->local.scale : 1.0f;
+        // WORLD scale — outTransform is a WORLD transform (see the two lines above). Reading
+        // local.scale here and letting UpdateKeyframedNode divide it by the parent's world
+        // scale again compounds the error every time the parent changes.
+        outTransform.scale = state.node->world.scale > 0.0f ? state.node->world.scale : 1.0f;
         return true;
     }
 
@@ -6411,6 +7513,80 @@ namespace
 
 namespace heisenberg
 {
+    bool IsPlayerConsumableItem(RE::TESObjectREFR* refr)
+    {
+        return IsConsumable(refr);
+    }
+
+    bool IsPlayerInjectableItem(RE::TESObjectREFR* refr)
+    {
+        return IsInjectable(refr);
+    }
+
+    bool IsDiseaseCureItem(RE::TESObjectREFR* refr)
+    {
+        return IsDiseaseCureItemImpl(refr);
+    }
+
+    bool IsCompanionStimpakItem(RE::TESObjectREFR* refr)
+    {
+        return IsCompanionStimpakItemImpl(refr);
+    }
+
+    bool HasHeldCompanionStimpakTarget(
+        bool isLeft,
+        RE::TESObjectREFR* refr,
+        RE::NiAVObject* heldNode)
+    {
+        if (!g_config.enableCompanionStimpakInjection ||
+            !IsCompanionStimpakItemImpl(refr)) {
+            return false;
+        }
+        if (!heldNode && refr) {
+            heldNode = refr->Get3D();
+        }
+        float targetDistance = -1.0f;
+        return FindInjectionTargetActor(
+                   isLeft,
+                   heldNode,
+                   InjectionTargetKind::WoundedCompanion,
+                   targetDistance) != nullptr;
+    }
+
+    NpcInjectionAttempt TryInjectHeldDiseaseCure(
+        bool isLeft,
+        RE::TESObjectREFR* refr,
+        RE::NiAVObject* heldNode,
+        float heldSeconds,
+        float handSpeedMetersPerSecond,
+        const std::function<bool()>& prepareInventoryCommit)
+    {
+        return TryInjectHeldDiseaseCureImpl(
+            isLeft,
+            refr,
+            heldNode,
+            heldSeconds,
+            handSpeedMetersPerSecond,
+            prepareInventoryCommit);
+    }
+
+    NpcInjectionAttempt TryInjectHeldCompanionStimpak(
+        bool isLeft,
+        RE::TESObjectREFR* refr,
+        RE::NiAVObject* heldNode,
+        float heldSeconds,
+        float handSpeedMetersPerSecond,
+        const std::function<bool()>& prepareInventoryCommit)
+    {
+        return TryInjectHeldCompanionStimpakImpl(
+            isLeft,
+            refr,
+            heldNode,
+            heldSeconds,
+            handSpeedMetersPerSecond,
+            prepareInventoryCommit);
+    }
+
     void TickDeferredDisables()
     {
         TickDeferredDisablesInternal();
@@ -6871,15 +8047,6 @@ namespace heisenberg
             heisenberg::Heisenberg::GetSingleton().DeactivateUnarmedForGrab();
         }
         
-        // FAVORITES MENU CHECK: Block grab when FavoritesMenu is open
-        // Holstering is done via FavoritesMenu (thumbstick click → grip), so if the
-        // FavoritesMenu is open and player presses grip, they're holstering, not grabbing.
-        auto& menuChecker = MenuChecker::GetSingleton();
-        if (menuChecker.IsFavoritesOpen()) {
-            spdlog::debug("[GRAB] FavoritesMenu open - blocking grab (player is holstering)");
-            return false;
-        }
-
         // STEALING CHECK: Block grab if picking up this item would be stealing (unless config allows it)
         RE::TESObjectREFR* selRefr = selection.GetRefr();
 
@@ -7071,8 +8238,51 @@ namespace heisenberg
                                 secondaryAnchorWorld,
                                 secondaryMeshDistance);
 
-                        constexpr float kTransferMeshTolerance = 12.0f;
-                        constexpr float kCoHoldMeshTolerance = 5.0f;
+                        constexpr float kTransferMeshTolerance =
+                            grab_pose_policy::
+                                kSameObjectTransferCandidateDistance;
+
+                        // CO-HOLD TOLERANCE MUST SCALE WITH THE OBJECT'S THICKNESS.
+                        //
+                        // A flat 5.0 units is generous slop on a rifle and nonsense on a
+                        // screwdriver: that shaft measures 2.81 units ACROSS, so a palm 3.9
+                        // units from the metal - nearly three shaft-radii away, not touching
+                        // anything - still qualified as a two-handed grip. The second hand then
+                        // curled its fingers in mid-air beside the shaft. Live evidence, ten
+                        // joins on one screwdriver: secondaryMesh ranged 0.01 (fingers wrap the
+                        // metal) to 3.92 (fingers close on nothing), all accepted identically.
+                        //
+                        // Derive the grip envelope from the object itself. Of the three AABB
+                        // spans the LARGEST is the long axis (33.5 for the screwdriver); the
+                        // MIDDLE one is the cross-section you actually close your hand around.
+                        // Half of it is the grip radius, plus a fixed allowance for palm flesh
+                        // and tracking noise. Never wider than the old constant, so chunky
+                        // objects keep exactly today's behaviour and only thin ones tighten.
+                        float coHoldMeshTolerance = 5.0f;
+                        {
+                            constexpr float kCoHoldHandSlop = 1.5f;
+                            RE::NiPoint3 lo{ FLT_MAX, FLT_MAX, FLT_MAX };
+                            RE::NiPoint3 hi{ -FLT_MAX, -FLT_MAX, -FLT_MAX };
+                            const auto include = [&](const RE::NiPoint3& v) {
+                                lo.x = (std::min)(lo.x, v.x); hi.x = (std::max)(hi.x, v.x);
+                                lo.y = (std::min)(lo.y, v.y); hi.y = (std::max)(hi.y, v.y);
+                                lo.z = (std::min)(lo.z, v.z); hi.z = (std::max)(hi.z, v.z);
+                            };
+                            for (const auto& tri : triangles) {
+                                include(tri.v0); include(tri.v1); include(tri.v2);
+                            }
+                            if (!triangles.empty()) {
+                                float spans[3] = { hi.x - lo.x, hi.y - lo.y, hi.z - lo.z };
+                                std::sort(spans, spans + 3);
+                                const float gripSpan = spans[1];   // middle = cross-section
+                                if (std::isfinite(gripSpan) && gripSpan > 0.0f) {
+                                    coHoldMeshTolerance =
+                                        (std::min)(coHoldMeshTolerance,
+                                                   gripSpan * 0.5f + kCoHoldHandSlop);
+                                }
+                            }
+                        }
+                        const float kCoHoldMeshTolerance = coHoldMeshTolerance;
                         const bool palmWithinTransferEnvelope =
                             haveSecondaryAnchor &&
                             secondaryMeshDistance <=
@@ -7205,12 +8415,13 @@ namespace heisenberg
                                     "[GRAB] Two-handed CO-HOLD: {} hand joined ref "
                                     "{:08X} at a distinct mesh spot "
                                     "(secondaryMesh={:.2f} primaryMesh={:.2f} "
-                                    "anchorSep={:.2f})",
+                                    "anchorSep={:.2f} tol={:.2f})",
                                     isLeft ? "Left" : "Right",
                                     selRefr->formID,
                                     secondaryMeshDistance,
                                     primaryMeshDistance,
-                                    anchorSeparation);
+                                    anchorSeparation,
+                                    kCoHoldMeshTolerance);
                                 // This is an internal support-hand marker, not
                                 // a second ownership grab.
                                 return true;
@@ -7606,17 +8817,56 @@ namespace heisenberg
             distToCenter = (objectPos - grabHandPos).Length();  // Distance to center
         }
         
-        // Calculate distance to SURFACE (subtract bounding radius)
-        // This is what matters for natural grab - are we touching the object?
+        // Calculate distance to SURFACE.
+        // Measured from the palm to the closest point of the rendered mesh.
+        // The previous sphere metric (centre distance minus bound radius)
+        // reported "touching" for a hand anywhere inside the bounding sphere
+        // of a long or flat object, which let the touch-preserve and
+        // telekinesis paths lock objects 10+ units away from the hand. The
+        // sphere metric stays as the fallback when no mesh can be read.
         float distToSurface = distToCenter - boundRadius;
         if (distToSurface < 0.0f) distToSurface = 0.0f;  // Hand is inside bounding sphere = touching
-        
+        const char* surfaceDistanceSource = "bound-sphere";
+        if (!forceUseOffset && state.node) {
+            RE::NiPoint3 surfaceProbe = grabHandPos;
+            if (auto* probeNodes = f4cf::f4vr::getPlayerNodes()) {
+                RE::NiTransform palmParent{};
+                RE::NiPoint3 palmProbe{};
+                RE::NiPoint3 palmarProbe{};
+                bool palmSkinned = false;
+                if (GetPalmSurfaceSeatFrame(
+                        heisenberg::GetWandNode(probeNodes, isLeft),
+                        isLeft,
+                        palmParent,
+                        palmProbe,
+                        palmarProbe,
+                        palmSkinned)) {
+                    surfaceProbe = palmProbe;
+                }
+            }
+            std::vector<TriangleData> surfaceTriangles;
+            surfaceTriangles.reserve(512);
+            GetTriangles(state.node.get(), surfaceTriangles, 4096);
+            RE::NiPoint3 closestSurfacePoint{};
+            float meshDistance = -1.0f;
+            if (GetClosestMeshPointToPoint(
+                    surfaceTriangles,
+                    surfaceProbe,
+                    closestSurfacePoint,
+                    meshDistance) &&
+                std::isfinite(meshDistance) &&
+                meshDistance >= 0.0f) {
+                distToSurface = meshDistance;
+                surfaceDistanceSource = "palm-to-mesh";
+            }
+        }
+
         // Use surface distance for NATURAL GRAB decision (hand touching object)
         // Use center distance for PALM SNAP decision (pointing at object from distance)
         float distToObject = distToSurface;
-        
-        spdlog::debug("[GRAB] Distance: center={:.1f}cm surface={:.1f}cm boundR={:.1f}cm (natural if <= {:.1f}cm)",
-                     distToCenter, distToSurface, boundRadius, heisenberg::g_config.naturalGrabDistance);
+
+        spdlog::debug("[GRAB] Distance: center={:.1f}cm surface={:.1f}cm ({}) boundR={:.1f}cm (natural if <= {:.1f}cm)",
+                     distToCenter, distToSurface, surfaceDistanceSource, boundRadius, heisenberg::g_config.naturalGrabDistance);
         
         // =========================================================================
         // TWO-TIER GRAB DISTANCE SYSTEM:
@@ -7802,6 +9052,21 @@ namespace heisenberg
                 // against can itself be unreliable. Three uniforms tested live
                 // all had a donor within 2.0 XZ units — one at 0.00 — and all
                 // three were placed wrongly by the generated path.
+                // MESH IDENTITY FIRST. Borrowing the pose of an item that
+                // renders the SAME NIF is exact, not a similarity guess, so it
+                // outranks the dimensional armor donor below.
+                if (!customOffset.has_value()) {
+                    auto meshDonor = offsetMgr.GetSharedModelDonorOffset(selRefr, isLeft);
+                    if (meshDonor.has_value()) {
+                        customOffset = meshDonor;
+                        spdlog::info(
+                            "[GRAB] '{}' using authored SHARED-MESH donor '{}' "
+                            "— identical model means identical pivot, so the "
+                            "authored hold applies verbatim",
+                            itemName,
+                            customOffset->matchedName);
+                    }
+                }
                 if (!customOffset.has_value()) {
                     auto donorOffset = offsetMgr.GetArmorDimensionalDonorOffset(selRefr, isLeft);
                     if (donorOffset.has_value()) {
@@ -7901,6 +9166,12 @@ namespace heisenberg
                     canonicalWeaponPlacementReason);
             }
         }
+
+        // Set when the no-offset branch below seated the object with the
+        // HIGGS mesh surface snap. Consumed by the runtime-placement gates
+        // after the touch/pull stage so the seat is not cleared as a stale
+        // geometry result.
+        bool geometryFallbackSeat = false;
 
         if (customOffset.has_value())
         {
@@ -8024,11 +9295,63 @@ namespace heisenberg
             ItemOffsetManager::GetItemDimensions(selRefr, itemLength, itemWidth, itemHeight);
             
             // distToObject and withinSnapDistance already calculated above
-            
-            if (heisenberg::g_config.enablePalmSnap && !withinSnapDistance)
+
+            // NATURAL GRAB: preserve the object's current world pose relative
+            // to the wand. Used for telekinesis and, when everything else is
+            // unavailable, as the last resort.
+            // F4VR row-vector convention:
+            //   local.pos    = parent.rotate * (world - parent.translate)
+            //   local.rotate = world.rotate * parent.rotate.Transpose()
+            const auto applyNaturalPreserve = [&]() {
+                RE::NiPoint3 worldOffset = objectPos - wandNode->world.translate;
+                state.itemOffset.position = wandNode->world.rotate * worldOffset;
+                state.itemOffset.rotation = worldTransform.rotate * wandNode->world.rotate.Transpose();
+
+                state.hasItemOffset = false;
+                state.usedSnapMode = false;  // Natural grab - will curl fingers around object
+                spdlog::debug("[GRAB] NATURAL grab for '{}': dist={:.1f}cm, PRESERVE offset=({:.2f}, {:.2f}, {:.2f})",
+                             itemName,
+                             distToObject,
+                             state.itemOffset.position.x, state.itemOffset.position.y, state.itemOffset.position.z);
+                spdlog::debug("[GRAB] NATURAL grab offset rotation[0]=({:.2f},{:.2f},{:.2f})",
+                             state.itemOffset.rotation[0][0], state.itemOffset.rotation[0][1], state.itemOffset.rotation[0][2]);
+            };
+
+            if (!withinSnapDistance &&
+                !grab_pose_policy::ShouldBypassSavedPlacement(baseFormID))
             {
-                // PALM SNAP: seat the object against the real palm.
-                // Only triggers when object is far (>50cm), otherwise use natural grab.
+                // HIGGS-faithful fallback (Hand::TransitionHeld surface snap)
+                // for every non-touching grab that has no exact, exact-dims
+                // or donor offset. A close grab seats from the live pose; a
+                // remote pull seats from its virtual arrival pose so the pull
+                // animation's target is the snapped seat.
+                geometryFallbackSeat = usePullToHand
+                    ? TryCalculatePulledArrivalPlacementFromGeometry(
+                          state, wandNode, isLeft, worldTransform)
+                    : TryCalculateRuntimeHandPlacementFromGeometry(
+                          state, wandNode, isLeft, worldTransform, /*pulledArrival=*/false);
+                if (geometryFallbackSeat) {
+                    state.hasItemOffset = false;
+                    state.usedSnapMode = true;
+                    spdlog::info(
+                        "[GRAB] MESH SURFACE SNAP for '{}': dist={:.1f}cm pull={} frame={} local=({:.2f}, {:.2f}, {:.2f})",
+                        itemName,
+                        distToObject,
+                        usePullToHand,
+                        state.runtimePlacementSkinnedHand ? "skinned" : "wand",
+                        state.itemOffset.position.x, state.itemOffset.position.y, state.itemOffset.position.z);
+                }
+            }
+
+            if (geometryFallbackSeat)
+            {
+                // Seated above.
+            }
+            else if (heisenberg::g_config.enablePalmSnap && !withinSnapDistance)
+            {
+                // PALM SNAP (bound-based): only reached when the mesh surface
+                // snap above could not run (no triangles, no palm frame, or a
+                // policy-bypassed object).
                 //
                 // The geometry-blind constant this replaces —
                 // (0, 1 + itemLength * 0.5, 3) in wand space — assumed the
@@ -8088,23 +9411,8 @@ namespace heisenberg
             }
             else
             {
-                // NATURAL GRAB: Object is close (<50cm) or snap disabled
-                // Calculate offset that PRESERVES object's current world position.
-                // F4VR row-vector convention:
-                //   local.pos    = parent.rotate * (world - parent.translate)
-                //   local.rotate = world.rotate * parent.rotate.Transpose()
-                RE::NiPoint3 worldOffset = objectPos - wandNode->world.translate;
-                state.itemOffset.position = wandNode->world.rotate * worldOffset;
-                state.itemOffset.rotation = worldTransform.rotate * wandNode->world.rotate.Transpose();
-                
-                state.hasItemOffset = false;
-                state.usedSnapMode = false;  // Natural grab - will curl fingers around object
-                spdlog::debug("[GRAB] NATURAL grab for '{}': dist={:.1f}cm, PRESERVE offset=({:.2f}, {:.2f}, {:.2f})",
-                             itemName,
-                             distToObject,
-                             state.itemOffset.position.x, state.itemOffset.position.y, state.itemOffset.position.z);
-                spdlog::debug("[GRAB] NATURAL grab offset rotation[0]=({:.2f},{:.2f},{:.2f})",
-                             state.itemOffset.rotation[0][0], state.itemOffset.rotation[0][1], state.itemOffset.rotation[0][2]);
+                // Telekinesis range, or no seat could be computed with pull disabled.
+                applyNaturalPreserve();
             }
         }
         else
@@ -8372,8 +9680,12 @@ namespace heisenberg
             }
         }
 
+        // A mesh surface seat counts as object-specific placement: it must
+        // survive the gates below exactly like a canonical weapon hold. A
+        // touch grab that ran afterwards has already replaced it.
         bool objectSpecificRuntimePlacement =
-            canonicalWeaponRuntimePlacement;
+            canonicalWeaponRuntimePlacement ||
+            (geometryFallbackSeat && !touchGrabApplied);
         if (!state.isTelekinesis &&
             wandNode &&
             !objectSpecificRuntimePlacement) {
@@ -8664,7 +9976,19 @@ namespace heisenberg
                     state.ClearRuntimeFingerCurls();
                     spdlog::debug("[GRAB-FINGERS] Deferred curls (stored first, geometry fallback) until object reaches the hand");
                 } else if (!naturalPosing && hasStoredCurls && ApplyStoredFingerCurls(state, isLeft)) {
-                    spdlog::debug("[GRAB-FINGERS] Applied saved offset curls for '{}'", itemName);
+                    // IMMEDIATE path: curls applied here, at grab time, BEFORE the object is
+                    // seated at its final placement, and pendingFingerCurls is left false - so
+                    // the rendered-hand rebase can commit as soon as the animator reports
+                    // Holding. The alternative DEFERRED path (see ~9030 -> ResolvePendingFingerCurls)
+                    // applies the same authored curls post-physics instead. Which of the two runs
+                    // decides how long the hand has to settle before the rebase freezes the
+                    // object's seat, and the owner reports the screwdriver sometimes ending up
+                    // beside the finger curl instead of inside it. Logged at INFO on both paths
+                    // so a bad grab can be attributed to one of them from the log alone.
+                    spdlog::info("[GRAB-FINGERS] {} '{}' curls=IMMEDIATE (applied at grab time, "
+                                 "pendingFingerCurls=false) joints={} thumb={:.2f}",
+                        isLeft ? "L" : "R", itemName,
+                        state.itemOffset.hasJointCurls, state.itemOffset.thumbCurl);
                 } else if (naturalPosing &&
                            state.hasRuntimeJointCurls &&
                            ApplyRuntimeFingerCurls(state, isLeft)) {
@@ -8745,6 +10069,128 @@ namespace heisenberg
         // This enables sticky grab if reposition mode is active
         configMode.OnGrabStarted(&state, isLeft);
         
+        return true;
+    }
+
+    bool GrabManager::CommitHeldConsumableConsumption(
+        bool isLeft,
+        RE::TESObjectREFR* refr,
+        const char* zoneLabel)
+    {
+        RE::TESForm* baseForm =
+            refr ? refr->GetObjectReference() : nullptr;
+        const bool isDiseaseCureItem = IsDiseaseCureItem(refr);
+        const bool consumed =
+            heisenberg::npc_injection_policy::TryPlayerConsumption(
+                isDiseaseCureItem,
+                [&]() { return ConsumeGrabbedItem(refr); });
+
+        if (consumed) {
+            spdlog::debug(
+                "[GRAB] Consume succeeded via {} zone",
+                zoneLabel);
+            HeisenbergPluginAPI::InvokeConsumedCallbacks(
+                isLeft,
+                baseForm);
+            g_vrInput.TriggerHaptic(isLeft, 2000);
+            g_heisenberg.BeginPostConsumeActivationSuppression(isLeft);
+            EndGrab(isLeft, nullptr, true);
+            return true;
+        }
+
+        spdlog::warn(
+            "[GRAB] Consume FAILED via {} zone - keeping in hand",
+            zoneLabel);
+        g_vrInput.TriggerHaptic(isLeft, 500);
+        return false;
+    }
+
+    bool GrabManager::TryConsumeHeldConsumableOnRelease(bool isLeft)
+    {
+        GrabState& state = isLeft ? _leftGrab : _rightGrab;
+        if (!state.active || state.coHeldSecondary || state.isPulling) {
+            return false;
+        }
+
+        if (ItemPositionConfigMode::GetSingleton().IsRepositionModeActive()) {
+            return false;
+        }
+
+        RE::TESObjectREFR* refr = state.GetRefr();
+
+        // Companion treatment owns the Stimpak before the player self-use
+        // route. This matters on the exact frame a grip is released while the
+        // held Stimpak is touching a wounded companion: never turn that gesture
+        // into a wrist self-injection merely because both zones overlap.
+        if (HasHeldCompanionStimpakTarget(
+                isLeft,
+                refr,
+                state.node.get())) {
+            const float heldSeconds =
+                static_cast<float>(Utils::GetTime()) -
+                state.grabStartTime;
+            const NpcInjectionAttempt injection =
+                TryInjectHeldCompanionStimpak(
+                    isLeft,
+                    refr,
+                    state.node.get(),
+                    heldSeconds,
+                    state.handSpeed);
+            if (injection.result !=
+                NpcInjectionResult::NotAttempted) {
+                state.consumeAttemptedThisVisit = true;
+                if (injection.result !=
+                    NpcInjectionResult::FailedKeptInHand) {
+                    g_vrInput.TriggerHaptic(
+                        isLeft,
+                        injection.result ==
+                                NpcInjectionResult::Accepted ?
+                            2000 :
+                            500);
+                    EndGrab(isLeft, nullptr, true);
+                    return true;
+                }
+                g_vrInput.TriggerHaptic(isLeft, 500);
+            }
+
+            // Contact was unambiguously aimed at a wounded companion, but
+            // target revalidation or the pre-commit ownership handoff did not
+            // complete. Let the ordinary release drop the object; do not fall
+            // through to player consumption.
+            return false;
+        }
+
+        if (!IsConsumable(refr) || IsDiseaseCureItem(refr)) {
+            return false;
+        }
+        if (g_config.blockConsumptionInPA &&
+            Utils::IsPlayerInPowerArmor()) {
+            return false;
+        }
+
+        const bool usesWristRoute =
+            IsInjectable(refr) && g_config.enableHandInjection;
+        const bool inValidZone = usesWristRoute ?
+            IsInHandInjectionZone(isLeft) :
+            IsInMouthZone(isLeft);
+        if (!inValidZone) {
+            return false;
+        }
+
+        // A physical release is the explicit commit gesture. Unlike optional
+        // auto-consume it has no speed, dwell, grab-age, or per-visit gate.
+        // Mark the visit before committing so a failed inventory transaction
+        // cannot be retried automatically every frame while grip is up.
+        state.consumeAttemptedThisVisit = true;
+        const char* zoneLabel =
+            usesWristRoute ? "hand injection release" : "mouth release";
+        spdlog::debug(
+            "[GRAB] Consumable released in {} zone - attempting consume",
+            usesWristRoute ? "hand injection" : "mouth");
+        (void)CommitHeldConsumableConsumption(
+            isLeft,
+            refr,
+            zoneLabel);
         return true;
     }
 
@@ -9331,22 +10777,35 @@ namespace heisenberg
         }
 
         // =====================================================================
-        // CONSUME CHECK — mouth zone OR hand injection zone
+        // CONSUME ZONE TRACKING / OPTIONAL AUTO-CONSUME
         // =====================================================================
         // Mouth zone: bring consumable to face (food, drinks, chems)
         // Hand injection zone: bring consumable to opposite hand (syringes)
-        // Both use one-shot consume (only try once per zone visit)
+        // Normal consumption commits on physical grip release in Hand::Release.
+        // The legacy in-zone commit remains available only through the two
+        // explicit, default-off auto-consume settings.
         if (!configMode.IsRepositionModeActive() && !state.isPulling)
         {
             // Injectables (stimpak, RadAway, med-x, etc.) are wrist-injected, not
             // eaten — when hand injection is enabled they must NOT mouth-consume.
             // (Falls back to mouth if hand injection is disabled, so they're still usable.)
+            const bool isDiseaseCureItem = IsDiseaseCureItem(refr);
+            const bool isCompanionStimpakItem =
+                IsCompanionStimpakItem(refr);
             const bool isInjectableItem = IsInjectable(refr);
-            bool inMouthZone = IsInMouthZone(isLeft) &&
+            bool inMouthZone = !isDiseaseCureItem && IsInMouthZone(isLeft) &&
                                !(isInjectableItem && heisenberg::g_config.enableHandInjection);
             // Hand injection zone only activates for injectables (chems, stimpaks — not food/drinks)
-            bool inHandInjectionZone = isInjectableItem && IsInHandInjectionZone(isLeft);
+            bool inHandInjectionZone = !isDiseaseCureItem &&
+                                       isInjectableItem &&
+                                       IsInHandInjectionZone(isLeft);
             bool inAnyConsumeZone = inMouthZone || inHandInjectionZone;
+
+            // Keep the public zone-query state live even when auto-consume is
+            // disabled. CheckMouthConsume/CheckHandInjectionConsume may refine
+            // these while their respective auto mode is enabled.
+            state.isInMouthZone = inMouthZone;
+            state.isInHandInjectionZone = inHandInjectionZone;
 
             // Per-hand zone visit tracking
             bool& consumeAttemptedThisVisit = state.consumeAttemptedThisVisit;
@@ -9375,22 +10834,104 @@ namespace heisenberg
                 wasInHandInjectionZone = true;
             }
 
-            // Reset one-shot guard when leaving ALL consume zones
-            if (!inAnyConsumeZone)
+            // A programmatically delivered item that appeared between seated
+            // hands is intentionally unarmed until the player separates it
+            // from both consume zones once. This prevents a stationary lap
+            // pose from merely waiting out the time grace and auto-consuming.
+            if (!inAnyConsumeZone) {
                 consumeAttemptedThisVisit = false;
+                state.consumeZoneExitRequired = false;
+            }
 
-            // Check consumption: mouth zone OR hand injection zone
+            // COMPANION STIMPAK INJECTION — checked before either SS2 treatment
+            // or self-use. A valid contact follows Fallout's normal companion
+            // ActivateRef route; without a wounded current companion contact,
+            // the Stimpak remains eligible for ordinary player use below.
+            if (!consumeAttemptedThisVisit &&
+                heisenberg::g_config.enableCompanionStimpakInjection &&
+                isCompanionStimpakItem)
+            {
+                const float elapsedSinceGrab =
+                    static_cast<float>(heisenberg::Utils::GetTime()) -
+                    state.grabStartTime;
+                const NpcInjectionAttempt injection =
+                    TryInjectHeldCompanionStimpak(
+                        isLeft,
+                        refr,
+                        state.node.get(),
+                        elapsedSinceGrab,
+                        state.handSpeed);
+                if (injection.result !=
+                    NpcInjectionResult::NotAttempted) {
+                    consumeAttemptedThisVisit = true;
+                    if (injection.result !=
+                        NpcInjectionResult::FailedKeptInHand) {
+                        g_vrInput.TriggerHaptic(
+                            isLeft,
+                            injection.result ==
+                                    NpcInjectionResult::Accepted ?
+                                2000 :
+                                500);
+                        EndGrab(isLeft, nullptr, true);
+                        return;
+                    }
+                    g_vrInput.TriggerHaptic(isLeft, 500);
+                }
+            }
+
+            // NPC INJECTION (disease cures only) — checked BEFORE the self-consume zones,
+            // because the self-injection zone sits on the opposite wand and can easily be near
+            // another actor while you reach toward them. SS2's manager owns
+            // the final eligibility check, item consumption/refund, and cure.
+            if (!consumeAttemptedThisVisit &&
+                heisenberg::g_config.enableNpcInjection &&
+                isDiseaseCureItem)
+            {
+                const float elapsedSinceGrab =
+                    static_cast<float>(heisenberg::Utils::GetTime()) -
+                    state.grabStartTime;
+                const NpcInjectionAttempt injection =
+                    TryInjectHeldDiseaseCure(
+                        isLeft,
+                        refr,
+                        state.node.get(),
+                        elapsedSinceGrab,
+                        state.handSpeed);
+                if (injection.result != NpcInjectionResult::NotAttempted) {
+                    consumeAttemptedThisVisit = true;
+                    if (injection.result !=
+                        NpcInjectionResult::FailedKeptInHand) {
+                        g_vrInput.TriggerHaptic(
+                            isLeft,
+                            injection.result == NpcInjectionResult::Accepted
+                                ? 2000
+                                : 500);
+                        EndGrab(isLeft, nullptr, true);
+                        return;
+                    }
+                    g_vrInput.TriggerHaptic(isLeft, 500);
+                }
+            }
+
+            // Optional auto-consumption: mouth zone OR hand injection zone.
+            // These keep the existing cooldown/exit/speed safety policy; the
+            // physical release path intentionally bypasses those readiness
+            // gates and checks only the current valid spatial route.
             // Blocked in Power Armor — PA helmet prevents eating/drinking/injecting
             bool shouldConsume = false;
             const char* zoneLabel = "";
             if (!consumeAttemptedThisVisit && IsConsumable(refr) && !(g_config.blockConsumptionInPA && Utils::IsPlayerInPowerArmor()))
             {
-                if (inMouthZone && CheckMouthConsume(isLeft, state)) {
+                if (g_config.autoConsumeInMouthArea &&
+                    inMouthZone &&
+                    CheckMouthConsume(isLeft, state)) {
                     shouldConsume = true;
-                    zoneLabel = "mouth";
-                } else if (inHandInjectionZone && CheckHandInjectionConsume(isLeft, state)) {
+                    zoneLabel = "mouth auto";
+                } else if (g_config.autoConsumeInWristArea &&
+                           inHandInjectionZone &&
+                           CheckHandInjectionConsume(isLeft, state)) {
                     shouldConsume = true;
-                    zoneLabel = "hand injection";
+                    zoneLabel = "hand injection auto";
                 }
             }
 
@@ -9398,24 +10939,10 @@ namespace heisenberg
             {
                 consumeAttemptedThisVisit = true;
                 spdlog::debug("[GRAB] Consumable entered {} zone - attempting consume (one-shot)!", zoneLabel);
-
-                RE::TESObjectREFR* refrToConsume = refr;
-                bool consumed = ConsumeGrabbedItem(refrToConsume);
-
-                if (consumed)
-                {
-                    spdlog::debug("[GRAB] Consume succeeded via {} zone", zoneLabel);
-                    RE::TESForm* baseForm = refrToConsume ? refrToConsume->GetObjectReference() : nullptr;
-                    HeisenbergPluginAPI::InvokeConsumedCallbacks(isLeft, baseForm);
-                    g_vrInput.TriggerHaptic(isLeft, 2000);
-                    EndGrab(isLeft, nullptr, true);
-                }
-                else
-                {
-                    spdlog::warn("[GRAB] Consume FAILED via {} zone - keeping in hand", zoneLabel);
-                    g_vrInput.TriggerHaptic(isLeft, 500);
-                }
-
+                (void)CommitHeldConsumableConsumption(
+                    isLeft,
+                    refr,
+                    zoneLabel);
                 return;
             }
             
@@ -10361,14 +11888,26 @@ namespace heisenberg
                         paLocal.y = g_config.paGrabOffsetY;
                         paLocal.z = g_config.paGrabOffsetZ;
                     }
+                    // ORTHONORMALIZE BEFORE INVERTING. Transpose is only the inverse of an
+                    // orthonormal matrix; on a drifted one it leaves an M^T*M factor that
+                    // stretches the object. This runs on EVERY hand-to-hand promotion and the
+                    // result is captured back into objectWorld on the next one, so the factor
+                    // COMPOUNDS: a few handovers visibly grow the object (owner: bottle, watch,
+                    // ammo box, desk fan). Proven by the [GRAB-SCALE] witness, which showed
+                    // local/world/parent scale all pinned at exactly 1.0000 through every
+                    // promotion while the object still grew - so it was never the scale field.
+                    RE::NiMatrix3 promotedHandRot = promotedHand->world.rotate;
+                    heisenberg::OrthoNormalize(promotedHandRot);
+
                     RE::NiPoint3 promotedLocalPos =
-                        promotedHand->world.rotate *
+                        promotedHandRot *
                         (objectWorld.translate -
                          promotedHand->world.translate);
                     promotedLocalPos -= paLocal;
-                    const RE::NiMatrix3 promotedLocalRot =
+                    RE::NiMatrix3 promotedLocalRot =
                         objectWorld.rotate *
-                        promotedHand->world.rotate.Transpose();
+                        promotedHandRot.Transpose();
+                    heisenberg::OrthoNormalize(promotedLocalRot);
                     partner.SetRigidRenderedHandPlacement(
                         promotedLocalPos,
                         promotedLocalRot);
@@ -10412,6 +11951,31 @@ namespace heisenberg
                 configMode.OnGrabStarted(
                     &partner,
                     promotedIsLeft);
+
+                // SCALE WITNESS. The object grows across repeated hand-to-hand promotions and
+                // three fixed local/world conflations did not stop it, so capture the actual
+                // numbers rather than reason about them: if node world.scale climbs across
+                // promotions the writer is downstream of here; if local.scale climbs while
+                // world.scale holds, the parent scale is the multiplier; if the parent's scale
+                // is not 1.0 the object is parented to something scaled.
+                if (partner.node) {
+                    // Row norms, not scale. The scale field was proven innocent (it read
+                    // exactly 1.0000 through every promotion while the object still grew);
+                    // the real drift is in the rotation basis, where a row norm of r stretches
+                    // that axis by r^2. Anything other than 1.000 here is the bug returning.
+                    const auto rowNorm = [](const RE::NiMatrix3& m, int r) {
+                        return std::sqrt(m.entry[r][0] * m.entry[r][0] +
+                                         m.entry[r][1] * m.entry[r][1] +
+                                         m.entry[r][2] * m.entry[r][2]);
+                    };
+                    const RE::NiMatrix3& w = partner.node->world.rotate;
+                    spdlog::warn(
+                        "[GRAB-SCALE] promotion: node='{}' scale={:.4f} "
+                        "worldRotRowNorms=({:.4f},{:.4f},{:.4f})",
+                        partner.node->name.c_str(),
+                        partner.node->world.scale,
+                        rowNorm(w, 0), rowNorm(w, 1), rowNorm(w, 2));
+                }
 
                 spdlog::info(
                     "[GRAB] Two-handed: {} primary released — "
@@ -11335,7 +12899,6 @@ namespace heisenberg
             // but the caller's explicit parameter should take priority.
             if (stickyGrab) {
                 state.stickyGrab = true;
-                state.isFromLootDrop = true;  // Mark for 2s equip protection
                 spdlog::debug("[GRAB] StartGrabOnRef: Enabled sticky grab for dropped item");
             } else {
                 state.stickyGrab = false;  // Caller explicitly wants non-sticky (e.g., holotape removal)
@@ -11395,7 +12958,15 @@ namespace heisenberg
                     RE::NiTransform targetTransform;
                     targetTransform.translate = targetPos;
                     targetTransform.rotate = targetRot;
-                    targetTransform.scale = state.node->local.scale;
+                    // WORLD scale. UpdateKeyframedNode treats this as a world transform and
+                    // derives local by dividing by the parent's world scale, so feeding it
+                    // local.scale means local <- local / parentScale. This is the instant
+                    // placement used by hand-to-hand transfer, so the object was rescaled on
+                    // EVERY handover, compounding each time (owner: bottle, watch, ammo box
+                    // all grew when passed between hands).
+                    targetTransform.scale = state.node->world.scale > 0.0f
+                        ? state.node->world.scale
+                        : 1.0f;
                     Utils::UpdateKeyframedNode(state.node.get(), targetTransform);
                     
                     // Sync refr->data.location to prevent ghosting/culling
@@ -11535,14 +13106,12 @@ namespace heisenberg
         if (frameDeltaTime < 0.001f) frameDeltaTime = 0.001f;
         if (frameDeltaTime > 0.1f) frameDeltaTime = 0.1f;
 
-        // Check for blocking menus - but CONTINUE if we have an active grab
-        // This is critical for DropToHand: items spawn while PipboyMenu is open,
-        // and we need to keep updating their position or they'll appear frozen
-        // at the spawn location until the menu closes.
+        // Check genuinely blocking menus, but continue if we have an active grab.
+        // Favorites and Pip-Boy are live-world overlays and are not part of this gate.
         // Use cached menu state from MenuChecker for thread safety (avoids race conditions)
         auto& menuChecker = MenuChecker::GetSingleton();
-        bool menuBlocking = menuChecker.IsPipboyOpen() || menuChecker.IsPaused() || 
-                            menuChecker.IsLoading() || menuChecker.IsMainMenu();
+        bool menuBlocking = menuChecker.IsPaused() || menuChecker.IsLoading() ||
+                            menuChecker.IsMainMenu();
         
         // Only skip if menu is blocking AND we have no active grabs
         bool hasActiveGrab = _leftGrab.active || _rightGrab.active;
@@ -11830,10 +13399,21 @@ namespace heisenberg
                 // =================================================================
                 // VISUAL UPDATE - Update node and propagate to children (keyframed)
                 // =================================================================
+                // FINAL GUARD. targetRot is built from several transpose-as-inverse chains
+                // upstream; if any of them drifted, the object is multiplied by M^T*M and
+                // renders stretched or squashed. Normalising here catches all of them at the
+                // single point the visual transform is committed. No-op when already clean.
+                heisenberg::OrthoNormalize(targetRot);
+
                 RE::NiTransform desiredTransform;
                 desiredTransform.translate = targetPos;
                 desiredTransform.rotate = targetRot;
-                desiredTransform.scale = state.node->local.scale > 0.0f ? state.node->local.scale : 1.0f;
+                // WORLD, not local. This is a WORLD-space target, and UpdateKeyframedNode
+                // divides by the parent's world scale to derive local. Feeding local back in
+                // made local decay (or grow) by 1/parentScale every single frame whenever the
+                // parent's world scale was not exactly 1. The co-hold targets at ~11914 and
+                // ~12098 already read world.scale; this site was the outlier.
+                desiredTransform.scale = state.node->world.scale > 0.0f ? state.node->world.scale : 1.0f;
 
                 // WORLD-CHANGE RESYNC (Jul 19, "carried an ammo box through Vault 111's exit,
                 // hand/gun stopped colliding with it, still broken several cells later at
@@ -12218,13 +13798,12 @@ namespace heisenberg
         if (!playerNodes)
             return;
             
-        // Check for blocking menus - but CONTINUE if we have an active grab
-        // This is critical for DropToHand: items spawn while PipboyMenu is open,
-        // and we need to keep updating their position or they'll appear frozen
+        // Check genuinely blocking menus, but continue if we have an active grab.
+        // Favorites and Pip-Boy are live-world overlays and are not part of this gate.
         // Use cached menu state from MenuChecker for thread safety
         auto& menuChecker = MenuChecker::GetSingleton();
-        bool menuBlocking = menuChecker.IsPipboyOpen() || menuChecker.IsPaused() || 
-                            menuChecker.IsLoading() || menuChecker.IsMainMenu();
+        bool menuBlocking = menuChecker.IsPaused() || menuChecker.IsLoading() ||
+                            menuChecker.IsMainMenu();
         bool hasActiveGrab = _leftGrab.active || _rightGrab.active;
         if (menuBlocking && !hasActiveGrab)
             return;

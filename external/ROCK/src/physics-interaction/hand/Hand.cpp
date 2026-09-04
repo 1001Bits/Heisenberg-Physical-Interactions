@@ -13,6 +13,7 @@
 #include "physics-interaction/PhysicsBodyFrame.h"
 #include "physics-interaction/hand/HandSelection.h"
 #include "physics-interaction/object/ObjectPhysicsBodySet.h"
+#include "physics-interaction/object/ViewCasterSelectionPolicy.h"
 #include "physics-interaction/performance/PerformanceProfiler.h"
 #include "physics-interaction/TransformMath.h"
 #include "RockUtils.h"
@@ -54,6 +55,20 @@ namespace rock
         {
             const RE::NiPoint3 delta = lhs - rhs;
             return std::sqrt(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z);
+        }
+
+        pull_catch_retry_policy::PoseSample makePullCatchRetryPose(const RE::NiTransform& transform)
+        {
+            pull_catch_retry_policy::PoseSample result{};
+            result.position = { transform.translate.x, transform.translate.y, transform.translate.z };
+            for (std::size_t row = 0; row < 3; ++row) {
+                for (std::size_t column = 0; column < 3; ++column) {
+                    result.rotation[row * 3 + column] = transform.rotate.entry[row][column];
+                }
+            }
+            result.valid = pull_catch_retry_policy::finitePose(
+                pull_catch_retry_policy::PoseSample{ result.position, result.rotation, true });
+            return result;
         }
 
         RE::NiPoint3 normalizeOrFallback(const RE::NiPoint3& value, const RE::NiPoint3& fallback)
@@ -250,6 +265,7 @@ namespace rock
         _cachedFarCandidate.clear();
         clearGrabAcquisitionCache("reset");
         _farDetectCounter = 0;
+        _lastHostViewCasterCandidateFormId = 0;
         _selectionHoldFrames = 0;
         _deselectCooldown = 0;
         _lastDeselectedRef = nullptr;
@@ -287,6 +303,12 @@ namespace rock
         _grabStartTime = 0.0f;
         _heldLogCounter = 0;
         _notifCounter = 0;
+        _heldObjectSweepConnectedCursor = 0;
+        _heldObjectSweepSafeBodyWorld = {};
+        _heldObjectSweepSafeBodyWorldValid = false;
+        _heldObjectPredictiveWorldStopActive = false;
+        _heldObjectPredictiveWorldStopNormalWorld = {};
+        _heldObjectPredictiveWorldStopNormalValid = false;
         _heldBodyIds.clear();
         clearPullRuntimeState(false, "reset");
         clearPullCatchIntent("reset");
@@ -523,9 +545,11 @@ namespace rock
         _pulledPrimaryBodyId = INVALID_BODY_ID;
         _pullPointOffsetHavok = {};
         _pullTargetHavok = {};
+        _pullExactProfileDestinationHandLocalGame = {};
         _pullElapsedSeconds = 0.0f;
         _pullDurationSeconds = 0.0f;
         _pullHasTarget = false;
+        _pullExactProfileDestinationValid = false;
         _pullPresentationAxisBodyLocal = {};
         _pullPresentationElongationRatio = 0.0f;
         _pullPresentationValid = false;
@@ -777,8 +801,7 @@ namespace rock
             .formId = refr ? refr->GetFormID() : 0,
             .primaryBodyId = primaryBodyId,
             .targetKind = targetKind,
-            .commitElapsedSeconds = 0.0f,
-            .failedCommitAttempts = 0,
+            .retry = {},
         };
 
         if (_pullCatchIntent.active) {
@@ -797,8 +820,7 @@ namespace rock
         }
 
         _pullCatchIntent.commitPending = true;
-        _pullCatchIntent.commitElapsedSeconds = 0.0f;
-        _pullCatchIntent.failedCommitAttempts = 0;
+        pull_catch_retry_policy::reset(_pullCatchIntent.retry);
         ROCK_LOG_DEBUG(Hand,
             "{} hand PULL catch intent arrived formID={:08X} primaryBody={}",
             handName(),
@@ -833,28 +855,31 @@ namespace rock
         return pullCatchIntentMatchesSelection();
     }
 
-    bool Hand::advancePullCatchCommit(float deltaTime, float maxCommitSeconds)
+    pull_catch_retry_policy::Decision Hand::advancePullCatchCommit(
+        float deltaTime,
+        float maxCommitSeconds,
+        const RE::NiTransform& handWorldTransform)
     {
         if (!hasPendingPullCatchCommit()) {
-            return false;
+            return { pull_catch_retry_policy::Status::Inactive, "not-pending" };
         }
 
-        if (_pullCatchIntent.failedCommitAttempts == 0) {
-            return true;
-        }
-
-        _pullCatchIntent.commitElapsedSeconds += (std::max)(0.0f, std::isfinite(deltaTime) ? deltaTime : 0.0f);
-        const float retryWindow = (std::max)(0.0f, std::isfinite(maxCommitSeconds) ? maxCommitSeconds : 0.0f);
-        return retryWindow <= 0.0f || _pullCatchIntent.commitElapsedSeconds <= retryWindow;
+        return pull_catch_retry_policy::advance(
+            _pullCatchIntent.retry,
+            makePullCatchRetryPose(handWorldTransform),
+            deltaTime,
+            maxCommitSeconds);
     }
 
-    void Hand::notePullCatchCommitAttemptFailed()
+    void Hand::notePullCatchCommitAttemptFailed(const RE::NiTransform& handWorldTransform)
     {
         if (!hasPendingPullCatchCommit()) {
             return;
         }
 
-        ++_pullCatchIntent.failedCommitAttempts;
+        pull_catch_retry_policy::noteFailedAttempt(
+            _pullCatchIntent.retry,
+            makePullCatchRetryPose(handWorldTransform));
     }
 
     RE::TESObjectREFR* Hand::getPullCatchIntentRef() const
@@ -1258,8 +1283,8 @@ namespace rock
                 _pullCatchIntent.formId,
                 _pullCatchIntent.primaryBodyId,
                 _pullCatchIntent.commitPending ? "yes" : "no",
-                _pullCatchIntent.commitElapsedSeconds,
-                _pullCatchIntent.failedCommitAttempts);
+                _pullCatchIntent.retry.elapsedSeconds,
+                _pullCatchIntent.retry.failedAttempts);
         }
         _pullCatchIntent = {};
     }
@@ -1891,7 +1916,8 @@ namespace rock
 
     void Hand::updateSelection(RE::bhkWorld* bhkWorld, RE::hknpWorld* hknpWorld, const RE::NiPoint3& selectionOrigin, const RE::NiPoint3& closeSelectionDirection,
         const RE::NiPoint3& farSelectionDirection, const RE::NiPoint3& pinchOrigin, const RE::NiPoint3& pinchDirection, bool hasPinchOrigin,
-        const FarSelectionHmdConeGate& farHmdConeGate, float nearRange, float farRange, float deltaTime, const OtherHandSelectionContext& otherHandContext)
+        const FarSelectionHmdConeGate& farHmdConeGate, float nearRange, float farRange, float deltaTime, const OtherHandSelectionContext& otherHandContext,
+        RE::TESObjectREFR* hostViewCasterTarget)
     {
         if (!selection_state_policy::canUpdateSelectionFromState(_state))
             return;
@@ -1973,24 +1999,142 @@ namespace rock
             return _currentSelection.pinchCloseSelectionFallback && resolvedHasPinchOrigin ? resolvedPinchOrigin : selectionOrigin;
         };
 
+        if (hostViewCasterTarget &&
+            (hostViewCasterTarget->IsDeleted() ||
+                hostViewCasterTarget->IsDisabled())) {
+            hostViewCasterTarget = nullptr;
+        }
+
+        const std::uint32_t hostViewCasterFormId =
+            hostViewCasterTarget ? hostViewCasterTarget->GetFormID() : 0;
+        if (hostViewCasterFormId !=
+            _lastHostViewCasterCandidateFormId) {
+            _lastHostViewCasterCandidateFormId = hostViewCasterFormId;
+            _cachedFarCandidate.clear();
+            // Native ViewCaster changes are input changes, not ordinary far
+            // scan cadence. Validate a new target in this same frame.
+            _farDetectCounter = 2;
+            ROCK_LOG_DEBUG(Hand,
+                "{} hand host ViewCaster hint changed formID={:08X}",
+                handName(),
+                hostViewCasterFormId);
+        }
+
+        RE::NiPoint3 hostViewCasterDirection{};
+        bool hostViewCasterTargetCanBeQueried = false;
+        if (hostViewCasterTarget) {
+            if (auto* targetNode = hostViewCasterTarget->Get3D()) {
+                RE::NiPoint3 targetAnchor =
+                    targetNode->worldBound.center;
+                const auto anchorIsFinite = [](const RE::NiPoint3& point) {
+                    return std::isfinite(point.x) &&
+                           std::isfinite(point.y) &&
+                           std::isfinite(point.z);
+                };
+                if (!anchorIsFinite(targetAnchor) ||
+                    !std::isfinite(targetNode->worldBound.fRadius) ||
+                    targetNode->worldBound.fRadius <= 0.0f) {
+                    targetAnchor = targetNode->world.translate;
+                }
+                if (anchorIsFinite(targetAnchor)) {
+                    hostViewCasterDirection =
+                        targetAnchor - selectionOrigin;
+                    const float directionLengthSquared =
+                        hostViewCasterDirection.x *
+                            hostViewCasterDirection.x +
+                        hostViewCasterDirection.y *
+                            hostViewCasterDirection.y +
+                        hostViewCasterDirection.z *
+                            hostViewCasterDirection.z;
+                    hostViewCasterTargetCanBeQueried =
+                        std::isfinite(directionLengthSquared) &&
+                        directionLengthSquared > 1.0e-6f;
+                }
+            }
+        }
+
         const bool farSelectionQueryReady = !farHmdConeGate.enabled || farHmdConeGate.hasHmdFrame;
         if (!farSelectionQueryReady) {
             _cachedFarCandidate.clear();
-            _farDetectCounter = 0;
+            _farDetectCounter = hostViewCasterTarget ? 2 : 0;
         }
 
-        SelectedObject farCandidate;
+        SelectedObject rockFarCandidate;
+        SelectedObject hostViewCasterCandidate;
         if (farSelectionQueryReady) {
             _farDetectCounter++;
             if (_farDetectCounter >= 3) {
                 _farDetectCounter = 0;
-                farCandidate = findFarObject(bhkWorld, hknpWorld, selectionOrigin, farSelectionDirection, farRange, farHmdConeGate, otherHandContext);
-                _cachedFarCandidate = farCandidate;
+                rockFarCandidate = findFarObject(
+                    bhkWorld,
+                    hknpWorld,
+                    selectionOrigin,
+                    farSelectionDirection,
+                    farRange,
+                    farHmdConeGate,
+                    otherHandContext,
+                    hostViewCasterTarget);
+
+                const bool normalFarMatchesHostTarget =
+                    viewcaster_selection_policy::
+                        acceptsImportedCandidate(
+                            hostViewCasterTarget != nullptr,
+                            rockFarCandidate.isValid(),
+                            rockFarCandidate.refr ==
+                                hostViewCasterTarget);
+                if (normalFarMatchesHostTarget) {
+                    hostViewCasterCandidate = rockFarCandidate;
+                } else if (viewcaster_selection_policy::
+                               shouldRunTargetedFallback(
+                                   hostViewCasterTarget != nullptr,
+                                   nearCandidate.isValid(),
+                                   normalFarMatchesHostTarget,
+                                   hostViewCasterTargetCanBeQueried)) {
+                    auto targetedCandidate = findFarObject(
+                        bhkWorld,
+                        hknpWorld,
+                        selectionOrigin,
+                        hostViewCasterDirection,
+                        farRange,
+                        FarSelectionHmdConeGate{},
+                        otherHandContext,
+                        hostViewCasterTarget);
+                    if (viewcaster_selection_policy::
+                            acceptsImportedCandidate(
+                                true,
+                                targetedCandidate.isValid(),
+                                targetedCandidate.refr ==
+                                    hostViewCasterTarget)) {
+                        hostViewCasterCandidate =
+                            std::move(targetedCandidate);
+                    }
+                }
+
+                _cachedFarCandidate =
+                    hostViewCasterCandidate.isValid() ?
+                        hostViewCasterCandidate :
+                        rockFarCandidate;
             } else {
-                farCandidate = _cachedFarCandidate;
-                if (!selectedObjectPassesFarHmdCone(hknpWorld, farCandidate, farHmdConeGate)) {
-                    farCandidate.clear();
+                auto cachedFarCandidate = _cachedFarCandidate;
+                if (!selectedObjectPassesFarHmdCone(
+                        hknpWorld,
+                        cachedFarCandidate,
+                        farHmdConeGate)) {
+                    cachedFarCandidate.clear();
                     _cachedFarCandidate.clear();
+                }
+
+                if (viewcaster_selection_policy::
+                        acceptsImportedCandidate(
+                            hostViewCasterTarget != nullptr,
+                            cachedFarCandidate.isValid(),
+                            cachedFarCandidate.refr ==
+                                hostViewCasterTarget)) {
+                    hostViewCasterCandidate =
+                        std::move(cachedFarCandidate);
+                } else {
+                    rockFarCandidate =
+                        std::move(cachedFarCandidate);
                 }
             }
         }
@@ -1999,13 +2143,16 @@ namespace rock
             _deselectCooldown--;
             if (nearCandidate.refr == _lastDeselectedRef)
                 nearCandidate.clear();
-            if (farCandidate.refr == _lastDeselectedRef)
-                farCandidate.clear();
+            if (hostViewCasterCandidate.refr == _lastDeselectedRef)
+                hostViewCasterCandidate.clear();
+            if (rockFarCandidate.refr == _lastDeselectedRef)
+                rockFarCandidate.clear();
             if (_deselectCooldown == 0)
                 _lastDeselectedRef = nullptr;
         }
 
-        if (_currentSelection.isValid() && _currentSelection.isFarSelection) {
+        if (_currentSelection.isValid() && _currentSelection.isFarSelection &&
+            _currentSelection.refr != hostViewCasterTarget) {
             float hmdConeDot = -1.0f;
             if (!selectedObjectPassesFarHmdCone(hknpWorld, _currentSelection, farHmdConeGate, &hmdConeDot)) {
                 ROCK_LOG_DEBUG(Hand,
@@ -2019,7 +2166,27 @@ namespace rock
             }
         }
 
-        SelectedObject best = nearCandidate.isValid() ? nearCandidate : farCandidate;
+        SelectedObject best;
+        switch (viewcaster_selection_policy::chooseCandidateSource(
+            nearCandidate.isValid(),
+            hostViewCasterCandidate.isValid(),
+            rockFarCandidate.isValid(),
+            nearCandidate.isValid() &&
+                hostViewCasterCandidate.isValid() &&
+                nearCandidate.refr == hostViewCasterCandidate.refr)) {
+        case viewcaster_selection_policy::CandidateSource::RockNear:
+            best = nearCandidate;
+            break;
+        case viewcaster_selection_policy::CandidateSource::HostViewCaster:
+            best = hostViewCasterCandidate;
+            break;
+        case viewcaster_selection_policy::CandidateSource::RockFar:
+            best = rockFarCandidate;
+            break;
+        case viewcaster_selection_policy::CandidateSource::None:
+        default:
+            break;
+        }
 
         if (best.isValid() && _currentSelection.isValid() && best.refr != _currentSelection.refr && !best.isFarSelection && !_currentSelection.isFarSelection) {
             const float currentScore = _currentSelection.hasSelectionScore ? _currentSelection.selectionScore : (std::numeric_limits<float>::infinity)();

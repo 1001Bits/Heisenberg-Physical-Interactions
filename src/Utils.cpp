@@ -347,15 +347,23 @@ namespace heisenberg::Utils
             const auto& parentWorld = parent->world;
             float invParentScale = (parentWorld.scale != 0.0f) ? (1.0f / parentWorld.scale) : 1.0f;
             
+            // Transpose is only the inverse of an ORTHONORMAL matrix. Every held-object
+            // transform write funnels through here, so this is the one place that has to be
+            // right: if the parent's rotation has drifted, the transpose below stops being an
+            // inverse and the object picks up a M^T*M skew - a flattened axis and/or a wildly
+            // enlarged one. Normalising a COPY leaves the parent's own transform untouched.
+            RE::NiMatrix3 parentRotOrtho = parentWorld.rotate;
+            OrthoNormalize(parentRotOrtho);
+
             // local.rotate = world.rotate * inverse(parent.rotate)
-            node->local.rotate = transform.rotate * parentWorld.rotate.Transpose();
+            node->local.rotate = transform.rotate * parentRotOrtho.Transpose();
             
             // local.scale = world.scale / parent.scale
             node->local.scale = transform.scale * invParentScale;
             
             // local.translate = inverse(parent.rotate) * (world.translate - parent.translate) / parent.scale
             RE::NiPoint3 worldOffset = transform.translate - parentWorld.translate;
-            node->local.translate = (parentWorld.rotate * worldOffset) * invParentScale;
+            node->local.translate = (parentRotOrtho * worldOffset) * invParentScale;
         } else if (!parent) {
             // No parent - local = world
             node->local = transform;

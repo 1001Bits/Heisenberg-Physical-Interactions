@@ -987,8 +987,18 @@ namespace rock
             bool firingHandIsLeft,
             std::uint64_t weaponGenerationKey,
             std::uint64_t weaponOwnershipKey);
+        bool applyWeaponWorldContactPose(
+            RE::NiNode* weaponNode,
+            const RE::NiTransform& blockedWeaponWorld,
+            bool firingHandIsLeft,
+            std::uint64_t weaponGenerationKey,
+            std::uint64_t weaponOwnershipKey,
+            bool immutableWallStop);
         void clearWeaponWorldContactTranslation(
-            RE::NiNode* currentWeaponNode = nullptr);
+            RE::NiNode* currentWeaponNode = nullptr,
+            std::uint64_t currentWeaponGenerationKey = 0,
+            std::uint64_t currentWeaponOwnershipKey = 0,
+            bool preserveRigidStopPin = false);
         bool getSupportFingerCurls(bool isLeft, float outCurls[5]) const;
 
     private:
@@ -1192,14 +1202,30 @@ namespace rock
         {
             bool active{ false };
             RE::NiPointer<RE::NiNode> weaponNode{};
+            RE::NiPointer<RE::NiNode> parentNode{};
             std::uint64_t weaponGenerationKey{ 0 };
             std::uint64_t weaponOwnershipKey{ 0 };
             RE::NiTransform baseLocal{};
             RE::NiTransform appliedLocal{};
             RE::NiPoint3 correctionWorld{};
+            bool ownsFullPose{ false };
         };
         WeaponWorldContactVisualState
             _weaponWorldContactVisual{};
+
+        struct WeaponWorldContactRigidStopPin
+        {
+            bool active{ false };
+            std::uint64_t weaponGenerationKey{ 0 };
+            std::uint64_t weaponOwnershipKey{ 0 };
+            bool immutableWallStop{ false };
+            RE::NiTransform blockedWeaponWorld{};
+            std::array<RE::NiTransform, 2> attachedHandWorld{};
+            std::array<RE::NiTransform, 2>
+                attachedHandWeaponLocal{};
+            std::array<bool, 2> attachedHandExpected{};
+        };
+        WeaponWorldContactRigidStopPin _weaponWorldContactRigidStopPin{};
 
         float _primaryGripConfidence{ 0.0f };
 

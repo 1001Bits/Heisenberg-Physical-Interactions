@@ -1,6 +1,7 @@
 
 
 #include "RockConfig.h"
+#include "RockConfigFileWatchPolicy.h"
 
 #include <SimpleIni.h>
 #include <algorithm>
@@ -263,7 +264,7 @@ namespace rock
         rockWeaponCollisionSupportFitMaxErrorGameUnits = kDefaultWeaponCollisionSupportFitMaxErrorGameUnits;
         rockWeaponCollisionMaxLinearVelocity = 50.0f;
         rockWeaponCollisionMaxAngularVelocity = 100.0f;
-        rockWeaponCollisionMaxSourceDistanceEnabled = true;
+        rockWeaponCollisionMaxSourceDistanceEnabled = false;
         rockWeaponCollisionMaxSourceDistanceMelee = 90.0f;
         rockWeaponCollisionMaxSourceDistancePistol = 20.0f;
         rockWeaponCollisionMaxSourceDistanceRifle = 45.0f;
@@ -337,7 +338,7 @@ namespace rock
         rockNativeScopeOverlayRollDegrees = 0.0f;
 
         rockSoftContactWorldEnabled = true;
-        rockHandWorldPushbackEnabled = false;
+        rockHandWorldPushbackEnabled = true;
         rockSoftContactVisualPriority = 80;
         rockSoftContactWorldRadiusPaddingGameUnits = 1.5f;
         rockSoftContactWorldContactPaddingGameUnits = 0.35f;
@@ -359,13 +360,10 @@ namespace rock
         rockSoftContactWorldHapticSpeedScale = 0.006f;
         rockSoftContactWorldHapticMinApproachSpeedGameUnits = 3.0f;
         rockSoftContactWorldHapticCooldownSeconds = 0.12f;
-        // EMBED: upstream's dynamic hand-collision drive replaces the Heisenberg-preserved
-        // soft-contact runtime (see the mutual-exclusion note in PhysicsInteraction::updateFrame).
-        // The embed-wide hand-world gate above controls both paths and currently
-        // defaults OFF; this alternative also remains OFF (upstream: true).
-        // The runtime and all its tuning/haptic keys below stay compiled; flip
-        // bHandCollisionDynamicDrive in the INI to A/B it against soft contact.
-        rockHandCollisionDynamicDrive = false;
+        // Solver-backed dynamic proxies are the release hand-contact owner.
+        // SoftContactPolicy disables only its legacy HAND presentation channel
+        // while this is enabled; equipped-weapon/world correction remains live.
+        rockHandCollisionDynamicDrive = true;
         rockHandCollisionDynamicMaxLinearVelocityHavok = 15.0f;
         rockHandCollisionDynamicContactPressMaxVelocityHavok = 1.0f;
         rockHandCollisionDynamicDivergenceTeleportGameUnits = 40.0f;
@@ -579,18 +577,18 @@ namespace rock
         rockDynamicPushCooldownSeconds = 0.08f;
         rockDynamicPushMaxVelocityDelta = 2.5f;
 
-        rockGrabLinearTau = 0.03f;
+        rockGrabLinearTau = 0.01f;
         rockGrabLinearDamping = 0.8f;
         rockGrabLinearProportionalRecovery = 2.0f;
         rockGrabLinearConstantRecovery = 1.0f;
 
-        rockGrabAngularTau = 0.03f;
+        rockGrabAngularTau = 0.01f;
         rockGrabAngularDamping = 0.8f;
         rockGrabAngularProportionalRecovery = 2.0f;
         rockGrabAngularConstantRecovery = 1.0f;
 
-        rockGrabConstraintMaxForce = 2000.0f;
-        rockGrabMaxForceToMassRatio = 500.0f;
+        rockGrabConstraintMaxForce = 8000.0f;
+        rockGrabMaxForceToMassRatio = 1500.0f;
         rockForceGrabAttachSettleSeconds = 0.10f;
         rockGrabEffectiveMotorMassFloorEnabled = true;
         rockGrabEffectiveMotorMassFloor = kDefaultGrabEffectiveMotorMassFloor;
@@ -599,12 +597,20 @@ namespace rock
         rockGrabPhysicsRateForceScaleExponent = kDefaultGrabPhysicsRateForceScaleExponent;
         rockGrabPhysicsRateMinForceScale = kDefaultGrabPhysicsRateMinForceScale;
         rockGrabPhysicsRateMaxForceScale = kDefaultGrabPhysicsRateMaxForceScale;
-        rockGrabRoomVelocityFeedForward = false;
-        rockGrabLocomotionTransport = false;
-        rockGrabSmoothVelocityDrive = false;
+        rockGrabRoomVelocityFeedForward = true;
+        rockGrabLocomotionTransport = true;
+        rockGrabSmoothVelocityDrive = true;
         rockGrabSmoothVelocityCorrectorGain = 0.2f;
+        rockGrabHeldObjectSweepEnabled = true;
+        rockGrabHeldObjectSweepSkinGameUnits = 0.75f;
+        rockGrabHeldObjectSweepMinDistanceGameUnits = 0.5f;
+        rockGrabHeldObjectSweepMaxBodies = 16;
+        rockGrabHeldObjectSweepRotationEnabled = true;
+        rockGrabHeldObjectSweepMaxAngularStepDegrees = 5.0f;
+        rockGrabHeldObjectSweepMaxSurfaceArcStepGameUnits = 2.0f;
+        rockGrabHeldObjectSweepMaxCasts = 48;
 
-        rockGrabForceFadeInTime = 0.1f;
+        rockGrabForceFadeInTime = 0.02f;
         rockGrabRagdollDecompositionMode = -1;
         rockRightGrabAuthorityProxyOffsetGameUnits = RE::NiPoint3(0.0f, -2.0f, 0.0f);
         rockLeftGrabAuthorityProxyOffsetGameUnits = RE::NiPoint3(0.0f, -2.0f, 0.0f);
@@ -673,9 +679,9 @@ namespace rock
         rockGrabVelocityDamping = 0.25f;
         rockGrabPlayerSpaceCompensation = true;
         rockGrabPlayerSpaceWarpDistance = 35.0f;
-        rockGrabPlayerSpaceWarpMinRotationDegrees = 0.6f;
+        rockGrabPlayerSpaceWarpMinRotationDegrees = 12.0f;
         rockGrabPlayerSpaceTransformWarpEnabled = true;
-        rockGrabPlayerSpaceContinuousWarp = true;
+        rockGrabPlayerSpaceContinuousWarp = false;
         rockGrabVisualHandMaxOffsetGameUnits = 10.0f;
         rockGrabLocomotionAuthorityBridgeEnabled = true;
         rockGrabLocomotionAuthorityMaxLeadSeconds = grab_locomotion_authority_bridge::kDefaultMaxLeadSeconds;
@@ -801,7 +807,7 @@ namespace rock
         rockPulledAngularDamping = 8.0f;
         rockPulledGrabHandAdjustDistanceGameUnits = 10.5f;
         rockPullToObjectCenterEnabled = true;
-        rockPullLongAxisPresentationEnabled = true;
+        rockPullLongAxisPresentationEnabled = false;
         rockForceGrabSeatAlignmentEnabled = true;
         rockPullPresentationMinElongationRatio = 2.0f;
         rockPullPresentationAngularGainPerSecond = 6.0f;
@@ -1627,6 +1633,10 @@ namespace rock
             // 9 cedes both systems to ROCK; every other mode keeps both in the host.
             rockGrabEnabled = rockHostGrabOwnershipForced;
             rockSelectionEnabled = rockHostGrabOwnershipForced;
+            if (rockHostGrabOwnershipForced) {
+                rockHighlightEnabled = false;
+                rockSelectionBeamEnabled = false;
+            }
         }
         rockSuppressDominantHandCollision = ini.GetBoolValue(SECTION, "bSuppressDominantHandCollisionWhileWeaponDrawn", rockSuppressDominantHandCollision);
 
@@ -2037,6 +2047,56 @@ namespace rock
             0.2f,
             0.0f,
             1.0f);
+        rockGrabHeldObjectSweepEnabled =
+            ini.GetBoolValue(SECTION, "bGrabHeldObjectSweepEnabled", rockGrabHeldObjectSweepEnabled);
+        rockGrabHeldObjectSweepSkinGameUnits = readClampedFloat(ini,
+            SECTION,
+            "fGrabHeldObjectSweepSkinGameUnits",
+            rockGrabHeldObjectSweepSkinGameUnits,
+            0.75f,
+            0.0f,
+            5.0f);
+        rockGrabHeldObjectSweepMinDistanceGameUnits = readClampedFloat(ini,
+            SECTION,
+            "fGrabHeldObjectSweepMinDistanceGameUnits",
+            rockGrabHeldObjectSweepMinDistanceGameUnits,
+            0.5f,
+            0.01f,
+            10.0f);
+        rockGrabHeldObjectSweepMaxBodies = std::clamp(
+            static_cast<int>(ini.GetLongValue(
+                SECTION,
+                "iGrabHeldObjectSweepMaxBodies",
+                rockGrabHeldObjectSweepMaxBodies)),
+            1,
+            65);
+        rockGrabHeldObjectSweepRotationEnabled = ini.GetBoolValue(
+            SECTION,
+            "bGrabHeldObjectSweepRotationEnabled",
+            rockGrabHeldObjectSweepRotationEnabled);
+        rockGrabHeldObjectSweepMaxAngularStepDegrees = readClampedFloat(
+            ini,
+            SECTION,
+            "fGrabHeldObjectSweepMaxAngularStepDegrees",
+            rockGrabHeldObjectSweepMaxAngularStepDegrees,
+            5.0f,
+            0.5f,
+            30.0f);
+        rockGrabHeldObjectSweepMaxSurfaceArcStepGameUnits = readClampedFloat(
+            ini,
+            SECTION,
+            "fGrabHeldObjectSweepMaxSurfaceArcStepGameUnits",
+            rockGrabHeldObjectSweepMaxSurfaceArcStepGameUnits,
+            2.0f,
+            0.25f,
+            20.0f);
+        rockGrabHeldObjectSweepMaxCasts = std::clamp(
+            static_cast<int>(ini.GetLongValue(
+                SECTION,
+                "iGrabHeldObjectSweepMaxCasts",
+                rockGrabHeldObjectSweepMaxCasts)),
+            1,
+            192);
         rockGrabPhysicsRateReferenceHz = readClampedFloat(ini,
             SECTION,
             "fGrabPhysicsRateReferenceHz",
@@ -2275,8 +2335,13 @@ namespace rock
         rockGrabVelocityDamping = static_cast<float>(ini.GetDoubleValue(SECTION, "fGrabVelocityDamping", rockGrabVelocityDamping));
         rockGrabPlayerSpaceCompensation = ini.GetBoolValue(SECTION, "bGrabPlayerSpaceCompensation", rockGrabPlayerSpaceCompensation);
         rockGrabPlayerSpaceWarpDistance = static_cast<float>(ini.GetDoubleValue(SECTION, "fGrabPlayerSpaceWarpDistance", rockGrabPlayerSpaceWarpDistance));
-        rockGrabPlayerSpaceWarpMinRotationDegrees =
-            static_cast<float>(ini.GetDoubleValue(SECTION, "fGrabPlayerSpaceWarpMinRotationDegrees", rockGrabPlayerSpaceWarpMinRotationDegrees));
+        rockGrabPlayerSpaceWarpMinRotationDegrees = readClampedFloat(ini,
+            SECTION,
+            "fGrabPlayerSpaceWarpMinRotationDegrees",
+            rockGrabPlayerSpaceWarpMinRotationDegrees,
+            12.0f,
+            5.0f,
+            180.0f);
         rockGrabPlayerSpaceTransformWarpEnabled = ini.GetBoolValue(SECTION, "bGrabPlayerSpaceTransformWarpEnabled", rockGrabPlayerSpaceTransformWarpEnabled);
         rockGrabPlayerSpaceContinuousWarp = ini.GetBoolValue(SECTION, "bGrabPlayerSpaceContinuousWarp", rockGrabPlayerSpaceContinuousWarp);
         rockGrabVisualHandMaxOffsetGameUnits =
@@ -3163,67 +3228,118 @@ namespace rock
         if (_fileWatch) {
             return;
         }
-        if (_iniFilePath.empty()) {
-            ROCK_LOG_WARN(Config, "Cannot start file watch — INI path not resolved");
-            return;
-        }
 
         if (_fileWatchInitThread.joinable()) {
             _fileWatchInitThread.join();
         }
 
-        _fileWatchInitThread = std::thread([this]() {
-            ROCK_LOG_DEBUG(Config, "Starting file watch on '{}'", _iniFilePath);
+        std::error_code statusError;
+        const bool targetIsRegularFile = !_iniFilePath.empty() &&
+            std::filesystem::is_regular_file(_iniFilePath, statusError);
+        const auto preflight = config_file_watch_policy::decidePreflight(
+            !_iniFilePath.empty(),
+            targetIsRegularFile,
+            static_cast<bool>(statusError));
+        switch (preflight) {
+        case config_file_watch_policy::PreflightDecision::SkipUnresolvedPath:
+            ROCK_LOG_WARN(Config, "Cannot start file watch — INI path not resolved; continuing with current in-memory settings");
+            return;
+        case config_file_watch_policy::PreflightDecision::SkipUnavailableTarget:
+            ROCK_LOG_WARN(Config,
+                "Shared Heisenberg config '{}' is absent or not a regular file; continuing with current in-memory settings and hot reload disabled",
+                _iniFilePath);
+            return;
+        case config_file_watch_policy::PreflightDecision::SkipStatusError:
+            ROCK_LOG_WARN(Config,
+                "Cannot inspect shared Heisenberg config '{}' for file watch ({}); continuing with current in-memory settings and hot reload disabled",
+                _iniFilePath,
+                statusError.message());
+            return;
+        case config_file_watch_policy::PreflightDecision::Start:
+            break;
+        }
 
-            _fileWatch = std::make_unique<filewatch::FileWatch<std::string>>(_iniFilePath, [this](const std::string&, const filewatch::Event changeType) {
-                if (changeType != filewatch::Event::modified &&
-                    changeType != filewatch::Event::added &&
-                    changeType != filewatch::Event::renamed_new) {
-                    return;
-                }
+        std::exception_ptr fileWatchFailure;
+        try {
+            _fileWatchInitThread = std::thread([this, &fileWatchFailure]() noexcept {
+                fileWatchFailure = config_file_watch_policy::captureFactoryFailure([this] {
+                    ROCK_LOG_DEBUG(Config, "Starting file watch on '{}'", _iniFilePath);
 
-                constexpr auto delay = std::chrono::milliseconds(200);
+                    auto fileWatch = std::make_unique<filewatch::FileWatch<std::string>>(_iniFilePath, [this](const std::string&, const filewatch::Event changeType) {
+                        if (changeType != filewatch::Event::modified &&
+                            changeType != filewatch::Event::added &&
+                            changeType != filewatch::Event::renamed_new) {
+                            return;
+                        }
 
-                auto prevWriteTime = _lastIniFileWriteTime.load();
-                std::error_code ec;
-                const auto writeTime = std::filesystem::last_write_time(_iniFilePath, ec);
-                if (ec || writeTime - prevWriteTime < delay) {
-                    return;
-                }
+                        constexpr auto delay = std::chrono::milliseconds(200);
 
-                const auto selfWriteTime = _lastSelfIniWriteTime.load(std::memory_order_acquire);
-                if (_selfIniWriteInProgress.load(std::memory_order_acquire) ||
-                    (selfWriteTime != std::filesystem::file_time_type{} && writeTime <= selfWriteTime)) {
-                    _lastIniFileWriteTime.store(writeTime, std::memory_order_release);
-                    if (!_selfIniWriteInProgress.load(std::memory_order_acquire)) {
-                        _lastSelfIniWriteTime.store(std::filesystem::file_time_type{}, std::memory_order_release);
-                    }
-                    _ignoreNextIniFileChange.store(false, std::memory_order_release);
-                    return;
-                }
+                        auto prevWriteTime = _lastIniFileWriteTime.load();
+                        std::error_code ec;
+                        const auto writeTime = std::filesystem::last_write_time(_iniFilePath, ec);
+                        if (ec || writeTime - prevWriteTime < delay) {
+                            return;
+                        }
 
-                if (!_lastIniFileWriteTime.compare_exchange_strong(prevWriteTime, writeTime)) {
-                    return;
-                }
+                        const auto selfWriteTime = _lastSelfIniWriteTime.load(std::memory_order_acquire);
+                        if (_selfIniWriteInProgress.load(std::memory_order_acquire) ||
+                            (selfWriteTime != std::filesystem::file_time_type{} && writeTime <= selfWriteTime)) {
+                            _lastIniFileWriteTime.store(writeTime, std::memory_order_release);
+                            if (!_selfIniWriteInProgress.load(std::memory_order_acquire)) {
+                                _lastSelfIniWriteTime.store(std::filesystem::file_time_type{}, std::memory_order_release);
+                            }
+                            _ignoreNextIniFileChange.store(false, std::memory_order_release);
+                            return;
+                        }
 
-                bool expected = true;
-                if (_ignoreNextIniFileChange.compare_exchange_strong(expected, false)) {
-                    return;
-                }
+                        if (!_lastIniFileWriteTime.compare_exchange_strong(prevWriteTime, writeTime)) {
+                            return;
+                        }
 
-                auto now = std::filesystem::file_time_type::clock::now();
-                auto lastEventTime = _lastIniFileWriteTime.load();
-                while (now - lastEventTime < delay) {
-                    std::this_thread::sleep_for(std::max(std::chrono::milliseconds(0), std::chrono::duration_cast<std::chrono::milliseconds>(delay - (now - lastEventTime))));
-                    now = std::filesystem::file_time_type::clock::now();
-                    lastEventTime = _lastIniFileWriteTime.load();
-                }
+                        bool expected = true;
+                        if (_ignoreNextIniFileChange.compare_exchange_strong(expected, false)) {
+                            return;
+                        }
 
-                _reloadPending.store(true, std::memory_order_release);
+                        auto now = std::filesystem::file_time_type::clock::now();
+                        auto lastEventTime = _lastIniFileWriteTime.load();
+                        while (now - lastEventTime < delay) {
+                            std::this_thread::sleep_for(std::max(std::chrono::milliseconds(0), std::chrono::duration_cast<std::chrono::milliseconds>(delay - (now - lastEventTime))));
+                            now = std::filesystem::file_time_type::clock::now();
+                            lastEventTime = _lastIniFileWriteTime.load();
+                        }
+
+                        _reloadPending.store(true, std::memory_order_release);
+                    });
+
+                    _fileWatch = std::move(fileWatch);
+                });
             });
-        });
+        } catch (const std::exception& error) {
+            ROCK_LOG_WARN(Config,
+                "Cannot launch shared Heisenberg config file-watch worker ({}); continuing with hot reload disabled",
+                error.what());
+            return;
+        } catch (...) {
+            ROCK_LOG_WARN(Config, "Cannot launch shared Heisenberg config file-watch worker; continuing with hot reload disabled");
+            return;
+        }
 
         _fileWatchInitThread.join();
+
+        if (!fileWatchFailure) {
+            return;
+        }
+
+        try {
+            std::rethrow_exception(fileWatchFailure);
+        } catch (const std::exception& error) {
+            ROCK_LOG_WARN(Config,
+                "Shared Heisenberg config file watch failed to initialize ({}); continuing with current in-memory settings and hot reload disabled",
+                error.what());
+        } catch (...) {
+            ROCK_LOG_WARN(Config, "Shared Heisenberg config file watch failed to initialize; continuing with compiled defaults and hot reload disabled");
+        }
     }
 
     void RockConfig::stopFileWatch()

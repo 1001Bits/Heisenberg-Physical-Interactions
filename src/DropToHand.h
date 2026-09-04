@@ -79,7 +79,9 @@ namespace heisenberg
             int itemCount = 1,
             bool stickyGrab = true,
             bool markAsSmartGrab = false,
-            bool bypassInitialDelay = false);
+            bool bypassInitialDelay = false,
+            std::uint16_t uniqueID = 0,            // exact stack: ExtraUniqueID (0 = unknown)
+            const void* instanceHint = nullptr);   // exact stack: TBO_InstanceData* (compared only)
 
         // BSTEventSink override
         RE::BSEventNotifyControl ProcessEvent(
@@ -197,6 +199,10 @@ namespace heisenberg
 
         std::vector<PendingDrop> _pendingDrops;
         std::set<std::uint32_t> _grabsInProgress;  // RefIDs currently being grabbed (before StartGrab completes)
+        // Timeout retries per BASE form, NOT per PendingDrop. QueueDropToHand builds a fresh
+        // PendingDrop every time, so a counter living in the struct resets on each re-queue and
+        // the cap silently never fires. Keyed by base form so it survives the whole cycle.
+        std::unordered_map<std::uint32_t, int> _timeoutRetryCounts;
         std::unordered_map<std::uint32_t, int> _weaponSheatheWait;  // RefID -> frames waited for the weapon to holster before placing
         std::mutex _mutex;
         bool _initialized = false;
@@ -230,8 +236,21 @@ namespace heisenberg
             bool bypassInitialDelay = false;  // Explicit physical handoff: process on the next update, without the generic 0.1s settle
             std::uint32_t oldContainerFormID = 0;  // Source container (for Take-All bulk detection)
             std::uint64_t burstId = 0;        // Frame-burst id when queued (for Take-All bulk detection)
+            // Identity of the EXACT inventory stack to drop. RemoveItem by base
+            // form takes the first stack of that form, which swaps a looted
+            // legendary/modded item for the player's own plain copy. Either key
+            // resolves the stack; 0/nullptr = no identity known (default stack).
+            std::uint16_t uniqueID = 0;                 // ExtraUniqueID from the container-changed event
+            const void* instanceHint = nullptr;         // TBO_InstanceData* of the world ref (compared, never dereferenced)
         };
         std::vector<PendingLoot> _pendingLoots;
+
+        // Drop `count` of the loot's base form from the player's inventory at pos/rot,
+        // targeting the exact stack identified by loot.uniqueID / loot.instanceHint.
+        // Falls back to the engine's default stack when no identity matches.
+        RE::ObjectRefHandle DropLootFromInventory(RE::Actor* player, RE::TESBoundObject* boundObj,
+                                                  const PendingLoot& loot, std::int32_t count,
+                                                  const RE::NiPoint3& pos, const RE::NiPoint3& rot);
 
         // Take-All / bulk-transfer detection: all container-changed events from a
         // single "Take All" fire synchronously in one game frame, so they share a

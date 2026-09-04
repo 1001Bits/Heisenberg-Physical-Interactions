@@ -721,7 +721,9 @@ namespace rock
         return havok_convex_shape_builder::buildConvexShapeFromLocalHavokPoints(toHavokPointCloud(gamePoints), frame.convexRadius * gameToHavokScale());
     }
 
-    RE::hknpShape* HandBoneColliderSet::buildDynamicTwinShape(const dynamic_hand_twin::TwinSlotFrame& slotFrame, bool isPalm) const
+    RE::hknpShape* HandBoneColliderSet::buildDynamicTwinShape(
+        const dynamic_hand_twin::TwinSlotFrame& slotFrame,
+        HandColliderRole role) const
     {
         if (!slotFrame.valid) {
             return nullptr;
@@ -729,10 +731,9 @@ namespace rock
 
         /*
          * The dynamic twins reuse the exact hull construction of their
-         * keyframed counterparts: the palm-anchor box hull or the fingertip
-         * capsule hull for the published dimensions. buildShapeForRole only
-         * branches on palm-vs-segment, so any Tip role selects the segment
-         * path.
+         * keyframed counterpart for the exact semantic role. This matters for
+         * PalmFace/PalmBack/PalmHeel/ThumbPad: those production colliders use
+         * palm box geometry, while all finger segments use capsule geometry.
          */
         RoleFrameResult frame{};
         frame.valid = true;
@@ -740,7 +741,7 @@ namespace rock
         frame.length = slotFrame.length;
         frame.radius = slotFrame.radius;
         frame.convexRadius = slotFrame.convexRadius;
-        return buildShapeForRole(frame, isPalm ? HandColliderRole::PalmAnchor : HandColliderRole::IndexTip);
+        return buildShapeForRole(frame, role);
     }
 
     bool HandBoneColliderSet::createBodyForRole(RE::hknpWorld* world, void* bhkWorld, bool isLeft, HandColliderRole role, const RoleFrameResult& frame, BodyInstance& instance)
@@ -822,7 +823,9 @@ namespace rock
             ROCK_LOG_ERROR(Hand, "{} palm anchor frame could not be derived; bone-derived hand creation cannot continue", isLeft ? "Left" : "Right");
             return false;
         }
-        publishCanonicalTwinSlot(canonicalTwinTargets.palm, anchorFrame);
+        publishCanonicalTwinSlot(
+            canonicalTwinTargets.forRole(HandColliderRole::PalmAnchor),
+            anchorFrame);
 
         auto* anchorShape = buildShapeForRole(anchorFrame, HandColliderRole::PalmAnchor);
         if (!anchorShape) {
@@ -871,14 +874,9 @@ namespace rock
                 destroy(bhkWorld, palmAnchorBody);
                 return false;
             }
-            if (hand_collider_semantics::isFingerRole(role) &&
-                hand_collider_semantics::segmentForRole(role) == HandFingerSegment::Tip) {
-                const auto fingerIndex =
-                    static_cast<std::size_t>(hand_collider_semantics::fingerForRole(role));
-                if (fingerIndex < canonicalTwinTargets.fingertips.size()) {
-                    publishCanonicalTwinSlot(canonicalTwinTargets.fingertips[fingerIndex], frame);
-                }
-            }
+            publishCanonicalTwinSlot(
+                canonicalTwinTargets.forRole(role),
+                frame);
             ++createdCount;
         }
 
@@ -1044,7 +1042,9 @@ namespace rock
             _latestPalmAnchorTarget = anchorFrame.transform;
             _hasLatestPalmAnchorTarget = true;
             _palmAnchorCollisionFrame = anchorFrame;
-            publishTwinSlot(twinTargets.palm, anchorFrame);
+            publishTwinSlot(
+                twinTargets.forRole(HandColliderRole::PalmAnchor),
+                anchorFrame);
             queueBodyTarget(palmAnchorBody, anchorFrame.transform, deltaTime, _palmAnchorDriveState, _palmAnchorPublicationIndex);
         }
 
@@ -1054,13 +1054,9 @@ namespace rock
             }
             RoleFrameResult frame{};
             if (makeRoleFrame(lookup, isLeft, instance.role, frame)) {
-                if (hand_collider_semantics::isFingerRole(instance.role) &&
-                    hand_collider_semantics::segmentForRole(instance.role) == HandFingerSegment::Tip) {
-                    const auto fingerIndex = static_cast<std::size_t>(hand_collider_semantics::fingerForRole(instance.role));
-                    if (fingerIndex < twinTargets.fingertips.size()) {
-                        publishTwinSlot(twinTargets.fingertips[fingerIndex], frame);
-                    }
-                }
+                publishTwinSlot(
+                    twinTargets.forRole(instance.role),
+                    frame);
                 instance.collisionFrame = frame;
                 instance.collisionFrameValid = true;
                 queueBodyTarget(instance.body, frame.transform, deltaTime, instance.driveState, instance.publicationIndex);

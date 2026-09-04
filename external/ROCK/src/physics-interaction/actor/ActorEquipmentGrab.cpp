@@ -1,6 +1,7 @@
 #include "physics-interaction/actor/ActorEquipmentGrab.h"
 
 #include "physics-interaction/grab/GrabNodeInfoMath.h"
+#include "physics-interaction/native/NativeMemory.h"
 #include "physics-interaction/PhysicsLog.h"
 
 #include "RE/Bethesda/Actor.h"
@@ -27,6 +28,9 @@ namespace rock::actor_equipment_grab
     {
         constexpr int kMaxNodeSearchDepth = 48;
         constexpr std::uint32_t kMaxSkinBoneCount = 512;
+        constexpr std::ptrdiff_t kVrGeometrySkinInstanceOffset = 0x180;
+        constexpr std::ptrdiff_t kSkinBonesDataOffset = 0x10;
+        constexpr std::ptrdiff_t kSkinBonesCountOffset = 0x18;
 
         struct EquippedStackMatch
         {
@@ -181,13 +185,17 @@ namespace rock::actor_equipment_grab
                 return false;
             }
 
-            auto* skinInstance = geometry->GetRuntimeData().skinInstance.get();
-            if (!skinInstance || !skinInstance->bonesData || skinInstance->bonesCount == 0 || skinInstance->bonesCount > kMaxSkinBoneCount) {
+            RE::BSSkin::Instance* skinInstance = nullptr;
+            RE::NiAVObject** boneNodes = nullptr;
+            std::uint32_t boneCount = 0;
+            if (!native_memory::tryReadField(geometry, kVrGeometrySkinInstanceOffset, skinInstance) || !skinInstance ||
+                !native_memory::tryReadField(skinInstance, kSkinBonesDataOffset, boneNodes) || !boneNodes ||
+                !native_memory::tryReadField(skinInstance, kSkinBonesCountOffset, boneCount) || boneCount == 0 || boneCount > kMaxSkinBoneCount ||
+                !native_memory::pointerRangeLooksReadable(boneNodes, static_cast<std::size_t>(boneCount) * sizeof(*boneNodes))) {
                 return false;
             }
 
-            auto** boneNodes = reinterpret_cast<RE::NiAVObject**>(skinInstance->bonesData);
-            for (std::uint32_t i = 0; i < skinInstance->bonesCount; ++i) {
+            for (std::uint32_t i = 0; i < boneCount; ++i) {
                 auto* bone = boneNodes[i];
                 if (bone && targetNodes.find(bone) != targetNodes.end()) {
                     return true;

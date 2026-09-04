@@ -290,15 +290,19 @@ namespace heisenberg
                       std::size_t maxTriangles = SIZE_MAX);
 
     /**
-     * Find the closest point on object geometry to a line (palm position + direction)
-     * 
+     * Find the closest point on object geometry to a line (palm position + direction).
+     * Port of HIGGS GetClosestPointOnGraphicsGeometryToLine: weighted
+     * along/lateral distance to the infinite line, front faces only
+     * (dot(normal, lineDir) <= 0). If no front face qualifies a second pass
+     * accepts any face and logs it.
+     *
      * @param triangles Pre-extracted triangles
      * @param lineStart Start of line (palm position)
-     * @param lineDir Direction of line (palm direction)
+     * @param lineDir Direction of line (palm normal, out of the palm)
      * @param outPoint Closest point on geometry
-     * @param outNormal Normal at closest point
+     * @param outNormal Raw face normal of the winning triangle
      * @param outTriIndex Index of triangle containing closest point
-     * @param outDist Distance to closest point
+     * @param outDist Lateral distance from the closest point to the line
      * @return True if a point was found
      */
     bool GetClosestPointOnGeometryToLine(

@@ -81,8 +81,17 @@ namespace rock::collision_suppression_registry
             } else if ((entry->ownerMask & bit) != 0) {
                 result.valid = true;
                 result.ownerAlreadyHeld = true;
-                result.filterAfter = currentFilter;
-                result.filterChanged = false;
+                /*
+                 * Match the runtime registry's watchdog semantics: an
+                 * idempotent per-frame acquire also repairs a lost bit-14
+                 * filter write. This is what lets tests model acquisition
+                 * retry/filter drift instead of treating local ownership as
+                 * proof that Havok is still suppressed.
+                 */
+                result.filterAfter =
+                    currentFilter | kSuppressionNoCollideBit;
+                result.filterChanged =
+                    result.filterAfter != currentFilter;
                 result.wasNoCollideBeforeSuppression = entry->wasNoCollideBeforeSuppression;
                 result.activeLeaseCount = activeLeaseCount(bodyId);
                 return result;

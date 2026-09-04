@@ -5,6 +5,7 @@
 #include "RE/NetImmerse/NiTransform.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 
 namespace rock::dynamic_hand_twin
@@ -12,13 +13,14 @@ namespace rock::dynamic_hand_twin
     inline constexpr std::size_t kForearmSegmentCountPerHand = 1;
 
     /*
-     * Per-frame publication from HandBoneColliderSet for the stage A dynamic
-     * hand twins: the EXACT role frames and dimensions the keyframed palm
-     * anchor and fingertip (Tip segment) colliders are driven with, so the
-     * dynamic proxies mirror the production collider conventions by
-     * construction instead of re-deriving hand geometry. Main-thread only:
-     * written by HandBoneColliderSet::update and consumed by
-     * DynamicHandCollisionRuntime::updateFrame in the same frame loop.
+     * Per-frame publication from HandBoneColliderSet for the complete dynamic
+     * hand twin set: one fixed slot for every production hand collider role.
+     * Each slot carries the EXACT frame and dimensions used by its keyframed
+     * counterpart, so the solver-responsive proxy cannot leave uncovered
+     * palm faces or base/middle phalanges while the contact-evidence set says
+     * the hand touched the weapon. Main-thread only: written by
+     * HandBoneColliderSet::update and consumed by DynamicHandCollisionRuntime
+     * in the same frame loop.
      */
     struct TwinSlotFrame
     {
@@ -34,13 +36,34 @@ namespace rock::dynamic_hand_twin
 
     struct TwinTargets
     {
-        TwinSlotFrame palm{};
-        std::array<TwinSlotFrame, hand_collider_semantics::kHandFingerCount> fingertips{};
+        std::array<
+            TwinSlotFrame,
+            hand_collider_semantics::kHandColliderBodyCountPerHand>
+            roles{};
         std::uint64_t updateCounter = 0;
         // Changes only when the owning keyframed collider set is rebuilt for
         // a real source/tuning/lifetime reason; never changes for live pose.
         std::uint64_t geometryGeneration = 0;
+
+        [[nodiscard]] TwinSlotFrame& forRole(
+            hand_collider_semantics::HandColliderRole role)
+        {
+            return roles[static_cast<std::size_t>(role)];
+        }
+
+        [[nodiscard]] const TwinSlotFrame& forRole(
+            hand_collider_semantics::HandColliderRole role) const
+        {
+            return roles[static_cast<std::size_t>(role)];
+        }
     };
+
+    static_assert(
+        static_cast<std::size_t>(
+            hand_collider_semantics::HandColliderRole::PinkyTip) +
+                1u ==
+            hand_collider_semantics::kHandColliderBodyCountPerHand,
+        "dynamic hand role slots require the contiguous semantic role table");
 
     /*
      * Main-thread publication from BodyBoneColliderSet. These are the exact
@@ -89,11 +112,10 @@ namespace rock::dynamic_hand_twin
         TwinTargets& liveTargets,
         const TwinTargets& canonicalTargets)
     {
-        applyCanonicalSlotDimensions(liveTargets.palm, canonicalTargets.palm);
-        for (std::size_t index = 0; index < liveTargets.fingertips.size(); ++index) {
+        for (std::size_t index = 0; index < liveTargets.roles.size(); ++index) {
             applyCanonicalSlotDimensions(
-                liveTargets.fingertips[index],
-                canonicalTargets.fingertips[index]);
+                liveTargets.roles[index],
+                canonicalTargets.roles[index]);
         }
     }
 

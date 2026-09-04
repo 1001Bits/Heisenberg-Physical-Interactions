@@ -30,4 +30,11 @@ namespace rock::character_controller_runtime
     // Consumer: the grab-authority room-velocity feed-forward (one-substep target prediction at the
     // physics flush). This is a physics-clock signal read on the physics thread by design.
     bool tryGetPlayerLocomotionVelocityRawGameUnits(RE::NiPoint3& outVelocityGameUnits) noexcept;
+
+    // Applies a short, signed game-space displacement through the verified
+    // native controller API. This is game-frame-thread authority: callers
+    // must not invoke it from a Havok between-step callback.
+    bool tryApplyPlayerDisplacementModifierGameUnits(
+        const RE::NiPoint3& displacementGameUnits,
+        float durationSeconds) noexcept;
 }

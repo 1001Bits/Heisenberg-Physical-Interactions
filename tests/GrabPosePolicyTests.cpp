@@ -112,6 +112,18 @@ int main()
         "an aged native-contact identity alone must not authorize a transfer");
 
     Require(
+        ShouldOfferSameObjectTransferCandidate(6.46f),
+        "the default authored palm offset must reach StartGrab's transfer validation");
+    Require(
+        ShouldOfferSameObjectTransferCandidate(
+            kSameObjectTransferCandidateDistance),
+        "the ordinary transfer-candidate boundary must be inclusive");
+    Require(
+        !ShouldOfferSameObjectTransferCandidate(
+            kSameObjectTransferCandidateDistance + 0.01f),
+        "handoff admission must stay bounded to StartGrab's transfer envelope");
+
+    Require(
         CanRejectCoHoldMeshQuery(31.0f, 10.0f, 5.0f),
         "a hand clearly outside the held mesh bound and guarded contact range may skip extraction");
     Require(

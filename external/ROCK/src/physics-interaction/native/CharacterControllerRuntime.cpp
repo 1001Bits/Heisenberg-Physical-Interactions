@@ -1,7 +1,9 @@
 #include "physics-interaction/native/CharacterControllerRuntime.h"
 #include "physics-interaction/native/CharacterControllerLayoutPolicy.h"
+#include "physics-interaction/native/HavokOffsets.h"
 
 #include "RE/Bethesda/PlayerCharacter.h"
+#include "REL/Relocation.h"
 
 #include <cmath>
 #include <cstdint>
@@ -10,6 +12,17 @@
 
 namespace rock::character_controller_runtime
 {
+    namespace
+    {
+        using SetVelocityModifier = void(__fastcall*)(
+            RE::bhkCharacterController*, const float*, float);
+        REL::Relocation<SetVelocityModifier> s_setVelocityModifier{
+            REL::Offset(
+                offsets::
+                    kFunc_CharacterController_SetVelocityModifier)
+        };
+    }
+
     RE::bhkCharacterController* tryGetActorCharacterController(RE::Actor* actor) noexcept
     {
         RE::bhkCharacterController* controller = nullptr;
@@ -63,5 +76,44 @@ namespace rock::character_controller_runtime
         }
 
         return ok;
+    }
+
+    bool tryApplyPlayerDisplacementModifierGameUnits(
+        const RE::NiPoint3& displacementGameUnits,
+        float durationSeconds) noexcept
+    {
+        if (!std::isfinite(displacementGameUnits.x) ||
+            !std::isfinite(displacementGameUnits.y) ||
+            !std::isfinite(displacementGameUnits.z) ||
+            !std::isfinite(durationSeconds) ||
+            durationSeconds <= 0.0f) {
+            return false;
+        }
+
+        bool applied = false;
+        __try {
+            auto* controller = tryGetPlayerCharacterController();
+            if (controller && s_setVelocityModifier.address() != 0) {
+                // FO4VR 1.2.72 begins this routine with
+                // `movaps xmm5, xmmword ptr [rdx]`: the native argument must
+                // be 16-byte aligned and expose a readable fourth float.
+                // NiPoint3 is only three floats and carries no such alignment
+                // guarantee, so never pass its address across this seam.
+                alignas(16) const float nativeDisplacement[4]{
+                    displacementGameUnits.x,
+                    displacementGameUnits.y,
+                    displacementGameUnits.z,
+                    0.0f,
+                };
+                s_setVelocityModifier(
+                    controller,
+                    nativeDisplacement,
+                    durationSeconds);
+                applied = true;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            applied = false;
+        }
+        return applied;
     }
 }

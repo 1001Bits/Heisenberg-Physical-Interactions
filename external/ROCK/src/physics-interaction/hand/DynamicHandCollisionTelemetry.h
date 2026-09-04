@@ -24,42 +24,87 @@
 namespace rock::dynamic_hand_collision_telemetry
 {
     inline constexpr std::size_t kPalmSlot = 0;
-    inline constexpr std::size_t kFirstForearmSlot = 1 + hand_collider_semantics::kHandFingerCount;
+    inline constexpr std::size_t kFirstForearmSlot =
+        hand_collider_semantics::kHandColliderBodyCountPerHand;
     inline constexpr std::size_t kForearmSlot = kFirstForearmSlot;
     inline constexpr std::size_t kBodiesPerHand = kFirstForearmSlot + dynamic_hand_twin::kForearmSegmentCountPerHand;
     inline constexpr std::uint32_t kInvalidBodyId = 0x7FFF'FFFF;
 
     enum class TwinRole : std::uint8_t
     {
-        Palm = 0,
+        PalmAnchor = 0,
+        PalmFace,
+        PalmBack,
+        PalmHeel,
+        ThumbPad,
+        ThumbBase,
+        ThumbMiddle,
         ThumbTip,
+        IndexBase,
+        IndexMiddle,
         IndexTip,
+        MiddleBase,
+        MiddleMiddle,
         MiddleTip,
+        RingBase,
+        RingMiddle,
         RingTip,
+        PinkyBase,
+        PinkyMiddle,
         PinkyTip,
         Forearm,
     };
 
     [[nodiscard]] constexpr TwinRole roleForBodyIndex(std::size_t bodyIndex) noexcept
     {
-        return bodyIndex < kBodiesPerHand ? static_cast<TwinRole>(bodyIndex) : TwinRole::Palm;
+        return bodyIndex < kBodiesPerHand ?
+            static_cast<TwinRole>(bodyIndex) :
+            TwinRole::PalmAnchor;
     }
 
     [[nodiscard]] constexpr const char* roleCode(TwinRole role) noexcept
     {
         switch (role) {
-        case TwinRole::Palm:
-            return "PALM";
+        case TwinRole::PalmAnchor:
+            return "PANC";
+        case TwinRole::PalmFace:
+            return "PFAC";
+        case TwinRole::PalmBack:
+            return "PBAK";
+        case TwinRole::PalmHeel:
+            return "PHEL";
+        case TwinRole::ThumbPad:
+            return "TPAD";
+        case TwinRole::ThumbBase:
+            return "TBAS";
+        case TwinRole::ThumbMiddle:
+            return "TMID";
         case TwinRole::ThumbTip:
-            return "THMB";
+            return "TTIP";
+        case TwinRole::IndexBase:
+            return "IBAS";
+        case TwinRole::IndexMiddle:
+            return "IMID";
         case TwinRole::IndexTip:
-            return "INDX";
+            return "ITIP";
+        case TwinRole::MiddleBase:
+            return "MBAS";
+        case TwinRole::MiddleMiddle:
+            return "MMID";
         case TwinRole::MiddleTip:
-            return "MIDL";
+            return "MTIP";
+        case TwinRole::RingBase:
+            return "RBAS";
+        case TwinRole::RingMiddle:
+            return "RMID";
         case TwinRole::RingTip:
-            return "RING";
+            return "RTIP";
+        case TwinRole::PinkyBase:
+            return "PBAS";
+        case TwinRole::PinkyMiddle:
+            return "PMID";
         case TwinRole::PinkyTip:
-            return "PNKY";
+            return "PTIP";
         case TwinRole::Forearm:
             return "FARM";
         }
@@ -67,10 +112,16 @@ namespace rock::dynamic_hand_collision_telemetry
     }
 
     static_assert(static_cast<std::size_t>(TwinRole::Forearm) + 1 == kBodiesPerHand);
+    static_assert(kBodiesPerHand <= 32u, "dynamic hand telemetry contact masks are 32-bit fixed capacity");
+    static_assert(
+        static_cast<std::size_t>(TwinRole::PinkyTip) ==
+            static_cast<std::size_t>(
+                hand_collider_semantics::HandColliderRole::PinkyTip),
+        "dynamic twin role order must match hand collider semantic order");
 
     struct TwinSample
     {
-        TwinRole role{ TwinRole::Palm };
+        TwinRole role{ TwinRole::PalmAnchor };
         std::uint32_t bodyId{ kInvalidBodyId };
         std::uint64_t physicsSampleSequence = 0;
 
@@ -122,6 +173,7 @@ namespace rock::dynamic_hand_collision_telemetry
         bool handDisabled = false;
         bool ownedByStrongerSystem = false;
         bool visualAuthorityAvailable = false;
+        bool worldStopOperational = false;
         bool visualActive = false;
         bool anyContact = false;
     };

@@ -8,9 +8,11 @@
 #include "physics-interaction/grab/GrabTelemetry.h"
 #include "physics-interaction/grab/GrabThreePhase.h"
 #include "physics-interaction/grab/GrabAuthoritySourceClockResampler.h"
+#include "physics-interaction/grab/HeldLocomotionTransportPolicy.h"
 #include "physics-interaction/grab/GrabConstraint.h"
 #include "physics-interaction/grab/GrabHeldObject.h"
 #include "physics-interaction/grab/GrabMotionController.h"
+#include "physics-interaction/grab/PullCatchRetryPolicy.h"
 #include "physics-interaction/hand/HandBoneColliderSet.h"
 #include "physics-interaction/hand/HandLifecycle.h"
 #include "physics-interaction/hand/HandInteractionStateMachine.h"
@@ -35,9 +37,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -242,6 +246,14 @@ namespace rock
         bool warpByDistance = false;
         bool warpByRotation = false;
         bool hasWarpTransforms = false;
+        // Set only after at least one native body transform write succeeds.
+        // This is the single discontinuity signal used by proxy/history rebase
+        // and by the held-body world sweep's one-frame skip.
+        bool runtimeTransformWarpApplied = false;
+        bool rightHandRuntimeTransformWarpApplied = false;
+        bool leftHandRuntimeTransformWarpApplied = false;
+        bool rightHandRuntimeTransformWarpRetryPending = false;
+        bool leftHandRuntimeTransformWarpRetryPending = false;
     };
 
     enum class GrabReleaseCollisionRestoreMode : std::uint8_t
@@ -259,12 +271,36 @@ namespace rock
         OwnershipHandoff,
     };
 
+    struct GrabRoomMotionFrame
+    {
+        std::uint64_t gameFrameIndex = 0;
+        RE::NiPoint3 velocityGameUnitsPerSecond{};
+        bool velocityUsable = false;
+    };
+
+    struct GrabSharedHeldObjectRuntime
+    {
+        // This runtime is shared by both Hand instances when they constrain the
+        // same object. A per-Hand proxy mutex cannot protect it: each hand owns
+        // a different mutex. Keep transport serialization object-owned so the
+        // physics flush and cross-hand telemetry reads agree without ever
+        // nesting one hand's lock inside the peer hand's lock.
+        mutable std::mutex locomotionTransportMutex{};
+        static constexpr std::size_t kLocomotionTransportMotionCapacity = 65;
+        std::array<held_locomotion_transport_policy::MotionRuntimeSlot<RE::NiPoint3>,
+            kLocomotionTransportMotionCapacity>
+            locomotionTransportMotions{};
+        std::uint64_t lastPlayerSpaceWarpSequence = 0;
+        bool hasPlayerSpaceWarpSequence = false;
+    };
+
     struct GrabSharedObjectContext
     {
         bool joiningPeerHeldObject = false;
         const SavedObjectState* peerSavedObjectState = nullptr;
         const active_grab_body_lifecycle::BodyLifecycleSnapshot* peerActiveGrabLifecycle = nullptr;
         const std::vector<std::uint32_t>* peerHeldBodyIds = nullptr;
+        std::shared_ptr<GrabSharedHeldObjectRuntime> peerHeldObjectRuntime{};
 
         [[nodiscard]] bool hasPeerState() const noexcept
         {
@@ -482,8 +518,33 @@ namespace rock
         bool isHolding() const { return isHoldingState(_state); }
         bool isHoldingLooseWeapon() const { return isHolding() && _heldObjectIsLooseWeapon; }
         RE::TESObjectREFR* getHeldRef() const { return _savedObjectState.refr; }
+        RE::NiAVObject* getHeldNode() const { return _grabFrame.heldNode; }
+        float getGrabElapsedSeconds() const { return _grabStartTime; }
+        std::uint64_t getGrabTraceId() const { return _grabFrame.traceId; }
+        float getHeldHandSpeedMetersPerSecond() const
+        {
+            if (_heldHandVelocityHistoryCount == 0 ||
+                _heldLocalHandVelocityHistory.empty()) {
+                return 0.0f;
+            }
+            const std::size_t latest =
+                (_heldHandVelocityHistoryNext +
+                    _heldLocalHandVelocityHistory.size() - 1) %
+                _heldLocalHandVelocityHistory.size();
+            const auto& velocity = _heldLocalHandVelocityHistory[latest];
+            const float speedSquared =
+                velocity.x * velocity.x +
+                velocity.y * velocity.y +
+                velocity.z * velocity.z;
+            return std::isfinite(speedSquared) && speedSquared >= 0.0f ?
+                       std::sqrt(speedSquared) :
+                       0.0f;
+        }
         const ActiveConstraint& getActiveConstraint() const { return _activeConstraint; }
         const SavedObjectState& getSavedObjectState() const { return _savedObjectState; }
+        std::shared_ptr<GrabSharedHeldObjectRuntime> getSharedHeldObjectRuntime() const;
+        void prepareHeldPlayerSpaceWarpRetry();
+        void invalidateGrabAfterPlayerSpaceWarpFailure();
         const active_grab_body_lifecycle::BodyLifecycleSnapshot& getActiveGrabLifecycle() const { return _activeGrabLifecycle; }
         bool tryGetHeldObjectGrabPivotWorld(RE::hknpWorld* world, RE::NiPoint3& outPivotWorld) const;
         bool getGrabPivotDebugSnapshot(RE::hknpWorld* world, GrabPivotDebugSnapshot& out) const;
@@ -578,7 +639,14 @@ namespace rock
             float forceFadeInTime,
             float tauMin,
             const BodyBoneColliderSet* bodyBoneColliders,
-            const GrabReleaseContext& releaseContext = {});
+            const GrabReleaseContext& releaseContext = {},
+            bool playerSpaceWarpApplied = false,
+            bool playerSpaceWarpRetryPending = false);
+        void rebaseHeldMotionAfterPlayerSpaceWarp(RE::hknpWorld* world,
+            const RE::NiTransform& previousPlayerSpaceWorld,
+            const RE::NiTransform& currentPlayerSpaceWorld,
+            std::uint64_t warpSequence,
+            const std::vector<std::uint32_t>& warpedMotionIndices);
         void captureHeldReleaseMotion(RE::hknpWorld* world, const RE::NiTransform& handWorldTransform, float deltaTime);
         void applyReleaseVelocitySnapshot(RE::hknpWorld* world, const GrabReleaseOutcome::VelocitySnapshot& snapshot) const;
 
@@ -599,8 +667,11 @@ namespace rock
         bool hasActivePullCatchIntent() const;
         bool hasArrivedPullCatchIntent() const;
         bool hasPendingPullCatchCommit() const;
-        bool advancePullCatchCommit(float deltaTime, float maxCommitSeconds);
-        void notePullCatchCommitAttemptFailed();
+        pull_catch_retry_policy::Decision advancePullCatchCommit(
+            float deltaTime,
+            float maxCommitSeconds,
+            const RE::NiTransform& handWorldTransform);
+        void notePullCatchCommitAttemptFailed(const RE::NiTransform& handWorldTransform);
         RE::TESObjectREFR* getPullCatchIntentRef() const;
         bool reacquirePullCatchCloseSelection(RE::bhkWorld* bhkWorld,
             RE::hknpWorld* hknpWorld,
@@ -635,7 +706,8 @@ namespace rock
 
         void updateSelection(RE::bhkWorld* bhkWorld, RE::hknpWorld* hknpWorld, const RE::NiPoint3& selectionOrigin, const RE::NiPoint3& closeSelectionDirection,
             const RE::NiPoint3& farSelectionDirection, const RE::NiPoint3& pinchOrigin, const RE::NiPoint3& pinchDirection, bool hasPinchOrigin,
-            const FarSelectionHmdConeGate& farHmdConeGate, float nearRange, float farRange, float deltaTime, const OtherHandSelectionContext& otherHandContext);
+            const FarSelectionHmdConeGate& farHmdConeGate, float nearRange, float farRange, float deltaTime, const OtherHandSelectionContext& otherHandContext,
+            RE::TESObjectREFR* hostViewCasterTarget);
         void preloadSelectionBeam();
         void updateSelectionBeam(RE::hknpWorld* hknpWorld, const RE::NiPoint3& selectionOrigin);
         void stopSelectionBeam();
@@ -656,7 +728,7 @@ namespace rock
         {
             return RE::hknpBodyId{ _boneColliders.getBodyIdAtomic(0) };
         }
-        RE::hknpBodyId getGrabAuthorityProxyBodyId() const { return _grabAuthorityProxy.getBodyId(); }
+        RE::hknpBodyId getGrabAuthorityProxyBodyId() const;
         // Diagnostic: magnitude of proxy A's per-frame TARGET velocity (game units/sec) from the last flush,
         // i.e. how fast A's keyframe target itself moves. Localizes the held-object shake -- target jitter
         // (=> smooth the sampled hand/room target) vs motor jitter (=> motor tuning). -1 when unavailable.
@@ -692,9 +764,11 @@ namespace rock
         bool tryGetHandColliderMetadata(std::uint32_t bodyId, HandColliderBodyMetadata& outMetadata) const { return _boneColliders.tryGetBodyMetadataAtomic(bodyId, outMetadata); }
         bool tryGetPalmAnchorTarget(RE::NiTransform& outTarget) const { return _boneColliders.tryGetPalmAnchorTarget(outTarget); }
         const dynamic_hand_twin::TwinTargets& dynamicTwinTargets() const { return _boneColliders.dynamicTwinTargets(); }
-        RE::hknpShape* buildDynamicTwinShape(const dynamic_hand_twin::TwinSlotFrame& slotFrame, bool isPalm) const
+        RE::hknpShape* buildDynamicTwinShape(
+            const dynamic_hand_twin::TwinSlotFrame& slotFrame,
+            hand_collider_semantics::HandColliderRole role) const
         {
-            return _boneColliders.buildDynamicTwinShape(slotFrame, isPalm);
+            return _boneColliders.buildDynamicTwinShape(slotFrame, role);
         }
         void recordSemanticContact(const HandColliderBodyMetadata& metadata,
             std::uint32_t otherBodyId,
@@ -727,7 +801,10 @@ namespace rock
             const RE::NiPoint3& authorityTranslationOffsetGame = RE::NiPoint3{});
 
         void flushPendingCollisionPhysicsDrive(RE::hknpWorld* world, const havok_physics_timing::PhysicsTimingSample& timing);
-        void flushPendingCustomGrabAuthority(RE::hknpWorld* world, const havok_physics_timing::PhysicsTimingSample& timing);
+        void flushPendingCustomGrabAuthority(
+            RE::hknpWorld* world,
+            const havok_physics_timing::PhysicsTimingSample& timing,
+            const GrabRoomMotionFrame& roomMotionFrame);
         void observeCustomGrabAuthorityAfterSolve(RE::hknpWorld* world, const havok_physics_timing::PhysicsTimingSample& timing);
         bool beginStashCandidate();
         bool cancelStashCandidate();
@@ -787,7 +864,8 @@ namespace rock
             float grabPositionErrorGameUnits,
             float grabRotationErrorDegrees,
             float authorityForceScale,
-            bool heldBodyColliding);
+            bool heldBodyColliding,
+            bool predictiveWorldStopped);
         void destroyGrabAuthorityProxy(RE::bhkWorld* bhkWorld);
         void abandonGrabAuthorityProxy();
         void clearGrabAuthorityProxyRuntime();
@@ -796,7 +874,7 @@ namespace rock
         void clearGrabAuthorityProxyRuntimeLocked();
         void beginGrabVisualReturn();
         void clearGrabVisualReturn(const char* reason, bool logCancellation);
-        void applyHeldLocomotionTransportLocked(RE::hknpWorld* world, bool roomVelocityOk, const RE::NiPoint3& roomVelocityGameUnitsPerSecond);
+        void applyHeldLocomotionTransportLocked(RE::hknpWorld* world, const GrabRoomMotionFrame& roomMotionFrame);
         bool tryGetGrabDriveObjectWorldTransform(RE::hknpWorld* world, RE::hknpBodyId bodyId, RE::NiTransform& outTransform) const;
         RE::NiPoint3 activeProxyConstraintPivotBLocalGame() const;
 
@@ -815,8 +893,7 @@ namespace rock
             std::uint32_t formId = 0;
             std::uint32_t primaryBodyId = INVALID_BODY_ID;
             grab_target::Kind targetKind = grab_target::Kind::LooseObject;
-            float commitElapsedSeconds = 0.0f;
-            std::uint32_t failedCommitAttempts = 0;
+            pull_catch_retry_policy::RuntimeState retry{};
         };
 
         /*
@@ -914,6 +991,7 @@ namespace rock
         SelectedObject _cachedFarCandidate;
         GrabAcquisitionCache _grabAcquisitionCache;
         int _farDetectCounter = 0;
+        std::uint32_t _lastHostViewCasterCandidateFormId = 0;
         int _selectionHoldFrames = 0;
         int _selectionHighlightRefreshFrames = 0;
         int _deselectCooldown = 0;
@@ -1072,7 +1150,8 @@ namespace rock
             bool hasAngularVelocity = false;
         };
 
-        HeldHandMotionSample recordHeldControllerMotionSample(const RE::NiTransform& handWorldTransform, float deltaTime);
+        RE::NiPoint3 currentAppliedRoomVelocityHavok(RE::hknpWorld* world) const;
+        HeldHandMotionSample recordHeldControllerMotionSample(RE::hknpWorld* world, const RE::NiTransform& handWorldTransform, float deltaTime);
         void recordHeldObjectVelocitySample(RE::hknpWorld* world);
 
         ActiveConstraint _activeConstraint;
@@ -1096,6 +1175,7 @@ namespace rock
             float grabRotationErrorDegrees = 0.0f;
             float authorityForceScale = 1.0f;
             bool heldBodyColliding = false;
+            bool predictiveWorldStopped = false;
             bool valid = false;
         };
         GrabAuthorityProxyPendingTarget _grabAuthorityPendingTarget{};
@@ -1107,17 +1187,13 @@ namespace rock
         RE::NiTransform _lastAppliedGrabAuthorityRawHandWorld{};
         bool _hasLastAppliedGrabAuthorityProxyWorld = false;
         /*
-         * Locomotion transport (HIGGS SimulatePlayerSpace parity): the standing
-         * room-velocity contribution currently carried by the held body set, in
-         * game units/s. Guarded by _grabAuthorityProxyMutex like the pending
-         * target: written only by the physics flush, reset with the proxy
-         * runtime. The contribution is REAL world-space velocity (the object
-         * genuinely travels with the player), so release deliberately keeps it.
+         * Shared by both hand constraints on the same held object. Room-motion
+         * transport is object-owned and consumed once per game frame even when
+         * either hand becomes the surviving authority. Pointer lifetime is
+         * guarded by _grabAuthorityProxyMutex; the pointed-to state is written
+         * only by the serial physics between-step flush.
          */
-        RE::NiPoint3 _grabTransportRoomVelocityGame{};
-        std::uint64_t _grabTransportLastQueuedSequence = 0;
-        std::uint32_t _grabTransportReadFailures = 0;
-        bool _grabTransportActive = false;
+        std::shared_ptr<GrabSharedHeldObjectRuntime> _sharedHeldObjectRuntime{};
         /*
          * Bounded velocity-smoother state (opt-in rockGrabSmoothVelocityDrive):
          * the persistent commanded target the predictor-corrector advances by
@@ -1209,12 +1285,18 @@ namespace rock
         int _grabAuthorityProxyLogCounter = 0;
         std::uint64_t _grabAuthorityProxyAfterSolveLogCounter = 0;
         std::atomic<bool> _grabAuthorityProxyReleasePending{ false };
-        std::mutex _grabAuthorityProxyMutex;
+        mutable std::mutex _grabAuthorityProxyMutex;
         SavedObjectState _savedObjectState;
         active_grab_body_lifecycle::BodyLifecycleSnapshot _activeGrabLifecycle;
         float _grabStartTime = 0.0f;
         int _heldLogCounter = 0;
         int _notifCounter = 0;
+        std::size_t _heldObjectSweepConnectedCursor = 0;
+        RE::NiTransform _heldObjectSweepSafeBodyWorld{};
+        bool _heldObjectSweepSafeBodyWorldValid = false;
+        bool _heldObjectPredictiveWorldStopActive = false;
+        RE::NiPoint3 _heldObjectPredictiveWorldStopNormalWorld{};
+        bool _heldObjectPredictiveWorldStopNormalValid = false;
 
         CanonicalGrabFrame _grabFrame;
         grab_three_phase::AcquisitionPhase _grabAcquisitionPhase = grab_three_phase::AcquisitionPhase::Idle;
@@ -1284,6 +1366,7 @@ namespace rock
         RE::NiPoint3 _lastHeldHandPositionHavok{};
         bool _hasPreviousHeldRawHandWorld = false;
         bool _hasLastHeldHandPositionHavok = false;
+        bool _heldReleaseMotionSampleSuppressedForPlayerSpaceWarp = false;
 
         std::vector<std::uint32_t> _heldBodyIds;
         std::vector<std::uint32_t> _pulledBodyIds;
@@ -1297,9 +1380,11 @@ namespace rock
         std::uint32_t _pulledPrimaryBodyId = INVALID_BODY_ID;
         RE::NiPoint3 _pullPointOffsetHavok{};
         RE::NiPoint3 _pullTargetHavok{};
+        RE::NiPoint3 _pullExactProfileDestinationHandLocalGame{};
         float _pullElapsedSeconds = 0.0f;
         float _pullDurationSeconds = 0.0f;
         bool _pullHasTarget = false;
+        bool _pullExactProfileDestinationValid = false;
         // Long-object presentation during pull flight: mesh principal axis in
         // primary-body local space, captured once at pull start. Flight-only;
         // held objects keep the no-rotate rule.

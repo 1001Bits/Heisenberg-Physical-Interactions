@@ -388,7 +388,16 @@ namespace rock::held_object_damping_math
 
 namespace rock::held_object_physics_math
 {
-    inline constexpr float kMaxGrabAuthorityTargetDeltaSeconds = 0.05f;
+    /*
+     * Keep this synchronized with the source-clock phase lock's accepted
+     * interval.  A low-FPS game frame is still a new hand target: dropping it
+     * leaves the keyframed proxy at the previous frame while room locomotion
+     * keeps moving the hand.  Repeated 50-100 ms frames then accumulate enough
+     * error to trip the grab-deviation release.  The phase lock already knows
+     * how to consume intervals through 100 ms without turning them into a
+     * discontinuity, so do not starve it at the older 50 ms gate.
+     */
+    inline constexpr float kMaxGrabAuthorityTargetDeltaSeconds = 0.1f;
 
     /*
      * Pure held-object motion formulas shared by the constraint code and the
@@ -820,7 +829,10 @@ namespace rock::grab_held_response
                 localVelocity = add(localVelocity, scale(input.tangentialVelocityHavok, finiteOr(input.tangentialVelocityScale, 1.0f)));
             }
             if (input.hasObjectLocalVelocity) {
-                localVelocity = add(localVelocity, scale(input.objectLocalVelocityHavok, clamp01(input.objectVelocityBlend)));
+                const float objectBlend = clamp01(input.objectVelocityBlend);
+                localVelocity = add(
+                    scale(localVelocity, 1.0f - objectBlend),
+                    scale(input.objectLocalVelocityHavok, objectBlend));
             }
         } else if (input.hasObjectLocalVelocity) {
             localVelocity = input.objectLocalVelocityHavok;
@@ -908,6 +920,20 @@ namespace rock::held_player_space_math
     inline constexpr bool shouldApplyRuntimeTransformWarp(bool enabled, bool diagnosticWarp, bool hasWarpTransforms)
     {
         return enabled && diagnosticWarp && hasWarpTransforms;
+    }
+
+    template <class Transform, class Vec3>
+    inline Vec3 reorientWorldVectorThroughPlayerSpace(
+        const Transform& previousPlayerSpaceWorld,
+        const Transform& currentPlayerSpaceWorld,
+        const Vec3& worldVector)
+    {
+        const Vec3 roomLocalVector = transform_math::rotateWorldVectorToLocal(
+            previousPlayerSpaceWorld.rotate,
+            worldVector);
+        return transform_math::rotateLocalVectorToWorld(
+            currentPlayerSpaceWorld.rotate,
+            roomLocalVector);
     }
 
     template <class Transform>

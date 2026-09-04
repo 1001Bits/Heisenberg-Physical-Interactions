@@ -350,6 +350,14 @@ namespace rock::offsets
      */
     constexpr std::uintptr_t kFunc_HandleBumpedCharacter = 0x1E24980;
 
+    // CONFIRMED 2026-08-31 (Ghidra, Fallout4VR.exe 1.2.72):
+    // bhkCharacterController::SetVelocityModifier. The point argument is a
+    // signed displacement in game units and the scalar is its duration in
+    // seconds; the native routine performs the Havok conversion and velocity
+    // derivation before publishing the bounded controller modifier.
+    constexpr std::uintptr_t kFunc_CharacterController_SetVelocityModifier =
+        0x1E22FC0;
+
     /*
      * CONFIRMED (decrypted Fallout4VR.exe 1.2.72): VR CreateMouseSpring entry.
      * installNativeGrabHook() validates the complete native prefix before its

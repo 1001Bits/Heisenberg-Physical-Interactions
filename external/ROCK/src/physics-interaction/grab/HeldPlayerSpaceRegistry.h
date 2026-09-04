@@ -13,6 +13,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "physics-interaction/grab/HeldPlayerSpaceWarpPolicy.h"
+
 namespace RE
 {
     class hknpWorld;
@@ -71,9 +73,22 @@ namespace rock::held_player_space_registry
     {
         std::uint32_t registeredBodies = 0;
         std::uint32_t motionsWritten = 0;
+        std::uint32_t motionsReoriented = 0;
         std::uint32_t transformsWarped = 0;
         std::uint32_t duplicateMotionSkips = 0;
         std::uint32_t writerMask = 0;
+        std::vector<std::uint32_t> warpedMotionIndices{};
+        held_player_space_warp_policy::Input warpTransaction{};
+
+        [[nodiscard]] bool motionWasWarped(
+            std::uint32_t motionIndex) const
+        {
+            return motionIndex != 0 &&
+                   std::find(
+                       warpedMotionIndices.begin(),
+                       warpedMotionIndices.end(),
+                       motionIndex) != warpedMotionIndices.end();
+        }
     };
 
     inline PureVec3 makeVec3(float x, float y, float z) { return PureVec3{ .x = x, .y = y, .z = z }; }
@@ -191,7 +206,9 @@ namespace rock::held_player_space_registry
         const RE::NiPoint3& previousPlayerVelocityHavok,
         float residualVelocityKeep,
         bool enabled,
+        bool writeVelocity,
         bool warp,
         const RE::NiTransform* previousPlayerSpaceWorld = nullptr,
-        const RE::NiTransform* currentPlayerSpaceWorld = nullptr);
+        const RE::NiTransform* currentPlayerSpaceWorld = nullptr,
+        const std::vector<std::uint32_t>* warpProxyBodyIds = nullptr);
 }

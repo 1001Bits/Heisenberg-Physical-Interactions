@@ -1020,6 +1020,23 @@ namespace rock::grab_frame_math
         return result;
     }
 
+    template <class Transform>
+    inline Transform generatedProxyFromObjectAndLocalSpace(
+        const Transform& objectWorld,
+        const Transform& objectProxyLocal)
+    {
+        /*
+         * objectFromGeneratedProxyLocalSpace composes through the generated
+         * collider's row-view relation frame, while the physical proxy stores
+         * that rotation transposed. Solve the ordinary parent frame first,
+         * then convert it back to the exact physical generated-proxy frame.
+         */
+        return hand_bone_collider_geometry_math::
+            generatedColliderFrameFromObjectLocalRelation(
+                objectWorld,
+                objectProxyLocal);
+    }
+
     template <class Transform, class Vector>
     inline Vector computePivotAHandBodyLocal(const Transform& handBodyWorld, const Vector& grabPivotWorld)
     {
@@ -1376,6 +1393,8 @@ namespace rock::grab_authority_frame_math
 
 // ---- PullMotionMath.h ----
 
+#include "physics-interaction/grab/PullMotionPolicy.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -1394,6 +1413,7 @@ namespace rock::pull_motion_math
         float trackHandSeconds = 0.1f;
         float destinationOffsetHavok = 0.01f;
         float maxVelocityHavok = 10.0f;
+        float deltaTimeSeconds = pull_motion_policy::kDefaultPhysicsStepSeconds;
         bool hasPreviousTarget = false;
     };
 
@@ -1424,38 +1444,12 @@ namespace rock::pull_motion_math
     }
 
     template <class Vec3>
-    float vectorLength(const Vec3& value)
-    {
-        return std::sqrt(value.x * value.x + value.y * value.y + value.z * value.z);
-    }
-
-    template <class Vec3>
-    Vec3 clampLength(Vec3 value, float maxLength)
-    {
-        if (maxLength <= 0.0f) {
-            return value;
-        }
-
-        const float length = vectorLength(value);
-        if (length <= maxLength || length <= 0.0001f) {
-            return value;
-        }
-
-        const float scale = maxLength / length;
-        value.x *= scale;
-        value.y *= scale;
-        value.z *= scale;
-        return value;
-    }
-
-    template <class Vec3>
     PullMotionResult<Vec3> computePullMotion(const PullMotionInput<Vec3>& input)
     {
         /*
-         * ROCK drives the pulled body for a short predicted-velocity window,
-         * then keeps the pulled-object owner alive until pullDuration + grace so
-         * heavy or cluttered objects can still be reacquired by the close catch
-         * path after the impulse phase ends.
+         * ROCK directly motors the pulled body for the planned flight, then
+         * keeps ownership alive without driving it for the existing grace
+         * period so obstructed objects can still be reacquired or drop safely.
          */
         const float elapsedSeconds = std::isfinite(input.elapsedSeconds) ? (std::max)(0.0f, input.elapsedSeconds) : 0.0f;
         const float durationSeconds = std::isfinite(input.durationSeconds) ? (std::max)(0.0f, input.durationSeconds) : 0.0f;
@@ -1464,34 +1458,40 @@ namespace rock::pull_motion_math
         const float trackHandSeconds = std::isfinite(input.trackHandSeconds) ? (std::max)(0.0f, input.trackHandSeconds) : 0.0f;
 
         PullMotionResult<Vec3> result{};
-        result.refreshTarget = !input.hasPreviousTarget || elapsedSeconds <= trackHandSeconds;
+        result.refreshTarget = pull_motion_policy::shouldRefreshTarget(
+            input.hasPreviousTarget,
+            elapsedSeconds,
+            trackHandSeconds,
+            durationSeconds);
         result.targetHavok = result.refreshTarget ? input.handHavok : input.previousTargetHavok;
         if (result.refreshTarget) {
             result.targetHavok.z += input.destinationOffsetHavok;
         }
 
-        if (elapsedSeconds > durationSeconds + ownerGraceSeconds) {
+        if (pull_motion_policy::ownerExpired(
+                elapsedSeconds,
+                durationSeconds,
+                ownerGraceSeconds)) {
             result.expired = true;
             return result;
         }
 
         const float rawDurationRemainingSeconds = durationSeconds - elapsedSeconds;
         result.durationRemainingSeconds = (std::max)(0.0f, rawDurationRemainingSeconds);
-        if (elapsedSeconds > applyVelocitySeconds || rawDurationRemainingSeconds <= 0.001f) {
+        if (!pull_motion_policy::shouldApplyDirectMotor(
+                elapsedSeconds,
+                durationSeconds,
+                applyVelocitySeconds)) {
             return result;
         }
 
-        Vec3 horizontalDelta{
-            result.targetHavok.x - input.objectPointHavok.x,
-            result.targetHavok.y - input.objectPointHavok.y,
-            0.0f,
-        };
-
-        const float verticalDelta = result.targetHavok.z - input.objectPointHavok.z;
-        result.velocityHavok.x = horizontalDelta.x / result.durationRemainingSeconds;
-        result.velocityHavok.y = horizontalDelta.y / result.durationRemainingSeconds;
-        result.velocityHavok.z = 0.5f * 9.81f * result.durationRemainingSeconds + verticalDelta / result.durationRemainingSeconds;
-        result.velocityHavok = clampLength(result.velocityHavok, input.maxVelocityHavok);
+        result.velocityHavok = pull_motion_policy::computeDirectMotorVelocity(
+            result.targetHavok,
+            input.objectPointHavok,
+            result.durationRemainingSeconds,
+            input.deltaTimeSeconds,
+            9.81f,
+            input.maxVelocityHavok);
         result.applyVelocity = true;
         return result;
     }

@@ -2013,79 +2013,112 @@ namespace heisenberg
         const float directionalWeight = (std::max)(0.0f, g_config.grabDirectionalWeight);
         const float lateralWeight = (std::max)(0.0f, g_config.grabLateralWeight);
 
-        float minScore         = std::numeric_limits<float>::max();
-        float minDistSqToRay   = std::numeric_limits<float>::max();
-        float minDistSqToPalm  = std::numeric_limits<float>::max();
-        bool  found            = false;
+        // Port of HIGGS GetClosestPointOnGraphicsGeometryToLine
+        // (math_utils.cpp:2176-2224). Per triangle: intersect the palm LINE
+        // with the triangle plane, clamp that hit to the triangle
+        // (GetClosestPointOnTriangleToLine, math_utils.cpp:906), then score
+        //   directionalWeight * along^2 + lateralWeight * lateral^2
+        // where `along` is the UNCLAMPED distance along the line (a point
+        // behind the palm is penalised by how far behind it is, exactly as
+        // one in front) and `lateral` is the distance to the infinite line.
+        // Only triangles whose front face looks back at the palm are
+        // eligible (`dot(normal, direction) <= 0`, math_utils.cpp:2203).
+        // Without that test the far wall of a hollow or thick mesh could win
+        // and the snap pulled the object THROUGH the hand (the vase symptom).
+        //
+        // HIGGS returns false when no front face qualifies and its caller
+        // falls back to the Havok contact point. We have no such point, so a
+        // second pass that ignores facing is the safety net; it is logged
+        // because it usually means the mesh winding is inverted.
+        const auto search = [&](bool requireFrontFace,
+                                float& outScore,
+                                float& outDistSqToLine) -> bool {
+            float minScore        = std::numeric_limits<float>::max();
+            float minDistSqToLine = std::numeric_limits<float>::max();
+            float minDistSqToPalm = std::numeric_limits<float>::max();
+            bool  found           = false;
 
-        for (size_t i = 0; i < triangles.size(); i++) {
-            const TriangleData& tri = triangles[i];
+            for (size_t i = 0; i < triangles.size(); i++) {
+                const TriangleData& tri = triangles[i];
 
-            RE::NiPoint3 edge1 = tri.v1 - tri.v0;
-            RE::NiPoint3 edge2 = tri.v2 - tri.v0;
-            RE::NiPoint3 rawNormal = CrossProduct(edge1, edge2);
-            RE::NiPoint3 triNormal = VectorNormalized(rawNormal);
-            if (VectorLengthSquared(triNormal) < 1e-6f) {
-                continue; // degenerate triangle
-            }
-
-            // Closest point on THIS triangle to the infinite palm LINE, not
-            // to the palm position. Using to-line makes per-triangle candidate
-            // points independent of small palm jitter along the ray, which
-            // fixes grab-to-grab placement drift on thin triangles (e.g. fan
-            // blades) where closest-to-palm slid along the triangle with tiny
-            // palm shifts. Method: ray-plane intersect, then clamp to triangle
-            // (HIGGS math_utils.cpp:906). If line is ~parallel to the plane,
-            // fall back to projecting the centroid onto the line.
-            RE::NiPoint3 candidatePoint;
-            if (usePalmRay) {
-                const float denom = DotProduct(rawNormal, direction);
-                if (std::abs(denom) > 1e-6f) {
-                    float t = DotProduct(tri.v0 - lineStart, rawNormal) / denom;
-                    RE::NiPoint3 planeHit = lineStart + direction * t;
-                    candidatePoint = ClosestPointOnTriangleToPoint(planeHit, tri);
-                } else {
-                    RE::NiPoint3 centroid = (tri.v0 + tri.v1 + tri.v2) * (1.0f / 3.0f);
-                    float t = DotProduct(centroid - lineStart, direction);
-                    RE::NiPoint3 onLine = lineStart + direction * t;
-                    candidatePoint = ClosestPointOnTriangleToPoint(onLine, tri);
+                // HIGGS winding: cross(v1 - v0, v2 - v1) == cross(v1 - v0, v2 - v0).
+                const RE::NiPoint3 edge1 = tri.v1 - tri.v0;
+                const RE::NiPoint3 edge2 = tri.v2 - tri.v0;
+                const RE::NiPoint3 rawNormal = CrossProduct(edge1, edge2);
+                const RE::NiPoint3 triNormal = VectorNormalized(rawNormal);
+                if (VectorLengthSquared(triNormal) < 1e-6f) {
+                    continue; // degenerate triangle
                 }
-            } else {
-                candidatePoint = ClosestPointOnTriangleToPoint(lineStart, tri);
-            }
-            RE::NiPoint3 toCandidate    = candidatePoint - lineStart;
-            float        alongRay       = DotProduct(toCandidate, direction);
-            RE::NiPoint3 closestOnRay   = (alongRay > 0.0f)
-                ? lineStart + direction * alongRay
-                : lineStart; // clamp at ray origin for points behind the palm
 
-            float distSqToRay  = VectorLengthSquared(candidatePoint - closestOnRay);
-            float distSqToPalm = VectorLengthSquared(toCandidate);
-            float directionalDist = (std::max)(0.0f, alongRay);
-            float score = usePalmRay
-                ? directionalWeight * directionalDist * directionalDist + lateralWeight * distSqToRay
-                : distSqToPalm;
+                RE::NiPoint3 candidatePoint;
+                float distSqToPalm;
+                float score;
+                float distSqToLine;
+                if (usePalmRay) {
+                    const float denom = DotProduct(rawNormal, direction);
+                    if (std::abs(denom) <= 1e-6f) {
+                        // HIGGS: "This ray is parallel to this triangle" -> skip.
+                        continue;
+                    }
+                    const float t = DotProduct(tri.v0 - lineStart, rawNormal) / denom;
+                    const RE::NiPoint3 planeHit = lineStart + direction * t;
+                    candidatePoint = ClosestPointOnTriangleToPoint(planeHit, tri);
 
-            bool isBetter = score < minScore - 1e-4f;
-            if (!isBetter && std::abs(score - minScore) <= 1e-4f) {
-                isBetter = distSqToPalm < minDistSqToPalm;
+                    const RE::NiPoint3 toCandidate = candidatePoint - lineStart;
+                    const float alongLine = DotProduct(toCandidate, direction);
+                    const RE::NiPoint3 alongVec = direction * alongLine;
+                    distSqToLine = VectorLengthSquared(toCandidate - alongVec);
+                    distSqToPalm = VectorLengthSquared(toCandidate);
+                    score = directionalWeight * alongLine * alongLine +
+                            lateralWeight * distSqToLine;
+                } else {
+                    // Legacy closest-to-point metric (bEnablePalmRayCastPlacement=0).
+                    candidatePoint = ClosestPointOnTriangleToPoint(lineStart, tri);
+                    const RE::NiPoint3 toCandidate = candidatePoint - lineStart;
+                    const float alongLine = DotProduct(toCandidate, direction);
+                    distSqToLine = VectorLengthSquared(toCandidate - direction * alongLine);
+                    distSqToPalm = VectorLengthSquared(toCandidate);
+                    score = distSqToPalm;
+                }
+
+                if (requireFrontFace && DotProduct(triNormal, direction) > 0.0f) {
+                    continue; // back face: front of the triangle looks away from the palm
+                }
+
+                bool isBetter = score < minScore - 1e-4f;
+                if (!isBetter && std::abs(score - minScore) <= 1e-4f) {
+                    isBetter = distSqToPalm < minDistSqToPalm;
+                }
+                if (isBetter) {
+                    minScore        = score;
+                    minDistSqToLine = distSqToLine;
+                    minDistSqToPalm = distSqToPalm;
+                    outPoint        = candidatePoint;
+                    outNormal       = triNormal;  // HIGGS returns the raw face normal
+                    outTriIndex     = static_cast<int>(i);
+                    found           = true;
+                }
             }
-            if (isBetter) {
-                minScore        = score;
-                minDistSqToRay  = distSqToRay;
-                minDistSqToPalm = distSqToPalm;
-                outPoint        = candidatePoint;
-                // Orient normal toward the palm so placement offset push
-                // direction is consistent regardless of triangle winding.
-                outNormal = (DotProduct(triNormal, direction) > 0.0f)
-                    ? triNormal * -1.0f
-                    : triNormal;
-                outTriIndex = static_cast<int>(i);
-                found = true;
+
+            outScore = minScore;
+            outDistSqToLine = minDistSqToLine;
+            return found;
+        };
+
+        float bestScore = 0.0f;
+        float bestDistSqToLine = std::numeric_limits<float>::max();
+        bool found = search(/*requireFrontFace=*/usePalmRay, bestScore, bestDistSqToLine);
+        if (!found && usePalmRay && !triangles.empty()) {
+            found = search(/*requireFrontFace=*/false, bestScore, bestDistSqToLine);
+            if (found) {
+                spdlog::warn(
+                    "[GEOM-PLACE] no front-facing triangle met the palm line "
+                    "({} triangles) - accepted a back face; check mesh winding",
+                    triangles.size());
             }
         }
 
-        outDist = found ? std::sqrt(minDistSqToRay) : std::numeric_limits<float>::max();
+        outDist = found ? std::sqrt(bestDistSqToLine) : std::numeric_limits<float>::max();
         return found;
     }
 

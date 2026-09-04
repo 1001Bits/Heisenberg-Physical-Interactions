@@ -132,7 +132,6 @@ namespace heisenberg
         bool stopped =
             _isLoading.load(std::memory_order_relaxed) ||
             _isPaused.load(std::memory_order_relaxed) ||
-            _isPipboyOpen.load(std::memory_order_relaxed) ||
             _isMainMenu.load(std::memory_order_relaxed) ||
             _isInventoryOpen.load(std::memory_order_relaxed) ||
             _isContainerOpen.load(std::memory_order_relaxed) ||
@@ -141,8 +140,7 @@ namespace heisenberg
             _isMessageBoxOpen.load(std::memory_order_relaxed) ||
             _isTerminalOpen.load(std::memory_order_relaxed) ||
             _isWorkshopOpen.load(std::memory_order_relaxed) ||
-            _isCookingOpen.load(std::memory_order_relaxed) ||
-            _isFavoritesOpen.load(std::memory_order_relaxed);
+            _isCookingOpen.load(std::memory_order_relaxed);
         
         _isGameStopped.store(stopped, std::memory_order_relaxed);
     }
@@ -255,16 +253,15 @@ namespace heisenberg
         // Update combined flag
         _owner.UpdateGameStopped();
         
-        // Start menu close cooldown when a blocking menu closes
-        // (prevents grabbing immediately after closing inventory, pipboy, etc.)
+        // Start menu close cooldown when a genuinely blocking menu closes.
+        // Favorites and Pip-Boy are live-world overlays, so neither opening nor
+        // closing them is allowed to suppress picking up objects.
         if (!opening) {
             // Only start cooldown for menus that block gameplay
             bool isBlockingMenu = 
-                strcmp(menuName, "PipboyMenu") == 0 ||
                 strcmp(menuName, "InventoryMenu") == 0 ||
                 strcmp(menuName, "ContainerMenu") == 0 ||
                 strcmp(menuName, "WorkshopMenu") == 0 ||
-                strcmp(menuName, "FavoritesMenu") == 0 ||
                 strcmp(menuName, "CookingMenu") == 0;
             
             if (isBlockingMenu) {

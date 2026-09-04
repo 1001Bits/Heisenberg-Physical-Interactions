@@ -45,8 +45,28 @@ namespace rock::mouth_consume
         DetectorConfig config{};
     };
 
+    // Shared sphere evaluator used by the mouth route and the opposite-wrist
+    // injection route.  Keeping the object/hand probe selection and the
+    // dwell/speed hysteresis in one place prevents the two gestures from
+    // drifting apart while still allowing each route to supply its own center.
+    struct CenteredDetectorInput
+    {
+        bool hasCenter = false;
+        RE::NiPoint3 centerGame{};
+        Probe objectProbe{};
+        bool hasObjectProbe = false;
+        Probe handProbe{};
+        bool hasHandProbe = false;
+        float deltaSeconds = 0.0f;
+        DetectorConfig config{};
+    };
+
     struct Decision
     {
+        // True when the current probe is inside the configured core sphere.
+        // This intentionally ignores speed, dwell and hysteresis: releasing a
+        // held consumable in its valid zone is an explicit commit gesture.
+        bool spatiallyEligibleForRelease = false;
         bool candidate = false;
         bool confirmedForCommit = false;
         bool enteredCandidate = false;
@@ -66,5 +86,6 @@ namespace rock::mouth_consume
         const RE::NiPoint3& offsetGameUnits) noexcept;
     [[nodiscard]] float probeSpeed(const Probe& probe) noexcept;
     [[nodiscard]] float candidateConfidence(float distanceGameUnits, float thresholdGameUnits, float radiusGameUnits) noexcept;
+    [[nodiscard]] Decision evaluateCenteredZone(const CenteredDetectorInput& input, RuntimeState& runtime) noexcept;
     [[nodiscard]] Decision evaluate(const DetectorInput& input, RuntimeState& runtime) noexcept;
 }

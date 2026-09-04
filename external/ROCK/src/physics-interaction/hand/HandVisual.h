@@ -17,6 +17,20 @@
 
 namespace rock::hand_visual_lerp_math
 {
+    inline constexpr float
+        kMaximumInitialHeldHandTargetDistanceGameUnits = 32.0f;
+    inline constexpr float
+        kMaximumContinuingHeldHandTargetDistanceGameUnits = 16.0f;
+    inline constexpr float
+        kMaximumHeldHandTargetAngularStepDegrees = 45.0f;
+    inline constexpr float
+        kMaximumHeldNodeBodyMismatchGameUnits = 8.0f;
+    inline constexpr float
+        kMaximumHeldNodeBodyMismatchDegrees = 35.0f;
+    inline constexpr float
+        kMaximumHeldHandVisualLinearSpeedGameUnitsPerSecond = 270.0f;
+    inline constexpr float
+        kMaximumHeldHandVisualAngularSpeedDegreesPerSecond = 720.0f;
     /*
      * Visual hand lerp is intentionally isolated from collision and grab
      * constraint math. The physics hand frame remains authoritative; this helper
@@ -360,24 +374,185 @@ namespace rock::hand_visual_lerp_math
         return transform_math::composeTransforms(heldObjectWorld, transform_math::invertTransform(frozenObjectHandSpace));
     }
 
-    inline bool shouldSmoothHeldObjectRelativeHand(bool lerpEnabled, bool touchHeldPhase, bool acquisitionVisual)
+    template <class Transform>
+    inline Transform buildRigidlyCorrectedTrackedHandWorld(
+        const Transform& requestedBodyWorld,
+        const Transform& admittedBodyWorld,
+        const Transform& trackedHandWorld)
     {
-        return lerpEnabled && acquisitionVisual && !touchHeldPhase;
+        /*
+         * A predictive stop changes only the requested rigid command. Preserve
+         * the live tracked hand-to-requested-body relation and carry that exact
+         * relation through the admitted (sweep-clamped) body pose. Rebuilding
+         * through the independently frozen object/raw-hand capture can mix the
+         * generated proxy and Ni row-axis conventions and manufacture a large
+         * angular jump even though the admitted rigid delta is small.
+         */
+        const Transform trackedHandInRequestedBody =
+            transform_math::composeTransforms(
+                transform_math::invertTransform(requestedBodyWorld),
+                trackedHandWorld);
+        return transform_math::composeTransforms(
+            admittedBodyWorld,
+            trackedHandInRequestedBody);
+    }
+
+    inline bool shouldSmoothHeldObjectRelativeHand(
+        bool lerpEnabled,
+        bool acquisitionVisual,
+        bool visualTransformInitialized,
+        bool initialBlendInProgress,
+        bool touchHeldPhase)
+    {
+        return lerpEnabled &&
+               (initialBlendInProgress ||
+                   (!touchHeldPhase &&
+                       (acquisitionVisual ||
+                           !visualTransformInitialized)));
+    }
+
+    inline bool heldHandTargetDistanceIsSafe(
+        float targetDistanceFromCurrentHandGameUnits) noexcept
+    {
+        return std::isfinite(targetDistanceFromCurrentHandGameUnits) &&
+               targetDistanceFromCurrentHandGameUnits <=
+                   kMaximumInitialHeldHandTargetDistanceGameUnits;
+    }
+
+    inline bool heldHandTargetContinuityIsSafe(
+        bool visualTransformInitialized,
+        float targetDistanceFromTrackedHandGameUnits,
+        float targetDistanceFromLastAppliedGameUnits) noexcept
+    {
+        /*
+         * Acquisition is admitted relative to the tracked hand. Once visual
+         * authority is live, a sustained obstruction may legitimately put the
+         * object-relative target more than 32gu from the controller. Judge
+         * later samples relative to the last safe publication instead: this
+         * keeps normal continuous motion while rejecting a one-frame stale or
+         * malformed held-object pose.
+         */
+        const float distance = visualTransformInitialized ?
+            targetDistanceFromLastAppliedGameUnits :
+            targetDistanceFromTrackedHandGameUnits;
+        const float maximumDistance = visualTransformInitialized ?
+            kMaximumContinuingHeldHandTargetDistanceGameUnits :
+            kMaximumInitialHeldHandTargetDistanceGameUnits;
+        return std::isfinite(distance) && distance <= maximumDistance;
+    }
+
+    template <class Transform>
+    inline bool heldHandTransformIsUsable(
+        const Transform& transform) noexcept
+    {
+        if (!std::isfinite(transform.translate.x) ||
+            !std::isfinite(transform.translate.y) ||
+            !std::isfinite(transform.translate.z) ||
+            !std::isfinite(transform.scale) ||
+            std::abs(transform.scale) <= 0.0001f) {
+            return false;
+        }
+
+        for (int row = 0; row < 3; ++row) {
+            for (int column = 0; column < 3; ++column) {
+                if (!std::isfinite(
+                        transform.rotate.entry[row][column])) {
+                    return false;
+                }
+            }
+        }
+
+        const auto& matrix = transform.rotate.entry;
+        const float determinant =
+            matrix[0][0] *
+                (matrix[1][1] * matrix[2][2] -
+                    matrix[1][2] * matrix[2][1]) -
+            matrix[0][1] *
+                (matrix[1][0] * matrix[2][2] -
+                    matrix[1][2] * matrix[2][0]) +
+            matrix[0][2] *
+                (matrix[1][0] * matrix[2][1] -
+                    matrix[1][1] * matrix[2][0]);
+        const auto rowLengthSquared = [&](const int row) {
+            return matrix[row][0] * matrix[row][0] +
+                   matrix[row][1] * matrix[row][1] +
+                   matrix[row][2] * matrix[row][2];
+        };
+        const auto rowDot = [&](const int lhs, const int rhs) {
+            return matrix[lhs][0] * matrix[rhs][0] +
+                   matrix[lhs][1] * matrix[rhs][1] +
+                   matrix[lhs][2] * matrix[rhs][2];
+        };
+        const bool rowLengthsUsable =
+            rowLengthSquared(0) >= 0.5f &&
+            rowLengthSquared(0) <= 1.5f &&
+            rowLengthSquared(1) >= 0.5f &&
+            rowLengthSquared(1) <= 1.5f &&
+            rowLengthSquared(2) >= 0.5f &&
+            rowLengthSquared(2) <= 1.5f;
+        const bool rowsNearlyOrthogonal =
+            std::abs(rowDot(0, 1)) <= 0.25f &&
+            std::abs(rowDot(0, 2)) <= 0.25f &&
+            std::abs(rowDot(1, 2)) <= 0.25f;
+        return std::isfinite(determinant) &&
+               determinant >= 0.5f && determinant <= 1.5f &&
+               rowLengthsUsable && rowsNearlyOrthogonal;
+    }
+
+    inline bool shouldPreferBodyDerivedHeldPose(
+        bool bodyDerivedPoseAvailable,
+        float nodeBodyDistanceGameUnits,
+        float nodeBodyRotationDegrees) noexcept
+    {
+        return bodyDerivedPoseAvailable &&
+               (!std::isfinite(nodeBodyDistanceGameUnits) ||
+                   !std::isfinite(nodeBodyRotationDegrees) ||
+                   nodeBodyDistanceGameUnits >
+                       kMaximumHeldNodeBodyMismatchGameUnits ||
+                   nodeBodyRotationDegrees >
+                       kMaximumHeldNodeBodyMismatchDegrees);
+    }
+
+    inline bool targetWithinArmReach(
+        float shoulderToTargetDistanceGameUnits,
+        float maximumReachGameUnits,
+        float allowanceGameUnits = 2.0f) noexcept
+    {
+        return !std::isfinite(maximumReachGameUnits) ||
+               maximumReachGameUnits <= 0.0f ||
+               (std::isfinite(shoulderToTargetDistanceGameUnits) &&
+                   shoulderToTargetDistanceGameUnits <=
+                       maximumReachGameUnits +
+                           (std::max)(0.0f, allowanceGameUnits));
     }
 
     template <class Transform>
     inline AdvanceResult<Transform> advanceTransform(const Transform& current, const Transform& target, float positionSpeed, float angularSpeedDegrees, float deltaTime)
     {
         AdvanceResult<Transform> result{};
+        result.transform = current;
+        result.reachedTarget = false;
+        if (!heldHandTransformIsUsable(current) ||
+            !heldHandTransformIsUsable(target)) {
+            // Never let quaternion conversion manufacture a NaN hand target.
+            // Keeping the last safe pose is continuous and lets the caller
+            // retry when scene/body telemetry becomes coherent again.
+            return result;
+        }
         result.transform = target;
 
+        const float safeDeltaTime = std::clamp(
+            std::isfinite(deltaTime) ? deltaTime : 0.0f,
+            0.0f,
+            0.05f);
+
         bool positionReached = true;
-        result.transform.translate = advancePosition(current.translate, target.translate, positionSpeed, deltaTime, positionReached);
+        result.transform.translate = advancePosition(current.translate, target.translate, positionSpeed, safeDeltaTime, positionReached);
 
         const Quaternion currentRotation = matrixToQuaternion(current.rotate);
         const Quaternion targetRotation = matrixToQuaternion(target.rotate);
         const float angle = quaternionAngleRadians(currentRotation, targetRotation);
-        const float maxAngle = (std::max)(0.0f, angularSpeedDegrees) * 0.01745329251994329577f * (std::max)(0.0f, deltaTime);
+        const float maxAngle = (std::max)(0.0f, angularSpeedDegrees) * 0.01745329251994329577f * safeDeltaTime;
         const bool rotationReached = angle <= maxAngle || angle <= 0.000001f;
         if (!rotationReached) {
             result.transform.rotate = quaternionToMatrix<decltype(result.transform.rotate)>(slerp(currentRotation, targetRotation, maxAngle / angle));

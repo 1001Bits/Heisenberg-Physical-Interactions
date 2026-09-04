@@ -11,6 +11,12 @@ namespace heisenberg::grab_pose_policy
     inline constexpr std::uint32_t kFreshTouchMaxAgeFrames = 4u;
     inline constexpr std::uint32_t kRecentTouchMaxAgeFrames = 180u;
     inline constexpr float kRecentTouchMaxMeshDistance = 14.0f;
+    // The five-unit range is strong enough to treat a grip-edge mesh result as
+    // exact contact.  Candidate admission is deliberately wider: StartGrab's
+    // canonical palm/mesh solve already accepts an ordinary same-object
+    // ownership transfer through twelve units.
+    inline constexpr float kHeldObjectExactContactDistance = 5.0f;
+    inline constexpr float kSameObjectTransferCandidateDistance = 12.0f;
     inline constexpr float kPalmSurfaceSkin = 0.5f;
     inline constexpr float kBroadPalmMinimumSecondSpan = 8.0f;
     inline constexpr float kBroadPalmMaximumAspectRatio = 2.25f;
@@ -66,7 +72,7 @@ namespace heisenberg::grab_pose_policy
         std::uint32_t physicalTouchAgeFrames,
         bool isHeldObjectTransferContact,
         float selectionMeshDistance,
-        float heldObjectContactLimit = 5.0f) noexcept
+        float heldObjectContactLimit = kHeldObjectExactContactDistance) noexcept
     {
         if (isPhysicalTouch &&
             physicalTouchAgeFrames <= kFreshTouchMaxAgeFrames) {
@@ -79,6 +85,19 @@ namespace heisenberg::grab_pose_policy
                std::isfinite(heldObjectContactLimit) &&
                heldObjectContactLimit >= 0.0f &&
                selectionMeshDistance <= heldObjectContactLimit;
+    }
+
+    // Hand::TryStartGrab is only an admission stage.  It must not apply the
+    // stricter exact-contact threshold and make StartGrab's normal transfer
+    // envelope unreachable (especially when the authored palm is offset from
+    // the controller origin by more than five units).
+    inline bool ShouldOfferSameObjectTransferCandidate(
+        float currentMeshDistance) noexcept
+    {
+        return std::isfinite(currentMeshDistance) &&
+               currentMeshDistance >= 0.0f &&
+               currentMeshDistance <=
+                   kSameObjectTransferCandidateDistance;
     }
 
     // The rendered world bound contains every mesh point. Therefore a hand

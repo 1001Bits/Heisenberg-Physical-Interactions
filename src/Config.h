@@ -1,5 +1,10 @@
 #pragma once
 
+#include "GrabOwnershipPolicy.h"
+
+#include <set>
+#include <string>
+
 namespace heisenberg
 {
     /**
@@ -32,6 +37,14 @@ namespace heisenberg
         // entries carry provenance metadata so untouched seeds follow future default changes,
         // while values changed in MCM become permanently user-owned.
         void SeedMCMDefaultsIfMissing();
+
+        // The set of settings the MCM menu exposes, as "Section|Key", parsed once from
+        // MCM config.json. This is the authority for what belongs in the user-facing INI:
+        // Save() writes these and strips every other Heisenberg-owned key, so the INI and
+        // the in-game menu can never drift apart. Everything else is internal — still
+        // READ from the INI if a key is present (so hidden keys stay usable for
+        // diagnostics), just never written back.
+        static const std::set<std::string>& McmExposedKeys();
 
         // Converts the conversion-block fields (naturalGrabDistance, itemStorageZoneRadius,
         // mouthRadius, zone radii/offsets, etc.) from their ORIGINAL cm units to game units
@@ -113,7 +126,8 @@ namespace heisenberg
         // 9 = Full Dynamic (embedded ROCK engine owns grab+selection natively; needs
         //     bUseRockEngineArchitecture=1, else degrades to Keyframed).
         // Any other value degrades to Keyframed (historical modes 1-8 removed).
-        int grabMode = 0;
+        int grabMode =
+            grab_ownership_policy::kFullDynamicGrabMode;
         // Two-handed single-object grab (HIGGS-style): grab one object with both hands; the
         // second hand acts as an aim/stabilize hand (object swings to point along the line
         // between the two hands). Default ON. When off, a second-hand grab transfers the
@@ -129,10 +143,10 @@ namespace heisenberg
         // the keyframed hold (iGrabMode=0).
         bool heldObjectCollidable = true;
         bool heldObjectWallClamp = true;  // keyframed grab: stop held object at walls/NPCs
-        // Block the A/activate button from looting/using a grabbable item just because it's
-        // a grab SELECTION (you're pointing at it). Default OFF — it broke A-button looting
-        // and secondary actions (Tune The Radios, Sentinel PA) at 0.7.9. The held-item block
-        // already covers the Grip>A binding case, so this extra block is not needed.
+        // Legacy compatibility field. Selection-only activation blocking was
+        // retired because it can swallow a primary Grip->A press when the
+        // other hand merely points at a pickup. Parsed but intentionally
+        // ignored.
         bool blockActivateOnGrabSelection = false;
 
         // Remap grab from Grip to A/X for users with custom controller bindings
@@ -322,7 +336,7 @@ namespace heisenberg
         // Uses spheres positioned relative to HMD in local space
         // =====================================================================
         bool enableItemStorageZones = true;  // Enable item storage zone system
-        bool enableStorageZoneWeaponEquip = true;  // Grip in storage zone unequips/re-equips weapons (auto-off with VH)
+        bool enableStorageZoneWeaponEquip = true;  // Allow offhand-held weapon swap gesture to unequip the primary weapon
         bool showStorageMessages = true;     // Show HUD message when storing items ("X stored")
         
         // Item storage zone configuration mode - similar to throwable zone config
@@ -371,11 +385,10 @@ namespace heisenberg
         // 1 = force on (delegate to ROCK if present). Default auto.
         int  useRockPhysics = -1;
 
-        // When true AND ROCK is active, Heisenberg stops initiating WORLD-OBJECT grabs
-        // (grip->select->grab, pull, hand-to-hand) so ROCK owns the grab and holds the
-        // object fully dynamically. Heisenberg's programmatic in-hand placement
-        // (loot-to-hand, drop-to-hand chems, holotape removal via StartGrabOnRef) is
-        // unaffected, as is release/drop of those items. Default off (Heisenberg owns grab).
+        // Legacy compatibility alias for iGrabMode=9. It originally addressed an external
+        // ROCK.dll; while the embedded engine is hosted it now resolves through the same
+        // single-owner policy so existing delegate=true configurations cannot leave the
+        // embedded dynamic grab disabled. New configurations should use iGrabMode=9.
         bool delegateWorldGrabToRock = false;
 
         // Hand collision settings (two-scenario cleanup: gates the body-less proximity
@@ -402,14 +415,14 @@ namespace heisenberg
         // only with physics hand bodies on; the hook is installed regardless and is a
         // no-op when this is off.
         bool rockHandBumpGuard = false;
-        float handCollisionRadius = 8.0f;    // Game units - radius of hand collision sphere (broadphase reach)
-        float handContactSlop = 1.5f;        // Game units - bone-to-mesh distance that counts as TRUE contact (push trigger). ~finger flesh radius; smaller = must touch closer
+        float handCollisionRadius = 3.0f;    // Game units - radius of hand collision sphere (broadphase reach)
+        float handContactSlop = 2.5f;        // Game units - bone-to-mesh distance that counts as TRUE contact (push trigger). ~finger flesh radius; smaller = must touch closer
         float handPushVelocityThreshold = 10.0f; // Min hand speed to push objects (lower = more sensitive)
-        float handPushForceMultiplier = 1.0f;    // Push force multiplier (higher = stronger push)
+        float handPushForceMultiplier = 1.5f;    // Push force multiplier (higher = stronger push)
 
         // Collision-driven haptics (proximity push → TriggerCollisionHaptics)
         bool  enableHandCollisionHaptics = true;   // Pulse controller on hand contact
-        float handCollisionHapticScale   = 500.0f; // Microseconds per unit (mass·speed); 500 = prior hardcoded value, now live
+        float handCollisionHapticScale   = 100.0f; // Microseconds per unit (mass·speed); 500 = prior hardcoded value, now live
 
         // FRIK-GOAL seam (FrikArmGoalHook): 1 = swap FRIK's arm-solve goal via the U1PA
         // slot (v5-equivalent, default), 0 = legacy post-FRIK analytic bone IK only.
@@ -450,9 +463,9 @@ namespace heisenberg
         // Havok timing fix (ROCK HAVOK_TIMING_FIX): override the engine's physics substep
         // delta/count so physics steps at >= the min rate even on long render frames — keeps
         // held-object / hand physics stable at low FPS.
-        bool  havokTimingFix = false;
-        float havokTimingMinFrameRate = 70.0f;  // clamped [30,240]
-        int   havokTimingMaxSubsteps  = 3;       // clamped [1,6] (engine max)
+        bool  havokTimingFix = true;  // RELEASE: required for solid contact — without it collision degrades to a soft nudge.
+        float havokTimingMinFrameRate = 60.0f;  // clamped [30,240]
+        int   havokTimingMaxSubsteps  = 6;       // clamped [1,6] (engine max)
         // ─── SECOND ARCHITECTURE: embedded full ROCK engine (rock_engine static lib) ───
         // When ON, Heisenberg hosts ROCK's *complete* vendored engine in-process via
         // rock::HostLoad() — ROCK's own PhysicsInteraction/grab/hand/weapon pipeline runs
@@ -462,7 +475,9 @@ namespace heisenberg
         // listener registered), so behaviour is identical to today.
         // Read EARLY (during F4SEPlugin_Load) so ROCK registers its lifecycle listener
         // before kGameLoaded fires — see Heisenberg::OnF4SELoad.
-        bool  useRockEngineArchitecture = false;
+        bool  useRockEngineArchitecture = true;  // RELEASE: the embedded ROCK engine IS the mod's physics — hand/weapon collision and
+        // two-handing all live behind this. Shipped false through 0.8.4, which meant a fresh
+        // install had none of it unless the user hand-edited the INI.
 
         // Throw settings  
         float throwVelocityThreshold = 3.0f;  // m/s - minimum speed for throw (increased to reduce accidental throws)
@@ -489,12 +504,24 @@ namespace heisenberg
         float mouthOffsetY = 10.0f;           // Forward of HMD (toward face)
         float mouthOffsetZ = -9.0f;           // Below eye level (mouth area)
         float mouthRadius = 11.0f;            // Sphere radius for detection (Game units - ~11cm, matches HIGGS)
-        float mouthVelocityThreshold = 2.0f;  // m/s - must be moving slower than this to consume
+        float mouthVelocityThreshold = 2.0f;  // Legacy compatibility value; release consumption has no speed gate
+        bool autoConsumeInMouthArea = false;  // Consume in the mouth zone without releasing grip
         
         // Hand injection zone - sphere on opposite wand for syringe-style consumption
         // Offsets relative to the opposite wand node
         // Defaults match Virtual Chems (which uses game units): converted to cm (×1.4)
         bool enableHandInjection = true;          // Enable injection consumption on opposite hand
+        bool autoConsumeInWristArea = false;      // Inject in the wrist zone without releasing grip
+
+        // NPC injection: press SS2's generic Disease Cure against another actor's body.
+        // Heisenberg calls SS2's own menuless treatment entry point so its eligibility,
+        // consumption/refund, disease, and quest logic remain authoritative.
+        bool  enableNpcInjection = true;
+        // Separately allow a held Stimpak to revive the player's current companion.
+        // This is independent of the SS2 settler Disease Cure gesture above.
+        bool  enableCompanionStimpakInjection = true;
+        float npcInjectionRadius = 25.0f;         // game units from wand to the actor's torso bone
+        bool  showInjectionMessages = true;       // HUD confirmation so a transfer is never silent
         float handInjectionOffsetX = 0.0f;         // Right of wand (cm)
         float handInjectionOffsetY = 5.0f;        // Forward from wand (cm)
         float handInjectionOffsetZ = 0.0f;        // Below wand (cm)
@@ -566,13 +593,17 @@ namespace heisenberg
         // Debug
         bool debugDrawControllers = false;
         bool debugLogging = false;  // Enable verbose per-frame logging (impacts performance!)
-        // RELEASE (v0.8.4): default is ERROR-ONLY. Info/debug chatter costs frame time in VR
-        // and fills testers' logs; fatal/startup errors and warnings-escalated-to-error still
-        // print. [Debug] bVerboseLaunch is the opt-in pre-config diagnostic escape hatch.
+        // RELEASE (v0.8.6): default is WARN. Warnings and errors reach the log - which is
+        // what a user bug report needs - while the info-level narration this codebase emits
+        // heavily stays out of the file and off the frame budget. Raise to 2 (info) or 1
+        // (debug) when diagnosing; iLogLevel is kept visible in the shipped INI for exactly
+        // that. [Debug] bVerboseLaunch remains the pre-config diagnostic escape hatch.
+        // NOTE: spdlog flush_on(warn) makes warn/error SYNCHRONOUS file writes, so anything
+        // logged at warn on a per-frame path is far costlier than the same line at info.
         // NOTE: this NSDMI IS the effective default - Config::Load() passes the live member as
         // the GetLongValue fallback, and the embedded kDefaultConfig block (Config.cpp) must
         // agree with it or the embedded copy wins.
-        int logLevel = 4; // 0=trace, 1=debug, 2=info, 3=warn, 4=error
+        int logLevel = 3; // 0=trace, 1=debug, 2=info, 3=warn, 4=error (release ships warn)
 
         // =====================================================================
         // GRIP WEAPON DRAW
@@ -677,7 +708,9 @@ namespace heisenberg
         // And Actor::PickpocketAlarm for the full crime system on failure.
         // No custom modifiers — matches the base game exactly.
         // =====================================================================
-        bool enablePickpocket = true;              // Master toggle for pickpocketing
+        // PARKED 2026-09-04: the browse/steal flow is not working correctly yet.
+        // Forced off in Config::Load() and hidden from the MCM until it is fixed.
+        bool enablePickpocket = false;             // Master toggle for pickpocketing
 
         // MCM support - reload settings if MCM changed them
         void ReloadIfMCMChanged();

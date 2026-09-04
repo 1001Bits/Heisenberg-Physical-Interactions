@@ -558,8 +558,8 @@ namespace rock::frik_visual_authority
     {
         const auto* frikApi = coreApi();
         return frikApi &&
-               ((frikApi->isConfigOpen && frikApi->isConfigOpen()) ||
-                   (frikApi->isWristPipboyOpen && frikApi->isWristPipboyOpen()));
+               frikApi->isConfigOpen &&
+               frikApi->isConfigOpen();
     }
 
     [[nodiscard]] inline bool clearHandPose(const char* tag, Hand hand)

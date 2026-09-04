@@ -308,6 +308,28 @@ namespace rock::input_remap_runtime
         std::array<std::atomic<bool>, kGameStoppingMenuNames.size()> s_gameStoppingMenuModeOpen{};
         std::array<std::atomic<std::uint32_t>, kGameStoppingMenuNames.size()> s_gameStoppingMenuModeDepth{};
 
+        [[nodiscard]] constexpr bool isGameplayTransparentOverlay(
+            const std::size_t index) noexcept
+        {
+            return kGameStoppingMenuNames[index] == "FavoritesMenu" ||
+                   kGameStoppingMenuNames[index] == "PipboyMenu";
+        }
+
+        [[nodiscard]] bool isGameplayTransparentOverlayActive()
+        {
+            for (std::size_t i = 0; i < kGameStoppingMenuNames.size(); ++i) {
+                if (!isGameplayTransparentOverlay(i)) {
+                    continue;
+                }
+                if (s_gameStoppingMenuOpen[i].load(std::memory_order_acquire) ||
+                    s_gameStoppingMenuModeOpen[i].load(std::memory_order_acquire) ||
+                    s_gameStoppingMenuModeDepth[i].load(std::memory_order_acquire) > 0) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         void publishPipboyMenuOpen(const bool open)
         {
             const bool wasOpen = s_pipboyMenuOpen.exchange(open, std::memory_order_acq_rel);
@@ -347,6 +369,11 @@ namespace rock::input_remap_runtime
         void publishMenuInputActiveFromTrackedMenus()
         {
             for (std::size_t i = 0; i < kGameStoppingMenuNames.size(); ++i) {
+                // Favorites and Pip-Boy retain their native UI events, but are
+                // live-world overlays: ROCK input/grab remapping must continue.
+                if (isGameplayTransparentOverlay(i)) {
+                    continue;
+                }
                 if (s_gameStoppingMenuOpen[i].load(std::memory_order_acquire) ||
                     s_gameStoppingMenuModeOpen[i].load(std::memory_order_acquire) ||
                     s_gameStoppingMenuModeDepth[i].load(std::memory_order_acquire) > 0) {
@@ -362,8 +389,8 @@ namespace rock::input_remap_runtime
         {
             const auto* frikApi = frik::api::FRIKApi::inst;
             return frikApi &&
-                   ((frikApi->isConfigOpen && frikApi->isConfigOpen()) ||
-                       (frikApi->isWristPipboyOpen && frikApi->isWristPipboyOpen()));
+                   frikApi->isConfigOpen &&
+                   frikApi->isConfigOpen();
         }
 
         void refreshTrackedMenuState(const RE::UI& ui)
@@ -849,6 +876,14 @@ namespace rock::input_remap_runtime
                 return true;
             }
 
+            // FO4VR can leave a broad menu input context on the priority stack
+            // for Favorites/Pip-Boy. Those two overlays are explicitly
+            // gameplay-transparent. A real tracked blocking menu wins above;
+            // only an overlay-only context reaches this exemption.
+            if (isGameplayTransparentOverlayActive()) {
+                return false;
+            }
+
             auto* controlMap = RE::ControlMap::GetSingleton();
             if (!controlMap) {
                 return false;
@@ -894,7 +929,14 @@ namespace rock::input_remap_runtime
             }
 
             auto& tracker = s_controllers[controllerIndex(hand)];
-            const std::uint64_t rawPressed = state->ulButtonPressed;
+            const std::uint64_t previousPressedForHysteresis =
+                tracker.rawPressed.load(std::memory_order_acquire);
+            const std::uint64_t rawPressed =
+                input_remap_policy::normalizeGripPressedMask(
+                    state->ulButtonPressed,
+                    previousPressedForHysteresis,
+                    state->rAxis[
+                        input_remap_policy::kOpenVrGripAxisIndex].x);
             const std::uint64_t rawTouched = state->ulButtonTouched;
             constexpr std::size_t triggerAxisIndex =
                 static_cast<std::size_t>(input_remap_policy::kOpenVrSteamVrTriggerButtonId - input_remap_policy::kOpenVrAxisButtonBase);
@@ -910,7 +952,10 @@ namespace rock::input_remap_runtime
                 std::memory_order_release);
 
             const bool hadPrevious = tracker.valid.exchange(true, std::memory_order_acq_rel);
-            const std::uint64_t previousRawPressed = tracker.rawPressed.exchange(rawPressed, std::memory_order_acq_rel);
+            const std::uint64_t previousRawPressed =
+                tracker.rawPressed.exchange(
+                    rawPressed,
+                    std::memory_order_acq_rel);
             tracker.rawTouched.store(rawTouched, std::memory_order_release);
 
             const auto rawTransition = input_remap_policy::evaluateEdgeTransition(hadPrevious, previousRawPressed, rawPressed);

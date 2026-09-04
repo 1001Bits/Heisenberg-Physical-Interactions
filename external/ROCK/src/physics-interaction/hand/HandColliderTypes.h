@@ -482,6 +482,25 @@ namespace rock::hand_bone_collider_geometry_math
     }
 
     template <class Transform>
+    inline Transform generatedColliderFrameFromObjectLocalRelation(
+        const Transform& objectWorld,
+        const Transform& objectGeneratedLocal)
+    {
+        /*
+         * Generated collider frames store the transpose of the ordinary
+         * parent/relation rotation. Solve that relation, then restore the
+         * physical generated-frame storage convention.
+         */
+        Transform generatedRelationWorld =
+            transform_math::composeTransforms(
+                objectWorld,
+                transform_math::invertTransform(objectGeneratedLocal));
+        generatedRelationWorld.rotate = transposeStoredRotation(
+            generatedRelationWorld.rotate);
+        return generatedRelationWorld;
+    }
+
+    template <class Transform>
     inline Transform generatedColliderFrameToGrabAuthorityFrame(const Transform& colliderFrame)
     {
         /*

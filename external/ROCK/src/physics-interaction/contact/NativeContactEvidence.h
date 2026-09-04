@@ -66,6 +66,9 @@ namespace rock::contact_evidence
         RE::NiPoint3 contactPointGame{};
         RE::NiPoint3 contactNormalGame{};
         RE::NiPoint3 sourceVelocityGame{};
+        RE::NiPoint3 targetVelocityGame{};
+        bool sourceVelocityValid = false;
+        bool targetVelocityValid = false;
         float contactPointWeightSum = 0.0f;
     };
 

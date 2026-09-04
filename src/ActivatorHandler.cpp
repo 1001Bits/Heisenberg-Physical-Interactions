@@ -40,8 +40,8 @@ namespace heisenberg
 Water Fountain=0x0020DE62
 Vault Water Fountain=0x000B1CFE
 Vault Sink=0x000C3676
-Elevator Call Button=0x000F7C7C
-Elevator Floor Button=0x000F7C7B
+Elevator Panel HiTech=0x000F7C7C
+Elevator Call Button HiTech=0x000F7C7B
 Big Red Button=0x0005815F
 Big Red Button 2=0x0019C656
 Power Lift Button Door=0x073037AC
@@ -79,19 +79,19 @@ fActivationRadius=10.0
 fPointingRadius=30.0
 fZOffset=0.0
 
-[Elevator Call Button:000F7C7C]
+[Elevator Panel HiTech:000F7C7C]
 ; Elevator call button - uses default settings
 fActivationRadius=8.0
 fPointingRadius=25.0
 fZOffset=0.0
-sTargetNode=
+sTargetNode=Button02
 
-[Elevator Floor Button:000F7C7B]
+[Elevator Call Button HiTech:000F7C7B]
 ; Elevator floor selection button - uses default settings  
 fActivationRadius=8.0
 fPointingRadius=25.0
 fZOffset=0.0
-sTargetNode=
+sTargetNode=Button01
 
 [Big Red Button:0005815F]
 ; Red button box - target the actual button, not the base
@@ -148,13 +148,13 @@ sTargetNode=
 fActivationRadius=8.0
 fPointingRadius=25.0
 fZOffset=0.0
-sTargetNode=
+sTargetNode=b_Bell
 
 [Call Elevator Button:00065F71]
 fActivationRadius=8.0
 fPointingRadius=25.0
 fZOffset=0.0
-sTargetNode=
+sTargetNode=button
 
 [Elevator Button:00065F72]
 fActivationRadius=8.0
@@ -167,6 +167,390 @@ fActivationRadius=8.0
 fPointingRadius=25.0
 fZOffset=0.0
 sTargetNode=
+; === VANILLA TOUCH-TARGET SWEEP (auto-generated, adversarially verified) ===
+; Every ACTI in Fallout4.esm whose mesh names its pressable part unambiguously.
+; sTargetNode aims the touch point at that node - instance-independent, unlike
+; a captured world offset. Radii intentionally unset: they follow the global
+; fActivatorActivationRadius / fActivatorPointingRadius config values.
+; NOT whitelist entries - whitelist membership is only the [Whitelist] section.
+
+[Bell_Free:001244BA]
+sTargetNode=Bell
+
+[BoS304PrimeStartupButton:00162A53]
+sTargetNode=b_Button
+
+[CircuitBreaker:00108650]
+sTargetNode=Lever01
+
+[CircuitBreaker01OLD:0010798E]
+sTargetNode=Lever01
+
+[ConButtonStand01:0006D13B]
+sTargetNode=button
+
+[ConButtonStand01_NoActivate:00230F00]
+sTargetNode=button
+
+[ConButtonStand01Vault111:001A90CA]
+sTargetNode=button
+
+[CZLiftButton:0004651E]
+sTargetNode=Button01
+
+[DN001_BADTFLLootDoorTerminal:00043B42]
+sTargetNode=T01Keyboard008:21
+
+[DN009_SynthGateTerminal:0006D0C8]
+sTargetNode=T01Keyboard008:21
+
+[DN015_CleanRoomButton:0009834C]
+sTargetNode=b_Button
+
+[DN017_ToggleButtonDoors:0001D89D]
+sTargetNode=Button01
+
+[DN017_ToggleButtonRocket:0001D885]
+sTargetNode=Button01
+
+[DN029FireCannonActivator:000B810D]
+sTargetNode=Handle
+
+[DN041_PowerActivator:000E92B3]
+sTargetNode=button
+
+[DN041_StartButton:000E7FDA]
+sTargetNode=b_Button
+
+[DN045_TrainButton:0012D13C]
+sTargetNode=b_Button
+
+[DN047_CircuitBreaker:0002B0AC]
+sTargetNode=Lever01
+
+[DN047TempSensor:0003D70A]
+sTargetNode=Handle
+
+[DN049_GenAtomicsGiantHandyLiftButton:00157A8F]
+sTargetNode=Button01
+
+[DN050DoorTerminal:00099C20]
+sTargetNode=T01Keyboard008:21
+
+[DN070_IDCardReader:0014E09E]
+sTargetNode=Keycard01
+
+[DN070_JamaicaPlainButton:000B098A]
+sTargetNode=Button01
+
+[DN080_Siren01:001B3192]
+sTargetNode=b_Switch
+
+[DN084_InterlockReleaseButton:0014F673]
+sTargetNode=b_Button
+
+[DN107_TempButton:000E720B]
+sTargetNode=b_Button
+
+[DN130_HamRadioOFF:001E3340]
+sTargetNode=Knob
+
+[DN133CastleSpeakerControls:001642F0]
+sTargetNode=b_Switch
+
+[Dn136_ElevatorButton:001A8D03]
+sTargetNode=Button01
+
+[DN138ElevatorButton:0006AF2A]
+sTargetNode=b_Button
+
+[DN138ValveActivator:001157D4]
+sTargetNode=Valve
+
+[DN142_Vault114TempDoorTerminal:0005C99A]
+sTargetNode=T01Keyboard008:21
+
+[DN143AdminAccessCardReader:001A58AD]
+sTargetNode=Keycard01
+
+[DN143LabAccessCardReader:001A58A3]
+sTargetNode=Keycard01
+
+[DN143WallTerminal:000BCEEE]
+sTargetNode=T01Keyboard008:21
+
+[DN149_WattzUnlockTerminal:000A1CF6]
+sTargetNode=T01Keyboard008:21
+
+[DN151_CircuitBreaker:0019DFE4]
+sTargetNode=Lever01
+
+[DN151_ToggleButton:000E6AFB]
+sTargetNode=Button01
+
+[DN151_WaterDebris:001E7996]
+sTargetNode=Lever01
+
+[elevatorbutton01:000A78F5]
+sTargetNode=Button01
+
+[ElevatorCallButtonPublic:000E8D88]
+sTargetNode=Button01
+
+[ElevatorCallButtonUtility:000A2784]
+sTargetNode=Button01
+
+[ElevatorCallButtonVault:00183353]
+sTargetNode=VltElevatorCallButton:0
+
+[ElevatorLiftButton01:000B11EA]
+sTargetNode=Button02
+
+[ElevatorMaintenanceDoorSwitch:000A285B]
+sTargetNode=Handle
+
+[ElevatorPanelPublic:000E8D8C]
+sTargetNode=Button02
+
+[ElevatorPanelUtility:000A2785]
+sTargetNode=Button02
+
+[ElevatorPanelVault:00183354]
+sTargetNode=VltElevatorCarCallButton
+
+[Fusebox01:0001D306]
+sTargetNode=Handle
+
+[HamRadio:0018E8FC]
+sTargetNode=Knob
+
+[HamRadioOFF:001BA3A0]
+sTargetNode=Knob
+
+[IDCardReader01:000998F4]
+sTargetNode=Keycard01
+
+[Inst305ReactorButton:000AB2D5]
+sTargetNode=Handle
+
+[InstituteControlPanelButton01:00062994]
+sTargetNode=Button01
+
+[InstituteRelayButton:0016D062]
+sTargetNode=b_Button
+
+[InstM03ThermalRegulator:000BA07F]
+sTargetNode=Handle
+
+[LoadElevatorCallButtonHiTech:000F7C5C]
+sTargetNode=Button01
+
+[LoadElevatorCallButtonPublic:000E8DC9]
+sTargetNode=Button01
+
+[LoadElevatorCallButtonUtility:0009DC99]
+sTargetNode=Button01
+
+[LoadElevatorPanelHiTech:000F7C5E]
+sTargetNode=Button02
+
+[LoadElevatorPanelPublic:000E8DC8]
+sTargetNode=Button02
+
+[LoadElevatorPanelUtility:0009C020]
+sTargetNode=Button02
+
+[MS02InstallCoupler:00024B03]
+sTargetNode=Handle
+
+[MS02SaugusPowerCore:00026F09]
+sTargetNode=Handle
+
+[MS02SensorConsole:000250FB]
+sTargetNode=Handle
+
+[MS04_KentPrimaryOverride:000328D4]
+sTargetNode=Handle
+
+[MS04_KentSearch:000471B8]
+sTargetNode=Handle
+
+[MS04_KentSecondaryOverride:000328D6]
+sTargetNode=Handle
+
+[MS04TestActivities:0003FECC]
+sTargetNode=Handle
+
+[MS09LorenzoCellDoorButton:0004D939]
+sTargetNode=b_Button
+
+[MS09LorenzoCellGenerator:0007CB5C]
+sTargetNode=Lever01
+
+[MS10_Intercom:0006AAD7]
+sTargetNode=Handle
+
+[MS11_FinalCircuitBreaker:0003ADD2]
+sTargetNode=Handle
+
+[MS11_TestCannons:0003ADD0]
+sTargetNode=Handle
+
+[MS11_TestComponents:0003ADCC]
+sTargetNode=Handle
+
+[MS17_HiddenHQIntercom:00039FDA]
+sTargetNode=Handle
+
+[MS17_KidnapClue:00039FD7]
+sTargetNode=Handle
+
+[MS19_Intercom:00079217]
+sTargetNode=Handle
+
+[NatDoorSmSwitch01:001B5A3B]
+sTargetNode=Wheel01
+
+[nauticalswitch01:000BB7F7]
+sTargetNode=SwitchHelper01
+
+[PaintMixer01:001F3F1F]
+sTargetNode=Handle01
+
+[PfbBarredDoorChains01:0006D133]
+sTargetNode=Chains
+
+[PfbBarredDoorChainsDbl01:00022210]
+sTargetNode=Chains
+
+[PlayerHouse_KitchenSink01Activator:000F5D8D]
+sTargetNode=fBoneTap
+
+[PlayerHouse_Ruin_KitchenSink01Activator:001A4AA4]
+sTargetNode=fBoneTap
+
+[PowerLiftButton01:000EEFBD]
+sTargetNode=Button01
+
+[RelayTowerButton:0003C626]
+sTargetNode=b_Button
+
+[RelayTowerReceiver01:00191EB7]
+sTargetNode=Knob
+
+[RelayTowerReceiver02:00191EB8]
+sTargetNode=Knob
+
+[RelayTowerReceiver03:00191EB9]
+sTargetNode=Knob
+
+[RelayTowerReceiver04:001E5FAB]
+sTargetNode=Knob
+
+[RelayTowerReceiver05:001E5FAC]
+sTargetNode=Knob
+
+[RelayTowerReceiver06:001E5FAD]
+sTargetNode=Knob
+
+[RelayTowerReceiver08:001E5FAE]
+sTargetNode=Knob
+
+[RelayTowerReceiver09:001E5FAA]
+sTargetNode=Knob
+
+[RelayTowerReceiver10:001E5FAF]
+sTargetNode=Knob
+
+[RelayTowerReceiver12:001E5FB0]
+sTargetNode=Knob
+
+[RelayTowerReceiver13:001E5FB1]
+sTargetNode=Knob
+
+[RelayTowerReceiver14:001E5FA9]
+sTargetNode=Knob
+
+[RelayTowerReceiver15:001E5FB2]
+sTargetNode=Knob
+
+[RelayTowerReceiver16:001E5FB3]
+sTargetNode=Knob
+
+[RelayTowerReceiver17:001E5FB4]
+sTargetNode=Knob
+
+[RelayTowerReceiver18:001E5FB5]
+sTargetNode=Knob
+
+[RelayTowerReceiver19:001E5FB6]
+sTargetNode=Knob
+
+[RR101CenterRing:00108091]
+sTargetNode=Button
+
+[RRFreedomTrailMarkerActivator01:0010C3D4]
+sTargetNode=Button
+
+[TellMeMoreDisplayAnimated:00173B16]
+sTargetNode=Button01
+
+[ToggleButton:00194FB3]
+sTargetNode=Button01
+
+[tpSmelterButton:00090BAC]
+sTargetNode=b_Button
+
+[V111GearDoorConsole01:00091A48]
+sTargetNode=Button
+
+[Valve:001157D8]
+sTargetNode=Valve
+
+[VaultControlPanel:0001ED64]
+sTargetNode=Handle
+
+[VaultDoorConsole01:00145D93]
+sTargetNode=Button
+
+[VaultDoorConsole01NoActivate:0019C899]
+sTargetNode=Button
+
+[VltElevatorCallButtonCar:0013C380]
+sTargetNode=VltElevatorCarCallButton
+
+[VltElevatorCallButtonExt:0013C37F]
+sTargetNode=VltElevatorCallButton:0
+
+[vltoutsideentranceexterior01valve:00092015]
+sTargetNode=Valve:5
+
+[WorkshopBell01:000C01D0]
+sTargetNode=b_Bell
+
+[WorkshopCircuitBreaker_SI:002404B9]
+sTargetNode=Lever01
+
+[WorkshopPowerInteriorFuseboxNoEdit:000CFF77]
+sTargetNode=b_Switch
+
+[WorkshopPowerPylonSwitch01:0014583D]
+sTargetNode=b_Lever
+
+[WorkshopPowerPylonSwitch02:00138BF8]
+sTargetNode=b_Switch
+
+[WorkshopPowerSource_SI:002404BB]
+sTargetNode=Lever01
+
+[WorkshopPowerSwitchbox01:00138BF4]
+sTargetNode=b_Switch
+
+[WorkshopRadioBeacon:0002A193]
+sTargetNode=b_Switch
+
+[WorkshopSiren01:000C4444]
+sTargetNode=b_Switch
 )";
 
     // Embedded captured activation offsets — shipped with the mod so no JSON files needed
@@ -279,6 +663,7 @@ sTargetNode=
                         settings.baseFormID = formID;
                         settings.description = key.pItem;
                         _activatorSettings[formID] = settings;
+                        _whitelist.insert(formID);
                         spdlog::debug("[ActivatorHandler] Whitelist: {:08X} '{}'", formID, key.pItem);
                     }
                 }
@@ -574,13 +959,18 @@ sTargetNode=
                 // Get per-activator settings if configured
                 const ActivatorSettings* actSettings = GetActivatorSettings(tracked.baseFormID);
                 if (actSettings) {
-                    // Use configured settings
-                    if (actSettings->activationRadius >= 0) {
-                        tracked.activationRadius = actSettings->activationRadius;
-                    }
-                    if (actSettings->pointingRadius >= 0) {
-                        tracked.pointingRadius = actSettings->pointingRadius;
-                    }
+                    // Use configured settings. Unset radii (-1) fall back to the GLOBAL config
+                    // values, not TrackedActivator's hard-coded 8.0/25.0: the embedded sweep
+                    // data ships ~120 node-only sections with no radii, and a user tuning
+                    // fActivatorActivationRadius in the INI/MCM would otherwise find their
+                    // setting applied to unlisted activators but silently ignored for every
+                    // listed one. (The numbers coincide today; the ROUTE is what matters.)
+                    tracked.activationRadius = actSettings->activationRadius >= 0
+                        ? actSettings->activationRadius
+                        : g_config.activatorActivationRadius;
+                    tracked.pointingRadius = actSettings->pointingRadius >= 0
+                        ? actSettings->pointingRadius
+                        : g_config.activatorPointingRadius;
                     tracked.zOffset = actSettings->zOffset;
                     tracked.targetNodeName = actSettings->targetNode;
                     
@@ -594,8 +984,11 @@ sTargetNode=
                             tracked.capturedOffsetX, tracked.capturedOffsetY, tracked.capturedOffsetZ, tracked.baseFormID);
                     }
                     
-                    // Cache target node pointer (avoid recursive search every frame)
+                    // Cache target node pointer (avoid recursive search every frame).
+                    // Also remember WHICH 3D root it was resolved against - see
+                    // RefreshTargetNodeIfStale for why the pointer alone is not enough.
                     if (!tracked.targetNodeName.empty()) {
+                        tracked.cachedTargetRoot = ref->Get3D();
                         tracked.cachedTargetNode.reset(FindNodeRecursive(ref->Get3D(), tracked.targetNodeName));
                         if (tracked.cachedTargetNode) {
                             spdlog::debug("[ActivatorHandler] Found target node '{}' for {:08X}",
@@ -739,12 +1132,43 @@ sTargetNode=
             return (std::numeric_limits<float>::max)();
         }
 
+        // Re-resolve a stale target-node cache. It is resolved once per cell scan, which
+        // breaks silently in two directions: 3D that streams in AFTER the scan leaves the
+        // node null for the whole cell visit (targeting degrades to root-origin), and 3D
+        // rebuilt mid-visit (workshop build/scrap, Reset3D) leaves the NiPointer holding a
+        // DETACHED node whose world transform never updates again - distances against frozen
+        // geometry. Comparing the current root against the one we resolved under catches
+        // both; the compare is two pointer reads, the FindNode walk only runs on change.
+        if (!activator.targetNodeName.empty()) {
+            RE::NiAVObject* curRoot = actRef->Get3D();
+            const bool rootChanged = curRoot != activator.cachedTargetRoot;
+            const bool unresolved = !activator.cachedTargetNode && curRoot;
+            if (rootChanged || unresolved) {
+                activator.cachedTargetRoot = curRoot;
+                activator.cachedTargetNode.reset(
+                    curRoot ? FindNodeByName(curRoot, activator.targetNodeName) : nullptr);
+            }
+        }
         // Get activator position and rotation for distance calculation
         RE::NiPoint3 actPos;
         RE::NiMatrix3 actRot;
         bool hasRotation = false;
 
-        if (activator.hasCapturedOffset) {
+        // PRECEDENCE: a RESOLVED target node beats a captured offset. The node is the mesh
+        // author's own name for the pressable part, correct for every placement of that mesh;
+        // a capture is a hand-measured world offset authored against ONE instance, and it can
+        // be wrong for another (live case: ConButtonStand01ElevatorCaller 00065F71 carries an
+        // embedded capture at Z+72.8 that misses the owner's elevator entirely, while the mesh
+        // names its pressable node 'button' outright). The capture remains the authority when
+        // no target node is configured or the node fails to resolve on this instance - the
+        // node pointer being null is exactly the "capture knows better" case.
+        bool usedTargetNode = false;
+        if (activator.cachedTargetNode) {
+            actPos = activator.cachedTargetNode->world.translate;
+            actRot = activator.cachedTargetNode->world.rotate;
+            hasRotation = true;
+            usedTargetNode = true;
+        } else if (activator.hasCapturedOffset) {
             // Captured offsets were computed relative to the ROOT node during capture
             // (NodeCaptureMode::PerformCapture uses root3D->world.rotate for inverse transform)
             // MUST use root node here too, not a target child node — child nodes have their
@@ -756,11 +1180,6 @@ sTargetNode=
             } else {
                 actPos = actRef->GetPosition();
             }
-        } else if (activator.cachedTargetNode) {
-            // No captured offset — use the cached target node's world position and rotation
-            actPos = activator.cachedTargetNode->world.translate;
-            actRot = activator.cachedTargetNode->world.rotate;
-            hasRotation = true;
         } else if (auto* node3D = actRef->Get3D()) {
             actPos = node3D->world.translate;
             actRot = node3D->world.rotate;
@@ -772,8 +1191,10 @@ sTargetNode=
         // Apply Z offset (for buttons that are above/below the node center)
         actPos.z += activator.zOffset;
 
-        // If we have a captured offset, transform it from local to world space and apply
-        if (activator.hasCapturedOffset && hasRotation) {
+        // If we have a captured offset, transform it from local to world space and apply.
+        // Never on top of a target node - the offset is root-relative and the node position
+        // already IS the activation point; adding both lands somewhere meaningless.
+        if (activator.hasCapturedOffset && hasRotation && !usedTargetNode) {
             // Transform local offset to world space using root node's rotation
             RE::NiPoint3 localOffset(activator.capturedOffsetX, activator.capturedOffsetY, activator.capturedOffsetZ);
             RE::NiPoint3 worldOffset = actRot * localOffset;
@@ -849,6 +1270,17 @@ sTargetNode=
                 activator.refrHandle.get();
             RE::TESObjectREFR* actRef = actRefPtr.get();
             if (!actRef || !actRef->Get3D()) {
+                // Clear the in-range flags before skipping. Leaving them alone lets a TRUE
+                // survive from the last frame the activator was measurable - so an activator
+                // the player stood next to, then walked away from until its 3D unloaded,
+                // keeps reporting "hand in range" indefinitely. Anything reading these flags
+                // (prompt text, pose decisions) then acts on proximity to an object that is
+                // not even loaded.
+                if (isLeftHand) {
+                    activator.isLeftHandInRange = false;
+                } else {
+                    activator.isRightHandInRange = false;
+                }
                 continue;
             }
             
@@ -1015,14 +1447,20 @@ sTargetNode=
 
     bool ActivatorHandler::IsWhitelisted(std::uint32_t baseFormID) const
     {
-        if (!_useWhitelist || _activatorSettings.empty()) {
+        // Membership means the [Whitelist] SECTION, not mere presence in _activatorSettings.
+        // The settings map now carries ~120 embedded sTargetNode entries whose only job is to
+        // aim the touch point better on activators that are tracked anyway - treating those as
+        // whitelist rows silently widened opt-in whitelist mode from ~17 curated forms to all
+        // of them, making the mode meaningless the moment the sweep data landed.
+        if (!_useWhitelist || _whitelist.empty()) {
             return true;  // No whitelist = everything allowed
         }
-        return _activatorSettings.find(baseFormID) != _activatorSettings.end();
+        return _whitelist.find(baseFormID) != _whitelist.end();
     }
 
     void ActivatorHandler::AddToWhitelist(std::uint32_t baseFormID, const std::string& description)
     {
+        _whitelist.insert(baseFormID);
         ActivatorSettings settings;
         settings.baseFormID = baseFormID;
         settings.description = description;

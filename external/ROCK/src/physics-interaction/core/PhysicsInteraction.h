@@ -156,6 +156,12 @@ namespace rock
         {
             _hostGrabDesired[leftHand ? 1 : 0].store(active, std::memory_order_release);
         }
+        void hostConsumeExternalGrabInputEdge(bool leftHand)
+        {
+            _hostConsumedGrabInputEdge[leftHand ? 1 : 0].store(
+                true,
+                std::memory_order_release);
+        }
         // Marks the ref restored to dynamic motion on a host release.
         void hostNotifyExternalRelease(bool isLeft, RE::TESObjectREFR* releasedRef);
 
@@ -228,6 +234,25 @@ namespace rock
             outHasContactPoint = hand.getLastTouchPoint(outContactPointWorld);
             return outRef != nullptr;
         }
+        // Main-thread snapshot used by the embedded host for interactions that
+        // ROCK intentionally does not author (for example, a scripted quest
+        // item pressed against an NPC). The grab trace makes the later release
+        // an exact-session operation rather than a hand-only command.
+        bool hostGetHeldObjectSnapshot(
+            bool isLeft,
+            RE::TESObjectREFR*& outRef,
+            RE::NiAVObject*& outHeldNode,
+            float& outHeldSeconds,
+            float& outHandSpeedMetersPerSecond,
+            std::uint64_t& outGrabTraceId) const;
+        // Detach the exact snapped grab as an inventory transfer, suppressing
+        // throw velocity. If the peer hand co-holds the same reference it is
+        // detached in the same call so a single committed item cannot remain
+        // constrained (or be dispatched by the host twice).
+        bool hostReleaseHeldObjectForInventory(
+            bool isLeft,
+            RE::TESObjectREFR* expectedRef,
+            std::uint64_t expectedGrabTraceId);
         std::uint32_t hostCopyHandCollisionSamples(
             bool isLeft,
             RE::NiPoint3* outWorldPoints,
@@ -513,6 +538,7 @@ namespace rock
         std::uint64_t _expectedWeaponLayerMask = 0;
         std::uint64_t _expectedReloadLayerMask = 0;
         std::uint64_t _expectedBodyLayerMask = 0;
+        std::uint64_t _expectedDynamicHandProxyLayerMask = 0;
         std::uint64_t _originalNativeCharacterControllerLayerMask = 0;
         std::uint64_t _expectedNativeCharacterControllerLayerMask = 0;
         bool _nativeCharacterControllerLayerPolicyCaptured = false;
@@ -530,6 +556,28 @@ namespace rock
         EquippedWeaponTransitionCoordinator _equippedWeaponTransition;
 
         PhysicsStepDriveCoordinator _generatedBodyStepDrive;
+        // update() queues every non-weapon generated-body target, then the
+        // embedded host applies its final hand winner. Registration and the
+        // single weapon-body queue therefore finish in
+        // finalizeWeaponAuthorityAfterHostHands(), from the pose the renderer
+        // actually sees. The consume-once epoch record is cleared at update()
+        // entry so an interrupted or superseded frame can never register stale
+        // targets into another physics world/generation.
+        struct PostHostGeneratedDriveFinalize
+        {
+            RE::NiPointer<RE::NiNode> weaponNode{};
+            RE::bhkWorld* bhkWorld = nullptr;
+            RE::hknpWorld* hknpWorld = nullptr;
+            std::uint64_t gameFrameIndex = 0;
+            std::uint64_t weaponGenerationKey = 0;
+            std::uint32_t worldGeneration = 0;
+            std::uint32_t skeletonGeneration = 0;
+            std::uint32_t providerGeneration = 0;
+            std::uint32_t collisionGeneration = 0;
+            float deltaSeconds = 1.0f / 90.0f;
+            bool pending = false;
+        };
+        PostHostGeneratedDriveFinalize _postHostGeneratedDriveFinalize{};
         // Written only by the post-solve callback and sampled by the main-frame
         // equipped-drop service. This explicit atomic is the cross-thread
         // settle barrier; PhysicsStepDriveCoordinator's internal counter is not
@@ -549,6 +597,13 @@ namespace rock
         // native contact evidence cache that feeds it.
         SoftContactRuntime _softContactRuntime;
         contact_evidence::NativeContactEvidenceCache _nativeContactEvidence;
+        // Room-scale locomotion is the headset's motion inside the room node,
+        // not the room node's own controller-driven translation. Keeping this
+        // baseline independent prevents the wall cancellation from feeding
+        // its own outward correction back into the next frame.
+        RE::NiPoint3 _weaponWallPreviousHmdPlayerLocal{};
+        bool _weaponWallHmdHistoryValid = false;
+        std::uint32_t _weaponWallHmdHistoryWorldGeneration = 0;
 
         mutable std::mutex _ownedObjectsMutex;
         std::unordered_map<std::uint32_t, std::uint32_t> _ownedObjects;
@@ -574,6 +629,13 @@ namespace rock
         // EMBEDDED-HOST SEAM state.
         // LEVEL-triggered: the host's current grabState.active, pushed every frame.
         std::atomic<bool> _hostGrabDesired[2]{ false, false };
+        std::atomic<bool> _hostConsumedGrabInputEdge[2]{ false, false };
+        // Resolved before equipped/support weapon input. Weapon ownership is
+        // always masked for a host-owned edge. Normal ROCK grabbing is masked
+        // only when ROCK/touch does not already own an object whose release
+        // edge must be preserved. Index 0=right, 1=left.
+        std::array<bool, 2> _hostConsumedWeaponInputFrameMask{};
+        std::array<bool, 2> _hostConsumedNormalGrabInputFrameMask{};
         bool _hostGrabWasActive[2]{ false, false };
         int _hostGrabReassertCounter[2]{ 0, 0 };
         std::atomic<std::uint32_t> _hostRecentReleaseFrames[2]{ 0u, 0u };
@@ -590,6 +652,7 @@ namespace rock
 
         static constexpr std::size_t kGeneratedBodyContactRegistryCapacity =
             (hand_collider_semantics::kHandColliderBodyCountPerHand * 2u) +
+            (DynamicHandCollisionRuntime::kFirstForearmSlot * 2u) +
             MAX_WEAPON_COLLISION_BODIES +
             kBodyBoneColliderBodyCount;
         generated_body_contact_registry::Registry<kGeneratedBodyContactRegistryCapacity> _generatedBodyContactRegistry;
@@ -764,9 +827,20 @@ namespace rock
         std::atomic<bool> _rightWeaponSupportCollisionSuppressed{ false };
         std::atomic<bool> _rightEquippedWeaponDropCollisionSuppressed{ false };
         std::atomic<bool> _leftEquippedWeaponDropCollisionSuppressed{ false };
-        hand_collision_suppression_math::SuppressionSet<hand_collider_semantics::kHandColliderBodyCountPerHand> _rightDominantWeaponCollisionSuppression{};
-        hand_collision_suppression_math::SuppressionSet<hand_collider_semantics::kHandColliderBodyCountPerHand> _leftWeaponSupportCollisionSuppression{};
-        hand_collision_suppression_math::SuppressionSet<hand_collider_semantics::kHandColliderBodyCountPerHand> _rightWeaponSupportCollisionSuppression{};
+        /*
+         * Keep one complete retired bank while its restore is deferred and
+         * still admit one complete replacement bank. The local set is the
+         * retry ledger; dropping a stale entry merely to make room would lose
+         * the exact body whose shared registry lease still needs release.
+         */
+        static constexpr std::size_t
+            kWeaponHandCollisionSuppressionCapacity =
+                hand_collider_semantics::
+                    kHandColliderBodyCountPerHand *
+                2u;
+        hand_collision_suppression_math::SuppressionSet<kWeaponHandCollisionSuppressionCapacity> _rightDominantWeaponCollisionSuppression{};
+        hand_collision_suppression_math::SuppressionSet<kWeaponHandCollisionSuppressionCapacity> _leftWeaponSupportCollisionSuppression{};
+        hand_collision_suppression_math::SuppressionSet<kWeaponHandCollisionSuppressionCapacity> _rightWeaponSupportCollisionSuppression{};
         hand_collision_suppression_math::SuppressionSet<kGrabCollisionSuppressionBodyCountPerHand> _rightEquippedWeaponDropCollisionSuppression{};
         hand_collision_suppression_math::SuppressionSet<kGrabCollisionSuppressionBodyCountPerHand> _leftEquippedWeaponDropCollisionSuppression{};
         hand_collision_suppression_math::DelayedRestoreState _rightEquippedWeaponDropDelayedRestore{};
@@ -917,6 +991,8 @@ namespace rock
         bool _hasHeldPlayerSpacePosition = false;
         bool _hasHeldPlayerSpaceTransform = false;
         RE::NiPoint3 _lastCentralHeldPlayerSpaceVelocityHavok{};
+        std::uint64_t _heldPlayerSpaceWarpSequence = 0;
+        std::uint32_t _heldPlayerSpaceWarpRetryCount = 0;
         int _heldPlayerSpaceLogCounter = 0;
         grab_locomotion_authority_bridge::State _grabLocomotionAuthorityBridge{};
         int _grabLocomotionAuthorityLogCounter = 0;

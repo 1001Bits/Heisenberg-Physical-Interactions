@@ -2,6 +2,7 @@
 
 #include <vector>
 #include <chrono>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -87,8 +88,15 @@ namespace heisenberg
             float capturedOffsetY = 0.0f;
             float capturedOffsetZ = 0.0f;
             
-            // Cached node pointer with reference counting (avoid recursive search every frame)
-            RE::NiPointer<RE::NiAVObject> cachedTargetNode;
+            // Cached node pointer with reference counting (avoid recursive search every frame).
+            // MUTABLE: this is memoization, not state - the distance query is semantically
+            // const but must be able to re-resolve a stale cache (see GetDistanceToActivator).
+            mutable RE::NiPointer<RE::NiAVObject> cachedTargetNode;
+            // The 3D root cachedTargetNode was resolved against. COMPARED ONLY, never
+            // dereferenced - it exists to detect that the engine rebuilt the object's 3D
+            // (workshop edits, Reset3D, late streaming), which detaches the cached node and
+            // freezes its world transform while the NiPointer keeps it safely alive.
+            mutable RE::NiAVObject* cachedTargetRoot = nullptr;
             
             // Runtime state
             bool isLeftHandInRange = false;
@@ -289,6 +297,9 @@ namespace heisenberg
         
         // Per-activator settings (keyed by base form ID)
         std::unordered_map<std::uint32_t, ActivatorSettings> _activatorSettings;
+        // Forms named in the [Whitelist] SECTION only - the settings map above also holds
+        // ~120 embedded node-target entries that must NOT count as whitelist membership.
+        std::set<std::uint32_t> _whitelist;
         
         // Newly discovered activators (for saving to INI)
         std::unordered_map<std::uint32_t, ActivatorSettings> _discoveredActivators;

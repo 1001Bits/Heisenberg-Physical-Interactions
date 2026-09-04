@@ -1954,14 +1954,41 @@ namespace heisenberg
             if (candOffset.length != L || candOffset.width != W || candOffset.height != H) {
                 continue;
             }
-            // Rank candidates: prefer same form type (ALCH↔ALCH, avoids a chem inheriting a
+            // Rank candidates: prefer same form type (ALCH<->ALCH, avoids a chem inheriting a
             // MISC item that happens to share bounds), and prefer the non-hand/PA/throwable base
             // entry so the mirror logic in StartGrab behaves predictably.
+            //
+            // BASE-GAME PREFERENCE (highest weight). Several authored entries can share one
+            // bound box - two stimpak-shaped items both measure (11, 24, 2) - and before this
+            // the winner was whichever the unordered_map happened to yield first, i.e. neither
+            // deterministic nor principled. Live report: the Sim Settlements 2 item
+            // 'SS2_C2_DiseaseCureAllKnown' borrowed the MOD entry 'Used Stimpak' (formId
+            // 4800896E) instead of vanilla '[Stimpak] Stimpak' (00023736) and was held wrongly.
+            // A base-game donor is the safer default: its FormID is stable across load orders
+            // (a mod entry's plugin index means something different on every rig), and its pose
+            // was authored against the canonical mesh.
+            // WEIGHTING ORDER MATTERS, and getting it wrong is a live bug, not a nicety.
+            // Same form type must DOMINATE, because it is the strongest signal that two items
+            // are held the same way; base-game origin only breaks ties among equally-suitable
+            // donors. Shipping base-game at a higher weight than type produced exactly the
+            // failure the owner reported: an ALCH Nuka-Cola variant borrowed the base-game
+            // MISC '[Bottle] Nuka-Cola Bottle{{{Glass}}}' (the EMPTY bottle, 0004835A) instead
+            // of an ALCH drink, because +4 base-game beat +2 same-type. Sixteen authored
+            // entries share the 8x8x20/21 bottle bound box, so this collision is routine here.
             int rank = 0;
-            if (!itemType.empty() && candOffset.itemType == itemType) rank += 2;
+            if (!itemType.empty() && candOffset.itemType == itemType) rank += 8;
             bool isVariant = candOffset.isLeftHanded || candOffset.isPowerArmor || candOffset.isThrowable;
             if (!isVariant) rank += 1;
-            if (rank > bestRank) {
+            const bool isBaseGameForm =
+                candOffset.formId.size() == 8 &&
+                (candOffset.formId.compare(0, 2, "00") == 0 ||
+                 candOffset.formId.compare(0, 2, "01") == 0);
+            if (isBaseGameForm) rank += 4;
+
+            // Deterministic tiebreak. Equal-ranked candidates must resolve the same way on
+            // every machine and every launch, so fall back to the lexicographically smaller
+            // name instead of hash order.
+            if (rank > bestRank || (rank == bestRank && best && candName < bestName)) {
                 bestRank = rank;
                 best = &candOffset;
                 bestName = candName;
@@ -1984,6 +2011,180 @@ namespace heisenberg
         spdlog::debug("[ItemOffsets] GetExactDimensionsOffset: no 100%% dims match for '{}' (L={:.1f} W={:.1f} H={:.1f})",
                     itemName, L, W, H);
         return std::nullopt;
+    }
+
+    // ------------------------------------------------------------------
+    // MESH-IDENTITY DONOR
+    //
+    // Why this exists: the offset database is keyed on FormID, editor ID and
+    // localized display name. A modded item that reuses a vanilla mesh matches
+    // none of those, so it fell through to generated placement even though the
+    // correct authored pose was sitting right there under the vanilla item.
+    // Reported live: a Spanish-locale aid item (Elzee_Wet_Ingestible) that
+    // renders as a Stimpak was held wrongly, while "[Stimpak] Stimpak" has an
+    // authored pose.
+    //
+    // Why it is safe where the ARMO dimensional donor is a guess: the same NIF
+    // means the same geometry and the same pivot, so the donor's translation,
+    // rotation and finger curls all apply verbatim. There is no tolerance and
+    // no scoring - it either is the same model or it is not. The existing
+    // __NOTE_DEFAULT rule is the same idea keyed on form type.
+    // ------------------------------------------------------------------
+    static std::string NormalizeModelPathKey(const char* rawPath)
+    {
+        if (!rawPath) {
+            return {};
+        }
+        std::string path(rawPath);
+        // Bethesda paths appear with mixed case and either slash; some are
+        // written with a leading "meshes\" and some without.
+        std::transform(path.begin(), path.end(), path.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::replace(path.begin(), path.end(), '/', '\\');
+        while (!path.empty() && (path.front() == '\\' || path.front() == ' ')) {
+            path.erase(path.begin());
+        }
+        constexpr const char* kMeshesPrefix = "meshes\\";
+        if (path.rfind(kMeshesPrefix, 0) == 0) {
+            path.erase(0, std::char_traits<char>::length(kMeshesPrefix));
+        }
+        return path;
+    }
+
+    static const char* GetFormModelPath(RE::TESForm* form)
+    {
+        if (!form) {
+            return nullptr;
+        }
+        if (auto* asModel = form->As<RE::TESModel>()) {
+            return asModel->GetModel();
+        }
+        return nullptr;
+    }
+
+    void ItemOffsetManager::BuildModelPathDonorIndex() const
+    {
+        if (_modelPathIndexBuilt) {
+            return;
+        }
+        _modelPathIndexBuilt = true;  // set first: a failed build must not retry every grab
+
+        auto* dataHandler = RE::TESDataHandler::GetSingleton();
+        if (!dataHandler) {
+            spdlog::warn("[ItemOffsets] Model-path donor index: TESDataHandler unavailable");
+            return;
+        }
+
+        std::size_t authored = 0;
+        std::size_t collisions = 0;
+
+        // Only classes where an identical mesh implies an identical hold.
+        // Weapons and armour are deliberately excluded: weapons carry grip
+        // semantics resolved elsewhere, and armour already has its own donor.
+        const auto indexArray = [&](auto& formArray) {
+            for (auto* form : formArray) {
+                if (!form) {
+                    continue;
+                }
+                const std::string modelKey = NormalizeModelPathKey(GetFormModelPath(form));
+                if (modelKey.empty()) {
+                    continue;
+                }
+
+                // A form contributes ONLY if it already owns an authored
+                // offset, looked up through the same stable identity path the
+                // normal lookup uses.
+                std::string offsetKey;
+                char buf[16];
+                snprintf(buf, sizeof(buf), "%08X", static_cast<uint32_t>(form->formID));
+                const std::string formId = NormalizeFormIdIdentity(std::string(buf));
+                if (const auto it = _formIdToName.find(formId); it != _formIdToName.end()) {
+                    offsetKey = it->second;
+                } else {
+                    const char* rawEditorId = form->GetFormEditorID();
+                    if (rawEditorId) {
+                        const std::string editorId = NormalizeEditorIdentity(rawEditorId);
+                        if (!editorId.empty()) {
+                            if (const auto eit = _editorIdToName.find(editorId);
+                                eit != _editorIdToName.end()) {
+                                offsetKey = eit->second;
+                            }
+                        }
+                    }
+                }
+                if (offsetKey.empty()) {
+                    continue;
+                }
+
+                auto [it, inserted] = _modelPathToName.emplace(modelKey, offsetKey);
+                if (inserted) {
+                    ++authored;
+                } else if (it->second != offsetKey) {
+                    // Two authored items share one mesh. Keep the
+                    // lexicographically smaller key so the choice is stable
+                    // across sessions instead of depending on load order.
+                    ++collisions;
+                    if (offsetKey < it->second) {
+                        it->second = offsetKey;
+                    }
+                }
+            }
+        };
+
+        indexArray(dataHandler->GetFormArray<RE::AlchemyItem>());
+        indexArray(dataHandler->GetFormArray<RE::TESObjectMISC>());
+        indexArray(dataHandler->GetFormArray<RE::IngredientItem>());
+        indexArray(dataHandler->GetFormArray<RE::TESKey>());
+        indexArray(dataHandler->GetFormArray<RE::TESObjectBOOK>());
+
+        spdlog::info("[ItemOffsets] Model-path donor index built: {} authored meshes ({} shared-mesh collisions resolved)",
+                     authored, collisions);
+    }
+
+    std::optional<ItemOffset> ItemOffsetManager::GetSharedModelDonorOffset(
+        RE::TESObjectREFR* refr,
+        bool isLeft) const
+    {
+        if (!refr) {
+            return std::nullopt;
+        }
+
+        auto* baseForm = refr->GetObjectReference();
+        if (!baseForm) {
+            return std::nullopt;
+        }
+
+        const std::string modelKey = NormalizeModelPathKey(GetFormModelPath(baseForm));
+        if (modelKey.empty()) {
+            return std::nullopt;
+        }
+
+        BuildModelPathDonorIndex();
+
+        const auto it = _modelPathToName.find(modelKey);
+        if (it == _modelPathToName.end()) {
+            return std::nullopt;
+        }
+
+        // Same form type only. A shared mesh between different classes (a MISC
+        // prop reusing a weapon model, say) does not imply a shared hold.
+        const std::string targetType = GetItemType(refr);
+        if (const auto donorIt = _offsets.find(it->second); donorIt != _offsets.end()) {
+            if (!donorIt->second.itemType.empty() &&
+                !targetType.empty() &&
+                donorIt->second.itemType != "UNKNOWN" &&
+                targetType != "UNKNOWN" &&
+                donorIt->second.itemType != targetType) {
+                return std::nullopt;
+            }
+        }
+
+        auto donated = GetOffset(it->second, isLeft);
+        if (!donated.has_value()) {
+            return std::nullopt;
+        }
+        donated->matchedName = it->second;
+        return donated;
     }
 
     std::optional<ItemOffset> ItemOffsetManager::GetArmorDimensionalDonorOffset(

@@ -21,7 +21,10 @@ namespace rock::logging_policy
         Off = 6,
     };
 
-    constexpr int DefaultLogLevel = static_cast<int>(LogLevel::Error);
+    // Release ships at Warn: warnings and errors reach a user's log while the heavy
+    // info-level narration stays out of it. Both this and the host logger are driven by the
+    // same [Debug] iLogLevel key, so they can never disagree at runtime.
+    constexpr int DefaultLogLevel = static_cast<int>(LogLevel::Warn);
     constexpr int DefaultLogSampleMilliseconds = 2000;
     constexpr const char* DefaultLogPattern = "%Y-%m-%d %H:%M:%S.%e [%l] %v";
 

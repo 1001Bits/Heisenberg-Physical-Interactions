@@ -18,6 +18,8 @@ namespace rock::two_handed_weapon_policy
     // bodies/VR scales; neither the weapon nor the firing-hand pivot moves.
     inline constexpr float kSupportArmLengthScale = 1.40f;
     inline constexpr float kSupportArmReachSafetyMargin = 0.15f;
+    inline constexpr float kWeaponWallCorrectionFallbackGameUnits = 18.0f;
+    inline constexpr float kWeaponWallCorrectionHardSafetyGameUnits = 256.0f;
 
     /*
      * Hand-authority writer identities are part of the embedded-ROCK/legacy-FRIK
@@ -138,6 +140,212 @@ namespace rock::two_handed_weapon_policy
         return !ownsWeaponTransform &&
                firingHandWorldAvailable &&
                nativeFrikVisualAuthorityAvailable;
+    }
+
+    /*
+     * Visual-return ownership is deliberately absent from this predicate. In
+     * PartCarry the released firing hand may still be easing back visually, but
+     * only live part grips remain attached to and travel with the weapon.
+     */
+    [[nodiscard]] inline constexpr bool isHandAttachedForWeaponWallTransport(
+        const bool ownsWeaponTransform,
+        const bool isFiringHand,
+        const bool activePartGrip,
+        const bool occupiedPrimaryGrip)
+    {
+        return activePartGrip ||
+               (isFiringHand && occupiedPrimaryGrip) ||
+               (!ownsWeaponTransform && isFiringHand);
+    }
+
+    /*
+     * A wall response is a rigid weapon/hand transport, not an independent
+     * weapon correction. If the runtime knows that at least one hand is
+     * attached but cannot resolve every attached hand's current world frame,
+     * moving the weapon would visibly tear that hand off its grip. Fail closed
+     * for that frame. The no-attached-hand case remains valid for a genuinely
+     * free PartCarry/transition pose and uses the finite fallback envelope.
+     */
+    [[nodiscard]] inline constexpr bool
+    hasCompleteAttachedHandWorldSet(
+        const bool anyAttachedHandExpected,
+        const bool everyAttachedHandWorldAvailable)
+    {
+        return !anyAttachedHandExpected ||
+               everyAttachedHandWorldAvailable;
+    }
+
+    /*
+     * Publishing the corrected hand worlds is part of the same rigid
+     * weapon-wall transaction as moving the weapon.  Availability alone is
+     * not enough: the visual-authority host may reject either writer.  Never
+     * commit the weapon move unless every hand known to be attached accepted
+     * its matching correction in this frame.
+     */
+    [[nodiscard]] inline constexpr bool
+    hasCompleteAttachedHandPublicationSet(
+        const bool rightHandExpected,
+        const bool leftHandExpected,
+        const bool rightHandPublished,
+        const bool leftHandPublished)
+    {
+        return (!rightHandExpected || rightHandPublished) &&
+               (!leftHandExpected || leftHandPublished);
+    }
+
+    [[nodiscard]] inline constexpr bool
+    shouldReuseWeaponWorldContactRigidPin(
+        const bool pinActive,
+        const bool generationMatches,
+        const bool ownershipMatches,
+        const bool pinIsImmutableWallStop,
+        const bool requestIsImmutableWallStop,
+        const bool requestedBlockedPoseMatches) noexcept
+    {
+        if (!pinActive || !generationMatches || !ownershipMatches ||
+            pinIsImmutableWallStop != requestIsImmutableWallStop) {
+            return false;
+        }
+        // SoftContactRuntime advances the requested wall pose only after an
+        // outward plane exit. That bounded release is still the same contact
+        // episode and must keep the originally captured weapon/hand grip
+        // relation. Reciprocal hand stops retain the old exact-pose identity
+        // rule so their directional arbitration is unchanged.
+        return requestIsImmutableWallStop ||
+               requestedBlockedPoseMatches;
+    }
+
+    [[nodiscard]] inline float safeWeaponWallCorrectionFallback(
+        const float configuredAcquisitionLimit)
+    {
+        const float fallback =
+            std::isfinite(configuredAcquisitionLimit) &&
+                    configuredAcquisitionLimit > 0.0f
+                ? configuredAcquisitionLimit
+                : kWeaponWallCorrectionFallbackGameUnits;
+        return std::clamp(
+            fallback,
+            0.0f,
+            kWeaponWallCorrectionHardSafetyGameUnits);
+    }
+
+    [[nodiscard]] inline bool weaponWallPoseDoesNotWorsenReach(
+        const float rawReachDistance,
+        const float stoppedReachDistance,
+        const float nominalMaximumReach,
+        const float continuityToleranceGameUnits = 0.25f) noexcept
+    {
+        if (!std::isfinite(rawReachDistance) ||
+            !std::isfinite(stoppedReachDistance) ||
+            !std::isfinite(nominalMaximumReach) ||
+            nominalMaximumReach <= 1.0f) {
+            return false;
+        }
+        const float tolerance =
+            std::isfinite(continuityToleranceGameUnits) ?
+                (std::max)(continuityToleranceGameUnits, 0.0f) :
+                0.0f;
+        return stoppedReachDistance <=
+               (std::max)(nominalMaximumReach,
+                   rawReachDistance + tolerance);
+    }
+
+    struct DirectionalArmReachLimit
+    {
+        bool valid = false;
+        bool constrained = false;
+        float maxCorrection = 0.0f;
+    };
+
+    /*
+     * Intersect the requested correction ray with the shoulder reach sphere.
+     * Only its scalar length may change: unlike radial target projection, this
+     * cannot introduce a tangent component that slides the gun off the wall
+     * normal or leaves the collider in a different pose from the visual gun.
+     */
+    template <class Vec3>
+    [[nodiscard]] inline DirectionalArmReachLimit
+    directionalArmReachCorrectionLimit(
+        const Vec3& handPosition,
+        const Vec3& correction,
+        const Vec3& shoulderPosition,
+        const float maxReach,
+        const float safetyMargin = kSupportArmReachSafetyMargin)
+    {
+        DirectionalArmReachLimit result{};
+        const auto finitePoint = [](const Vec3& point) {
+            return std::isfinite(point.x) &&
+                   std::isfinite(point.y) &&
+                   std::isfinite(point.z);
+        };
+        if (!finitePoint(handPosition) ||
+            !finitePoint(correction) ||
+            !finitePoint(shoulderPosition) ||
+            !std::isfinite(maxReach) || maxReach <= 1.0f ||
+            !std::isfinite(safetyMargin) || safetyMargin < 0.0f) {
+            return result;
+        }
+
+        const float correctionLengthSquared =
+            correction.x * correction.x +
+            correction.y * correction.y +
+            correction.z * correction.z;
+        if (!std::isfinite(correctionLengthSquared) ||
+            correctionLengthSquared <= 1.0e-12f) {
+            result.valid = true;
+            return result;
+        }
+
+        const float requestedLength =
+            std::sqrt(correctionLengthSquared);
+        const float inverseLength = 1.0f / requestedLength;
+        const Vec3 direction{
+            correction.x * inverseLength,
+            correction.y * inverseLength,
+            correction.z * inverseLength,
+        };
+        const Vec3 shoulderToHand{
+            handPosition.x - shoulderPosition.x,
+            handPosition.y - shoulderPosition.y,
+            handPosition.z - shoulderPosition.z,
+        };
+        const float reachableRadius =
+            (std::max)(maxReach - safetyMargin, 0.0f);
+        const float along =
+            shoulderToHand.x * direction.x +
+            shoulderToHand.y * direction.y +
+            shoulderToHand.z * direction.z;
+        const float constant =
+            shoulderToHand.x * shoulderToHand.x +
+            shoulderToHand.y * shoulderToHand.y +
+            shoulderToHand.z * shoulderToHand.z -
+            reachableRadius * reachableRadius;
+        const float discriminant = along * along - constant;
+
+        result.valid = true;
+        if (!std::isfinite(discriminant) || discriminant < 0.0f) {
+            result.constrained = true;
+            return result;
+        }
+
+        const float root = std::sqrt((std::max)(discriminant, 0.0f));
+        const float intervalStart = -along - root;
+        const float intervalEnd = -along + root;
+        const float feasibleStart = (std::max)(0.0f, intervalStart);
+        const float feasibleEnd =
+            (std::min)(requestedLength, intervalEnd);
+        if (!std::isfinite(feasibleStart) ||
+            !std::isfinite(feasibleEnd) ||
+            feasibleEnd + 1.0e-5f < feasibleStart) {
+            result.constrained = true;
+            return result;
+        }
+
+        result.maxCorrection =
+            std::clamp(feasibleEnd, 0.0f, requestedLength);
+        result.constrained =
+            result.maxCorrection + 1.0e-5f < requestedLength;
+        return result;
     }
 
     /*

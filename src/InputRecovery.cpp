@@ -195,7 +195,6 @@ namespace heisenberg::InputRecovery
                 menus.IsMenuOpen("DialogueMenu") ||
                 menus.IsMenuOpen("TerminalMenu") ||
                 menus.IsMenuOpen("WorkshopMenu") ||
-                menus.IsMenuOpen("PipboyMenu") ||
                 menus.IsMenuOpen("PauseMenu") ||
                 menus.IsMenuOpen("MainMenu");
         }

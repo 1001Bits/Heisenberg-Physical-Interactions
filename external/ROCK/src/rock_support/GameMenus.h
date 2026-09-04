@@ -68,6 +68,28 @@ namespace rock::fo4vr
             return false;
         }
 
+        [[nodiscard]] bool isFavoritesMenuOpen() const noexcept
+        {
+            return _stoppingMenuOpen[kFavoritesMenuIndex];
+        }
+
+        [[nodiscard]] bool isPipboyMenuOpen() const noexcept
+        {
+            return _stoppingMenuOpen[kPipboyMenuIndex];
+        }
+
+        [[nodiscard]] bool isPhysicsStopped() const noexcept
+        {
+            for (std::size_t index = 0; index < _stoppingMenuOpen.size(); ++index) {
+                if (index != kFavoritesMenuIndex &&
+                    index != kPipboyMenuIndex &&
+                    _stoppingMenuOpen[index]) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
     private:
         RE::BSEventNotifyControl ProcessEvent(
             const RE::MenuOpenCloseEvent& event,
@@ -133,6 +155,11 @@ namespace rock::fo4vr
             std::string_view{ "Tutorial Menu" },
             std::string_view{ "TweenMenu" },
         };
+
+        inline static constexpr std::size_t kFavoritesMenuIndex = 10;
+        inline static constexpr std::size_t kPipboyMenuIndex = 18;
+        static_assert(kGameStoppingMenus[kFavoritesMenuIndex] == "FavoritesMenu");
+        static_assert(kGameStoppingMenus[kPipboyMenuIndex] == "PipboyMenu");
 
         std::array<bool, kGameStoppingMenus.size()> _stoppingMenuOpen{};
         bool _scopeMenuOpen{ false };

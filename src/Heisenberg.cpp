@@ -1,8 +1,10 @@
 #include "Heisenberg.h"
+#include "PostConsumeActivationPolicy.h"
 #include "HandAuthority.h"
 #include "FrikArmGoalHook.h"
 #include "LegacyFrikFingerPoseAuthority.h"
 
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -16,6 +18,8 @@
 #include "F4VROffsets.h"
 #include "FRIKInterface.h"
 #include "Grab.h"
+#include "GrabOwnershipPolicy.h"
+#include "NpcInjectionPolicy.h"
 #include "Hand.h"
 #include "HeisenbergInterface001.h"
 #include "Highlight.h"
@@ -40,6 +44,7 @@
 #include "rock/RockBridge.h"
 #include "../external/ROCK/src/ROCKMain.h"  // rock::HostLoad — embedded-engine host entry (lightweight fwd-decl header only)
 #include "../external/ROCK/src/physics-interaction/native/HavokOffsets.h"
+#include "../external/ROCK/src/physics-interaction/weapon/WeaponEquipTransfer.h"
 #include "SmartGrabHandler.h"
 #include "ThrownObjectTracker.h"
 #include "Utils.h"
@@ -58,6 +63,310 @@ namespace heisenberg
     // toggle is off, or forwarding would run ROCK's FRIK/physics init despite the engine being dormant.
     static bool s_rockEngineHosted = false;
 
+    struct RockNpcInjectionDiagnostics
+    {
+        std::uint64_t grabTraceId = 0;
+        NpcInjectionGate lastGate = NpcInjectionGate::FeatureDisabled;
+        double nextGateLogTime = 0.0;
+        double nextDispatchRetryTime = 0.0;
+        bool dispatchRetryThrottled = false;
+        bool identityLogged = false;
+    };
+    static std::array<npc_injection_policy::HostedDispatchGuard, 2>
+        s_rockNpcInjectionGuards{};
+    static std::array<RockNpcInjectionDiagnostics, 2>
+        s_rockNpcInjectionDiagnostics{};
+
+    static bool BlockRockPlayerConsume(RE::TESObjectREFR* ref)
+    {
+        // Exact same identity resolver as the NPC dispatch path. ROCK asks
+        // before it creates a mouth candidate, so a cure remains physically
+        // held instead of being detached/picked up and only then blocked by
+        // ActorEquipManager's final PlayerRef-use guard.
+        return IsDiseaseCureItem(ref);
+    }
+
+    static bool ResolveRockPlayerConsumeProfile(
+        RE::TESObjectREFR* ref,
+        bool isLeft,
+        rock::HostPlayerConsumeProfile& outProfile)
+    {
+        // A registered host resolver owns the complete delivery policy.  Start
+        // fail-closed, then open exactly one spatial route for an eligible
+        // player consumable.
+        outProfile = {};
+        if (!ref) {
+            return false;
+        }
+
+        if (IsDiseaseCureItem(ref) ||
+            (g_config.blockConsumptionInPA &&
+             Utils::IsPlayerInPowerArmor())) {
+            return true;
+        }
+
+        // Companion contact has priority over both mouth and opposite-wrist
+        // self-use.  Require ROCK's exact current held-node snapshot: the hand
+        // or permanent wand being near the actor is not sufficient evidence.
+        if (g_config.enableCompanionStimpakInjection &&
+            IsCompanionStimpakItem(ref)) {
+            rock::HostHeldObjectSnapshot snapshot{};
+            if (rock::HostGetHeldObjectSnapshot(isLeft, snapshot) &&
+                snapshot.ref == ref && snapshot.heldNode &&
+                HasHeldCompanionStimpakTarget(
+                    isLeft,
+                    ref,
+                    snapshot.heldNode)) {
+                return true;
+            }
+        }
+
+        if (!IsPlayerConsumableItem(ref)) {
+            return true;
+        }
+
+        if (IsPlayerInjectableItem(ref) &&
+            g_config.enableHandInjection) {
+            outProfile.route =
+                rock::HostPlayerConsumeRoute::OppositeWrist;
+            outProfile.autoConsumeWhileHeld =
+                g_config.autoConsumeInWristArea;
+            outProfile.zoneOffsetXGameUnits =
+                g_config.handInjectionOffsetX;
+            outProfile.zoneOffsetYGameUnits =
+                g_config.handInjectionOffsetY;
+            outProfile.zoneOffsetZGameUnits =
+                g_config.handInjectionOffsetZ;
+            outProfile.zoneRadiusGameUnits =
+                g_config.handInjectionRadius;
+            return true;
+        }
+
+        if (g_config.consumableActivationZone != 0) {
+            outProfile.route = rock::HostPlayerConsumeRoute::Mouth;
+            outProfile.autoConsumeWhileHeld =
+                g_config.autoConsumeInMouthArea;
+            outProfile.zoneOffsetXGameUnits = g_config.mouthOffsetX;
+            outProfile.zoneOffsetYGameUnits = g_config.mouthOffsetY;
+            outProfile.zoneOffsetZGameUnits = g_config.mouthOffsetZ;
+            outProfile.zoneRadiusGameUnits = g_config.mouthRadius;
+        }
+        return true;
+    }
+
+    static void ServiceRockHeldNpcInjection()
+    {
+        const double now = Utils::GetTime();
+        for (std::size_t handIndex = 0; handIndex < 2; ++handIndex) {
+            const bool isLeft = handIndex == 1;
+            rock::HostHeldObjectSnapshot snapshot{};
+            if (!rock::HostGetHeldObjectSnapshot(isLeft, snapshot)) {
+                s_rockNpcInjectionDiagnostics[handIndex] = {};
+                continue;
+            }
+            auto& diagnostics =
+                s_rockNpcInjectionDiagnostics[handIndex];
+            if (diagnostics.grabTraceId != snapshot.grabTraceId) {
+                diagnostics = {};
+                diagnostics.grabTraceId = snapshot.grabTraceId;
+            }
+            const bool isDiseaseCure =
+                IsDiseaseCureItem(snapshot.ref);
+            const bool isCompanionStimpak =
+                g_config.enableCompanionStimpakInjection &&
+                IsCompanionStimpakItem(snapshot.ref);
+            if (!diagnostics.identityLogged) {
+                auto* baseForm = snapshot.ref ?
+                    snapshot.ref->GetObjectReference() :
+                    nullptr;
+                const char* editorID = baseForm ?
+                    baseForm->GetFormEditorID() :
+                    nullptr;
+                spdlog::info(
+                    "[INJECT-NPC][ROCK] Held-form identity checked: ref={:08X} base={:08X} type={} editor='{}' diseaseCure={} companionStimpak={} hand={} trace={}",
+                    snapshot.ref ? snapshot.ref->GetFormID() : 0u,
+                    baseForm ? baseForm->formID : 0u,
+                    baseForm ?
+                        static_cast<std::uint32_t>(
+                            baseForm->GetFormType()) :
+                        0u,
+                    editorID ? editorID : "(none)",
+                    isDiseaseCure ? "yes" : "no",
+                    isCompanionStimpak ? "yes" : "no",
+                    isLeft ? "left" : "right",
+                    snapshot.grabTraceId);
+                diagnostics.identityLogged = true;
+            }
+            if (!isDiseaseCure && !isCompanionStimpak) {
+                continue;
+            }
+            const RE::ObjectRefHandle heldRefHandle =
+                snapshot.ref->GetHandle();
+            RE::NiPointer<RE::TESObjectREFR> heldRefKeepAlive =
+                heldRefHandle.get();
+            if (heldRefKeepAlive.get() != snapshot.ref) {
+                spdlog::warn(
+                    "[INJECT-NPC][ROCK] Held medicine snapshot could not be retained for the pre-commit ownership handoff (hand={} trace={})",
+                    isLeft ? "left" : "right",
+                    snapshot.grabTraceId);
+                continue;
+            }
+
+            auto& dispatchGuard = s_rockNpcInjectionGuards[handIndex];
+            if (!npc_injection_policy::AllowsHostedDispatch(
+                    dispatchGuard,
+                    snapshot.grabTraceId)) {
+                continue;
+            }
+
+            if (diagnostics.dispatchRetryThrottled &&
+                now < diagnostics.nextDispatchRetryTime) {
+                continue;
+            }
+            diagnostics.dispatchRetryThrottled = false;
+
+            bool backendHandoffAttempted = false;
+            bool backendHandoffSucceeded = false;
+            const auto prepareInventoryCommit = [&]() {
+                // The selected treatment invokes this only after its actor/
+                // runtime preflight has succeeded and immediately before
+                // inventory mutation. Release while the ref/body is still
+                // live; the ROCK seam also releases a peer co-hold here.
+                if (backendHandoffAttempted) {
+                    return false;
+                }
+                backendHandoffAttempted = true;
+                backendHandoffSucceeded =
+                    rock::HostReleaseHeldObjectForInventory(
+                        isLeft,
+                        heldRefKeepAlive.get(),
+                        snapshot.grabTraceId);
+                if (!backendHandoffSucceeded) {
+                    spdlog::error(
+                        "[INJECT-NPC][ROCK] Exact pre-commit release failed (hand={} ref={:08X} trace={}); inventory/treatment dispatch will be aborted",
+                        isLeft ? "left" : "right",
+                        heldRefKeepAlive->GetFormID(),
+                        snapshot.grabTraceId);
+                    return false;
+                }
+                npc_injection_policy::MarkHostedDispatchCommitted(
+                    dispatchGuard,
+                    snapshot.grabTraceId);
+                return true;
+            };
+
+            // If an SS2 installation intentionally aliases DiseaseCureForm to
+            // a Stimpak, companion contact wins; otherwise preserve the SS2
+            // route. An ordinary Stimpak with no contact still runs the
+            // companion attempt for useful gate diagnostics, but never commits.
+            const bool dispatchCompanionStimpak =
+                isCompanionStimpak &&
+                (!isDiseaseCure ||
+                 HasHeldCompanionStimpakTarget(
+                     isLeft,
+                     heldRefKeepAlive.get(),
+                     snapshot.heldNode));
+            const NpcInjectionAttempt attempt =
+                dispatchCompanionStimpak ?
+                    TryInjectHeldCompanionStimpak(
+                        isLeft,
+                        heldRefKeepAlive.get(),
+                        snapshot.heldNode,
+                        snapshot.heldSeconds,
+                        snapshot.handSpeedMetersPerSecond,
+                        prepareInventoryCommit) :
+                    TryInjectHeldDiseaseCure(
+                        isLeft,
+                        heldRefKeepAlive.get(),
+                        snapshot.heldNode,
+                        snapshot.heldSeconds,
+                        snapshot.handSpeedMetersPerSecond,
+                        prepareInventoryCommit);
+            const char* treatmentKind =
+                dispatchCompanionStimpak ?
+                    "Companion Stimpak" :
+                    "Disease Cure";
+
+            const bool diagnosticGate =
+                attempt.gate == NpcInjectionGate::NoTargetContact ||
+                attempt.gate == NpcInjectionGate::HoldAge ||
+                attempt.gate == NpcInjectionGate::HandSpeed;
+            if (diagnosticGate &&
+                (attempt.gate != diagnostics.lastGate ||
+                    now >= diagnostics.nextGateLogTime)) {
+                diagnostics.lastGate = attempt.gate;
+                diagnostics.nextGateLogTime = now + 2.0;
+                if (attempt.gate == NpcInjectionGate::NoTargetContact) {
+                    spdlog::warn(
+                        "[INJECT-NPC][ROCK] {} {:08X} recognized in {} hand, but no eligible target body contact was inside {:.1f}gu (trace={})",
+                        treatmentKind,
+                        snapshot.ref->GetFormID(),
+                        isLeft ? "left" : "right",
+                        g_config.npcInjectionRadius,
+                        snapshot.grabTraceId);
+                } else if (attempt.gate == NpcInjectionGate::HoldAge) {
+                    spdlog::warn(
+                        "[INJECT-NPC][ROCK] {} target {:08X} found at {:.1f}gu, but hold age {:.2f}s is below 0.50s (hand={} trace={})",
+                        treatmentKind,
+                        attempt.targetFormID,
+                        attempt.targetDistanceGameUnits,
+                        snapshot.heldSeconds,
+                        isLeft ? "left" : "right",
+                        snapshot.grabTraceId);
+                } else {
+                    spdlog::warn(
+                        "[INJECT-NPC][ROCK] {} target {:08X} found at {:.1f}gu, but hand speed {:.2f}m/s is at/above {:.2f}m/s (hand={} trace={})",
+                        treatmentKind,
+                        attempt.targetFormID,
+                        attempt.targetDistanceGameUnits,
+                        snapshot.handSpeedMetersPerSecond,
+                        g_config.mouthVelocityThreshold,
+                        isLeft ? "left" : "right",
+                        snapshot.grabTraceId);
+                }
+            }
+
+            if (attempt.result == NpcInjectionResult::NotAttempted) {
+                continue;
+            }
+            if (attempt.result == NpcInjectionResult::FailedKeptInHand) {
+                if (backendHandoffSucceeded) {
+                    // Ownership has already left ROCK and the trace is terminal;
+                    // do not describe or schedule this as a held-item retry.
+                    spdlog::error(
+                        "[INJECT-NPC][ROCK] Backend handoff succeeded but {} inventory/dispatch then failed for target {:08X}; trace={} remains latched",
+                        treatmentKind,
+                        attempt.targetFormID,
+                        snapshot.grabTraceId);
+                    g_vrInput.TriggerHaptic(isLeft, 500);
+                    continue;
+                }
+                // SS2 can be temporarily unavailable while its VM finishes
+                // binding after load, and a native target can change between
+                // contact and transaction revalidation. Permit retry, but
+                // never at frame rate.
+                diagnostics.dispatchRetryThrottled = true;
+                diagnostics.nextDispatchRetryTime = now + 1.0;
+                g_vrInput.TriggerHaptic(isLeft, 500);
+                continue;
+            }
+
+            if (!backendHandoffAttempted || !backendHandoffSucceeded) {
+                spdlog::error(
+                    "[INJECT-NPC][ROCK] {} reported an inventory-committed result for target {:08X} without a successful exact ROCK handoff (hand={} trace={})",
+                    treatmentKind,
+                    attempt.targetFormID,
+                    isLeft ? "left" : "right",
+                    snapshot.grabTraceId);
+            }
+            g_vrInput.TriggerHaptic(
+                isLeft,
+                attempt.result == NpcInjectionResult::Accepted ?
+                    2000 :
+                    500);
+        }
+    }
+
     // One post-FRIK tail owns all hosted scene writes. Whole-hand authority
     // lands first; finger locals then inherit that final wrist/weapon world.
     static void ApplyRockHostVisualAuthorities()
@@ -74,6 +383,7 @@ namespace heisenberg
         benchmarkVisualAuthoritiesReset = false;
         HandAuthority::ApplyWinners();
         LegacyFrikFingerPoseAuthority::ApplyWinners();
+        ServiceRockHeldNpcInjection();
     }
 
     // Public accessor (audit rank 10): ownership gates elsewhere (e.g. Hooks.cpp
@@ -596,7 +906,10 @@ namespace heisenberg
             CSimpleIniA bootIni;
             bootIni.SetUnicode();
             bootIni.LoadFile("Data/F4SE/Plugins/Heisenberg_F4VR.ini");
-            const bool useRockEngine = bootIni.GetBoolValue("RockEngine", "bUseRockEngineArchitecture", false);
+            const bool useRockEngine = bootIni.GetBoolValue(
+                "RockEngine",
+                "bUseRockEngineArchitecture",
+                true);
             if (useRockEngine) {
                 spdlog::info("[RockEngine] bUseRockEngineArchitecture=1 — hosting embedded ROCK engine via rock::HostLoad()");
                 if (rock::HostLoad(a_f4se)) {
@@ -615,25 +928,49 @@ namespace heisenberg
                     // rendered hand tracks the rendered weapon with zero lag.
                     rock::HostSetPostUpdateCallback(
                         &heisenberg::ApplyRockHostVisualAuthorities);
-                    // iGrabMode=9 (Full Dynamic): cede grab+selection ownership to the embedded
-                    // engine for the whole session (read from the boot ini — g_config loads later).
+                    rock::HostSetPlayerConsumeBlockCallback(
+                        &heisenberg::BlockRockPlayerConsume);
+                    rock::HostSetPlayerConsumeProfileCallback(
+                        &heisenberg::ResolveRockPlayerConsumeProfile);
+                    // Resolve grab+selection ownership for the whole session from the boot INI
+                    // (g_config loads later). iGrabMode=9 is canonical; the old external-ROCK
+                    // delegation flag remains a compatibility alias while this engine is hosted.
                     // The seam forces the embed's bGrabEnabled/bSelectionEnabled ON across every
                     // shared Heisenberg INI reload; Heisenberg's grip handlers stand down via
                     // GetEffectiveGrabMode.
-                    const long bootGrabMode = bootIni.GetLongValue("ObjectPickup", "iGrabMode", 0);
-                    const bool rockOwnsGrab = bootGrabMode == 9;
+                    const long bootGrabMode = bootIni.GetLongValue(
+                        "ObjectPickup",
+                        "iGrabMode",
+                        grab_ownership_policy::kFullDynamicGrabMode);
+                    const bool bootLegacyDelegate = bootIni.GetBoolValue(
+                        "ROCK",
+                        "bDelegateWorldGrabToRock",
+                        false);
+                    const auto grabOwnership =
+                        grab_ownership_policy::resolve(
+                            static_cast<int>(bootGrabMode),
+                            bootLegacyDelegate,
+                            true);
+                    const bool rockOwnsGrab =
+                        grabOwnership.embeddedRockOwnsGrab;
                     rock::HostSetGrabOwnership(rockOwnsGrab);
                     if (rockOwnsGrab) {
-                        spdlog::info("[RockEngine] iGrabMode=9 — embedded ROCK owns grab+selection this session");
+                        spdlog::info(
+                            "[RockEngine] Dynamic grab requested (iGrabMode={}, legacyDelegate={}) — embedded ROCK exclusively owns grab+selection this session",
+                            bootGrabMode,
+                            bootLegacyDelegate);
                     } else {
-                        spdlog::info("[RockEngine] iGrabMode={} — Heisenberg owns grab+selection; embedded ROCK supplies collision", bootGrabMode);
+                        spdlog::info(
+                            "[RockEngine] Keyframed grab selected (iGrabMode={}, legacyDelegate={}) — Heisenberg owns grab+selection; embedded ROCK supplies collision",
+                            bootGrabMode,
+                            bootLegacyDelegate);
                     }
                     spdlog::info("[RockEngine] Embedded ROCK engine load OK — settings share Heisenberg_F4VR.ini");
                 } else {
                     spdlog::error("[RockEngine] rock::HostLoad() FAILED — embedded ROCK engine disabled this session");
                 }
             } else {
-                spdlog::info("[RockEngine] bUseRockEngineArchitecture=0 — embedded ROCK engine dormant (default)");
+                spdlog::info("[RockEngine] bUseRockEngineArchitecture=0 — embedded ROCK engine explicitly disabled");
             }
         }
 
@@ -651,6 +988,29 @@ namespace heisenberg
         // Load configuration from INI file FIRST (before anything else uses it)
         g_config.Load();
         spdlog::info("Configuration loaded from INI");
+
+        // Reconcile the early boot decision with the fully merged config (external INI plus
+        // any higher-priority MCM settings). Without this second application, a stale manual
+        // MCM override could make Heisenberg's Hand handlers and ROCK's input reader both
+        // believe they own grip input. HostSetGrabOwnership is idempotent and also preserves
+        // the decision across ROCK's shared-INI reload.
+        if (IsRockEngineHosted()) {
+            const auto grabOwnership =
+                grab_ownership_policy::resolve(
+                    g_config.grabMode,
+                    g_config.delegateWorldGrabToRock,
+                    true);
+            rock::HostSetGrabOwnership(
+                grabOwnership.embeddedRockOwnsGrab);
+            spdlog::info(
+                "[RockEngine] Reconciled merged grab ownership: configuredMode={} legacyDelegate={} effectiveMode={} owner={}",
+                g_config.grabMode,
+                g_config.delegateWorldGrabToRock,
+                grabOwnership.effectiveGrabMode,
+                grabOwnership.embeddedRockOwnsGrab
+                    ? "embedded-ROCK"
+                    : "Heisenberg-keyframed");
+        }
 
         // Apply grip weapon draw patch based on config (like STUF VR)
         Hooks::SetGripWeaponDrawDisabled(g_config.disableGripWeaponDraw);
@@ -682,9 +1042,9 @@ namespace heisenberg
             }
         }
 
-        // Detect Virtual Holsters mod for compatibility mode.
-        // Storage zone is a Heisenberg behavior (behind-head zone) distinct from VH's
-        // hip/shoulder holster zones — keep storage-zone unequip active either way.
+        // Detect Virtual Holsters mod for compatibility mode. StorageZone weapon
+        // mutation is independently restricted to an explicit offhand-weapon
+        // grab, so ordinary primary-hand shoulder gestures remain VH-owned.
         HMODULE vhModule = GetModuleHandleA("VirtualHolsters.dll");
         if (vhModule) {
             _virtualHolstersDetected = true;
@@ -861,14 +1221,12 @@ namespace heisenberg
                         acceptWasPressed.exchange(
                             physicalAccept,
                             std::memory_order_acq_rel);
-                    const bool hasTarget =
-                        (isLeft ? modInst._hasGrabTargetLeft
-                                : modInst._hasGrabTargetRight)
-                            .load(std::memory_order_relaxed);
-
                     if (physicalAccept && !previousAccept) {
                         const bool intercept =
-                            hasTarget || thisHandGrabbing || inPostDropBlock;
+                            grab_ownership_policy::
+                                shouldInterceptAlternateGrabPress(
+                                    thisHandGrabbing,
+                                    inPostDropBlock);
                         acceptPressTime.store(
                             nowSeconds,
                             std::memory_order_relaxed);
@@ -1173,12 +1531,17 @@ namespace heisenberg
                 RE::UEFlag::kActivate |
                 RE::UEFlag::kMenu;
         }
+        if (has(Reason::HeldObjectActivation) ||
+            has(Reason::PostConsumeActivation)) {
+            disabledUser = disabledUser | RE::UEFlag::kActivate;
+        }
 
         RE::OEFlag disabledOther = static_cast<RE::OEFlag>(0);
         if (has(Reason::NativeZKey)) {
             disabledOther = disabledOther | RE::OEFlag::kZKey;
         }
-        if (has(Reason::HeldObjectActivation)) {
+        if (has(Reason::HeldObjectActivation) ||
+            has(Reason::PostConsumeActivation)) {
             disabledOther = disabledOther | RE::OEFlag::kActivation;
         }
         if (has(Reason::ItemPositionConfig) ||
@@ -1229,11 +1592,9 @@ namespace heisenberg
         }
 
         const auto& menus = MenuChecker::GetSingleton();
-        if (menus.IsPipboyOpen() ||
-            menus.IsPaused() ||
+        if (menus.IsPaused() ||
             menus.IsInventoryOpen() ||
             menus.IsContainerOpen() ||
-            menus.IsFavoritesOpen() ||
             menus.IsWorkshopOpen() ||
             menus.IsGameStopped()) {
             flags |= kPolicyMenuOpen;
@@ -1325,49 +1686,56 @@ namespace heisenberg
 
         auto* form = _pendingUnequipForm;
         auto name = std::move(_pendingUnequipName);
+        const bool offhandIsLeft =
+            _pendingUnequipOffhandIsLeft;
         _pendingUnequipForm = nullptr;
         _pendingUnequipName.clear();
 
-        auto* player = RE::PlayerCharacter::GetSingleton();
-        if (!player) return;
-
-        // Use ActorEquipManager::UnequipObject with queueEquip=true
-        // so the game defers the actual unequip to a safe phase.
-        // The raw UnEquipItem(0xe707b0) crashes even in EndUpdate context.
-        RE::ActorEquipManager** equipMgrPtr = heisenberg::g_ActorEquipManager.get();
-        if (!equipMgrPtr || !*equipMgrPtr) {
-            spdlog::error("[GRAB] ActorEquipManager not available for weapon unequip");
+        // Queueing happens during the input/physics callback and the actual
+        // ActorEquipManager mutation happens here. Revalidate the complete
+        // ownership condition at this transaction boundary so releasing the
+        // offhand weapon or changing equipment in between cancels the request.
+        auto* currentlyEquipped = GetPlayerEquippedRealWeapon();
+        const bool offhandStillGrabbingWeapon =
+            IsHandGrabbingRealWeapon(offhandIsLeft);
+        if (!g_config.enableStorageZoneWeaponEquip ||
+            !offhandStillGrabbingWeapon ||
+            currentlyEquipped != form) {
+            spdlog::info(
+                "[GRAB] Cancelled deferred StorageZone weapon unequip: "
+                "offhand={} stillGrabbingWeapon={} expected={:08X} current={:08X}",
+                offhandIsLeft ? "left" : "right",
+                offhandStillGrabbingWeapon,
+                form ? form->GetFormID() : 0u,
+                currentlyEquipped ? currentlyEquipped->GetFormID() : 0u);
             return;
         }
 
-        RE::ActorEquipManager* equipMgr = *equipMgrPtr;
+        // Resolve the exact currently equipped stack/instance at commit time.
+        // The old null-instance/stack=-1 call could unequip the wrong customized
+        // weapon when multiple stacks shared one base form.
+        const auto unequipResult =
+            rock::weapon_equip_transfer::
+                unequipEquippedWeaponFromPlayer(
+                    rock::weapon_equip_transfer::
+                        EquippedUnequipInput{
+                            .playSounds = true,
+                        });
+        if (!unequipResult.success ||
+            unequipResult.weapon != form) {
+            spdlog::warn(
+                "[GRAB] StorageZone exact-stack unequip failed: "
+                "expected={:08X} observed={:08X} reason={} attempted={}",
+                form ? form->GetFormID() : 0u,
+                unequipResult.formID,
+                rock::weapon_equip_transfer::unequipReasonName(
+                    unequipResult.reason),
+                unequipResult.attempted);
+            return;
+        }
 
-        // Construct BGSObjectInstance (same pattern as armor equip in Grab.cpp)
-        struct LocalObjectInstance {
-            RE::TESForm* object{ nullptr };
-            RE::BSTSmartPointer<RE::TBO_InstanceData> instanceData;
-        };
-        static_assert(sizeof(LocalObjectInstance) == 0x10);
-
-        LocalObjectInstance instance;
-        instance.object = form;
-        instance.instanceData = nullptr;
-
-        heisenberg::ActorEquipManager_UnequipObject(
-            reinterpret_cast<std::uint64_t>(equipMgr),
-            reinterpret_cast<RE::Actor*>(player),
-            reinterpret_cast<RE::BGSObjectInstance*>(&instance),
-            1,          // number
-            nullptr,    // slot - let game determine
-            -1,         // stackID - any stack
-            false,      // queueEquip - apply now (we're in EndUpdate, safe context)
-            true,       // playSounds - plays native unequip sound
-            true,       // applyNow - process immediately so sound plays and state updates
-            false,      // locked
-            nullptr     // slotBeingReplaced
-        );
-
-        // Remember this weapon for re-equip on next grip in storage zone
+        // Retain the historical record for API/save compatibility. StorageZone
+        // itself no longer consumes it to re-equip a primary-hand weapon.
         _lastUnequippedWeapon = form;
         _lastUnequippedWeaponName = name;
 
@@ -1443,6 +1811,156 @@ namespace heisenberg
         // Clear the last-unequipped tracking since we re-equipped
         _lastUnequippedWeapon = nullptr;
         _lastUnequippedWeaponName.clear();
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // SCOPE EXIT: recover a skeleton FRIK left collapsed
+    //
+    // FRIK's Skeleton::hideHands() (Skeleton.cpp:2265) does NOT just hide hands - it sets
+    // the whole third-person skeleton root to `local.scale = 0.00001f` and shoves it 10
+    // units behind the camera, so the body cannot render in front of the scope camera. It
+    // is called unconditionally from Skeleton::onFrameUpdate whenever isInScopeMenu().
+    //
+    // FRIK's ONLY restore is `_root->local.scale = 1.0f` in setBodyUnderHMD - and that line
+    // sits AFTER an early return:
+    //
+    //     if (!tryGetRotationFromVectors(back, bodyDir, bodyFacing)) { return; }
+    //     ...
+    //     _root->local.scale = 1.0f;        // never reached on that frame
+    //
+    // `back` is the normalized planar HMD forward. If it degenerates (near-vertical gaze,
+    // a momentarily unusable head pose) the function bails and the collapse is never undone
+    // - the player leaves the scope with an invisible body and a floating weapon, and it
+    // persists until some later frame happens to succeed. Reported live by a tester.
+    //
+    // This is FRIK's bug to fix properly; the guard below just stops it being ours to
+    // suffer. Deliberately narrow: it only acts while the scope is CLOSED, so it can never
+    // fight the collapse FRIK legitimately wants during a scope view, and it waits out a
+    // short grace period first so FRIK's own restore gets the first attempt on the normal
+    // path. Restoring the scale is enough - FRIK recomputes local rotation and translation
+    // itself on the next frame setBodyUnderHMD succeeds; scale is the part that makes the
+    // body invisible.
+    // ────────────────────────────────────────────────────────────────────────
+    // SURVIVAL STATUS-TOKEN AUDIT
+    //
+    // Fallout 4's Survival needs (hunger/thirst/fatigue) are implemented as hidden ALCH
+    // items sitting in the player's inventory - Peckish, Hungry, Ravenous, Starving,
+    // Parched, Dehydrated, Weary and so on. The game holds exactly ONE per need at a time
+    // and swaps it when the tier changes.
+    //
+    // Heisenberg's drop-to-hand watches container-changed events, and a tier swap
+    // (old removed from player, new added) is indistinguishable from a real player drop.
+    // If one of these is ever intercepted, the drop times out waiting for 3D that an
+    // invisible item never gets, and the token is re-added - RE-APPLYING ITS EFFECT. That
+    // is the "stuck starving, eating changes nothing" report: the tier can never fall
+    // because something keeps putting the token back.
+    //
+    // DropToHand already carries THREE stacked guards against this (non-playable, HC_/omod
+    // editor-ID prefix, model-less ALCH) - each added after a previous recurrence. Every one
+    // of them enumerates what a token LOOKS like, so a token shaped slightly differently
+    // slips through and the bug returns. This audit exists to stop guessing: it reports what
+    // is actually in the inventory so the next recurrence is diagnosed from data instead of
+    // from another round of pattern-matching.
+    //
+    // Read-only. It never removes anything - a wrong auto-removal here would corrupt a
+    // legitimate survival state, which is worse than the bug.
+    void Heisenberg::AuditSurvivalStatusTokens()
+    {
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player || !player->inventoryList) {
+            return;
+        }
+
+        int distinctTokens = 0;
+        int totalStacked = 0;
+
+        for (auto& invItem : player->inventoryList->data) {
+            auto* obj = invItem.object;
+            if (!obj || obj->GetFormType() != RE::ENUM_FORM_ID::kALCH) {
+                continue;
+            }
+
+            const char* editorId = obj->GetFormEditorID();
+            const bool hcPrefix = editorId && std::strncmp(editorId, "HC_", 3) == 0;
+
+            const char* modelPath = nullptr;
+            if (auto* asModel = obj->As<RE::TESModel>()) {
+                modelPath = asModel->GetModel();
+            }
+            const bool modelLess = (!modelPath || modelPath[0] == '\0');
+
+            if (!hcPrefix && !modelLess) {
+                continue;  // an ordinary edible/chem
+            }
+
+            const int count = invItem.GetCount();
+            std::string name;
+            {
+                const auto view = RE::TESFullName::GetFullName(*obj, false);
+                name = view.empty() ? "<no name>" : std::string(view);
+            }
+
+            ++distinctTokens;
+            totalStacked += count;
+
+            // count > 1 is the smoking gun. The game keeps exactly one token per need, so
+            // a stack means something re-added it - almost certainly us.
+            spdlog::warn("[SURVIVAL-AUDIT] {:08X} '{}' edID='{}' count={} hcPrefix={} modelLess={}{}",
+                         obj->GetFormID(),
+                         name,
+                         editorId ? editorId : "<none>",
+                         count,
+                         hcPrefix,
+                         modelLess,
+                         count > 1 ? "  <-- STACKED: re-added, this is the bug" : "");
+        }
+
+        if (distinctTokens > 0) {
+            spdlog::warn("[SURVIVAL-AUDIT] {} status token(s) in inventory, {} total. "
+                         "One per active need is NORMAL; any count>1 is not.",
+                         distinctTokens, totalStacked);
+        } else {
+            spdlog::info("[SURVIVAL-AUDIT] No survival status tokens in inventory "
+                         "(either Survival is off, or all needs are satisfied)");
+        }
+    }
+
+    void Heisenberg::RecoverSkeletonCollapsedByScopeExit(float deltaTime)
+    {
+        // Well below any legitimate skeleton scale, far above FRIK's 0.00001 sentinel.
+        constexpr float kCollapsedScaleThreshold = 0.01f;
+        constexpr float kPostScopeGraceSeconds = 0.25f;
+
+        static float s_grace = 0.0f;
+        static std::uint32_t s_recoveries = 0;
+
+        if (MenuChecker::GetSingleton().IsScopeOpen()) {
+            s_grace = kPostScopeGraceSeconds;   // FRIK owns the collapse while scoped
+            return;
+        }
+        if (s_grace > 0.0f) {
+            s_grace -= deltaTime;               // let FRIK restore it first
+            return;
+        }
+
+        RE::NiNode* skeletonRoot = f4vr::getRootNode();
+        if (!skeletonRoot || skeletonRoot->local.scale > kCollapsedScaleThreshold) {
+            return;                             // healthy - the overwhelmingly common path
+        }
+
+        // Capture BEFORE the write - reporting the threshold instead of what was actually
+        // there would make every occurrence look identical and hide a different root cause.
+        const float observedScale = skeletonRoot->local.scale;
+
+        skeletonRoot->local.scale = 1.0f;
+        f4vr::updateTransformsDown(skeletonRoot, true);
+
+        ++s_recoveries;
+        spdlog::warn("[SKELETON] Restored collapsed skeleton root after scope exit "
+                     "(observed scale={:.5f}; FRIK's setBodyUnderHMD early-returned before its "
+                     "own restore. 0.00001 = FRIK hideHands; anything else is a DIFFERENT "
+                     "cause worth investigating. n={})",
+                     observedScale, s_recoveries);
     }
 
     void Heisenberg::OnFrameUpdate()
@@ -1663,6 +2181,70 @@ namespace heisenberg
         UpdateChestPocketZone();
         UpdateStorageZoneConfig();
 
+        // FRIK can leave the whole skeleton collapsed after a scope exit (see the function).
+        RecoverSkeletonCollapsedByScopeExit(deltaTime);
+
+        // SKELETON STATE WITNESS.
+        //
+        // "My body disappeared" has now been reported for two DIFFERENT underlying causes, and
+        // the recovery guard above is silent whenever it decides NOT to act - so a log with no
+        // [SKELETON] line cannot distinguish "the body is fine" from "the body is gone for a
+        // reason I do not handle". This reports the actual state periodically so the next
+        // occurrence is diagnosed from numbers instead of from a theory.
+        //
+        // hideHands() collapses BOTH scale and position (scale 0.00001 and a 10-unit shove
+        // behind the camera), so position is reported too: a healthy scale with the root far
+        // from the player is a different failure from a collapsed scale, and only this line
+        // tells them apart.
+        {
+            static float s_skelWitness = 0.0f;
+            s_skelWitness -= deltaTime;
+            if (s_skelWitness <= 0.0f) {
+                s_skelWitness = 5.0f;
+                if (RE::NiNode* root = f4vr::getRootNode()) {
+                    auto* player = RE::PlayerCharacter::GetSingleton();
+                    const RE::NiPoint3 rp = root->world.translate;
+                    float distFromPlayer = -1.0f;
+                    if (player) {
+                        const RE::NiPoint3 pp = player->GetPosition();
+                        const RE::NiPoint3 d{ rp.x - pp.x, rp.y - pp.y, rp.z - pp.z };
+                        distFromPlayer = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+                    }
+                    const bool collapsed = root->local.scale < 0.01f;
+                    const bool displaced = distFromPlayer > 200.0f;
+                    if (collapsed || displaced) {
+                        spdlog::warn("[SKELETON-STATE] root localScale={:.5f} worldScale={:.5f} "
+                                     "distFromPlayer={:.1f} scopeOpen={} -- {}{}",
+                                     root->local.scale, root->world.scale, distFromPlayer,
+                                     MenuChecker::GetSingleton().IsScopeOpen(),
+                                     collapsed ? "COLLAPSED " : "",
+                                     displaced ? "DISPLACED" : "");
+                    } else {
+                        spdlog::info("[SKELETON-STATE] healthy: localScale={:.3f} "
+                                     "distFromPlayer={:.1f} scopeOpen={}",
+                                     root->local.scale, distFromPlayer,
+                                     MenuChecker::GetSingleton().IsScopeOpen());
+                    }
+                } else {
+                    spdlog::warn("[SKELETON-STATE] getRootNode() returned NULL - the player has "
+                                 "no skeleton root at all, which no scale/position fix can address");
+                }
+            }
+        }
+
+        // Survival status-token audit. Runs every 10s rather than once at load, because the
+        // failure mode is a token being RE-ADDED over time - a single snapshot at load would
+        // miss exactly the thing we need to see. Cheap: one inventory walk, and it only emits
+        // when something is actually there.
+        {
+            static float s_survivalAuditTimer = 0.0f;
+            s_survivalAuditTimer -= deltaTime;
+            if (s_survivalAuditTimer <= 0.0f) {
+                s_survivalAuditTimer = 10.0f;
+                AuditSurvivalStatusTokens();
+            }
+        }
+
         // Rollover-hook snapshot + witness drain. UNCONDITIONAL on purpose: it clears the
         // tracked-activator snapshot when the feature is off (an MCM toggle mid-session must
         // not leave it latched) and it is the main-thread drain point for the rollover hook's
@@ -1687,8 +2269,9 @@ namespace heisenberg
         }
 
         // ==== Pickpocket / Stealing ====
-        // Touch NPC while sneaking + grip to steal items
-        {
+        // Touch NPC while sneaking + grip to steal items.
+        // PARKED 2026-09-04: enablePickpocket is forced off in Config::Load().
+        if (g_config.enablePickpocket) {
             PickpocketHandler::GetSingleton().Update(deltaTime);
         }
 
@@ -2017,6 +2600,52 @@ namespace heisenberg
             spdlog::debug("Heisenberg: Restoring native activation");
             _inputSuppressed = false;
         }
+
+        // A consumed reference disappears before this update. Without a
+        // separate tail, HeldObjectActivation is cleared in that exact frame
+        // and a queued Grip->Activate reaches a companion/container. Retain
+        // the block for at least 500 ms and until the consuming grip is up.
+        const auto now = std::chrono::steady_clock::now();
+        for (const bool isLeft : { true, false }) {
+            const std::size_t index = isLeft ? 0u : 1u;
+            if (!_postConsumeActivationSuppressed[index].load(
+                    std::memory_order_acquire)) {
+                continue;
+            }
+            const bool minimumTailElapsed =
+                now >= _postConsumeActivationMinimumUntil[index];
+            const Hand* hand = isLeft ?
+                _leftHand.get() : _rightHand.get();
+            const bool grabInputHeld =
+                hand && hand->IsGrabPressed();
+            if (!post_consume_activation_policy::shouldKeepSuppressed(
+                    minimumTailElapsed,
+                    grabInputHeld)) {
+                _postConsumeActivationSuppressed[index].store(
+                    false,
+                    std::memory_order_release);
+            }
+        }
+        const bool anyPostConsumeSuppression =
+            IsPostConsumeActivationSuppressed();
+        SetInputSuppression(
+            InputSuppressionReason::PostConsumeActivation,
+            anyPostConsumeSuppression);
+    }
+
+    void Heisenberg::BeginPostConsumeActivationSuppression(
+        const bool isLeft)
+    {
+        const std::size_t index = isLeft ? 0u : 1u;
+        _postConsumeActivationMinimumUntil[index] =
+            std::chrono::steady_clock::now() +
+            POST_CONSUME_ACTIVATION_MINIMUM_TAIL;
+        _postConsumeActivationSuppressed[index].store(
+            true,
+            std::memory_order_release);
+        SetInputSuppression(
+            InputSuppressionReason::PostConsumeActivation,
+            true);
     }
 
     void Heisenberg::UpdateChestPocketZone()

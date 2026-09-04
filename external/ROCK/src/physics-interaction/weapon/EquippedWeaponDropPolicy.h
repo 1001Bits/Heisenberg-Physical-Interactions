@@ -42,24 +42,24 @@ namespace rock::equipped_weapon_drop_policy
     }
 
     /*
-     * Equipped-weapon shoulder stash only tracks a single carrying hand: the
-     * gesture is "carry the weapon over the shoulder and let go", which
-     * requires that releasing this hand is what would drop the weapon. With
-     * two active holds no single release drops, so no hand is a stash carry
-     * candidate until one grip lets go.
+     * Equipped-weapon shoulder stash is an explicit OFFHAND carry gesture.
+     * A firing/primary-hand shoulder movement belongs to Virtual Holsters and
+     * normal gameplay. With two active holds no single release drops the gun,
+     * and primary-only carry is likewise never a StorageZone candidate.
      */
     [[nodiscard]] inline constexpr SourceHand resolveEquippedWeaponStashCarryHand(
-        bool primaryOnlyActive,
+        bool /*primaryOnlyActive*/,
         bool partCarryActive,
         bool leftPartGripActive,
         bool rightPartGripActive,
         bool firingHandIsLeft) noexcept
     {
-        if (primaryOnlyActive) {
-            return firingHandIsLeft ? SourceHand::Left : SourceHand::Right;
-        }
         if (partCarryActive && leftPartGripActive != rightPartGripActive) {
-            return leftPartGripActive ? SourceHand::Left : SourceHand::Right;
+            const SourceHand carryHand =
+                leftPartGripActive ? SourceHand::Left : SourceHand::Right;
+            if (isLeft(carryHand) != firingHandIsLeft) {
+                return carryHand;
+            }
         }
         return SourceHand::None;
     }

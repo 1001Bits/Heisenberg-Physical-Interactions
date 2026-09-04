@@ -179,6 +179,7 @@ namespace heisenberg
         bool            _insertionOpenHandActive    = false;  // True = force open hand (cleared on deck close)
         bool            _insertionOpenHandIsLeft    = false;  // Which hand inserted the holotape
         bool            _deckOpenedByEject          = false;  // True = eject opened deck (removal pose), false = insertion/ceremony (open hand)
+        float           _deckPushCloseLockout       = 0.0f;   // Seconds during which the deck cannot be pushed closed after it opens (the pressing finger is still on the button)
 
         // Track last held holotape to set insertion cooldown on new grabs
         std::uint32_t   _lastHeldHolotapeRefID      = 0;     // RefID of last detected holotape grab
@@ -384,6 +385,12 @@ namespace heisenberg
         static constexpr float EJECT_Z_MIN            = -0.2f;   // Max button depression (FRIK light: -0.2)
         static constexpr float EJECT_SKIN_RADIUS      =  0.45f;  // Visible fingertip flesh around the tracked bone point — the button starts moving exactly when the SKIN touches it, not when the padded contact bubble does
         static constexpr float EJECT_COOLDOWN_TIME    =  0.5f;   // Seconds between presses
+        // The finger that just pressed eject is still resting on the button while the tray
+        // travels out, and the button sits directly adjacent to the tray. The old guard was
+        // an ANIMATION threshold (progress >= 0.75), which the finger simply outlasts — the
+        // deck opened and shut in one motion. This is a real time lockout instead, long
+        // enough for a deliberate press-and-withdraw.
+        static constexpr float DECK_PUSH_CLOSE_LOCKOUT = 0.6f;   // Seconds
         // Holotape slot
         static constexpr float TAPE_GRAB_RADIUS       = 15.0f;   // Distance from controller to tape deck tray for holotape removal
         static constexpr float TAPE_GRAB_COOLDOWN     =  1.5f;   // Seconds after removal before allowing that hand-held tape to reinsert

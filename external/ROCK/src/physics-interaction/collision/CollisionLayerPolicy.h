@@ -15,6 +15,15 @@ namespace rock::collision_layer_policy
      */
     inline constexpr std::uint32_t FO4_LAYER_UNIDENTIFIED = 0;
     inline constexpr std::uint32_t FO4_LAYER_FILTER_MASK = 0x7F;
+
+    [[nodiscard]] inline constexpr std::uint32_t withCollisionLayer(
+        const std::uint32_t filterInfo,
+        const std::uint32_t layer) noexcept
+    {
+        return (filterInfo & ~FO4_LAYER_FILTER_MASK) |
+               (layer & FO4_LAYER_FILTER_MASK);
+    }
+
     inline constexpr std::uint32_t FO4_LAYER_STATIC = 1;
     inline constexpr std::uint32_t FO4_LAYER_ANIMSTATIC = 2;
     inline constexpr std::uint32_t FO4_LAYER_TRANSPARENT = 3;
@@ -68,12 +77,26 @@ namespace rock::collision_layer_policy
     inline constexpr std::uint32_t ROCK_LAYER_RELOAD = ROCK_LAYER_HAND;
     /*
      * Dynamic hand proxy bodies live on their own extended row so they collide
-     * ONLY with static world-surface layers:
-     * no clutter, actors, projectiles, or other ROCK layers, and never each
-     * other. The proxy is a solver-side visual-stop driver, not gameplay
-     * contact evidence.
+     * only with static world-surface layers and generated equipped-weapon
+     * hulls: no clutter, actors, projectiles, other hands/body colliders, and
+     * never each other. The proxy is a solver-side visual-stop driver, not
+     * gameplay contact evidence.
      */
     inline constexpr std::uint32_t ROCK_LAYER_DYNAMIC_HAND_PROXY = 48;
+
+    /*
+     * Weapon CCD must see the same production hand hull that supplies the
+     * working hand->weapon manifold.  Layer 48 is an optional solver twin; it
+     * can be absent or one physics sample behind during hand transitions.
+     * Layer 43 is therefore an authoritative fallback, with body-ID ownership
+     * and directional arbitration performed by SoftContactRuntime.
+     */
+    [[nodiscard]] inline constexpr bool
+    isWeaponSweepHandTargetLayer(const std::uint32_t layer) noexcept
+    {
+        return layer == ROCK_LAYER_HAND ||
+               layer == ROCK_LAYER_DYNAMIC_HAND_PROXY;
+    }
 
     inline constexpr std::uint32_t FO4_LAYER_VANILLA_CONFIGURED_COUNT = 47;
     inline constexpr std::uint32_t FO4_LAYER_LAST_VANILLA_CONFIGURED = FO4_LAYER_DROPPINGPICK;
@@ -451,6 +474,13 @@ namespace rock::collision_layer_policy
         if (includeBodyLayer) {
             mask = withLayer(mask, ROCK_LAYER_BODY);
         }
+        /*
+         * The dynamic hand proxy is an extended (non-vanilla) layer, so it is
+         * absent from allConfiguredLayerBits(). Add it explicitly to keep the
+         * weapon row symmetric with buildRockDynamicHandProxyExpectedMask();
+         * otherwise the matrix watchdog observes bit 48 as perpetual drift.
+         */
+        mask = withLayer(mask, ROCK_LAYER_DYNAMIC_HAND_PROXY);
         return mask;
     }
 
@@ -585,6 +615,34 @@ namespace rock::collision_layer_policy
         return true;
     }
 
+    inline constexpr bool rockDynamicHandProxyPairsMatch(
+        const std::uint64_t* matrix,
+        std::uint64_t expectedProxyMask)
+    {
+        if (!matrix) {
+            return false;
+        }
+
+        /*
+         * Layer 48 is an extended ROCK-owned row. Checking only its row misses
+         * one-sided native/mod matrix rewrites in a world or weapon column;
+         * those leave Havok pair filtering asymmetric and can silently remove
+         * free-hand/weapon contact. Guard every row/column pair we author.
+         */
+        for (std::uint32_t other = 0;
+             other < FO4_LAYER_MATRIX_ADDRESSABLE_COUNT;
+             ++other) {
+            if (!layerPairSymmetricMatches(
+                    matrix,
+                    ROCK_LAYER_DYNAMIC_HAND_PROXY,
+                    other,
+                    maskEnablesLayer(expectedProxyMask, other))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     inline void applyRockHandLayerPolicy(std::uint64_t* matrix, bool includeWeaponLayer, bool includeStaticWorld = true)
     {
         applyLayerExpectedMask(matrix, ROCK_LAYER_HAND, buildRockHandExpectedMask(includeWeaponLayer, includeStaticWorld));
@@ -605,20 +663,32 @@ namespace rock::collision_layer_policy
         applyLayerExpectedMask(matrix, ROCK_LAYER_BODY, buildRockBodyExpectedMask(includeStaticWorld));
     }
 
-    inline constexpr std::uint64_t buildRockDynamicHandProxyExpectedMask()
+    inline constexpr std::uint64_t buildRockDynamicHandProxyExpectedMask(
+        bool includeStaticWorld = true)
     {
         std::uint64_t mask = 0;
-        for (std::uint32_t layer = 0; layer < FO4_LAYER_MATRIX_ADDRESSABLE_COUNT; ++layer) {
-            if (isWorldSurfaceLayer(layer)) {
-                mask = withLayer(mask, layer);
+        if (includeStaticWorld) {
+            for (std::uint32_t layer = 0; layer < FO4_LAYER_MATRIX_ADDRESSABLE_COUNT; ++layer) {
+                if (isWorldSurfaceLayer(layer)) {
+                    mask = withLayer(mask, layer);
+                }
             }
         }
+        // One-way visual stopping against the generated equipped-weapon hull.
+        // The weapon remains keyframed authority; owned-hand visual output is
+        // gated by DynamicHandCollisionRuntime rather than fed back to it.
+        mask = withLayer(mask, ROCK_LAYER_WEAPON);
         return mask;
     }
 
-    inline void applyRockDynamicHandProxyLayerPolicy(std::uint64_t* matrix)
+    inline void applyRockDynamicHandProxyLayerPolicy(
+        std::uint64_t* matrix,
+        bool includeStaticWorld = true)
     {
-        applyLayerExpectedMask(matrix, ROCK_LAYER_DYNAMIC_HAND_PROXY, buildRockDynamicHandProxyExpectedMask());
+        applyLayerExpectedMask(
+            matrix,
+            ROCK_LAYER_DYNAMIC_HAND_PROXY,
+            buildRockDynamicHandProxyExpectedMask(includeStaticWorld));
     }
 
     inline void applyNativeCharacterControllerObjectSuppressionPolicy(
@@ -666,6 +736,6 @@ namespace rock::collision_layer_policy
             buildRockWeaponExpectedMask(weaponBlocksProjectiles, weaponBlocksSpells, weaponStaticWorld, true));
         applyRockReloadLayerPolicy(matrix, weaponBlocksProjectiles, weaponBlocksSpells, handStaticWorld);
         applyRockBodyLayerPolicy(matrix, bodyStaticWorld);
-        applyRockDynamicHandProxyLayerPolicy(matrix);
+        applyRockDynamicHandProxyLayerPolicy(matrix, handStaticWorld);
     }
 }
