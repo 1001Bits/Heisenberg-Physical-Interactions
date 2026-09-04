@@ -260,7 +260,17 @@ Get the VirtualHolsters holster slot index (1-7), or 0 if not in a holster zone.
 ```cpp
 bool DropToHand(RE::TESForm* form, bool isLeft);
 ```
-Spawn an item from inventory into the specified hand.
+Spawn an item from inventory into the specified hand. Only the base form is
+known, so the engine removes the first stack of that form in the inventory
+list. For weapons and armor with mods, legendary effects or custom names use
+`DropInstanceToHand` (build 4) so the exact instance leaves the inventory.
+
+```cpp
+bool DropInstanceToHand(RE::TESForm* form, RE::TBO_InstanceData* instanceData,
+                        unsigned short uniqueID, bool isLeft, int count);
+```
+Build 4. Spawn a specific inventory stack into the hand. See the Build 4 tail
+below for the matching rules.
 
 ```cpp
 bool SmartGrab(bool isLeft);
@@ -352,6 +362,52 @@ callback. Registration never replaces another owner. Unregister waits for
 other in-flight calls; self-unregistration is safe and completes when the
 current invocation returns. See `DualWieldAPI.h` for the versioned structures.
 
+### Build 4 Tail
+
+After checking `GetBuildNumber() >= 4`, consumers can drop a specific
+inventory item instance into a hand:
+
+```cpp
+bool DropInstanceToHand(RE::TESForm* form, RE::TBO_InstanceData* instanceData,
+                        unsigned short uniqueID, bool isLeft, int count);
+```
+
+`DropToHand(form, isLeft)` only knows the base form, so the engine removes the
+first stack of that form in the inventory list. A looted legendary or modded
+weapon can therefore be swapped for the player's own plain copy of the same
+base form. `DropInstanceToHand` identifies the exact stack and drops it through
+`Actor::DropObject` with a `BGSObjectInstance`, so mods, legendary effects and
+custom names are preserved. (Proposed by CylonSurfer.)
+
+The stack is matched by either key; pass what you have:
+
+| Parameter | Source | Notes |
+|-----------|--------|-------|
+| `instanceData` | `BGSInventoryItem::Stack::extra` → `ExtraInstanceData::data` | Compared by pointer only, never dereferenced. `nullptr` = unknown. |
+| `uniqueID` | `ExtraUniqueID::uniqueID`, also `TESContainerChangedEvent::uniqueID` | `0` = unknown. |
+
+When neither key matches a stack, the engine's default stack is dropped, which
+is the same behaviour as `DropToHand`. The drop is queued and processed on the
+next main-thread update; call it from the main game thread. `count` is the
+number of items moved out of that stack (minimum 1).
+
+Example, dropping the stack an inventory menu just selected:
+
+```cpp
+void DropSelectedStack(RE::TESForm* baseForm, RE::BGSInventoryItem::Stack* stack, bool isLeft)
+{
+    if (!g_heisenberg || g_heisenberg->GetBuildNumber() < 4) return;
+
+    RE::TBO_InstanceData* instance = nullptr;
+    unsigned short uniqueID = 0;
+    if (auto* extra = stack ? stack->extra.get() : nullptr) {
+        if (auto* inst = extra->GetByType<RE::ExtraInstanceData>()) instance = inst->data.get();
+        if (auto* uid = extra->GetByType<RE::ExtraUniqueID>()) uniqueID = uid->uniqueID;
+    }
+    g_heisenberg->DropInstanceToHand(baseForm, instance, uniqueID, isLeft, 1);
+}
+```
+
 ## Thread Safety
 
 - `GetBuildNumber()` is immutable.
@@ -369,6 +425,7 @@ current invocation returns. See `DualWieldAPI.h` for the versioned structures.
 | 1 | Initial API plus item-to-hand suppression tail |
 | 2 | Weapon collision, offhand grip, and per-hand collision controls |
 | 3 | Versioned dual-wield state/input/contact bridge |
+| 4 | `DropInstanceToHand`: instance-exact inventory drop via `Actor::DropObject` |
 
 ## Example: Integration with Another VR Mod
 

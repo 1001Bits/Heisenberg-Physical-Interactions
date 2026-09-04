@@ -35,6 +35,7 @@
 namespace RE {
     class TESObjectREFR;  // Game object reference (NPC, item in world, etc.)
     class TESForm;        // Base form (item template)
+    class TBO_InstanceData;  // Per-instance item data (mods, legendary, name); opaque here
     class NiAVObject;
     struct NiPoint3 { float x, y, z; };
 
@@ -258,6 +259,17 @@ namespace HeisenbergPluginAPI {
             DualWieldWeaponContactCallback callback) = 0;
         virtual bool UnregisterDualWieldWeaponContactCallback(
             DualWieldWeaponContactCallback callback) = 0;
+
+        // --- Build 4 tail (guard every call with GetBuildNumber() >= 4) ---
+        // Instance-exact inventory drop. instanceData = the stack's
+        // ExtraInstanceData::data (compared by pointer, may be nullptr);
+        // uniqueID = the stack's ExtraUniqueID (0 = unknown). When neither
+        // matches, the engine's default stack is dropped like DropToHand.
+        virtual bool DropInstanceToHand(RE::TESForm* form,
+                                        RE::TBO_InstanceData* instanceData,
+                                        unsigned short uniqueID,
+                                        bool isLeft,
+                                        int count) = 0;
     };
 
     static_assert(sizeof(RE::NiPoint3) == 12);

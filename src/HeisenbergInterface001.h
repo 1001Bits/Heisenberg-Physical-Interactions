@@ -635,6 +635,46 @@ namespace HeisenbergPluginAPI {
 
         virtual bool RegisterDualWieldWeaponContactCallback(DualWieldWeaponContactCallback callback) = 0;
         virtual bool UnregisterDualWieldWeaponContactCallback(DualWieldWeaponContactCallback callback) = 0;
+
+        // =====================================================================
+        // INSTANCE-EXACT DROP TO HAND
+        // ABI: build 4, appended after every build-3 slot above. Never reorder.
+        // All methods below require GetBuildNumber() >= 4.
+        // =====================================================================
+
+        /**
+         * Spawn a SPECIFIC inventory item instance into a hand.
+         *
+         * DropToHand(form, isLeft) only knows the base form, so the engine
+         * removes the first stack of that form in the inventory list - a looted
+         * legendary or modded weapon can be swapped for the player's own plain
+         * copy. This overload identifies the exact stack and drops it through
+         * Actor::DropObject with a BGSObjectInstance, so mods, legendary effects
+         * and custom names are preserved. (Proposed by CylonSurfer.)
+         *
+         * The stack is matched by either key; pass what you have:
+         *   - instanceData: the stack's ExtraInstanceData::data (TBO_InstanceData*).
+         *     Compared by pointer only, never dereferenced.
+         *   - uniqueID: the stack's ExtraUniqueID::uniqueID (also delivered by
+         *     TESContainerChangedEvent::uniqueID). 0 = unknown.
+         * When neither matches a stack, the engine's default stack is dropped,
+         * which is the same behaviour as DropToHand.
+         *
+         * The drop is queued and processed on the next main-thread update, like
+         * DropToHand. Call from the main game thread.
+         *
+         * @param form         Base form of the item (must be in the player's inventory)
+         * @param instanceData Exact instance data of the stack, or nullptr
+         * @param uniqueID     ExtraUniqueID of the stack, or 0
+         * @param isLeft       Which hand should receive the item
+         * @param count        Number of items to move from that stack (>= 1)
+         * @return True if the request was queued
+         */
+        virtual bool DropInstanceToHand(RE::TESForm* form,
+                                        RE::TBO_InstanceData* instanceData,
+                                        unsigned short uniqueID,
+                                        bool isLeft,
+                                        int count) = 0;
     };
 
     // =========================================================================

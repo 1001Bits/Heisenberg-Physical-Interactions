@@ -30,7 +30,10 @@ namespace HeisenbergPluginAPI {
     //   External consumers must check GetBuildNumber() >= 2 before calling those slots.
     // 3 (Jul 20 2026): append-only dual-wield state/input/contact bridge.
     //   External consumers must check GetBuildNumber() >= 3 before calling those slots.
-    constexpr unsigned int HEISENBERG_BUILD_NUMBER = 3;
+    // 4 (Sep 4 2026): append-only DropInstanceToHand - instance-exact inventory drop
+    //   via Actor::DropObject + BGSObjectInstance (CylonSurfer's proposal).
+    //   External consumers must check GetBuildNumber() >= 4 before calling that slot.
+    constexpr unsigned int HEISENBERG_BUILD_NUMBER = 4;
 
     // =========================================================================
     // Callback storage
@@ -686,6 +689,27 @@ namespace HeisenbergPluginAPI {
         bool UnregisterDualWieldWeaponContactCallback(DualWieldWeaponContactCallback callback) override
         {
             return UnregisterDualWieldWeaponContactCallbackImpl(callback);
+        }
+
+        // =====================================================================
+        // INSTANCE-EXACT DROP TO HAND (build 4)
+        // =====================================================================
+
+        bool DropInstanceToHand(RE::TESForm* form,
+                                RE::TBO_InstanceData* instanceData,
+                                unsigned short uniqueID,
+                                bool isLeft,
+                                int count) override
+        {
+            if (!form) return false;
+            if (count < 1) count = 1;
+            heisenberg::DropToHand::GetSingleton().QueueDropToHand(
+                form->formID, isLeft, count,
+                /*stickyGrab*/ true, /*markAsSmartGrab*/ false, /*bypassInitialDelay*/ false,
+                uniqueID, instanceData);
+            spdlog::debug("[API] DropInstanceToHand {:08X} x{} uniqueID={} instance={} -> {} hand",
+                form->formID, count, uniqueID, instanceData != nullptr, isLeft ? "left" : "right");
+            return true;
         }
     };
 
